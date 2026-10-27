@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { runGlob, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { finishBackground, runGlob, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import type { RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -44,6 +44,28 @@ function killed(): ExecResult {
     stderrTruncated: false,
   }
 }
+
+test('a finished background job appends its note once and returns no result', () => {
+  const appended: string[] = []
+  const outcome = finishBackground({ ...killed(), signal: null, code: 0 }, 'note', text => appended.push(text))
+  assert.deepEqual(appended, ['note'])
+  assert.equal('result' in outcome, false)
+  assert.equal(outcome.status, 'completed')
+  assert.equal(outcome.detail, 'exit code: 0')
+})
+
+test('an empty background note is not appended', () => {
+  const appended: string[] = []
+  const outcome = finishBackground({ ...killed(), signal: null, code: 0 }, '', text => appended.push(text))
+  assert.deepEqual(appended, [])
+  assert.equal(outcome.status, 'completed')
+})
+
+test('a killed background job reports cancelled', () => {
+  const outcome = finishBackground(killed(), '', () => undefined)
+  assert.equal(outcome.status, 'killed')
+  assert.equal(outcome.detail, 'cancelled')
+})
 
 test('a cancelled glob is an abort, not a command failure', async () => {
   const controller = new AbortController()

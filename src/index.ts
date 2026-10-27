@@ -199,7 +199,10 @@ class Core {
 
   private async persistHosts(): Promise<void> {
     const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
-    if (row === undefined) return
+    if (row === undefined) {
+      this.ctx.logger?.warn('[@dsh-permission-remote] settings row "permission-remote" is missing; the host list changed in memory but was not persisted')
+      return
+    }
     await this.ctx.settings.update(String(row.ns), { hosts: this.config.hosts })
   }
 
@@ -332,7 +335,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     }
   } catch (error) {
     for (const unregister of disposers) unregister()
-    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${error instanceof Error ? error.message : String(error)}`)
     if (initial.kind === 'remote') throw error
     return false
   }
@@ -349,11 +352,15 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     agent.ctx.effect(() => drop)
   } catch (error) {
     drop()
-    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${error instanceof Error ? error.message : String(error)}`)
     if (initial.kind === 'remote') throw error
     return false
   }
   return true
+}
+
+function agentLabel(agent: AgentLike): string {
+  return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'
 }
 
 function withRemoteTimeout(definition: object): object {

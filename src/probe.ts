@@ -23,7 +23,7 @@ export function probeOutcome(exitCode: number | null, timedOut: boolean, stderr 
  * and the file sandbox bind-mounts the home directory.
  */
 export function hostFactsCommand(): string {
-  const line = (body: string) => `{ ${body}; } || printf '\\n'`
+  const line = (body: string) => `( ${body} ) || printf '\\n'`
   return [
     'uname -s',
     'uname -m',

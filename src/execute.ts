@@ -26,7 +26,6 @@ import {
   sandboxDenied,
   seatbeltBashCommand,
   seatbeltProbeArgv,
-  seatbeltProfileArgs,
   type RemoteFileRoots,
 } from './profile.ts'
 import { hostFactsCommand, parseHostFacts, probeOutcome, ripgrepPackage, type ProbeOutcome } from './probe.ts'
@@ -82,8 +81,8 @@ export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretM
   const uname = await pool.exec(host, secret, hostFactsCommand(), 20_000)
   const facts = parseHostFacts(uname.stdout)
   const { os, arch } = facts
-  const tmp = await canonicalRemotePath(pool, host, secret, facts.tmp)
-  const userTmp = await canonicalRemotePath(pool, host, secret, facts.userTmp)
+  const tmp = await existingRemotePath(pool, host, secret, facts.tmp)
+  const userTmp = await existingRemotePath(pool, host, secret, facts.userTmp)
   const home = facts.home
   const roots: RemoteFileRoots = { workspaceRoot: '/', tmp, userTmp }
   let sandbox: ProbeOutcome = { available: false, reason: 'missing' }
@@ -170,18 +169,23 @@ export function buildResolveMode(ctx: {
 
 async function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
   const workspaceRoot = await canonicalRemotePath(pool, host, secret, workspace)
-  const tmp = await existingRemotePath(pool, host, secret, status.roots.tmp)
-  const userTmp = await existingRemotePath(pool, host, secret, status.roots.userTmp)
-  return { workspaceRoot, tmp, userTmp }
+  return { workspaceRoot, tmp: status.roots.tmp, userTmp: status.roots.userTmp }
 }
 
-/** A temp root that is not on disk becomes `''`, so the file profile does not `--bind` it. */
+const NOT_FOUND = /no such file|cannot find|not found|does not exist/i
+
+/**
+ * A temp root that is not on disk becomes `''`, so the file profile does not
+ * `--bind` it. A transient SFTP failure keeps the normalized path instead of
+ * silently revoking write access to the temp directories.
+ */
 async function existingRemotePath(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
   if (remotePath.trim().length === 0) return ''
   try {
     return await pool.sftpRealpath(host, secret, remotePath)
-  } catch {
-    return ''
+  } catch (error) {
+    if (error instanceof Error && NOT_FOUND.test(error.message)) return ''
+    return posix.normalize(remotePath)
   }
 }
 
@@ -251,8 +255,26 @@ function fileCommand(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileR
     return shJoin(['bwrap', ...profile, '--chdir', roots.workspaceRoot, '--', 'bash', '-c', script])
   }
   const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
-  const profile = seatbeltProfileArgs(mode, writable) ?? []
-  return shJoin(['sandbox-exec', ...profile, '--', 'bash', '-c', script])
+  return seatbeltBashCommand(mode, writable, roots.workspaceRoot, script)
+}
+
+export interface BackgroundOutcome {
+  readonly status: 'completed' | 'killed'
+  readonly detail: string
+}
+
+/**
+ * Finish a background job. Output already reached the ring chunk by chunk, so
+ * the outcome carries only status: repeating the captured text as `result`
+ * would make `job_output` print it twice, because the model read is
+ * `delta + result`. The note is appended exactly once.
+ */
+export function finishBackground(result: ExecResult, note: string, append: (text: string) => void): BackgroundOutcome {
+  if (note.length > 0) append(note)
+  return {
+    status: result.timedOut || result.signal === 'KILL' ? 'killed' : 'completed',
+    detail: result.timedOut ? 'timed out' : result.signal === 'KILL' ? 'cancelled' : `exit code: ${result.code ?? 'null'}`,
+  }
 }
 
 async function startBackground(
@@ -295,18 +317,11 @@ async function startBackground(
         opened = commandHandle
         if (cancelled || exec.signal?.aborted === true) commandHandle.close()
         return commandHandle.done
-      }).then(result => {
-        if (note.length > 0) job.append(note)
-        const text = `${capturedText(result.stdout, result.stdoutTruncated)}${capturedText(result.stderr, result.stderrTruncated)}${note}`
-        return {
-          status: result.timedOut || result.signal === 'KILL' ? 'killed' as const : 'completed' as const,
-          detail: result.timedOut ? 'timed out' : result.signal === 'KILL' ? 'cancelled' : `exit code: ${result.code ?? 'null'}`,
-          result: text,
-        }
-      }).catch((error: unknown) => ({
-        status: 'failed' as const,
-        detail: error instanceof Error ? error.message : String(error),
-      }))
+      }).then(result => finishBackground(result, note, text => job.append(text)))
+        .catch((error: unknown) => ({
+          status: 'failed' as const,
+          detail: error instanceof Error ? error.message : String(error),
+        }))
       return {
         cancel: () => {
           cancelled = true

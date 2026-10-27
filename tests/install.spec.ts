@@ -38,7 +38,16 @@ test('a blank temp line does not move HOME into userTmp', () => {
   assert.equal(facts.home, '/home/dev')
 })
 
-test('a missing TMPDIR still yields five fact lines', () => {
+function hasBash(): boolean {
+  try {
+    execFileSync('bash', ['-c', 'true'], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+test('a missing TMPDIR still yields five fact lines', { skip: hasBash() ? false : 'bash is not available' }, () => {
   const stdout = execFileSync('bash', ['-c', hostFactsCommand()], {
     env: { ...process.env, TMPDIR: '/nonexistent-xyz-dsh-probe' },
     encoding: 'utf8',
