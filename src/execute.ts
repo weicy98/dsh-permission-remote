@@ -16,12 +16,15 @@ import { distroInstallFor, parseOsRelease, type DistroInstall } from './install-
 import { composeCreatedPath } from './contain.ts'
 import {
   atomicWriteScript,
+  bwrapFileProfileArgs,
   bwrapProfileArgs,
   bwrapProbeArgv,
+  fileWritableRoots,
   fileWriteAllowed,
   globArgv,
   grepArgv,
   sandboxDenied,
+  seatbeltBashCommand,
   seatbeltProbeArgv,
   seatbeltProfileArgs,
   type RemoteFileRoots,
@@ -167,9 +170,19 @@ export function buildResolveMode(ctx: {
 
 async function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
   const workspaceRoot = await canonicalRemotePath(pool, host, secret, workspace)
-  const tmp = await canonicalRemotePath(pool, host, secret, status.roots.tmp)
-  const userTmp = await canonicalRemotePath(pool, host, secret, status.roots.userTmp)
+  const tmp = await existingRemotePath(pool, host, secret, status.roots.tmp)
+  const userTmp = await existingRemotePath(pool, host, secret, status.roots.userTmp)
   return { workspaceRoot, tmp, userTmp }
+}
+
+/** A temp root that is not on disk becomes `''`, so the file profile does not `--bind` it. */
+async function existingRemotePath(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
+  if (remotePath.trim().length === 0) return ''
+  try {
+    return await pool.sftpRealpath(host, secret, remotePath)
+  } catch {
+    return ''
+  }
 }
 
 async function canonicalRemotePath(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
@@ -227,9 +240,19 @@ function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileR
     const profile = bwrapProfileArgs(mode, roots.workspaceRoot) ?? []
     return shJoin(['bwrap', ...profile, '--chdir', workdir, '--', ...inner])
   }
-  const writable = mode === 'workspace-write' ? [roots.workspaceRoot, roots.tmp, roots.userTmp] : []
+  const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
+  return seatbeltBashCommand(mode, writable, workdir, command)
+}
+
+/** File writes bind the real temp directories. Bash keeps its private tmpfs. */
+function fileCommand(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, script: string): string {
+  if (status.sandboxTool === 'bwrap') {
+    const profile = bwrapFileProfileArgs(mode, roots) ?? []
+    return shJoin(['bwrap', ...profile, '--chdir', roots.workspaceRoot, '--', 'bash', '-c', script])
+  }
+  const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
   const profile = seatbeltProfileArgs(mode, writable) ?? []
-  return shJoin(['sandbox-exec', ...profile, '--', ...inner])
+  return shJoin(['sandbox-exec', ...profile, '--', 'bash', '-c', script])
 }
 
 async function startBackground(
@@ -490,7 +513,7 @@ async function commitFile(
   const script = atomicWriteScript(directory, tmp, target)
   const wrapped = mode === 'danger-full-access'
     ? script
-    : commandArgv(status, mode, roots, roots.workspaceRoot, script)
+    : fileCommand(status, mode, roots, script)
   const result = await hostApi.pool.exec(host, secret, wrapped, 20_000, signal, content)
   if (result.code !== 0) throw new Error(result.stderr || 'remote write failed')
 }

@@ -25,17 +25,43 @@ export interface RemoteFileRoots {
 /** bwrap arguments before the `--` separator. danger-full-access does not wrap. */
 export function bwrapProfileArgs(mode: SandboxMode, workspaceRoot: string): string[] | null {
   if (mode === 'danger-full-access') return null
-  const args = [
+  const args = bwrapBaseArgs()
+  if (mode === 'workspace-write') {
+    args.push('--tmpfs', '/tmp', '--bind', workspaceRoot, workspaceRoot)
+  }
+  return args
+}
+
+/**
+ * File-tool bwrap profile. workspace-write bind-mounts the real workspace,
+ * `/tmp`, and user temp. It does not mount a private tmpfs, so a write the
+ * policy allows is still on the remote disk after bwrap exits.
+ * Shorter roots are mounted first; a later mount of a longer path stays visible.
+ */
+export function bwrapFileProfileArgs(mode: SandboxMode, roots: RemoteFileRoots): string[] | null {
+  if (mode === 'danger-full-access') return null
+  const args = bwrapBaseArgs()
+  if (mode === 'workspace-write') {
+    const binds = fileWritableRoots(mode, roots).slice().sort((left, right) => left.length - right.length || left.localeCompare(right))
+    for (const root of binds) args.push('--bind', root, root)
+  }
+  return args
+}
+
+function bwrapBaseArgs(): string[] {
+  return [
     '--ro-bind', '/', '/',
     '--dev', '/dev',
     '--unshare-pid',
     '--proc', '/proc',
     '--die-with-parent',
   ]
-  if (mode === 'workspace-write') {
-    args.push('--tmpfs', '/tmp', '--bind', workspaceRoot, workspaceRoot)
-  }
-  return args
+}
+
+/** `cd` happens before `sandbox-exec`, which inherits the calling process directory. */
+export function seatbeltBashCommand(mode: SandboxMode, writable: readonly string[], workdir: string, command: string): string {
+  const profile = seatbeltProfileArgs(mode, writable) ?? []
+  return `cd ${shJoin([workdir])} && ${shJoin(['sandbox-exec', ...profile, '--', 'bash', '-c', command])}`
 }
 
 /** Read-only profile used to probe that bwrap can actually create a user namespace. */
@@ -70,10 +96,14 @@ function sbplString(value: string): string {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
-/** File-tool writable roots under workspace-write. read-only allows nothing. */
+/**
+ * File-tool writable roots under workspace-write. read-only allows nothing.
+ * An empty root is left out: bwrap exits immediately when a `--bind` source
+ * does not exist, and that would reject a write inside the workspace as well.
+ */
 export function fileWritableRoots(mode: SandboxMode, roots: RemoteFileRoots): string[] {
   if (mode !== 'workspace-write') return []
-  return [...new Set([roots.workspaceRoot, roots.tmp, roots.userTmp])]
+  return [...new Set([roots.workspaceRoot, roots.tmp, roots.userTmp].filter(root => root.length > 0))]
 }
 
 export function pathInsideRoot(target: string, root: string): boolean {
