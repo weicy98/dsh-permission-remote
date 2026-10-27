@@ -33,7 +33,7 @@ export interface SettingsNamespace {
 
 export interface ClientFace {
   remote: { settings: {
-    describe(): Promise<{ namespaces: SettingsNamespace[] }>
+    describe(): Promise<{ ok?: boolean, value?: { namespaces?: SettingsNamespace[] }, namespaces?: SettingsNamespace[] }>
     mutate(ns: string, ops: Array<{ op: 'set', path: string[], value: unknown }>, revision?: number): Promise<unknown>
   } }
   connection: { rpc: { call(channel: string, endpoint: string, payload: unknown): Promise<RpcResult<unknown>> } }
@@ -42,8 +42,10 @@ export interface ClientFace {
 const NS = 'permission-remote'
 
 export async function readHosts(ctx: ClientFace): Promise<{ hosts: HostView[], revision: number }> {
-  const described = await ctx.remote.settings.describe()
-  const row = described.namespaces.find(item => item.ns === NS)
+  const response = await ctx.remote.settings.describe()
+  const described = response.value ?? response
+  const namespaces = described.namespaces ?? []
+  const row = namespaces.find(item => item.ns === NS)
   const hosts = Array.isArray(row?.value?.hosts) ? row.value.hosts : []
   return { hosts, revision: row?.revision ?? 0 }
 }

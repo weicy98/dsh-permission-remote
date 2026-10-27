@@ -24,6 +24,8 @@ dsh plugin --profile web add dsh-permission-remote
 
 然后重启 `dsh web` 并硬刷新页面。设置里会出现 **SSH 主机**。
 
+![SSH hosts](docs/images/ssh-hosts.png)
+
 ## 用法
 
 1. **添加主机。** 设置 → SSH 主机。填写地址、端口、用户，以及私钥路径或口令。口令和私钥口令只写入 DSH 凭据存储；私钥只记录本机路径。
