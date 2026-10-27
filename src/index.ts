@@ -290,7 +290,12 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const attach = (agent: AgentLike) => {
     if (seen.has(agent)) return
     seen.add(agent)
-    if (!installShadows(ctx, core, agent, unregisters)) seen.delete(agent)
+    let installed = false
+    try {
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) })
+    } finally {
+      if (!installed) seen.delete(agent)
+    }
   }
   ctx.on('agent/created', ({ agent }) => attach(agent))
   const agents = ctx.get('agents') as { list?: () => AgentLike[] } | undefined
@@ -300,7 +305,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   ctx.logger?.info('[@dsh-permission-remote] loaded')
 }
 
-function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>): boolean {
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void): boolean {
   const cwd = agent.session?.header?.cwd
   const initial = routeByCwd(cwd)
   const disposers: Array<() => void> = []
@@ -328,6 +333,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
   } catch (error) {
     for (const unregister of disposers) unregister()
     ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (initial.kind === 'remote') throw error
     return false
   }
   let dropped = false
@@ -336,6 +342,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     dropped = true
     for (const unregister of disposers) unregister()
     unregisters.delete(drop)
+    forget()
   }
   unregisters.add(drop)
   try {
@@ -343,6 +350,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
   } catch (error) {
     drop()
     ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (initial.kind === 'remote') throw error
     return false
   }
   return true
