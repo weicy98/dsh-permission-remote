@@ -173,13 +173,7 @@ class Core {
     const key = credentialKey('dsh-permission-remote', hostId)
     await this.ctx.credentials.modifyRecord(key, async current => {
       const previous = current?.kind === 'grant' && isPayload(current.payload) ? current.payload : {}
-      return {
-        kind: 'grant',
-        payload: {
-          password: material.password !== undefined ? material.password : previous.password,
-          passphrase: material.passphrase !== undefined ? material.passphrase : previous.passphrase,
-        },
-      }
+      return { kind: 'grant', payload: grantPayload(material, previous) }
     })
   }
 
@@ -239,6 +233,19 @@ function assertHostId(hostId: string): void {
 
 function isPayload(value: unknown): value is GrantPayload {
   return typeof value === 'object' && value !== null
+}
+
+/**
+ * Leave an unset secret off the object. `credentials-local` walks every own
+ * value and rejects `undefined`, which JSON cannot represent.
+ */
+function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPayload {
+  const password = material.password !== undefined ? material.password : previous.password
+  const passphrase = material.passphrase !== undefined ? material.passphrase : previous.passphrase
+  const payload: GrantPayload = {}
+  if (typeof password === 'string') payload.password = password
+  if (typeof passphrase === 'string') payload.passphrase = passphrase
+  return payload
 }
 
 function markRemote(service: SshApi): void {
