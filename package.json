@@ -31,6 +31,7 @@
     "lib",
     "src",
     "locale",
+    "vendor",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -54,7 +55,8 @@
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",
-    "ssh2": "^1.17.0"
+    "asn1": "^0.2.6",
+    "bcrypt-pbkdf": "^1.0.2"
   },
   "optionalDependencies": {
     "@vscode/ripgrep-darwin-arm64": "^1.15.11",

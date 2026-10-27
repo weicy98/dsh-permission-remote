@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
-import { Client, type ConnectConfig } from 'ssh2'
+import { Client, type ConnectConfig } from './ssh2-client.ts'
 import type { HostConfig } from './config.ts'
 import { claimPending } from './pool-claim.ts'
 import { shJoin } from './shell-quote.ts'

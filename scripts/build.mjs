@@ -34,6 +34,12 @@ const host = await build({
   target: 'node22',
   packages: 'external',
   logLevel: 'silent',
+  plugins: [{
+    name: 'external-vendored-ssh2',
+    setup(build) {
+      build.onResolve({ filter: /vendor\/ssh2/ }, args => ({ path: args.path, external: true }))
+    },
+  }],
 })
 
 const clientResult = await build({
@@ -53,6 +59,10 @@ const hostText = host.outputFiles?.[0]?.text
 const clientBundled = clientResult.outputFiles?.[0]?.text
 if (hostText === undefined || clientBundled === undefined) throw new Error('esbuild produced no bundle')
 if (clientBundled.includes('ssh2')) throw new Error('ssh2 leaked into the browser bundle')
+if (/\bfrom ["']ssh2["']/.test(hostText) || /\brequire\(["']ssh2["']\)/.test(hostText)) {
+  throw new Error('host bundle must load vendored ssh2, not the registry package')
+}
+if (!hostText.includes('vendor/ssh2/lib/index.js')) throw new Error('vendored ssh2 entry missing from host bundle')
 
 const clientText = `window.__ModuleLoader__.load({
   id: ${JSON.stringify(PACKAGE_NAME)},
