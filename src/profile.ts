@@ -87,3 +87,20 @@ export function fileWriteAllowed(mode: SandboxMode, target: string, roots: Remot
   if (mode === 'read-only') return false
   return fileWritableRoots(mode, roots).some(root => pathInsideRoot(target, root))
 }
+
+/** Kernel confinement dialects. Ordinary "Permission denied" is a command failure. */
+export function sandboxDenied(exitCode: number | null, stderr: string): boolean {
+  if (exitCode === 0 || exitCode === null) return false
+  return /read-only file system|operation not permitted/i.test(stderr)
+}
+
+export function grepArgv(rg: string, pattern: string, base: string, include?: string): string[] {
+  const argv = [rg, '--no-config', '--json', '-n', '--heading', pattern]
+  if (include !== undefined && include.length > 0) argv.push('--glob', include)
+  argv.push(base)
+  return argv
+}
+
+export function globArgv(rg: string, pattern: string): string[] {
+  return [rg, '--no-config', '--files', '--hidden', '--iglob', pattern, '--glob', '!.git/**', '--sort', 'modified']
+}

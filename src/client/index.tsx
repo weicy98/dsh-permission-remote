@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { callHost, readHosts, writeHosts, type ClientFace, type HostView, type RunnerView } from './api.ts'
+import { callHost, readHosts, type ClientFace, type HostView, type RunnerView } from './api.ts'
 import { MACOS_NOTE, MANUAL_INSTALLS, RIPGREP_NOTE } from './copy.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -22,7 +22,7 @@ export function apply(ctx: ClientFace & {
     name: 'settings.section',
     id: 'permission-remote',
     order: 80,
-    label: () => 'SSH 主机',
+    label: () => (typeof navigator !== 'undefined' && navigator.language.toLowerCase().startsWith('en') ? 'SSH hosts' : 'SSH 主机'),
     locale: NS,
     inject: () => ({ ctx }),
   }, Section)), 'dsh-permission-remote: settings section')
@@ -31,7 +31,6 @@ export function apply(ctx: ClientFace & {
 function Section(props: SectionProps): JSX.Element {
   const { ctx } = props
   const [hosts, setHosts] = useState<HostView[]>([])
-  const [revision, setRevision] = useState(0)
   const [draft, setDraft] = useState<HostView>(blankHost())
   const [secret, setSecret] = useState('')
   const [message, setMessage] = useState('')
@@ -45,7 +44,6 @@ function Section(props: SectionProps): JSX.Element {
   async function reload(): Promise<void> {
     const loaded = await readHosts(ctx)
     setHosts(loaded.hosts)
-    setRevision(loaded.revision)
   }
 
   useEffect(() => {
@@ -65,9 +63,7 @@ function Section(props: SectionProps): JSX.Element {
           passphrase: next.auth === 'key' ? secret : undefined,
         })
       }
-      const without = hosts.filter(item => item.id !== id)
-      const stored = [...without, { ...next, privateKeyPath: next.privateKeyPath }]
-      await writeHosts(ctx, stored, revision)
+      await callHost(ctx, 'saveHost', next)
       setSecret('')
       setDraft(blankHost())
       await reload()
@@ -91,7 +87,7 @@ function Section(props: SectionProps): JSX.Element {
         return
       }
       setMessage(offered.banner.length > 0 ? `连接成功：${offered.banner}` : '连接成功。')
-      const probed = await callHost<RunnerView>(ctx, 'probe', { hostId: host.id })
+      const probed = await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true })
       setStatus(probed)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error))
@@ -105,11 +101,9 @@ function Section(props: SectionProps): JSX.Element {
     setBusy(true)
     try {
       await callHost(ctx, 'trustFingerprint', { hostId: host.id, fingerprint: host.fingerprint })
-      const stored = hosts.map(item => item.id === host.id ? { ...item, fingerprint: host.fingerprint } : item)
-      await writeHosts(ctx, stored, revision)
       await reload()
       setMessage('已信任该指纹。')
-      const probed = await callHost<RunnerView>(ctx, 'probe', { hostId: host.id })
+      const probed = await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true })
       setStatus(probed)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error))
@@ -127,6 +121,23 @@ function Section(props: SectionProps): JSX.Element {
       setInstallLog([result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}`)
     } catch (error) {
       setInstallLog(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeHost(hostId: string): Promise<void> {
+    setBusy(true)
+    try {
+      await callHost(ctx, 'deleteHost', { hostId })
+      if (selected === hostId) {
+        setSelected('')
+        setStatus(null)
+        setEntries([])
+      }
+      await reload()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy(false)
     }
@@ -169,7 +180,8 @@ function Section(props: SectionProps): JSX.Element {
           <li key={host.id}>
             {host.name || host.host} ({host.username}@{host.host}:{host.port}){' '}
             <button type="button" disabled={busy} onClick={() => void test(host)}>测试连接</button>{' '}
-            <button type="button" disabled={busy} onClick={() => void browse(host.id, '/')}>浏览目录</button>
+            <button type="button" disabled={busy} onClick={() => void browse(host.id, '/')}>浏览目录</button>{' '}
+            <button type="button" disabled={busy} onClick={() => void removeHost(host.id)}>删除</button>
           </li>
         ))}
       </ul>
@@ -221,6 +233,7 @@ function Section(props: SectionProps): JSX.Element {
       {selected.length > 0 ? (
         <div>
           <h3 style={{ marginBottom: 8 }}>远端目录 {dir}</h3>
+          {dir !== '/' ? <button type="button" disabled={busy} onClick={() => void browse(selected, parentDir(dir))}>上一级</button> : null}{' '}
           <button type="button" disabled={busy} onClick={() => void createWorkspace(selected, dir)}>把当前目录作成工作区</button>
           <ul>
             {entries.map(entry => (
@@ -237,6 +250,13 @@ function Section(props: SectionProps): JSX.Element {
 
 function blankHost(): HostView {
   return { id: '', name: '', host: '', port: 22, username: '', auth: 'key', privateKeyPath: '', fingerprint: '' }
+}
+
+function parentDir(dir: string): string {
+  const trimmed = dir.replace(/\/+$/, '')
+  const slash = trimmed.lastIndexOf('/')
+  if (slash <= 0) return '/'
+  return trimmed.slice(0, slash)
 }
 
 function newId(): string {

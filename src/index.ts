@@ -20,6 +20,7 @@ import {
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
+import { sniffImage } from './image.ts'
 import { mapRemoteToLocal, routeByCwd } from './router.ts'
 import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
@@ -78,8 +79,8 @@ class SshApi extends TypertRemoteService {
     return { ok: true }
   }
 
-  async probe(input: { hostId: string }): Promise<RunnerStatus> {
-    return this.core.probe(input.hostId)
+  async probe(input: { hostId: string, refresh?: boolean }): Promise<RunnerStatus> {
+    return this.core.probe(input.hostId, input.refresh === true)
   }
 
   async installDeps(input: { hostId: string }): Promise<{ code: number | null, stdout: string, stderr: string, status: RunnerStatus }> {
@@ -98,12 +99,24 @@ class SshApi extends TypertRemoteService {
   }
 
   async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string }> {
+    const host = this.core.requireHost(input.hostId)
+    await this.core.pool.sftpRealpath(host, await this.core.secret(host), input.path)
     const local = mapRemoteToLocal(input.hostId, input.path)
     if (local === null) throw new Error('remote path must be absolute')
     await mkdir(local, { recursive: true })
     const title = input.title?.trim() || basename(input.path)
     await this.core.workspaces.create(local, title)
     return { path: local }
+  }
+
+  async saveHost(input: HostConfig): Promise<{ ok: true }> {
+    await this.core.saveHost(input)
+    return { ok: true }
+  }
+
+  async deleteHost(input: { hostId: string }): Promise<{ ok: true }> {
+    await this.core.deleteHost(input.hostId)
+    return { ok: true }
   }
 
   async saveSecret(input: { hostId: string, password?: string, passphrase?: string }): Promise<{ ok: true }> {
@@ -149,13 +162,7 @@ class Core {
     }
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
-    const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
-    if (row === undefined) return
-    try {
-      await this.ctx.settings.update(String(row.ns), { hosts: this.config.hosts })
-    } catch (error) {
-      this.ctx.logger?.warn(`[@dsh-permission-remote] fingerprint was trusted in this process but not saved: ${error instanceof Error ? error.message : String(error)}`)
-    }
+    await this.persistHosts()
   }
 
   forgetStatus(hostId: string): void {
@@ -183,7 +190,27 @@ class Core {
     })
   }
 
-  probe(hostId: string): Promise<RunnerStatus> {
+  async saveHost(host: HostConfig): Promise<void> {
+    const hosts = this.config.hosts.filter(item => item.id !== host.id)
+    this.config = { ...this.config, hosts: [...hosts, host] }
+    await this.persistHosts()
+  }
+
+  async deleteHost(hostId: string): Promise<void> {
+    this.config = { ...this.config, hosts: this.config.hosts.filter(item => item.id !== hostId) }
+    this.pool.invalidate(hostId)
+    this.status.delete(hostId)
+    await this.persistHosts()
+  }
+
+  private async persistHosts(): Promise<void> {
+    const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
+    if (row === undefined) return
+    await this.ctx.settings.update(String(row.ns), { hosts: this.config.hosts })
+  }
+
+  probe(hostId: string, refresh = false): Promise<RunnerStatus> {
+    if (refresh) this.status.delete(hostId)
     const cached = this.status.get(hostId)
     if (cached !== undefined) return cached
     const pending = (async () => {
@@ -214,7 +241,7 @@ function isPayload(value: unknown): value is GrantPayload {
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'saveSecret']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({
@@ -235,63 +262,77 @@ const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<Return
   read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
     const attachments = ctx.get('attachments') as { saveImage(input: { data: Buffer, mediaType: string, name: string }): Promise<Record<string, unknown>> } | undefined
     if (attachments === undefined) throw new Error('no attachment service is mounted')
-    const mediaType = mediaOf(fileName)
+    const mediaType = sniffImage(data)
+    if (mediaType === undefined) throw new Error(`cannot read "${fileName}": the file content is not a PNG, JPEG, WebP, or GIF`)
     return attachments.saveImage({ data, mediaType, name: fileName })
   }),
   glob: (host, route, args) => runGlob(host, route, args),
   grep: (host, route, args) => runGrep(host, route, args),
 }
 
-function mediaOf(fileName: string): string {
-  const lower = fileName.toLowerCase()
-  if (lower.endsWith('.png')) return 'image/png'
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
-  if (lower.endsWith('.webp')) return 'image/webp'
-  if (lower.endsWith('.gif')) return 'image/gif'
-  return 'application/octet-stream'
-}
-
 export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const ctx = rawCtx as unknown as HostContext
   const core = new Core(ctx, readConfig(rawConfig), ctx.workspaceRegistry)
   const api = new SshApi(rawCtx, core)
+  const unregisters = new Set<() => void>()
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => () => {
+    for (const unregister of unregisters) unregister()
+    unregisters.clear()
     void core.pool.dispose()
   })
   void api
 
   ctx.on('agent/created', ({ agent }) => {
-    try {
-      const cwd = agent.session?.header?.cwd
-      const route = routeByCwd(cwd)
-      if (route.kind !== 'local') {
-        const plans = planShadows(name => agent.ctx.tools.get(name, agent))
-        const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
-        for (const plan of plans) {
-          const official = plan.official
-          const runner = RUNNERS[plan.name]
-          agent.ctx.tools.register({
-            ...capturedSchema(agent.ctx, plan.name, agent),
-            name: plan.name,
-            async execute(args: unknown, exec: ToolExec) {
-              const current = routeByCwd(effectiveCwd(ctx, exec, cwd))
-              return dispatchShadow(
-                official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined,
-                current.kind === 'remote',
-                () => runner(host, current.kind === 'remote' ? current : route, args as Record<string, unknown>, exec, ctx),
-                args,
-                exec,
-              )
-            },
-          })
-        }
-      }
-    } catch (error) {
-      ctx.logger?.warn(`[@dsh-permission-remote] agent/created failed: ${error instanceof Error ? error.message : String(error)}`)
+    const cwd = agent.session?.header?.cwd
+    const initial = routeByCwd(cwd)
+    const plans = planShadows(name => agent.ctx.tools.get(name, agent))
+    const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
+    const disposers: Array<() => void> = []
+    for (const plan of plans) {
+      if (plan.official === undefined && !(plan.name === 'bash' && initial.kind === 'remote')) continue
+      const official = plan.official
+      const runner = RUNNERS[plan.name]
+      const unregister = agent.ctx.tools.register(withRemoteTimeout({
+        ...capturedSchema(agent.ctx, plan.name, agent),
+        name: plan.name,
+        async execute(args: unknown, exec: ToolExec) {
+          const current = routeByCwd(effectiveCwd(ctx, exec, cwd))
+          if (current.kind !== 'remote') {
+            return dispatchShadow(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, false, async () => {
+              throw new Error('dsh-permission-remote: local call has no official tool')
+            }, args, exec)
+          }
+          return runner(host, current, args as Record<string, unknown>, exec, ctx)
+        },
+      }))
+      disposers.push(unregister)
     }
+    const drop = () => {
+      for (const unregister of disposers) unregister()
+    }
+    unregisters.add(drop)
+    agent.ctx.effect(() => () => {
+      drop()
+      unregisters.delete(drop)
+    })
   })
   ctx.logger?.info('[@dsh-permission-remote] loaded')
+}
+
+function withRemoteTimeout(definition: object): object {
+  const parameters = (definition as { parameters?: Record<string, { description?: string }> }).parameters
+  if (parameters?.timeoutMs === undefined) return definition
+  return {
+    ...definition,
+    parameters: {
+      ...parameters,
+      timeoutMs: {
+        ...parameters.timeoutMs,
+        description: 'Timeout in milliseconds. When it expires this remote command is killed. Without a sandbox runner, child processes of the command may keep running on the remote host.',
+      },
+    },
+  }
 }
 
 function effectiveCwd(ctx: HostContext, exec: ToolExec, fallback: string | undefined): string | undefined {

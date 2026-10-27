@@ -27,6 +27,16 @@ test('relative and placeholder paths re-anchor to the remote directory', () => {
   assert.equal(resolveRemotePath(nested, route.remoteCwd, route.placeholderCwd), '/srv/app/src/main.ts')
 })
 
+test('a subdirectory of the placeholder still routes to the remote workspace', () => {
+  const local = mapRemoteToLocal('host1', '/srv/app', env)!
+  const child = path.join(local, 'src')
+  const route = routeByCwd(child, env)
+  assert.equal(route.kind, 'remote')
+  if (route.kind !== 'remote') return
+  assert.equal(route.remoteCwd, '/srv/app/src')
+  assert.equal(route.placeholderCwd, child)
+})
+
 test('model-facing paths stay on the placeholder the session cwd uses', () => {
   const local = mapRemoteToLocal('host1', '/srv/app', env)!
   const route = routeByCwd(local, env)

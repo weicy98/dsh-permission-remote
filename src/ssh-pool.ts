@@ -1,7 +1,10 @@
 import { readFile } from 'node:fs/promises'
 import { Client, type ConnectConfig } from 'ssh2'
 import type { HostConfig } from './config.ts'
+import { claimPending } from './pool-claim.ts'
 import { shJoin } from './shell-quote.ts'
+
+const OUTPUT_CAP = 1024 * 1024
 
 export interface ExecResult {
   readonly code: number | null
@@ -9,6 +12,8 @@ export interface ExecResult {
   readonly stdout: string
   readonly stderr: string
   readonly timedOut: boolean
+  readonly stdoutTruncated: boolean
+  readonly stderrTruncated: boolean
 }
 
 /** One remote command on its own SSH channel. `close` kills that channel only. */
@@ -34,9 +39,15 @@ export class SshFailure extends Error {
   }
 }
 
+interface SftpSession {
+  readonly api: SftpLike
+  end(): void
+}
+
 interface Live {
   readonly client: Client
   readonly hostId: string
+  sftp?: Promise<SftpSession>
 }
 
 const FINGERPRINT_PREFIX = 'SHA256:'
@@ -58,7 +69,7 @@ export class SshPool {
     for (const item of pending) {
       try {
         const live = await item
-        live.client.end()
+        await closeLive(live)
       } catch {
         // A failed connect has nothing to close.
       }
@@ -69,18 +80,25 @@ export class SshPool {
     const current = this.live.get(hostId)
     this.live.delete(hostId)
     if (current === undefined) return
-    void current.then(live => live.client.end()).catch(() => undefined)
+    void current.then(live => closeLive(live)).catch(() => undefined)
   }
 
-  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number): Promise<ExecResult> {
-    const commandHandle = await this.open(host, secret, command, timeoutMs)
+  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal): Promise<ExecResult> {
+    const commandHandle = await this.open(host, secret, command, timeoutMs, signal)
     return commandHandle.done
   }
 
-  /** `timeoutMs` of 0 waits until the command exits or `close` kills its channel. */
-  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number): Promise<RemoteCommand> {
+  /** `timeoutMs` of 0 waits until the command exits, the signal aborts, or `close` kills its channel. */
+  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal): Promise<RemoteCommand> {
     const live = await this.acquire(host, secret, true)
-    return openChannel(live.client, command, timeoutMs)
+    const commandHandle = openChannel(live.client, command, timeoutMs)
+    if (signal !== undefined) {
+      const abort = () => commandHandle.close()
+      if (signal.aborted) commandHandle.close()
+      else signal.addEventListener('abort', abort, { once: true })
+      void commandHandle.done.finally(() => signal.removeEventListener('abort', abort))
+    }
+    return commandHandle
   }
 
   /** Connect far enough to read the host key. Does not persist trust. */
@@ -103,33 +121,45 @@ export class SshPool {
     }
   }
 
-  async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<Buffer> {
-    const live = await this.acquire(host, secret, true)
-    return sftpBuffer(live.client, sftp => readAll(sftp, remotePath))
+  async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string, maxBytes?: number): Promise<Buffer> {
+    const session = await this.sftp(host, secret)
+    if (maxBytes !== undefined) {
+      const size = await statSize(session, remotePath)
+      if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read')
+    }
+    return readAll(session, remotePath)
   }
 
   async sftpWrite(host: HostConfig, secret: SecretMaterial, remotePath: string, body: Buffer | string): Promise<void> {
-    const live = await this.acquire(host, secret, true)
-    await sftpBuffer(live.client, sftp => writeAll(sftp, remotePath, body))
+    const session = await this.sftp(host, secret)
+    await writeAll(session, remotePath, body)
   }
 
   async sftpRealpath(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
-    const live = await this.acquire(host, secret, true)
-    return sftpBuffer(live.client, sftp => realpathOf(sftp, remotePath))
+    const session = await this.sftp(host, secret)
+    return realpathOf(session, remotePath)
   }
 
   async sftpList(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<DirEntry[]> {
+    const session = await this.sftp(host, secret)
+    const rows = await readdir(session, remotePath)
+    return rows
+      .filter(row => row.attrs.isDirectory())
+      .map(row => ({
+        name: row.filename,
+        path: remotePath === '/' ? `/${row.filename}` : `${remotePath.replace(/\/$/, '')}/${row.filename}`,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  private async sftp(host: HostConfig, secret: SecretMaterial): Promise<SftpLike> {
     const live = await this.acquire(host, secret, true)
-    return sftpBuffer(live.client, async sftp => {
-      const rows = await readdir(sftp, remotePath)
-      return rows
-        .filter(row => row.attrs.isDirectory())
-        .map(row => ({
-          name: row.filename,
-          path: remotePath === '/' ? `/${row.filename}` : `${remotePath.replace(/\/$/, '')}/${row.filename}`,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name))
+    live.sftp ??= openSftp(live.client).catch(error => {
+      live.sftp = undefined
+      throw error
     })
+    const session = await live.sftp
+    return session.api
   }
 
   async sftpUpload(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string): Promise<void> {
@@ -142,38 +172,35 @@ export class SshPool {
     await this.exec(host, secret, `chmod 755 ${shJoin([remotePath])}`, 15_000)
   }
 
-  private async acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
-    const existing = this.live.get(host.id)
-    if (existing !== undefined) {
+  private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
+    return claimPending(this.live, host.id, async () => {
+      await this.reserve()
       try {
-        return await existing
-      } catch {
-        this.live.delete(host.id)
+        const client = await connect(host, secret, key => {
+          const fingerprint = formatFingerprint(key)
+          if (!requireTrust) return true
+          return host.fingerprint.trim().length > 0 && host.fingerprint.trim() === fingerprint
+        })
+        const live: Live = { client, hostId: host.id }
+        let released = false
+        const drop = () => {
+          if (released) return
+          released = true
+          const current = this.live.get(host.id)
+          void current?.then(value => {
+            if (value === live) this.live.delete(host.id)
+          }).catch(() => undefined)
+          void live.sftp?.then(session => session.end()).catch(() => undefined)
+          this.release()
+        }
+        client.on('close', drop)
+        client.on('end', drop)
+        return live
+      } catch (error) {
+        this.release()
+        throw error
       }
-    }
-    await this.reserve()
-    const pending = connect(host, secret, key => {
-      const fingerprint = formatFingerprint(key)
-      if (!requireTrust) return true
-      return host.fingerprint.trim().length > 0 && host.fingerprint.trim() === fingerprint
-    }).then(client => {
-      client.on('close', () => {
-        if (this.live.get(host.id) === pending) this.live.delete(host.id)
-      })
-      client.on('end', () => {
-        if (this.live.get(host.id) === pending) this.live.delete(host.id)
-      })
-      return { client, hostId: host.id }
-    }).finally(() => {
-      this.release()
     })
-    this.live.set(host.id, pending)
-    try {
-      return await pending
-    } catch (error) {
-      this.live.delete(host.id)
-      throw error
-    }
   }
 
   private reserve(): Promise<void> {
@@ -241,7 +268,7 @@ interface ExecStream {
 
 function openChannel(client: Client, command: string, timeoutMs: number): RemoteCommand {
   let settled = false
-  let cause: 'exit' | 'timeout' | 'cancel' = 'exit'
+  let cause: 'exit' | 'timeout' | 'cancel' | 'truncate' = 'exit'
   let stream: ExecStream | undefined
   let resolveDone: (result: ExecResult) => void = () => undefined
   let rejectDone: (error: Error) => void = () => undefined
@@ -251,6 +278,8 @@ function openChannel(client: Client, command: string, timeoutMs: number): Remote
   })
   const stdout: Buffer[] = []
   const stderr: Buffer[] = []
+  let stdoutTruncated = false
+  let stderrTruncated = false
   const finish = (code: number | null, signal: string | null) => {
     if (settled) return
     settled = true
@@ -262,10 +291,12 @@ function openChannel(client: Client, command: string, timeoutMs: number): Remote
       stdout: Buffer.concat(stdout).toString('utf8'),
       stderr: Buffer.concat(stderr).toString('utf8'),
       timedOut: cause === 'timeout',
+      stdoutTruncated,
+      stderrTruncated,
     })
   }
   let fallback: ReturnType<typeof setTimeout> | undefined
-  const stop = (next: 'timeout' | 'cancel') => {
+  const stop = (next: 'timeout' | 'cancel' | 'truncate') => {
     if (settled || cause !== 'exit') return
     cause = next
     if (stream === undefined) {
@@ -295,8 +326,25 @@ function openChannel(client: Client, command: string, timeoutMs: number): Remote
       return
     }
     stream = opened as unknown as ExecStream
-    stream.on('data', chunk => stdout.push(chunk))
-    stream.stderr.on('data', chunk => stderr.push(chunk))
+    const push = (target: Buffer[], chunk: Buffer, which: 'stdout' | 'stderr') => {
+      const used = target.reduce((sum, part) => sum + part.length, 0)
+      if (used >= OUTPUT_CAP) {
+        if (which === 'stdout') stdoutTruncated = true
+        else stderrTruncated = true
+        stop('truncate')
+        return
+      }
+      if (used + chunk.length > OUTPUT_CAP) {
+        target.push(chunk.subarray(0, OUTPUT_CAP - used))
+        if (which === 'stdout') stdoutTruncated = true
+        else stderrTruncated = true
+        stop('truncate')
+        return
+      }
+      target.push(chunk)
+    }
+    stream.on('data', chunk => push(stdout, chunk, 'stdout'))
+    stream.stderr.on('data', chunk => push(stderr, chunk, 'stderr'))
     stream.on('close', (code, signal) => finish(code, signal))
     if (cause !== 'exit') {
       try {
@@ -319,16 +367,47 @@ interface SftpLike {
   writeFile(path: string, data: Buffer | string, callback: (error: Error | undefined) => void): void
   realpath(path: string, callback: (error: Error | undefined, resolved: string) => void): void
   readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>) => void): void
+  stat(path: string, callback: (error: Error | undefined, stats: { size: number }) => void): void
+  end(callback?: () => void): void
 }
 
-function sftpBuffer<T>(client: Client, run: (sftp: SftpLike) => Promise<T>): Promise<T> {
+function openSftp(client: Client): Promise<SftpSession> {
   return new Promise((resolve, reject) => {
     client.sftp((error, sftp) => {
       if (error) {
         reject(new SshFailure(error.message, 'sftp'))
         return
       }
-      void run(sftp as unknown as SftpLike).then(resolve, reject)
+      const api = sftp as unknown as SftpLike
+      resolve({
+        api,
+        end: () => {
+          try {
+            api.end()
+          } catch {
+            // The session channel is already closed.
+          }
+        },
+      })
+    })
+  })
+}
+
+async function closeLive(live: Live): Promise<void> {
+  try {
+    const session = await live.sftp
+    session?.end()
+  } catch {
+    // Opening SFTP failed; the client close still releases the session slot.
+  }
+  live.client.end()
+}
+
+function statSize(sftp: SftpLike, remotePath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    sftp.stat(remotePath, (error, stats) => {
+      if (error) reject(new SshFailure(error.message, 'sftp-stat'))
+      else resolve(stats.size)
     })
   })
 }

@@ -54,20 +54,26 @@ export interface LocalRoute {
 
 export type Route = RemoteRoute | LocalRoute
 
-/** A cwd that is exactly a placeholder path routes remote; anything else stays local. */
+/**
+ * A cwd under a placeholder routes remote, including subdirectories.
+ * The first two segments are host id and the encoded workspace root; further
+ * segments are a remote subdirectory. Local separators stay on this machine.
+ */
 export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): Route {
   if (!cwd) return { kind: 'local' }
   const root = remoteRoot(env)
   const rel = path.relative(root, cwd)
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return { kind: 'local' }
-  const segments = rel.split(path.sep)
-  if (segments.length !== 2) return { kind: 'local' }
+  const segments = rel.split(path.sep).filter(segment => segment.length > 0)
+  if (segments.length < 2) return { kind: 'local' }
   const hostId = segments[0]!
   const encoded = segments[1]!
   if (!isValidHostId(hostId)) return { kind: 'local' }
   const remotePath = decodeRemotePath(encoded)
   if (remotePath === null || !remotePath.startsWith('/')) return { kind: 'local' }
-  return { kind: 'remote', hostId, remoteCwd: remotePath, placeholderCwd: cwd }
+  const extra = segments.slice(2)
+  const remoteCwd = extra.length === 0 ? remotePath : posix.join(remotePath, ...extra)
+  return { kind: 'remote', hostId, remoteCwd, placeholderCwd: cwd }
 }
 
 /**

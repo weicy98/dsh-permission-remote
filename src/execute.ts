@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { posix } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
@@ -10,10 +11,14 @@ import {
 } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig } from './config.ts'
 import { distroInstallFor, parseOsRelease, type DistroInstall } from './install-commands.ts'
+import { composeCreatedPath } from './contain.ts'
 import {
   bwrapProfileArgs,
   bwrapProbeArgv,
   fileWriteAllowed,
+  globArgv,
+  grepArgv,
+  sandboxDenied,
   seatbeltProbeArgv,
   seatbeltProfileArgs,
   type RemoteFileRoots,
@@ -24,6 +29,8 @@ import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
 
 const require = createRequire(import.meta.url)
+const READ_CAP = 1024 * 1024
+const IMAGE_CAP = 8 * 1024 * 1024
 
 export interface RunnerStatus {
   readonly os: 'linux' | 'darwin' | 'other'
@@ -50,7 +57,15 @@ export interface ToolHost {
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
   readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string) => Promise<SandboxMode>
-  readonly jobs?: { start(spec: unknown): string }
+  readonly jobs?: {
+    start(spec: {
+      kind: string
+      label: string
+      owner?: string
+      toolCall?: { callId: string }
+      run: (job: { append(text: string): void }) => { cancel(): void, done: Promise<unknown> }
+    }): string
+  }
 }
 
 const denialMarker = sandboxDenialMarker
@@ -180,37 +195,39 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   if (mode !== 'danger-full-access' && !status.sandbox.available) {
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
-  const argv = commandArgv(status, mode, route.remoteCwd, workdir, command)
-  const result = await hostApi.pool.exec(host, secret, argv, timeoutMs)
-  const denied = mode !== 'danger-full-access' && result.code !== 0 && /read-only file system|operation not permitted|permission denied/i.test(result.stderr)
+  throwIfAborted(exec.signal)
+  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const argv = commandArgv(status, mode, roots, workdir, command)
+  const result = await hostApi.pool.exec(host, secret, argv, timeoutMs, exec.signal)
+  const denied = mode !== 'danger-full-access' && sandboxDenied(result.code, result.stderr)
   return {
     kind: 'foreground',
     cwd,
     exitCode: result.timedOut ? null : result.code,
     signal: result.signal,
     timedOut: result.timedOut,
-    aborted: false,
+    aborted: exec.signal?.aborted === true,
     timeoutMs,
-    stdout: { text: result.stdout, truncated: false },
-    stderr: { text: denied ? '' : result.stderr, truncated: false },
+    stdout: { text: capturedText(result.stdout, result.stdoutTruncated), truncated: result.stdoutTruncated },
+    stderr: { text: capturedText(result.stderr, result.stderrTruncated), truncated: result.stderrTruncated },
     ...mode === 'danger-full-access' && !status.sandbox.available
       ? { sandbox: { mode, denied: false, enforcement: 'partial' } }
       : { sandbox: { mode, denied, enforcement: status.sandbox.available ? 'full' : 'partial' } },
   }
 }
 
-function commandArgv(status: RunnerStatus, mode: SandboxMode, workspaceRoot: string, workdir: string, command: string): string {
-  const inner = ['bash', '-lc', command]
+function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, workdir: string, command: string): string {
+  const inner = ['bash', '-c', command]
   if (mode === 'danger-full-access' || !status.sandbox.available) {
     return `cd ${shJoin([workdir])} && ${shJoin(inner)}`
   }
   if (status.sandboxTool === 'bwrap') {
-    const profile = bwrapProfileArgs(mode, workspaceRoot) ?? []
+    const profile = bwrapProfileArgs(mode, roots.workspaceRoot) ?? []
     return shJoin(['bwrap', ...profile, '--chdir', workdir, '--', ...inner])
   }
-  const roots = mode === 'workspace-write' ? [workspaceRoot, status.roots.tmp, status.roots.userTmp] : []
-  const profile = seatbeltProfileArgs(mode, roots) ?? []
-  return `cd ${shJoin([workdir])} && ${shJoin(['sandbox-exec', ...profile, '--', ...inner])}`
+  const writable = mode === 'workspace-write' ? [roots.workspaceRoot, roots.tmp, roots.userTmp] : []
+  const profile = seatbeltProfileArgs(mode, writable) ?? []
+  return shJoin(['sandbox-exec', ...profile, '--', ...inner])
 }
 
 async function startBackground(
@@ -232,7 +249,8 @@ async function startBackground(
   if (mode !== 'danger-full-access' && !status.sandbox.available) {
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
-  const argv = commandArgv(status, mode, route.remoteCwd, workdir, command)
+  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const argv = commandArgv(status, mode, roots, workdir, command)
   const reaped = status.sandbox.available && status.sandboxTool === 'bwrap' && mode !== 'danger-full-access'
   const note = reaped ? '' : '\n[dsh-permission-remote] stopping this job closes its SSH channel; descendant processes may survive when no sandbox runner is wrapping the command'
   const id = jobs.start({
@@ -240,17 +258,24 @@ async function startBackground(
     label: command,
     owner: exec.agent?.session?.id,
     toolCall: exec.callId === undefined ? undefined : { callId: exec.callId },
-    run: () => {
+    run: (job) => {
       let opened: { close(): void } | undefined
       let cancelled = false
-      const done = hostApi.pool.open(host, secret, argv, 0).then(commandHandle => {
+      const done = hostApi.pool.open(host, secret, argv, 0, exec.signal).then(commandHandle => {
         opened = commandHandle
-        if (cancelled) commandHandle.close()
+        if (cancelled || exec.signal?.aborted === true) commandHandle.close()
         return commandHandle.done
-      }).then(result => ({
-        status: result.timedOut || result.signal === 'KILL' ? 'killed' as const : 'completed' as const,
-        detail: result.timedOut ? 'timed out' : result.signal === 'KILL' ? 'cancelled' : `exit code: ${result.code ?? 'null'}`,
-        result: `${result.stdout}${result.stderr}${note}`,
+      }).then(result => {
+        const text = `${capturedText(result.stdout, result.stdoutTruncated)}${capturedText(result.stderr, result.stderrTruncated)}${note}`
+        job.append(text)
+        return {
+          status: result.timedOut || result.signal === 'KILL' ? 'killed' as const : 'completed' as const,
+          detail: result.timedOut ? 'timed out' : result.signal === 'KILL' ? 'cancelled' : `exit code: ${result.code ?? 'null'}`,
+          result: text,
+        }
+      }).catch((error: unknown) => ({
+        status: 'failed' as const,
+        detail: error instanceof Error ? error.message : String(error),
       }))
       return {
         cancel: () => {
@@ -264,11 +289,13 @@ async function startBackground(
   return { kind: 'background', jobId: id, cwd }
 }
 
-export async function runRead(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function runRead(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
+  throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const bytes = await hostApi.pool.sftpRead(host, secret, remotePath)
+  const bytes = await hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP)
+  throwIfAborted(exec?.signal)
   const text = bytes.toString('utf8')
   const all = text.split(/\n/)
   const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1
@@ -288,25 +315,21 @@ export async function runWrite(hostApi: ToolHost, route: RemoteRoute, args: Reco
   const status = await hostApi.statusOf(host)
   const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'write', 'operation')
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const real = await safeRealpath(hostApi.pool, host, secret, remotePath)
-  const roots = await rootsFor({ ...status, roots: { ...status.roots, workspaceRoot: route.remoteCwd } }, route.remoteCwd, hostApi.pool, host, secret)
-  if (!fileWriteAllowed(mode, real, roots)) {
+  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const target = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
+  if (!fileWriteAllowed(mode, target, roots)) {
     throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
   }
   let before: string | null = null
   try {
-    before = (await hostApi.pool.sftpRead(host, secret, real)).toString('utf8')
+    before = (await hostApi.pool.sftpRead(host, secret, target, READ_CAP)).toString('utf8')
   } catch {
     before = null
   }
   const content = String(args.content ?? '')
-  const dir = posix.dirname(real)
-  await hostApi.pool.exec(host, secret, `mkdir -p ${shJoin([dir])}`, 15_000)
-  const tmp = `${real}.${process.pid}.tmp`
-  await hostApi.pool.sftpWrite(host, secret, tmp, content)
-  await hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, real])}`, 15_000)
+  await commitFile(hostApi, host, secret, status, mode, roots, target, content, exec.signal)
   return {
-    path: toModelPath(real, route),
+    path: toModelPath(target, route),
     operation: before === null ? 'create' : 'update',
     before,
     after: content,
@@ -319,12 +342,12 @@ export async function runEdit(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const status = await hostApi.statusOf(host)
   const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'edit', 'operation')
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const real = await safeRealpath(hostApi.pool, host, secret, remotePath)
-  const roots = await rootsFor({ ...status, roots: { ...status.roots, workspaceRoot: route.remoteCwd } }, route.remoteCwd, hostApi.pool, host, secret)
+  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const real = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
   if (!fileWriteAllowed(mode, real, roots)) {
     throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
   }
-  const before = (await hostApi.pool.sftpRead(host, secret, real)).toString('utf8')
+  const before = (await hostApi.pool.sftpRead(host, secret, real, READ_CAP)).toString('utf8')
   const oldString = String(args.old_string ?? '')
   const newString = String(args.new_string ?? '')
   const replaceAll = args.replace_all === true
@@ -332,9 +355,7 @@ export async function runEdit(hostApi: ToolHost, route: RemoteRoute, args: Recor
   if (count === 0) throw new Error(`old_string was not found in ${toModelPath(real, route)}`)
   if (!replaceAll && count !== 1) throw new Error(`old_string matched ${count} times; pass replace_all or include more context`)
   const after = replaceAll ? before.replaceAll(oldString, newString) : before.replace(oldString, newString)
-  const tmp = `${real}.${process.pid}.tmp`
-  await hostApi.pool.sftpWrite(host, secret, tmp, after)
-  await hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, real])}`, 15_000)
+  await commitFile(hostApi, host, secret, status, mode, roots, real, after, exec.signal)
   return { path: toModelPath(real, route), before, after }
 }
 
@@ -347,7 +368,7 @@ export async function runReadImage(
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const data = await hostApi.pool.sftpRead(host, secret, remotePath)
+  const data = await hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP)
   const image = await save(data, posix.basename(remotePath))
   return { path: toModelPath(remotePath, route), image }
 }
@@ -361,7 +382,7 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
   const pattern = String(args.pattern ?? '')
-  const command = `cd ${shJoin([base])} && ${shJoin([status.ripgrepPath, '--files', '--hidden', '--iglob', pattern, '--glob', '!.git/**', '--sort', 'modified'])}`
+  const command = `cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`
   const result = await hostApi.pool.exec(host, secret, command, 30_000)
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'glob failed')
   const paths = result.stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
@@ -379,9 +400,7 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const base = typeof args.path === 'string'
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
-  const argv = [status.ripgrepPath, '--json', '-n', '--heading', String(args.pattern ?? '')]
-  if (typeof args.include === 'string' && args.include.length > 0) argv.push('--glob', args.include)
-  argv.push(base)
+  const argv = grepArgv(status.ripgrepPath, String(args.pattern ?? ''), base, typeof args.include === 'string' ? args.include : undefined)
   const result = await hostApi.pool.exec(host, secret, shJoin(argv), 30_000)
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'grep failed')
   const matches: Array<{ path: string, lineNumber: number, line: string }> = []
@@ -404,12 +423,61 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
   return { matches }
 }
 
-async function safeRealpath(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
-  try {
-    return await pool.sftpRealpath(host, secret, remotePath)
-  } catch {
-    return posix.normalize(remotePath)
+async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {
+  let cursor = posix.normalize(lexicalPath)
+  const missing: string[] = []
+  while (true) {
+    try {
+      const real = await pool.sftpRealpath(host, secret, cursor)
+      return composeCreatedPath(real, missing)
+    } catch {
+      if (cursor === '/') return composeCreatedPath('/', missing)
+      missing.unshift(posix.basename(cursor))
+      const parent = posix.dirname(cursor)
+      if (parent === cursor) return composeCreatedPath(cursor, missing)
+      cursor = parent
+    }
   }
+}
+
+async function commitFile(
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  status: RunnerStatus,
+  mode: SandboxMode,
+  roots: RemoteFileRoots,
+  target: string,
+  content: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal)
+  if (mode !== 'danger-full-access' && !status.sandbox.available) {
+    throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
+  }
+  const tmp = posix.join(roots.workspaceRoot, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
+  await hostApi.pool.sftpWrite(host, secret, tmp, content)
+  const command = `mkdir -p ${shJoin([posix.dirname(target)])} && mv -f ${shJoin([tmp, target])}`
+  const wrapped = mode === 'danger-full-access'
+    ? command
+    : commandArgv(status, mode, roots, roots.workspaceRoot, command)
+  const result = await hostApi.pool.exec(host, secret, wrapped, 20_000, signal)
+  if (result.code !== 0) {
+    await hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, 10_000).catch(() => undefined)
+    throw new Error(result.stderr || 'remote write failed')
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted !== true) return
+  const error = new Error('tool call aborted')
+  error.name = 'AbortError'
+  throw error
+}
+
+function capturedText(text: string, truncated: boolean): string {
+  if (!truncated) return text
+  return `${text}\n[output truncated]`
 }
 
 function requireHost(hostApi: ToolHost, hostId: string): HostConfig {
