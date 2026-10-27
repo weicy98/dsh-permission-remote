@@ -5,6 +5,11 @@
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weicy98/dsh-permission-remote.git"
+  },
+  "homepage": "https://github.com/weicy98/dsh-permission-remote#readme",
   "keywords": [
     "deepseek-harness",
     "dsh",
