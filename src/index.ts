@@ -102,7 +102,8 @@ class SshApi extends TypertRemoteService {
 
   async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string }> {
     const host = this.core.requireHost(input.hostId)
-    await this.core.pool.sftpRealpath(host, await this.core.secret(host), input.path)
+    const info = await this.core.pool.sftpStat(host, await this.core.secret(host), input.path)
+    if (!info.isDirectory) throw new Error(`remote path is not a directory: ${input.path}`)
     const local = mapRemoteToLocal(input.hostId, input.path)
     if (local === null) throw new Error('remote path must be absolute')
     await mkdir(local, { recursive: true })
@@ -285,17 +286,32 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   })
   void api
 
-  ctx.on('agent/created', ({ agent }) => {
-    const cwd = agent.session?.header?.cwd
-    const initial = routeByCwd(cwd)
+  const seen = new Set<AgentLike>()
+  const attach = (agent: AgentLike) => {
+    if (seen.has(agent)) return
+    seen.add(agent)
+    if (!installShadows(ctx, core, agent, unregisters)) seen.delete(agent)
+  }
+  ctx.on('agent/created', ({ agent }) => attach(agent))
+  const agents = ctx.get('agents') as { list?: () => AgentLike[] } | undefined
+  if (typeof agents?.list === 'function') {
+    for (const agent of agents.list()) attach(agent)
+  }
+  ctx.logger?.info('[@dsh-permission-remote] loaded')
+}
+
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>): boolean {
+  const cwd = agent.session?.header?.cwd
+  const initial = routeByCwd(cwd)
+  const disposers: Array<() => void> = []
+  try {
     const plans = planShadows(name => agent.ctx.tools.get(name, agent))
     const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
-    const disposers: Array<() => void> = []
     for (const plan of plans) {
       if (plan.official === undefined && !(plan.name === 'bash' && initial.kind === 'remote')) continue
       const official = plan.official
       const runner = RUNNERS[plan.name]
-      const unregister = agent.ctx.tools.register(withRemoteTimeout({
+      disposers.push(agent.ctx.tools.register(withRemoteTimeout({
         ...capturedSchema(agent.ctx, plan.name, agent),
         name: plan.name,
         async execute(args: unknown, exec: ToolExec) {
@@ -307,19 +323,29 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
           }
           return runner(host, current, args as Record<string, unknown>, exec, ctx)
         },
-      }))
-      disposers.push(unregister)
+      })))
     }
-    const drop = () => {
-      for (const unregister of disposers) unregister()
-    }
-    unregisters.add(drop)
-    agent.ctx.effect(() => () => {
-      drop()
-      unregisters.delete(drop)
-    })
-  })
-  ctx.logger?.info('[@dsh-permission-remote] loaded')
+  } catch (error) {
+    for (const unregister of disposers) unregister()
+    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    return false
+  }
+  let dropped = false
+  const drop = () => {
+    if (dropped) return
+    dropped = true
+    for (const unregister of disposers) unregister()
+    unregisters.delete(drop)
+  }
+  unregisters.add(drop)
+  try {
+    agent.ctx.effect(() => drop)
+  } catch (error) {
+    drop()
+    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed: ${error instanceof Error ? error.message : String(error)}`)
+    return false
+  }
+  return true
 }
 
 function withRemoteTimeout(definition: object): object {

@@ -145,6 +145,11 @@ export class SshPool {
     return realpathOf(session, remotePath)
   }
 
+  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number }> {
+    const session = await this.sftp(host, secret)
+    return statInfo(session, remotePath)
+  }
+
   async sftpList(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<DirEntry[]> {
     const session = await this.sftp(host, secret)
     const rows = await readdir(session, remotePath)
@@ -388,7 +393,7 @@ interface SftpLike {
   writeFile(path: string, data: Buffer | string, callback: (error: Error | undefined) => void): void
   realpath(path: string, callback: (error: Error | undefined, resolved: string) => void): void
   readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>) => void): void
-  stat(path: string, callback: (error: Error | undefined, stats: { size: number }) => void): void
+  stat(path: string, callback: (error: Error | undefined, stats: { size: number, isDirectory(): boolean }) => void): void
   end(callback?: () => void): void
 }
 
@@ -424,13 +429,17 @@ async function closeLive(live: Live): Promise<void> {
   live.client.end()
 }
 
-function statSize(sftp: SftpLike, remotePath: string): Promise<number> {
+function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number }> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => {
       if (error) reject(new SshFailure(error.message, 'sftp-stat'))
-      else resolve(stats.size)
+      else resolve({ isDirectory: stats.isDirectory(), size: stats.size })
     })
   })
+}
+
+function statSize(sftp: SftpLike, remotePath: string): Promise<number> {
+  return statInfo(sftp, remotePath).then(info => info.size)
 }
 
 function readAll(sftp: SftpLike, remotePath: string): Promise<Buffer> {
