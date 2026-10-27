@@ -16,6 +16,7 @@ function host(): HostConfig {
     auth: 'password',
     privateKeyPath: '',
     fingerprint: '',
+    opsPolicy: 'ask',
   }
 }
 

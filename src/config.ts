@@ -1,6 +1,17 @@
 import Schema from '@deepseek-ai/schemastery'
 import { createVolatile, isVolatile, updateVolatile, type Volatile } from '@deepseek-ai/cosmokit'
 
+/**
+ * `ask` gates commands and writes behind the session permission mode and an
+ * approval card. `trust` runs them without a prompt. `deny` rejects every
+ * remote ops call, reads included.
+ */
+export const OpsPolicy = Schema.union([
+  Schema.const('ask').required(),
+  Schema.const('trust').required(),
+  Schema.const('deny').required(),
+]).default('ask')
+
 const Host = Schema.object({
   id: Schema.string().required(),
   name: Schema.string().default(''),
@@ -16,6 +27,7 @@ const Host = Schema.object({
   privateKeyPath: Schema.string().default(''),
   /** SHA-256 host key accepted by the operator. Empty until the first trust. */
   fingerprint: Schema.string().default(''),
+  opsPolicy: OpsPolicy,
 })
 
 export const Config = Schema.object({
@@ -24,6 +36,8 @@ export const Config = Schema.object({
   hosts: Schema.array(Host).default([]).volatile(),
   maxConnections: Schema.natural().min(1).max(32).default(4),
 })
+
+export type OpsPolicy = 'ask' | 'trust' | 'deny'
 
 export interface HostConfig {
   id: string
@@ -34,6 +48,12 @@ export interface HostConfig {
   auth: 'key' | 'password'
   privateKeyPath: string
   fingerprint: string
+  opsPolicy: OpsPolicy
+}
+
+/** Hosts saved before `opsPolicy` existed are treated as `ask`. */
+export function normalizeOpsPolicy(value: unknown): OpsPolicy {
+  return value === 'trust' || value === 'deny' ? value : 'ask'
 }
 
 export interface PluginConfig {

@@ -1,7 +1,7 @@
 {
   "nav": "SSH hosts",
   "title": "SSH hosts",
-  "description": "Turn a remote directory into a workspace. File and command tools run on that machine, under this session's sandbox mode and approval.",
+  "description": "Turn a remote directory into a workspace. File and command tools run on that machine, under this session's sandbox mode and approval. An ordinary workspace can also run ops on a host with ssh_hosts / ssh_exec / ssh_read / ssh_write.",
   "addHost": "Add host",
   "name": "Name",
   "address": "Address",
@@ -35,5 +35,11 @@
   "directory": "Remote directory",
   "up": "Up",
   "createWorkspace": "Use this directory as a workspace",
-  "workspaceCreated": "Workspace created"
+  "workspaceCreated": "Workspace created",
+  "opsPolicy": "Remote ops",
+  "opsAsk": "Ask",
+  "opsTrust": "Trust",
+  "opsDeny": "Deny",
+  "opsNote": "Ask: in an ordinary workspace, reading remote files needs no prompt, while commands and writes need a one-shot danger-full-access approval. Trust: commands and writes run without a prompt. Deny: this host accepts no remote ops at all.",
+  "policySaved": "Remote ops policy saved."
 }

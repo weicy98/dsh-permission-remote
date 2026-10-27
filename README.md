@@ -20,6 +20,8 @@ dsh plugin --profile web add github:weicy98/dsh-permission-remote
 dsh plugin --profile web add dsh-permission-remote
 ```
 
+不需要改 profile 的 `pnpm-workspace.yaml`。SSH 库随插件带上，安装时没有要批准的构建脚本。
+
 也可以用本机目录：`dsh plugin --profile web add /绝对路径/dsh-permission-remote`。
 
 然后重启 `dsh web` 并硬刷新页面。设置里会出现 **SSH 主机**。
@@ -53,13 +55,43 @@ dsh plugin --profile web add dsh-permission-remote
 
 模型带 `sandbox_permissions` 和一句话理由重试时，仍走现有审批。批准只放宽这一次调用。
 
+## 远程运维
+
+普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机，用来查日志、重启服务、改配置。打开会话即可看到四个工具：
+
+| 工具 | 作用 |
+|---|---|
+| `ssh_hosts` | 列出主机 id、名称、地址、用户、运维策略和指纹是否已信任 |
+| `ssh_exec` | 在那台机器上执行 `bash -lc`，可选绝对路径 `workdir` 和 `timeoutMs` |
+| `ssh_read` | 读取远端文件，1 MiB 上限，按行分页；支持 `~/` |
+| `ssh_write` | 用临时文件加 `mv -f` 原子替换远端文件 |
+
+每台主机在设置里有一个**远程运维**策略：
+
+| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` |
+|---|---|---|
+| 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，模型带 `sandbox_permissions: "danger-full-access"` 和理由重试后弹审批卡，批准只放宽这一次 |
+| 信任 | 允许 | 直接执行，不弹审批 |
+| 禁止 | 拒绝 | 拒绝 |
+
+`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
+
+运维工具的前提：
+
+- 目标主机必须已经在设置里信任过指纹，否则连接失败
+- `ssh_exec` 用 `bash -lc`，会读登录 shell 的 profile，这样 `PATH` 里才有 `systemctl`、`docker` 这类命令；profile 若往 stdout 打东西，会出现在命令输出里
+- `sudo` 只能走免密（`sudo -n`）。SSH 非交互执行没有 TTY，需要口令的 `sudo` 会卡住
+- 只支持直连的 Linux 或 macOS；不支持跳板机和 Windows 远端
+- 目前没有上传和下载工具
+- 网络中断时，正在执行的远端命令会失败；已经写入的文件留在远端，不会回滚
+
 ## 使用上要注意
 
 对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表和终端还是你自己的电脑，里面看不到远端工程。
 
 模型用「运行代码」，或者会话要读取项目里的 `AGENTS.md` 时，读到的也是你电脑上的这个工作区目录，不是远端那一份。
 
-目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。
+目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用上面的 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write`。
 
 Linux 上要让命令遵守当前权限，需要在那台机器上安装 bubblewrap。设置页可以代为安装，页面上也有可以自己执行的命令。
 
@@ -92,6 +124,8 @@ From npm:
 dsh plugin --profile web add dsh-permission-remote
 ```
 
+No `pnpm-workspace.yaml` edit. The SSH library ships inside the plugin, so install does not ask to approve a build script.
+
 A local checkout also works: `dsh plugin --profile web add /absolute/path/to/dsh-permission-remote`.
 
 Restart `dsh web` and hard-refresh. Add a host, trust its fingerprint, then browse a remote directory and create a workspace. Passwords stay in the DSH credential store. Private keys are referenced by local path.
@@ -101,6 +135,29 @@ Restart `dsh web` and hard-refresh. Add a host, trust its fingerprint, then brow
 Linux bash confinement needs bubblewrap. The settings page can install it with `sudo -n`, and also shows the manual command for Debian, Fedora, Arch, and Alpine. macOS uses the system `sandbox-exec`. `glob` and `grep` need ripgrep on the remote; the plugin uploads a matching binary when it has one.
 
 In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list and the terminal on the left still show your own computer.
+
+### Remote ops from an ordinary workspace
+
+A workspace whose directory is on your own computer can also act on a configured SSH host. Every session gets four tools:
+
+| Tool | Purpose |
+|---|---|
+| `ssh_hosts` | List host id, name, address, user, ops policy, and whether the host key is trusted |
+| `ssh_exec` | Run `bash -lc` on that host, with optional absolute `workdir` and `timeoutMs` |
+| `ssh_read` | Read a remote file, capped at 1 MiB, paginated by line; `~/` is expanded |
+| `ssh_write` | Replace a remote file atomically with a temp file and `mv -f` |
+
+Each host has a **Remote ops** policy in Settings:
+
+| Policy | `ssh_read` | `ssh_exec` / `ssh_write` |
+|---|---|---|
+| Ask (default) | allowed | runs only when the session is `danger-full-access`; otherwise the first call is denied and a retry with `sandbox_permissions: "danger-full-access"` plus a justification shows the approval card, which grants this one call |
+| Trust | allowed | runs without a prompt |
+| Deny | denied | denied |
+
+Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
+
+Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 
 Run Code, and the session's reading of `AGENTS.md`, also use the workspace directory on your computer, not the copy on the remote host.
 

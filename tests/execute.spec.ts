@@ -14,6 +14,7 @@ const host: HostConfig = {
   auth: 'key',
   privateKeyPath: '',
   fingerprint: '',
+  opsPolicy: 'ask',
 }
 
 const route: RemoteRoute = {

@@ -11,6 +11,7 @@ const host = (id: string): HostConfig => ({
   auth: 'key',
   privateKeyPath: '',
   fingerprint: '',
+  opsPolicy: 'ask',
 })
 
 test('the host list is a volatile settings field', () => {
@@ -35,4 +36,15 @@ test('readConfig accepts a plain settings object', () => {
   assert.equal(config.hosts[0]?.id, 'h1')
   config.hosts = []
   assert.deepEqual(config.hosts, [])
+})
+
+test('a host saved before opsPolicy existed defaults to ask', () => {
+  const { opsPolicy: _opsPolicy, ...legacy } = host('h1')
+  const config = readConfig({ hosts: [legacy], maxConnections: 2 })
+  assert.equal(config.hosts[0]?.opsPolicy, 'ask')
+})
+
+test('readConfig keeps an explicit opsPolicy', () => {
+  const config = readConfig({ hosts: [host('h1'), { ...host('h2'), opsPolicy: 'deny' }] })
+  assert.deepEqual(config.hosts.map(item => item.opsPolicy), ['ask', 'deny'])
 })

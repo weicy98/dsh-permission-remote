@@ -1,7 +1,7 @@
 {
   "nav": "SSH 主机",
   "title": "SSH 主机",
-  "description": "把远端目录做成工作区。文件和命令工具在那台机器上执行，权限仍用这个会话现有的沙箱档位和审批。",
+  "description": "把远端目录做成工作区。文件和命令工具在那台机器上执行，权限仍用这个会话现有的沙箱档位和审批。普通工作区也可以用 ssh_hosts / ssh_exec / ssh_read / ssh_write 对主机做运维。",
   "addHost": "添加主机",
   "name": "名称",
   "address": "地址",
@@ -35,5 +35,11 @@
   "directory": "远端目录",
   "up": "上一级",
   "createWorkspace": "把当前目录做成工作区",
-  "workspaceCreated": "工作区已创建"
+  "workspaceCreated": "工作区已创建",
+  "opsPolicy": "远程运维",
+  "opsAsk": "询问",
+  "opsTrust": "信任",
+  "opsDeny": "禁止",
+  "opsNote": "询问：普通工作区读取远端文件不弹卡，执行命令和写文件需要一次 danger-full-access 审批。信任：命令和写入不再弹卡。禁止：这台主机不执行任何远程运维操作。",
+  "policySaved": "远程运维策略已保存。"
 }

@@ -9,6 +9,7 @@ export interface HostView {
   auth: 'key' | 'password'
   privateKeyPath: string
   fingerprint: string
+  opsPolicy: 'ask' | 'trust' | 'deny'
 }
 
 export interface RunnerView {

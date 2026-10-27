@@ -200,6 +200,12 @@ const CSS = `
   justify-content: flex-start;
   width: fit-content;
 }
+.dsh-ssh-policy {
+  width: auto;
+  min-width: 92px;
+  height: 28px;
+  padding: 0 6px;
+}
 `
 
 export function installStyles(): void {

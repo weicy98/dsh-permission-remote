@@ -5,6 +5,7 @@ import { posix } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import {
   SandboxUnavailableError,
+  WIDER_MODES,
   approveEscalation,
   escalationHintMarker,
   sandboxDenialMarker,
@@ -151,6 +152,11 @@ export function buildResolveMode(ctx: {
     const standing = ctx.sandboxPolicy.resolve(session === undefined ? {} : { session }).mode
     validateEscalationArgs(requested, justification)
     if (requested === undefined || justification === undefined) return standing
+    // Asking for a narrower mode than the standing one is not an escalation.
+    // A danger-full-access session already permits the call; approving a
+    // downgrade would otherwise throw and fail a call that needs no approval.
+    if (requested === standing) return standing
+    if (!(WIDER_MODES[standing] ?? []).includes(requested as SandboxMode)) return standing
     const approved = await approveEscalation({
       requestedMode: requested,
       justification,
@@ -497,7 +503,7 @@ export async function runWorkingDirectory(
   return { cwd }
 }
 
-async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {
+export async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {
   let cursor = posix.normalize(lexicalPath)
   const missing: string[] = []
   while (true) {
@@ -539,7 +545,7 @@ async function commitFile(
   if (result.code !== 0) throw new Error(result.stderr || 'remote write failed')
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
+export function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw abortError()
 }
 
@@ -555,7 +561,7 @@ function abortError(): Error {
 }
 
 /** Stop waiting when the tool call is cancelled. The underlying transfer may still finish. */
-function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   throwIfAborted(signal)
   if (signal === undefined) return work
   return new Promise((resolve, reject) => {
@@ -565,7 +571,7 @@ function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   })
 }
 
-function capturedText(text: string, truncated: boolean): string {
+export function capturedText(text: string, truncated: boolean): string {
   if (!truncated) return text
   return `${text}\n[output truncated]`
 }

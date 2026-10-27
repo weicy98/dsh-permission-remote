@@ -160,6 +160,19 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  async function savePolicy(host: HostView, opsPolicy: HostView['opsPolicy']): Promise<void> {
+    setBusy(true)
+    try {
+      await callHost(ctx, 'saveHost', { ...host, opsPolicy })
+      await reload()
+      note(t('policySaved'))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function removeHost(hostId: string): Promise<void> {
     setBusy(true)
     try {
@@ -218,6 +231,17 @@ function Section(props: SectionProps): JSX.Element {
                 <div className="dsh-ssh-host-meta">{host.username}@{host.host}:{host.port}</div>
               </div>
               <div className="dsh-ssh-row-actions">
+                <select
+                  className="dsh-ssh-select dsh-ssh-policy"
+                  aria-label={t('opsPolicy')}
+                  value={host.opsPolicy ?? 'ask'}
+                  disabled={busy}
+                  onChange={event => void savePolicy(host, event.target.value as HostView['opsPolicy'])}
+                >
+                  <option value="ask">{t('opsAsk')}</option>
+                  <option value="trust">{t('opsTrust')}</option>
+                  <option value="deny">{t('opsDeny')}</option>
+                </select>
                 <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void test(host)}>{t('test')}</button>
                 <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, '/')}>{t('browse')}</button>
                 <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
@@ -246,6 +270,15 @@ function Section(props: SectionProps): JSX.Element {
         {draft.auth === 'key'
           ? <Field label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
           : null}
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-policy">
+          <span className="dsh-ssh-label">{t('opsPolicy')}</span>
+          <select id="dsh-ssh-policy" className="dsh-ssh-select" value={draft.opsPolicy} onChange={event => setDraft({ ...draft, opsPolicy: event.target.value as HostView['opsPolicy'] })}>
+            <option value="ask">{t('opsAsk')}</option>
+            <option value="trust">{t('opsTrust')}</option>
+            <option value="deny">{t('opsDeny')}</option>
+          </select>
+        </label>
+        <p className="dsh-ssh-note">{t('opsNote')}</p>
         <Field label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
         <div className="dsh-ssh-actions">
           <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0}>{t('save')}</button>
@@ -311,7 +344,7 @@ function Field(props: { label: string, value: string, secret?: boolean, onChange
 }
 
 function blankHost(): HostView {
-  return { id: '', name: '', host: '', port: 22, username: '', auth: 'key', privateKeyPath: '', fingerprint: '' }
+  return { id: '', name: '', host: '', port: 22, username: '', auth: 'key', privateKeyPath: '', fingerprint: '', opsPolicy: 'ask' }
 }
 
 function parentDir(dir: string): string {
