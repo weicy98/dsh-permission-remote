@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/cordis": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"],
+      "@deepseek-ai/schemastery": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-fs": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-sandbox": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-credentials": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-credentials/types": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-credentials/lib/types/types.d.ts"],
+      "@deepseek-ai/dsh-typert-protocol": ["/home/weichongyong/.nvm/versions/node/v22.20.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-typert-protocol/lib/types/index.d.ts"]
+    }
+  },
+  "include": ["src", "tests"]
+}

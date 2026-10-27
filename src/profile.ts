@@ -1,0 +1,89 @@
+/**
+ * Remote confinement argv copied from @deepseek-ai/dsh-sandbox-local.
+ *
+ * bwrapProfileArgs and seatbeltProfileArgs are internal to that package
+ * (not re-exported from its public entry). The spellings below match
+ * lib/index.js of dsh 0.2.1-rc.3.
+ *
+ * Bash and file writes do not share a temp root: bash workspace-write mounts
+ * a private tmpfs on /tmp, while file tools may write the real remote temp dirs.
+ */
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+
+export interface RemoteFileRoots {
+  /** Canonical remote workspace root. */
+  readonly workspaceRoot: string
+  /** Canonical remote /tmp (on macOS this is often /private/tmp). */
+  readonly tmp: string
+  /** Canonical remote per-user temp directory (os.tmpdir() on that host). */
+  readonly userTmp: string
+}
+
+/** bwrap arguments before the `--` separator. danger-full-access does not wrap. */
+export function bwrapProfileArgs(mode: SandboxMode, workspaceRoot: string): string[] | null {
+  if (mode === 'danger-full-access') return null
+  const args = [
+    '--ro-bind', '/', '/',
+    '--dev', '/dev',
+    '--unshare-pid',
+    '--proc', '/proc',
+    '--die-with-parent',
+  ]
+  if (mode === 'workspace-write') {
+    args.push('--tmpfs', '/tmp', '--bind', workspaceRoot, workspaceRoot)
+  }
+  return args
+}
+
+/** Read-only profile used to probe that bwrap can actually create a user namespace. */
+export function bwrapProbeArgv(): string[] {
+  return ['bwrap', ...bwrapProfileArgs('read-only', '/')!, '--', 'true']
+}
+
+/**
+ * Seatbelt arguments before `--`. Writable roots are the remote-probed set,
+ * not writableRoots() from the harness host.
+ */
+export function seatbeltProfileArgs(mode: SandboxMode, roots: readonly string[]): string[] | null {
+  if (mode === 'danger-full-access') return null
+  const forms = [
+    '(version 1)',
+    '(allow default)',
+    '(deny file-write*)',
+    '(allow file-write* (literal "/dev/null"))',
+  ]
+  if (mode === 'workspace-write' && roots.length > 0) {
+    const grants = roots.map(root => `(subpath ${sbplString(root)})`).join(' ')
+    forms.push(`(allow file-write* ${grants})`)
+  }
+  return ['-p', forms.join(' ')]
+}
+
+export function seatbeltProbeArgv(): string[] {
+  return ['sandbox-exec', ...seatbeltProfileArgs('read-only', [])!, '--', 'true']
+}
+
+function sbplString(value: string): string {
+  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
+}
+
+/** File-tool writable roots under workspace-write. read-only allows nothing. */
+export function fileWritableRoots(mode: SandboxMode, roots: RemoteFileRoots): string[] {
+  if (mode !== 'workspace-write') return []
+  return [...new Set([roots.workspaceRoot, roots.tmp, roots.userTmp])]
+}
+
+export function pathInsideRoot(target: string, root: string): boolean {
+  const normalizedTarget = target.length > 1 && target.endsWith('/') ? target.slice(0, -1) : target
+  const normalizedRoot = root.length > 1 && root.endsWith('/') ? root.slice(0, -1) : root
+  if (normalizedRoot === '/') return normalizedTarget.startsWith('/')
+  if (normalizedTarget === normalizedRoot) return true
+  return normalizedTarget.startsWith(`${normalizedRoot}/`)
+}
+
+export function fileWriteAllowed(mode: SandboxMode, target: string, roots: RemoteFileRoots): boolean {
+  if (mode === 'danger-full-access') return true
+  if (mode === 'read-only') return false
+  return fileWritableRoots(mode, roots).some(root => pathInsideRoot(target, root))
+}

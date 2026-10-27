@@ -1,0 +1,11 @@
+# dsh-permission-remote bundle patch.
+#
+# Installed with:
+#   dsh plugin --profile web add <this directory>
+#
+# Inserts one host row. The browser module graph only scans enabled Loader
+# entries, so this row is also what makes the settings page appear.
+# Local bash-sandbox / fs-sandbox / sandbox-policy / approval stay mounted.
+- insert:
+    - id: permission-remote
+      name: 'dsh-permission-remote'

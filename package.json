@@ -1,0 +1,77 @@
+{
+  "name": "dsh-permission-remote",
+  "version": "0.1.0",
+  "private": false,
+  "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "ssh"
+  ],
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "locale",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5",
+    "dsh": "0.2.1-rc.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.spec.ts"
+  },
+  "dependencies": {
+    "@vscode/ripgrep": "^1.15.11",
+    "ssh2": "^1.17.0"
+  },
+  "optionalDependencies": {
+    "@vscode/ripgrep-darwin-arm64": "^1.15.11",
+    "@vscode/ripgrep-darwin-x64": "^1.15.11",
+    "@vscode/ripgrep-linux-arm64": "^1.15.11",
+    "@vscode/ripgrep-linux-x64": "^1.15.11"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-credentials": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-fs": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-sandbox": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-settings": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.3",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "~18.3.1",
+    "@types/ssh2": "^1.15.5",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.9.3"
+  }
+}

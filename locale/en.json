@@ -1,0 +1,4 @@
+{
+  "title": "SSH hosts",
+  "description": "Turn a remote directory into a workspace. File and command tools run there, under the session sandbox mode and approval flow."
+}
