@@ -17,14 +17,19 @@ export function probeOutcome(exitCode: number | null, timedOut: boolean, stderr 
   return { available: false, reason: 'rejected' }
 }
 
-/** Five lines: kernel, machine, canonical /tmp, canonical user temp, home. */
+/**
+ * Five lines: kernel, machine, canonical /tmp, canonical user temp, home.
+ * A failed `cd` still prints a blank line. Otherwise HOME slides into userTmp
+ * and the file sandbox bind-mounts the home directory.
+ */
 export function hostFactsCommand(): string {
+  const line = (body: string) => `{ ${body}; } || printf '\\n'`
   return [
     'uname -s',
     'uname -m',
-    'cd /tmp && pwd -P',
-    'cd "${TMPDIR:-/tmp}" && pwd -P',
-    'printf %s "$HOME"',
+    line('cd /tmp && pwd -P'),
+    line('cd "${TMPDIR:-/tmp}" && pwd -P'),
+    `printf '%s\\n' "$HOME"`,
   ].join('; ')
 }
 

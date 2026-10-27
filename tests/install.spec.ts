@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { distroInstallFor, parseOsRelease } from '../src/install-commands.ts'
@@ -28,6 +29,25 @@ test('host facts use the canonical temp directory, including macOS /tmp', () => 
   assert.equal(facts.tmp, '/private/tmp')
   assert.equal(facts.userTmp, '/var/folders/ab/T')
   assert.equal(facts.home, '/Users/dev')
+})
+
+test('a blank temp line does not move HOME into userTmp', () => {
+  const facts = parseHostFacts('Linux\nx86_64\n/tmp\n\n/home/dev\n')
+  assert.equal(facts.tmp, '/tmp')
+  assert.equal(facts.userTmp, '/tmp')
+  assert.equal(facts.home, '/home/dev')
+})
+
+test('a missing TMPDIR still yields five fact lines', () => {
+  const stdout = execFileSync('bash', ['-c', hostFactsCommand()], {
+    env: { ...process.env, TMPDIR: '/nonexistent-xyz-dsh-probe' },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+  const facts = parseHostFacts(stdout)
+  assert.equal(facts.userTmp, facts.tmp)
+  assert.notEqual(facts.userTmp, '/nonexistent-xyz-dsh-probe')
+  assert.equal(facts.home, process.env.HOME || '/tmp')
 })
 
 test('ripgrep package follows the remote uname', () => {
