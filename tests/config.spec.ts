@@ -1,9 +1,38 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { Config } from '../src/config.ts'
+import { Config, readConfig, type HostConfig } from '../src/config.ts'
+
+const host = (id: string): HostConfig => ({
+  id,
+  name: '',
+  host: '127.0.0.1',
+  port: 22,
+  username: 'u',
+  auth: 'key',
+  privateKeyPath: '',
+  fingerprint: '',
+})
 
 test('the host list is a volatile settings field', () => {
   const hosts = Config.dict?.hosts
   assert.equal(hosts?.meta.volatile, true)
   assert.equal(Config.dict?.maxConnections?.meta.volatile, undefined)
+})
+
+test('readConfig accepts the resolved config and keeps its hosts reference', () => {
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 }) as unknown as { hosts: { get(): HostConfig[] } }
+  const config = readConfig(resolved)
+  assert.equal(config.hosts[0]?.id, 'h1')
+  assert.equal(config.maxConnections, 4)
+  config.hosts = [host('h1'), host('h2')]
+  assert.deepEqual(resolved.hosts.get().map(item => item.id), ['h1', 'h2'])
+  assert.deepEqual(config.hosts.map(item => item.id), ['h1', 'h2'])
+})
+
+test('readConfig accepts a plain settings object', () => {
+  const config = readConfig({ hosts: [host('h1')], maxConnections: 2 })
+  assert.equal(config.maxConnections, 2)
+  assert.equal(config.hosts[0]?.id, 'h1')
+  config.hosts = []
+  assert.deepEqual(config.hosts, [])
 })

@@ -141,15 +141,6 @@ class Core {
     this.pool = new SshPool(config.maxConnections)
   }
 
-  update(config: PluginConfig): void {
-    this.config = config
-    this.status.clear()
-  }
-
-  hosts(): HostConfig[] {
-    return this.config.hosts
-  }
-
   requireHost(hostId: string): HostConfig {
     const host = this.config.hosts.find(item => item.id === hostId)
     if (host === undefined) throw new Error(`unknown SSH host ${hostId}`)
@@ -158,10 +149,7 @@ class Core {
 
   async trust(hostId: string, fingerprint: string): Promise<void> {
     this.requireHost(hostId)
-    this.config = {
-      ...this.config,
-      hosts: this.config.hosts.map(item => item.id === hostId ? { ...item, fingerprint } : item),
-    }
+    this.config.hosts = this.config.hosts.map(item => item.id === hostId ? { ...item, fingerprint } : item)
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     await this.persistHosts()
@@ -180,6 +168,7 @@ class Core {
 
   async saveSecret(hostId: string, material: SecretMaterial): Promise<void> {
     assertHostId(hostId)
+    this.requireHost(hostId)
     const key = credentialKey('dsh-permission-remote', hostId)
     await this.ctx.credentials.modifyRecord(key, async current => {
       const previous = current?.kind === 'grant' && isPayload(current.payload) ? current.payload : {}
@@ -196,12 +185,12 @@ class Core {
   async saveHost(host: HostConfig): Promise<void> {
     assertHostId(host.id)
     const hosts = this.config.hosts.filter(item => item.id !== host.id)
-    this.config = { ...this.config, hosts: [...hosts, host] }
+    this.config.hosts = [...hosts, host]
     await this.persistHosts()
   }
 
   async deleteHost(hostId: string): Promise<void> {
-    this.config = { ...this.config, hosts: this.config.hosts.filter(item => item.id !== hostId) }
+    this.config.hosts = this.config.hosts.filter(item => item.id !== hostId)
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     await this.persistHosts()
