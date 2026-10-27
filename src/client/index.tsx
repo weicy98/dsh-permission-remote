@@ -89,6 +89,7 @@ function Section(props: SectionProps): JSX.Element {
       const id = draft.id || newId()
       const next = { ...draft, id, port: Number(draft.port) || 22 }
       await callHost(ctx, 'saveHost', next)
+      setDraft(next)
       if (next.auth === 'password' || secret.trim().length > 0) {
         await callHost(ctx, 'saveSecret', {
           hostId: id,

@@ -352,7 +352,8 @@ export async function runWrite(hostApi: ToolHost, route: RemoteRoute, args: Reco
   let before: string | null = null
   try {
     before = (await withSignal(hostApi.pool.sftpRead(host, secret, target, READ_CAP), exec.signal)).toString('utf8')
-  } catch {
+  } catch (error) {
+    if (exec.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
     before = null
   }
   const content = String(args.content ?? '')
@@ -416,7 +417,7 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const pattern = String(args.pattern ?? '')
   const command = `cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`
   const result = await hostApi.pool.exec(host, secret, command, 30_000, exec?.signal)
-  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'glob failed')
+  throwIfRgFailed(result, exec?.signal, 'glob')
   const paths = result.stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
     const absolute = posix.isAbsolute(line) ? line : posix.join(base, line)
     return toModelPath(absolute, route)
@@ -435,7 +436,7 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
     : route.remoteCwd
   const argv = grepArgv(status.ripgrepPath, String(args.pattern ?? ''), base, typeof args.include === 'string' ? args.include : undefined)
   const result = await hostApi.pool.exec(host, secret, shJoin(argv), 30_000, exec?.signal)
-  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'grep failed')
+  throwIfRgFailed(result, exec?.signal, 'grep')
   const matches: Array<{ path: string, lineNumber: number, line: string }> = []
   for (const row of result.stdout.split('\n')) {
     if (row.trim().length === 0) continue
@@ -525,6 +526,11 @@ async function commitFile(
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw abortError()
+}
+
+function throwIfRgFailed(result: ExecResult, signal: AbortSignal | undefined, label: string): void {
+  if (signal?.aborted === true) throw abortError()
+  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || `${label} failed`)
 }
 
 function abortError(): Error {
