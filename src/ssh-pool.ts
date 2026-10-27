@@ -1,10 +1,23 @@
 import { readFile } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { Client, type ConnectConfig } from 'ssh2'
 import type { HostConfig } from './config.ts'
 import { claimPending } from './pool-claim.ts'
 import { shJoin } from './shell-quote.ts'
 
 const OUTPUT_CAP = 1024 * 1024
+
+/** Decode one SSH chunk. Incomplete UTF-8 stays in `decoder` until the next chunk or `end()`. */
+export function takeChannelText(decoder: StringDecoder, chunk: Buffer): string {
+  return decoder.write(chunk)
+}
+
+/** The live log emits the truncation line once, whichever stream hits the cap first. */
+export function truncationMarker(noted: { current: boolean }): string {
+  if (noted.current) return ''
+  noted.current = true
+  return '\n[output truncated]'
+}
 
 export interface ExecResult {
   readonly code: number | null
@@ -292,9 +305,34 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
   const stderr: Buffer[] = []
   let stdoutTruncated = false
   let stderrTruncated = false
+  const decoders = {
+    stdout: new StringDecoder('utf8'),
+    stderr: new StringDecoder('utf8'),
+  }
+  const decoderEnded = { stdout: false, stderr: false }
+  const truncationNoted = { current: false }
+  const emit = (which: 'stdout' | 'stderr', text: string) => {
+    if (text.length === 0 || onOutput === undefined) return
+    try {
+      onOutput({ stream: which, text })
+    } catch {
+      // An observer must not tear the channel down.
+    }
+  }
+  const flushDecoder = (which: 'stdout' | 'stderr') => {
+    if (decoderEnded[which]) return
+    decoderEnded[which] = true
+    emit(which, decoders[which].end())
+  }
+  const markTruncation = (which: 'stdout' | 'stderr') => {
+    flushDecoder(which)
+    emit(which, truncationMarker(truncationNoted))
+  }
   const finish = (code: number | null, signal: string | null) => {
     if (settled) return
     settled = true
+    flushDecoder('stdout')
+    flushDecoder('stderr')
     clearTimeout(timer)
     clearTimeout(fallback)
     resolveDone({
@@ -338,30 +376,23 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
       return
     }
     stream = opened as unknown as ExecStream
-    const emit = (stream: 'stdout' | 'stderr', text: string) => {
-      if (text.length === 0 || onOutput === undefined) return
-      try {
-        onOutput({ stream, text })
-      } catch {
-        // An observer must not tear the channel down.
-      }
-    }
     const push = (target: Buffer[], chunk: Buffer, which: 'stdout' | 'stderr') => {
       const used = target.reduce((sum, part) => sum + part.length, 0)
       const room = OUTPUT_CAP - used
       if (room <= 0) {
         if (which === 'stdout') stdoutTruncated = true
         else stderrTruncated = true
+        markTruncation(which)
         stop('truncate')
         return
       }
-      const kept = chunk.length > room ? chunk.subarray(0, room) : chunk
+      const kept = Buffer.from(chunk.subarray(0, Math.min(chunk.length, room)))
       target.push(kept)
-      emit(which, kept.toString('utf8'))
+      emit(which, takeChannelText(decoders[which], kept))
       if (kept.length < chunk.length) {
         if (which === 'stdout') stdoutTruncated = true
         else stderrTruncated = true
-        emit(which, '\n[output truncated]')
+        markTruncation(which)
         stop('truncate')
       }
     }

@@ -50,7 +50,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/*.spec.ts"
+    "test": "node --experimental-transform-types --test tests/*.spec.ts"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",
