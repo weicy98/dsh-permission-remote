@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { posix } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
@@ -7,12 +8,14 @@ import {
   approveEscalation,
   escalationHintMarker,
   sandboxDenialMarker,
+  validateEscalationArgs,
   type SandboxMode,
 } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig } from './config.ts'
 import { distroInstallFor, parseOsRelease, type DistroInstall } from './install-commands.ts'
 import { composeCreatedPath } from './contain.ts'
 import {
+  atomicWriteScript,
   bwrapProfileArgs,
   bwrapProbeArgv,
   fileWriteAllowed,
@@ -24,7 +27,7 @@ import {
   type RemoteFileRoots,
 } from './profile.ts'
 import { hostFactsCommand, parseHostFacts, probeOutcome, ripgrepPackage, type ProbeOutcome } from './probe.ts'
-import { resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
+import { mapRemoteToLocal, resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
 
@@ -48,6 +51,7 @@ export interface ToolExec {
     readonly session?: { readonly id?: string, readonly header?: { readonly cwd?: string } }
   }
   readonly callId?: string
+  readonly rootCallId?: string
   readonly signal?: AbortSignal
 }
 
@@ -62,7 +66,7 @@ export interface ToolHost {
       kind: string
       label: string
       owner?: string
-      toolCall?: { callId: string }
+      toolCall?: { callId: string, rootCallId: string }
       run: (job: { append(text: string): void }) => { cancel(): void, done: Promise<unknown> }
     }): string
   }
@@ -143,10 +147,8 @@ export function buildResolveMode(ctx: {
   return async (exec, requested, justification, toolName, subject) => {
     const session = exec.agent?.session
     const standing = ctx.sandboxPolicy.resolve(session === undefined ? {} : { session }).mode
-    if (requested === undefined && justification === undefined) return standing
-    if (requested === undefined || justification === undefined) {
-      throw new Error('sandbox_permissions and justification must be sent together')
-    }
+    validateEscalationArgs(requested, justification)
+    if (requested === undefined || justification === undefined) return standing
     const approved = await approveEscalation({
       requestedMode: requested,
       justification,
@@ -257,7 +259,10 @@ async function startBackground(
     kind: 'bash',
     label: command,
     owner: exec.agent?.session?.id,
-    toolCall: exec.callId === undefined ? undefined : { callId: exec.callId },
+    toolCall: exec.callId === undefined ? undefined : {
+      callId: exec.callId,
+      rootCallId: exec.rootCallId ?? exec.callId,
+    },
     run: (job) => {
       let opened: { close(): void } | undefined
       let cancelled = false
@@ -423,6 +428,31 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
   return { matches }
 }
 
+export async function runWorkingDirectory(
+  hostApi: ToolHost,
+  route: RemoteRoute,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+  setDirectory: (directory: string) => Promise<string>,
+): Promise<{ cwd: string }> {
+  if (args.cd === undefined || args.cd === '') return { cwd: route.placeholderCwd }
+  const requested = resolveRemotePath(String(args.cd), route.remoteCwd, route.placeholderCwd)
+  const host = requireHost(hostApi, route.hostId)
+  const secret = await hostApi.secretOf(host)
+  let remote: string
+  try {
+    remote = await hostApi.pool.sftpRealpath(host, secret, requested)
+  } catch {
+    throw new Error(`directory does not exist on the remote host: ${requested}`)
+  }
+  const local = mapRemoteToLocal(route.hostId, remote)
+  if (local === null) throw new Error('remote directory cannot be mapped to a workspace path')
+  await mkdir(local, { recursive: true })
+  if (exec.agent === undefined) throw new Error('working_directory requires an agent Session')
+  const cwd = await setDirectory(local)
+  return { cwd }
+}
+
 async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {
   let cursor = posix.normalize(lexicalPath)
   const missing: string[] = []
@@ -455,17 +485,14 @@ async function commitFile(
   if (mode !== 'danger-full-access' && !status.sandbox.available) {
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
-  const tmp = posix.join(roots.workspaceRoot, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
-  await hostApi.pool.sftpWrite(host, secret, tmp, content)
-  const command = `mkdir -p ${shJoin([posix.dirname(target)])} && mv -f ${shJoin([tmp, target])}`
+  const directory = posix.dirname(target)
+  const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
+  const script = atomicWriteScript(directory, tmp, target)
   const wrapped = mode === 'danger-full-access'
-    ? command
-    : commandArgv(status, mode, roots, roots.workspaceRoot, command)
-  const result = await hostApi.pool.exec(host, secret, wrapped, 20_000, signal)
-  if (result.code !== 0) {
-    await hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, 10_000).catch(() => undefined)
-    throw new Error(result.stderr || 'remote write failed')
-  }
+    ? script
+    : commandArgv(status, mode, roots, roots.workspaceRoot, script)
+  const result = await hostApi.pool.exec(host, secret, wrapped, 20_000, signal, content)
+  if (result.code !== 0) throw new Error(result.stderr || 'remote write failed')
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

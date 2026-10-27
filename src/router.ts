@@ -14,9 +14,9 @@ export function remoteRoot(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(home, 'remote')
 }
 
+/** Same grammar as `credentialKey()` segments: lowercase, digits, and hyphens. */
 export function isValidHostId(hostId: string): boolean {
-  if (hostId.length === 0 || hostId === '.' || hostId === '..') return false
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(hostId)
+  return /^[a-z][a-z0-9-]*$/.test(hostId)
 }
 
 export function encodeRemotePath(remotePath: string): string {

@@ -39,7 +39,9 @@ dsh plugin --profile web add dsh-permission-remote
 4. **ripgrep。** `glob` / `grep` 需要远端有 `rg`。连接时会按远端架构上传随插件带上的二进制；上传不了时，在远端安装 ripgrep，让 `rg` 出现在 `PATH` 里。
 5. **创建工作区。** 在同一页浏览远端目录，把当前目录作成工作区。它会出现在原来的工作区列表里。左侧文件列表和终端仍显示你这台电脑上的目录，远端文件要在对话的执行结果里看。
 
-打开这个工作区的会话后，对话和 Permissions 与本地会话相同。相对路径按远端工作目录解析。工具结果里的路径写成占位目录，模型下一轮仍用这条路径。
+打开这个工作区的会话后，对话和 Permissions 与本地会话相同。相对路径按远端工作目录解析。工具结果里的路径写成占位目录，模型下一轮仍用这条路径。`working_directory` 也留在这条占位路径上：切换目录会确认远端目录存在，再把会话目录改成对应的占位路径，不会改到你这台电脑上的真实目录。
+
+`workspace-write` 的文件写入在远端沙箱进程里完成：内容先进入同目录的临时文件，再 `mv -f` 换成目标文件。中途断开留下的是临时文件，原来的内容还在。`danger-full-access` 用同一步替换，但不包沙箱。
 
 ## 权限
 
@@ -93,6 +95,8 @@ dsh plugin --profile web add dsh-permission-remote
 A local checkout also works: `dsh plugin --profile web add /absolute/path/to/dsh-permission-remote`.
 
 Restart `dsh web` and hard-refresh. Add a host, trust its fingerprint, then browse a remote directory and create a workspace. Passwords stay in the DSH credential store. Private keys are referenced by local path.
+
+`working_directory` stays on the placeholder path for that remote directory. Under `workspace-write`, the confined command writes a temp file in the same directory and `mv -f` replaces the target, so a dropped connection does not truncate the original. `danger-full-access` uses the same replace without confinement.
 
 Linux bash confinement needs bubblewrap. The settings page can install it with `sudo -n`, and also shows the manual command for Debian, Fedora, Arch, and Alpine. macOS uses the system `sandbox-exec`. `glob` and `grep` need ripgrep on the remote; the plugin uploads a matching binary when it has one.
 

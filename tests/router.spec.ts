@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { mapRemoteToLocal, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
+import { isValidHostId, mapRemoteToLocal, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
 
 const env = { DSH_HOME: '/tmp/dsh-home' }
 
@@ -44,4 +44,12 @@ test('model-facing paths stay on the placeholder the session cwd uses', () => {
   if (route.kind !== 'remote') return
   assert.equal(toModelPath('/srv/app/src/main.ts', route, env), path.join(local, 'src', 'main.ts'))
   assert.equal(toModelPath('/srv/app', route, env), local)
+})
+
+test('host ids use the credential-key grammar', () => {
+  assert.equal(isValidHostId('host1'), true)
+  assert.equal(isValidHostId('h0123abcd'), true)
+  assert.equal(isValidHostId('Host'), false)
+  assert.equal(isValidHostId('host.name'), false)
+  assert.equal(mapRemoteToLocal('Host', '/srv/app', env), null)
 })

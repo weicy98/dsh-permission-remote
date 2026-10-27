@@ -83,15 +83,15 @@ export class SshPool {
     void current.then(live => closeLive(live)).catch(() => undefined)
   }
 
-  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal): Promise<ExecResult> {
-    const commandHandle = await this.open(host, secret, command, timeoutMs, signal)
+  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer): Promise<ExecResult> {
+    const commandHandle = await this.open(host, secret, command, timeoutMs, signal, stdin)
     return commandHandle.done
   }
 
   /** `timeoutMs` of 0 waits until the command exits, the signal aborts, or `close` kills its channel. */
-  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal): Promise<RemoteCommand> {
+  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer): Promise<RemoteCommand> {
     const live = await this.acquire(host, secret, true)
-    const commandHandle = openChannel(live.client, command, timeoutMs)
+    const commandHandle = openChannel(live.client, command, timeoutMs, stdin)
     if (signal !== undefined) {
       const abort = () => commandHandle.close()
       if (signal.aborted) commandHandle.close()
@@ -264,9 +264,11 @@ interface ExecStream {
   stderr: { on(event: 'data', listener: (chunk: Buffer) => void): void }
   close(): void
   signal?(name: string, callback?: () => void): void
+  write(chunk: Buffer | string): boolean
+  end(): void
 }
 
-function openChannel(client: Client, command: string, timeoutMs: number): RemoteCommand {
+function openChannel(client: Client, command: string, timeoutMs: number, stdin?: string | Buffer): RemoteCommand {
   let settled = false
   let cause: 'exit' | 'timeout' | 'cancel' | 'truncate' = 'exit'
   let stream: ExecStream | undefined
@@ -346,6 +348,10 @@ function openChannel(client: Client, command: string, timeoutMs: number): Remote
     stream.on('data', chunk => push(stdout, chunk, 'stdout'))
     stream.stderr.on('data', chunk => push(stderr, chunk, 'stderr'))
     stream.on('close', (code, signal) => finish(code, signal))
+    if (stdin !== undefined && cause === 'exit') {
+      stream.write(typeof stdin === 'string' ? Buffer.from(stdin) : stdin)
+      stream.end()
+    }
     if (cause !== 'exit') {
       try {
         stream.signal?.('KILL', () => undefined)

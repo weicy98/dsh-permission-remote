@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bwrapProbeArgv, bwrapProfileArgs, fileWriteAllowed, seatbeltProbeArgv } from '../src/profile.ts'
+import { atomicWriteScript, bwrapProbeArgv, bwrapProfileArgs, fileWriteAllowed, seatbeltProbeArgv } from '../src/profile.ts'
 
 test('read-only bwrap profile matches the official argv', () => {
   assert.deepEqual(bwrapProfileArgs('read-only', '/srv/app'), [
@@ -44,4 +44,10 @@ test('file writes use the remote temp roots, not the harness host temp', () => {
   assert.equal(fileWriteAllowed('workspace-write', '/var/folders/ab/T/x', roots), true)
   assert.equal(fileWriteAllowed('workspace-write', '/etc/passwd', roots), false)
   assert.equal(fileWriteAllowed('danger-full-access', '/etc/passwd', roots), true)
+})
+
+test('a confined write replaces the target by rename, and does not truncate it first', () => {
+  const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file')
+  assert.match(script, /cat > '\/srv\/app\/\.dsh-tmp' && mv -f '\/srv\/app\/\.dsh-tmp' '\/srv\/app\/file'/)
+  assert.doesNotMatch(script, /cat > '\/srv\/app\/file'/)
 })

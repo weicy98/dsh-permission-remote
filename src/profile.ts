@@ -9,6 +9,8 @@
  * a private tmpfs on /tmp, while file tools may write the real remote temp dirs.
  */
 
+import { shJoin } from './shell-quote.ts'
+
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 
 export interface RemoteFileRoots {
@@ -103,4 +105,16 @@ export function grepArgv(rg: string, pattern: string, base: string, include?: st
 
 export function globArgv(rg: string, pattern: string): string[] {
   return [rg, '--no-config', '--files', '--hidden', '--iglob', pattern, '--glob', '!.git/**', '--sort', 'modified']
+}
+
+/**
+ * Write stdin to a same-directory temp file, then rename it onto the target.
+ * `mv` on one filesystem replaces the destination atomically. A dropped
+ * connection leaves the temp file, not a truncated target.
+ * `cat` failure removes the temp file and does not run `mv`.
+ */
+export function atomicWriteScript(directory: string, tmp: string, target: string): string {
+  const write = `cat > ${shJoin([tmp])} && mv -f ${shJoin([tmp, target])}`
+  const cleanup = `{ status=$?; rm -f ${shJoin([tmp])}; exit $status; }`
+  return `mkdir -p ${shJoin([directory])} && ${write} || ${cleanup}`
 }

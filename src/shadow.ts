@@ -7,7 +7,7 @@
  * returns the wrapper and recurses.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep'] as const
+export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
 
 export interface OfficialTool<TArgs = unknown, TExec = unknown, TResult = unknown> {

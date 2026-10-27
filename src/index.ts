@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
+import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { Config, readConfig, type HostConfig, type PluginConfig } from './config.ts'
@@ -13,6 +14,7 @@ import {
   runEdit,
   runGlob,
   runGrep,
+  runWorkingDirectory,
   runRead,
   runReadImage,
   runWrite,
@@ -21,7 +23,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { sniffImage } from './image.ts'
-import { mapRemoteToLocal, routeByCwd } from './router.ts'
+import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
 import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 
@@ -177,6 +179,7 @@ class Core {
   }
 
   async saveSecret(hostId: string, material: SecretMaterial): Promise<void> {
+    assertHostId(hostId)
     const key = credentialKey('dsh-permission-remote', hostId)
     await this.ctx.credentials.modifyRecord(key, async current => {
       const previous = current?.kind === 'grant' && isPayload(current.payload) ? current.payload : {}
@@ -191,6 +194,7 @@ class Core {
   }
 
   async saveHost(host: HostConfig): Promise<void> {
+    assertHostId(host.id)
     const hosts = this.config.hosts.filter(item => item.id !== host.id)
     this.config = { ...this.config, hosts: [...hosts, host] }
     await this.persistHosts()
@@ -236,6 +240,10 @@ class Core {
   }
 }
 
+function assertHostId(hostId: string): void {
+  if (!isValidHostId(hostId)) throw new Error('host id must be a lowercase credential key: it starts with a letter and contains only letters, digits, and hyphens')
+}
+
 function isPayload(value: unknown): value is GrantPayload {
   return typeof value === 'object' && value !== null
 }
@@ -268,6 +276,11 @@ const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<Return
   }),
   glob: (host, route, args) => runGlob(host, route, args),
   grep: (host, route, args) => runGrep(host, route, args),
+  working_directory: (host, route, args, exec, ctx) => runWorkingDirectory(host, route, args, exec, async directory => {
+    const directories = ctx.get('workingDirectory') as { set(agent: object, path: string, signal?: AbortSignal): Promise<string> } | undefined
+    if (directories === undefined || exec.agent === undefined) throw new Error('working_directory requires an agent Session')
+    return directories.set(exec.agent, directory, exec.signal)
+  }),
 }
 
 export function apply(rawCtx: Context, rawConfig?: unknown): void {
@@ -365,7 +378,7 @@ function fallbackSchema(toolName: string): object {
       timeoutMs: { type: 'number' },
       workdir: { type: 'string' },
       run_in_background: { type: 'boolean' },
-      sandbox_permissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'] },
+      sandbox_permissions: { type: 'string', enum: [...ESCALATION_TARGETS] },
       justification: { type: 'string' },
     },
     output: {

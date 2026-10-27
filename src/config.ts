@@ -18,7 +18,9 @@ const Host = Schema.object({
 })
 
 export const Config = Schema.object({
-  hosts: Schema.array(Host).default([]),
+  // Settings only lists and writes fields marked volatile. Without this, the
+  // host row is dropped from describe() and every save is a silent no-op.
+  hosts: Schema.array(Host).default([]).volatile(),
   maxConnections: Schema.natural().min(1).max(32).default(4),
 })
 
@@ -39,7 +41,7 @@ export interface PluginConfig {
 }
 
 export function readConfig(raw: unknown): PluginConfig {
-  const value = Config(raw ?? {}) as PluginConfig
+  const value = Config(raw ?? {}) as unknown as PluginConfig
   return {
     hosts: value.hosts ?? [],
     maxConnections: value.maxConnections ?? 4,
