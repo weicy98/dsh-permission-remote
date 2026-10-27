@@ -70,7 +70,7 @@ export interface ToolHost {
       label: string
       owner?: string
       toolCall?: { callId: string, rootCallId: string }
-      run: (job: { append(text: string): void }) => { cancel(): void, done: Promise<unknown> }
+      run: (job: { append(text: string, options?: { channel?: 'stdout' | 'stderr' }): void }) => { cancel(): void, done: Promise<unknown> }
     }): string
   }
 }
@@ -289,13 +289,15 @@ async function startBackground(
     run: (job) => {
       let opened: { close(): void } | undefined
       let cancelled = false
-      const done = hostApi.pool.open(host, secret, argv, 0, exec.signal).then(commandHandle => {
+      const done = hostApi.pool.open(host, secret, argv, 0, exec.signal, undefined, chunk => {
+        job.append(chunk.text, { channel: chunk.stream })
+      }).then(commandHandle => {
         opened = commandHandle
         if (cancelled || exec.signal?.aborted === true) commandHandle.close()
         return commandHandle.done
       }).then(result => {
+        if (note.length > 0) job.append(note)
         const text = `${capturedText(result.stdout, result.stdoutTruncated)}${capturedText(result.stderr, result.stderrTruncated)}${note}`
-        job.append(text)
         return {
           status: result.timedOut || result.signal === 'KILL' ? 'killed' as const : 'completed' as const,
           detail: result.timedOut ? 'timed out' : result.signal === 'KILL' ? 'cancelled' : `exit code: ${result.code ?? 'null'}`,
@@ -322,8 +324,7 @@ export async function runRead(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const bytes = await hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP)
-  throwIfAborted(exec?.signal)
+  const bytes = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP), exec?.signal)
   const text = bytes.toString('utf8')
   const all = text.split(/\n/)
   const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1
@@ -350,7 +351,7 @@ export async function runWrite(hostApi: ToolHost, route: RemoteRoute, args: Reco
   }
   let before: string | null = null
   try {
-    before = (await hostApi.pool.sftpRead(host, secret, target, READ_CAP)).toString('utf8')
+    before = (await withSignal(hostApi.pool.sftpRead(host, secret, target, READ_CAP), exec.signal)).toString('utf8')
   } catch {
     before = null
   }
@@ -375,7 +376,7 @@ export async function runEdit(hostApi: ToolHost, route: RemoteRoute, args: Recor
   if (!fileWriteAllowed(mode, real, roots)) {
     throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
   }
-  const before = (await hostApi.pool.sftpRead(host, secret, real, READ_CAP)).toString('utf8')
+  const before = (await withSignal(hostApi.pool.sftpRead(host, secret, real, READ_CAP), exec.signal)).toString('utf8')
   const oldString = String(args.old_string ?? '')
   const newString = String(args.new_string ?? '')
   const replaceAll = args.replace_all === true
@@ -392,16 +393,19 @@ export async function runReadImage(
   route: RemoteRoute,
   args: Record<string, unknown>,
   save: (data: Buffer, name: string) => Promise<Record<string, unknown>>,
+  exec?: ToolExec,
 ): Promise<Record<string, unknown>> {
+  throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const data = await hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP)
+  const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP), exec?.signal)
   const image = await save(data, posix.basename(remotePath))
   return { path: toModelPath(remotePath, route), image }
 }
 
-export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
+  throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const status = await hostApi.statusOf(host)
@@ -411,7 +415,7 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
     : route.remoteCwd
   const pattern = String(args.pattern ?? '')
   const command = `cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`
-  const result = await hostApi.pool.exec(host, secret, command, 30_000)
+  const result = await hostApi.pool.exec(host, secret, command, 30_000, exec?.signal)
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'glob failed')
   const paths = result.stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
     const absolute = posix.isAbsolute(line) ? line : posix.join(base, line)
@@ -420,7 +424,8 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
   return { root: toModelPath(base, route), paths }
 }
 
-export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
+  throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const status = await hostApi.statusOf(host)
@@ -429,7 +434,7 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
   const argv = grepArgv(status.ripgrepPath, String(args.pattern ?? ''), base, typeof args.include === 'string' ? args.include : undefined)
-  const result = await hostApi.pool.exec(host, secret, shJoin(argv), 30_000)
+  const result = await hostApi.pool.exec(host, secret, shJoin(argv), 30_000, exec?.signal)
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || 'grep failed')
   const matches: Array<{ path: string, lineNumber: number, line: string }> = []
   for (const row of result.stdout.split('\n')) {
@@ -519,10 +524,24 @@ async function commitFile(
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted !== true) return
+  if (signal?.aborted === true) throw abortError()
+}
+
+function abortError(): Error {
   const error = new Error('tool call aborted')
   error.name = 'AbortError'
-  throw error
+  return error
+}
+
+/** Stop waiting when the tool call is cancelled. The underlying transfer may still finish. */
+function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  if (signal === undefined) return work
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(abortError())
+    signal.addEventListener('abort', fail, { once: true })
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', fail))
+  })
 }
 
 function capturedText(text: string, truncated: boolean): string {

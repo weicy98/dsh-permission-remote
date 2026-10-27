@@ -253,7 +253,7 @@ function markRemote(service: SshApi): void {
 
 const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
-  read: (host, route, args) => runRead(host, route, args),
+  read: (host, route, args, exec) => runRead(host, route, args, exec),
   write: (host, route, args, exec) => runWrite(host, route, args, exec),
   edit: (host, route, args, exec) => runEdit(host, route, args, exec),
   read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
@@ -262,9 +262,9 @@ const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<Return
     const mediaType = sniffImage(data)
     if (mediaType === undefined) throw new Error(`cannot read "${fileName}": the file content is not a PNG, JPEG, WebP, or GIF`)
     return attachments.saveImage({ data, mediaType, name: fileName })
-  }),
-  glob: (host, route, args) => runGlob(host, route, args),
-  grep: (host, route, args) => runGrep(host, route, args),
+  }, exec),
+  glob: (host, route, args, exec) => runGlob(host, route, args, exec),
+  grep: (host, route, args, exec) => runGrep(host, route, args, exec),
   working_directory: (host, route, args, exec, ctx) => runWorkingDirectory(host, route, args, exec, async directory => {
     const directories = ctx.get('workingDirectory') as { set(agent: object, path: string, signal?: AbortSignal): Promise<string> } | undefined
     if (directories === undefined || exec.agent === undefined) throw new Error('working_directory requires an agent Session')

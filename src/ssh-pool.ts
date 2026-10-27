@@ -22,6 +22,11 @@ export interface RemoteCommand {
   close(): void
 }
 
+export interface CommandChunk {
+  readonly stream: 'stdout' | 'stderr'
+  readonly text: string
+}
+
 export interface DirEntry {
   readonly name: string
   readonly path: string
@@ -83,15 +88,15 @@ export class SshPool {
     void current.then(live => closeLive(live)).catch(() => undefined)
   }
 
-  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer): Promise<ExecResult> {
-    const commandHandle = await this.open(host, secret, command, timeoutMs, signal, stdin)
+  async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<ExecResult> {
+    const commandHandle = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput)
     return commandHandle.done
   }
 
   /** `timeoutMs` of 0 waits until the command exits, the signal aborts, or `close` kills its channel. */
-  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer): Promise<RemoteCommand> {
+  async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<RemoteCommand> {
     const live = await this.acquire(host, secret, true)
-    const commandHandle = openChannel(live.client, command, timeoutMs, stdin)
+    const commandHandle = openChannel(live.client, command, timeoutMs, stdin, onOutput)
     if (signal !== undefined) {
       const abort = () => commandHandle.close()
       if (signal.aborted) commandHandle.close()
@@ -268,7 +273,7 @@ interface ExecStream {
   end(): void
 }
 
-function openChannel(client: Client, command: string, timeoutMs: number, stdin?: string | Buffer): RemoteCommand {
+function openChannel(client: Client, command: string, timeoutMs: number, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): RemoteCommand {
   let settled = false
   let cause: 'exit' | 'timeout' | 'cancel' | 'truncate' = 'exit'
   let stream: ExecStream | undefined
@@ -328,22 +333,32 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
       return
     }
     stream = opened as unknown as ExecStream
+    const emit = (stream: 'stdout' | 'stderr', text: string) => {
+      if (text.length === 0 || onOutput === undefined) return
+      try {
+        onOutput({ stream, text })
+      } catch {
+        // An observer must not tear the channel down.
+      }
+    }
     const push = (target: Buffer[], chunk: Buffer, which: 'stdout' | 'stderr') => {
       const used = target.reduce((sum, part) => sum + part.length, 0)
-      if (used >= OUTPUT_CAP) {
+      const room = OUTPUT_CAP - used
+      if (room <= 0) {
         if (which === 'stdout') stdoutTruncated = true
         else stderrTruncated = true
         stop('truncate')
         return
       }
-      if (used + chunk.length > OUTPUT_CAP) {
-        target.push(chunk.subarray(0, OUTPUT_CAP - used))
+      const kept = chunk.length > room ? chunk.subarray(0, room) : chunk
+      target.push(kept)
+      emit(which, kept.toString('utf8'))
+      if (kept.length < chunk.length) {
         if (which === 'stdout') stdoutTruncated = true
         else stderrTruncated = true
+        emit(which, '\n[output truncated]')
         stop('truncate')
-        return
       }
-      target.push(chunk)
     }
     stream.on('data', chunk => push(stdout, chunk, 'stdout'))
     stream.stderr.on('data', chunk => push(stderr, chunk, 'stderr'))
