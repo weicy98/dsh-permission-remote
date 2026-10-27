@@ -1,4 +1,5 @@
 import Schema from '@deepseek-ai/schemastery'
+import { createVolatile, isVolatile, updateVolatile, type Volatile } from '@deepseek-ai/cosmokit'
 
 const Host = Schema.object({
   id: Schema.string().required(),
@@ -40,20 +41,14 @@ export interface PluginConfig {
   maxConnections: number
 }
 
-const volatileWrite = Symbol.for('cosmokit.volatile.write')
-
-interface HostRef {
-  get(): unknown
-  [volatileWrite](value: unknown): void
-}
+type HostRef = Volatile<unknown>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function isHostRef(value: unknown): value is HostRef {
-  if (typeof value !== 'object' || value === null || !(volatileWrite in value)) return false
-  return typeof (value as { get?: unknown }).get === 'function'
+  return isVolatile(value)
 }
 
 function asHostArray(value: unknown): HostConfig[] {
@@ -67,9 +62,7 @@ function copyHostRows(value: unknown): HostConfig[] | undefined {
 }
 
 function commitHosts(ref: HostRef, hosts: HostConfig[]): void {
-  const frozen = Object.freeze(hosts.map(host => Object.freeze({ ...host })))
-  const writer = (ref as unknown as Record<symbol, (value: unknown) => void>)[volatileWrite]
-  writer(frozen)
+  updateVolatile(ref, createVolatile(hosts.map(host => ({ ...host }))))
 }
 
 /**
@@ -85,11 +78,10 @@ export function readConfig(raw: unknown): PluginConfig {
     ...record,
     hosts: copyHostRows(isHostRef(incoming) ? incoming.get() : incoming),
   }) as { hosts?: unknown, maxConnections?: number }
-  const normalized = asHostArray(isHostRef(parsed.hosts) ? parsed.hosts.get() : parsed.hosts)
   const maxConnections = parsed.maxConnections ?? 4
-  if (isHostRef(incoming)) return viewConfig(incoming, maxConnections)
-  if (isHostRef(parsed.hosts)) return viewConfig(parsed.hosts, maxConnections)
-  return { hosts: normalized, maxConnections }
+  const ref = isHostRef(incoming) ? incoming : parsed.hosts
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections)
+  return { hosts: asHostArray(ref), maxConnections }
 }
 
 function viewConfig(ref: HostRef, maxConnections: number): PluginConfig {
