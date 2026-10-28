@@ -100,13 +100,18 @@ class SshApi extends TypertRemoteService {
     return this.core.probe(input.hostId, input.refresh === true)
   }
 
-  async installDeps(input: { hostId: string }): Promise<{ code: number | null, stdout: string, stderr: string, status: RunnerStatus }> {
+  /**
+   * Install bubblewrap on the remote. `ok` is the command's own exit status;
+   * `sandbox.available` is the re-probe, which is what actually matters after
+   * an install that reported success.
+   */
+  async installDeps(input: { hostId: string }): Promise<{ ok: boolean, code: number | null, stdout: string, stderr: string, status: RunnerStatus }> {
     const host = this.core.requireHost(input.hostId)
     const status = await this.core.probe(input.hostId)
     const result = await installBubblewrap(this.core.pool, host, await this.core.secret(host), status)
     this.core.forgetStatus(input.hostId)
     const next = await this.core.probe(input.hostId)
-    return { code: result.code, stdout: result.stdout, stderr: result.stderr, status: next }
+    return { ok: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr, status: next }
   }
 
   /**

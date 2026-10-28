@@ -3,7 +3,16 @@
 export interface DistroInstall {
   readonly id: string
   readonly title: string
-  /** Command the settings button runs. Uses sudo -n so a password prompt cannot hang. */
+  /**
+   * Command the settings button runs. Uses sudo -n so a password prompt cannot hang.
+   *
+   * The refresh step and the install step are separate statements joined by
+   * `;`, and the exit status reported is the install's. A stale index is
+   * recoverable — the package is usually still installable from it — while a
+   * broken third-party source (a retired apt repository, for example) makes
+   * `apt-get update` fail forever. Chaining with `&&` would let that
+   * unrelated failure skip the install entirely.
+   */
   readonly auto: string
   /** Command shown for the operator to run themselves. */
   readonly manual: string
@@ -13,8 +22,8 @@ export const BUBBLEWRAP_INSTALLS: readonly DistroInstall[] = [
   {
     id: 'debian',
     title: 'Debian/Ubuntu',
-    auto: 'sudo -n apt-get update && sudo -n apt-get install -y bubblewrap',
-    manual: 'sudo apt-get update && sudo apt-get install -y bubblewrap',
+    auto: 'sudo -n apt-get update; sudo -n apt-get install -y bubblewrap',
+    manual: 'sudo apt-get update; sudo apt-get install -y bubblewrap',
   },
   {
     id: 'fedora',

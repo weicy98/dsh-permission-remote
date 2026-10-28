@@ -6,11 +6,31 @@ import { hostFactsCommand, parseHostFacts, probeOutcome, remoteArchOf, remoteOsO
 
 test('os-release selects a fixed sudo -n command', () => {
   const ubuntu = distroInstallFor(parseOsRelease('ID=ubuntu\nID_LIKE=debian\n'))
-  assert.equal(ubuntu?.auto, 'sudo -n apt-get update && sudo -n apt-get install -y bubblewrap')
-  assert.equal(ubuntu?.manual, 'sudo apt-get update && sudo apt-get install -y bubblewrap')
+  assert.equal(ubuntu?.auto, 'sudo -n apt-get update; sudo -n apt-get install -y bubblewrap')
+  assert.equal(ubuntu?.manual, 'sudo apt-get update; sudo apt-get install -y bubblewrap')
   const fedora = distroInstallFor(parseOsRelease('ID="fedora"\n'))
   assert.match(fedora?.auto ?? '', /^sudo -n dnf /)
   assert.equal(distroInstallFor(parseOsRelease('ID=gentoo\n')), null)
+})
+
+test('a failing package-list refresh does not skip the install', () => {
+  // A retired third-party apt source makes `apt-get update` fail forever. With
+  // `&&` that unrelated failure skipped the install and the run ended with no
+  // verdict at all.
+  const ubuntu = distroInstallFor(parseOsRelease('ID=ubuntu\n'))
+  const auto = ubuntu?.auto ?? ''
+  assert.equal(auto.includes('&&'), false)
+  assert.equal(auto.includes(';'), true)
+  // The install has to be the last statement so its status is the one reported.
+  assert.match(auto, /;\s*sudo -n apt-get install -y bubblewrap$/)
+})
+
+test('every distro runs its install as the last statement', () => {
+  for (const id of ['ubuntu', 'fedora', 'arch', 'alpine']) {
+    const install = distroInstallFor(parseOsRelease(`ID=${id}\n`))
+    assert.match(install?.auto ?? '', /bubblewrap$/, id)
+    assert.equal((install?.auto ?? '').includes('&&'), false, id)
+  }
 })
 
 test('a present binary is unavailable unless the read-only probe exits 0', () => {

@@ -306,11 +306,26 @@ function Section(props: SectionProps): JSX.Element {
     setBusy(true)
     setInstallLog(null)
     try {
-      const result = await callHost<{ code: number | null, stdout: string, stderr: string, status: RunnerView }>(ctx, 'installDeps', { hostId })
+      const result = await callHost<{ ok: boolean, code: number | null, stdout: string, stderr: string, status: RunnerView }>(ctx, 'installDeps', { hostId })
       setStatus({ hostId, banner: '', runner: result.status })
-      setInstallLog({ hostId, text: [result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}` })
+      // The outcome is the re-probe, not the exit status: a package manager can
+      // report success on an already-installed package, and a non-zero status
+      // can still leave a usable bwrap behind.
+      const ready = result.status.sandbox.available
+      const verdict = ready
+        ? t('installOk')
+        : result.ok ? t('installNoEffect') : t('installFailed')
+      const exit = `exit ${result.code ?? 'null'}`
+      const body = [result.stdout, result.stderr].filter(Boolean).join('\n')
+      setInstallLog({ hostId, text: `${verdict} (${exit})\n${body.length > 0 ? body : t('installNoOutput')}` })
+      // The banner has to say the same thing the log does.
+      if (ready) note(t('installOk'))
+      else if (result.ok) fail(t('installNoEffect'))
+      else fail(t('installFailed'))
     } catch (error) {
-      setInstallLog({ hostId, text: error instanceof Error ? error.message : String(error) })
+      const text = error instanceof Error ? error.message : String(error)
+      setInstallLog({ hostId, text: `${t('installFailed')}\n${text}` })
+      fail(text)
     } finally {
       setBusy(false)
     }

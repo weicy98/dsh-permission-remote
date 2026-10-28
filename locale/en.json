@@ -73,5 +73,9 @@
   "rgRegistryHint": "Used only by Install ripgrep. Leave empty for npmjs; set a mirror where it is slow.",
   "registrySaved": "Download source saved.",
   "rgInstalled": "ripgrep ready:",
-  "rgStillMissing": "Downloaded, but the remote still reports it missing"
+  "rgStillMissing": "Downloaded, but the remote still reports it missing",
+  "installOk": "bubblewrap is available.",
+  "installNoEffect": "The command reported success, but the remote sandbox is still unavailable.",
+  "installFailed": "Install failed.",
+  "installNoOutput": "(the command printed nothing)"
 }

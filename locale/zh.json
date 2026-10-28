@@ -73,5 +73,9 @@
   "rgRegistryHint": "仅在使用「安装 ripgrep」时访问。留空用 npmjs，国内可填镜像地址。",
   "registrySaved": "下载源已保存。",
   "rgInstalled": "ripgrep 已就绪：",
-  "rgStillMissing": "下载完成但远端仍不可用"
+  "rgStillMissing": "下载完成但远端仍不可用",
+  "installOk": "bubblewrap 已可用。",
+  "installNoEffect": "命令报告成功，但远端沙箱仍不可用。",
+  "installFailed": "安装失败。",
+  "installNoOutput": "（命令没有输出）"
 }
