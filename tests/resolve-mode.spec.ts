@@ -55,20 +55,58 @@ test('an unknown sandbox mode is rejected', async () => {
   assert.deepEqual(requests, [])
 })
 
-test('an ops approval card names the remote action', async () => {
-  const requests: string[] = []
-  const resolve = resolver('read-only', requests)
+test('an ops approval card names the remote action in the interface language', async () => {
+  const requests: Array<{ en?: string, zh?: string }> = []
+  const resolve = buildResolveMode({
+    sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
+    get: name => {
+      if (name !== 'approval') return undefined
+      return {
+        request: async (req: { reason: string, displayReason?: { en?: string, zh?: string } }) => {
+          requests.push(req.displayReason ?? { en: req.reason })
+          return 'allowed-once'
+        },
+      }
+    },
+  })
   const mode = await resolve(
     { agent },
     'danger-full-access',
     'restart nginx',
     'ssh_exec',
     'remote command',
-    'command on prod (10.0.0.1): systemctl restart nginx',
+    { en: 'command on prod (10.0.0.1): systemctl restart nginx', zh: '在 prod (10.0.0.1) 上执行：systemctl restart nginx' },
   )
   assert.equal(mode, 'danger-full-access')
-  assert.match(requests[0]!, /restart nginx/)
-  assert.match(requests[0]!, /systemctl restart nginx/)
+  assert.match(requests[0]!.en ?? '', /systemctl restart nginx/)
+  assert.match(requests[0]!.zh ?? '', /在 prod \(10\.0\.0\.1\) 上执行/)
+  assert.doesNotMatch(requests[0]!.zh ?? '', /^command on/)
+})
+
+test('a missing translation falls back to the English line', async () => {
+  const requests: Array<{ en?: string, zh?: string }> = []
+  const resolve = buildResolveMode({
+    sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
+    get: name => {
+      if (name !== 'approval') return undefined
+      return {
+        request: async (req: { reason: string, displayReason?: { en?: string, zh?: string } }) => {
+          requests.push(req.displayReason ?? { en: req.reason })
+          return 'allowed-once'
+        },
+      }
+    },
+  })
+  await resolve(
+    { agent },
+    'danger-full-access',
+    'restart nginx',
+    'ssh_write',
+    'remote file write',
+    { en: 'write /etc/app.conf on prod', zh: '   ' },
+  )
+  assert.match(requests[0]!.en ?? '', /\nwrite \/etc\/app\.conf on prod$/)
+  assert.match(requests[0]!.zh ?? '', /\nwrite \/etc\/app\.conf on prod$/)
 })
 
 test('a call without escalation args keeps the standing mode', async () => {

@@ -84,6 +84,31 @@ test('a cancelled glob is an abort, not a command failure', async () => {
   )
 })
 
+test('a login banner before the search block is not a glob path', async () => {
+  let command = ''
+  const api = {
+    pool: {
+      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
+        command = argv
+        return {
+          ...killed(),
+          code: 0,
+          signal: null,
+          stdout: ['Welcome to Ubuntu 24.04', '__DSH_SEARCH_BEGIN__', 'src/main.ts', '__DSH_SEARCH_END__', ''].join('\n'),
+        }
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'read-only' as const,
+  } satisfies ToolHost
+  const result = await runGlob(api, route, { pattern: '*.ts' }, {})
+  assert.match(command, /__DSH_SEARCH_BEGIN__/)
+  assert.match(command, /exit \$status/)
+  assert.deepEqual(result.paths, [`${route.placeholderCwd}/src/main.ts`])
+})
+
 test('a glob that exits 2 is still a command failure', async () => {
   const api = {
     pool: {
@@ -165,4 +190,24 @@ test('a foreground bash result survives a JSON round trip', async () => {
   const value = await runBash(api, route, { command: 'echo ok', description: 'echo' }, {})
   assert.equal(value.exitCode, 0)
   assert.deepEqual(JSON.parse(JSON.stringify(value)), value)
+})
+
+test('a non-positive timeout falls back to the default instead of passing it on', async () => {
+  const timeouts: number[] = []
+  const api = {
+    pool: {
+      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
+      exec: async (_host: HostConfig, _secret: unknown, _command: string, timeoutMs: number) => {
+        timeouts.push(timeoutMs)
+        return { ...killed(), code: 0, signal: null }
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'danger-full-access' as const,
+  } satisfies ToolHost
+  const value = await runBash(api, route, { command: 'echo ok', description: 'echo', timeoutMs: 0 }, {})
+  assert.equal(value.timeoutMs, 60_000)
+  assert.deepEqual(timeouts, [60_000])
 })

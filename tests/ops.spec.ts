@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import type { RunnerStatus, ToolHost } from '../src/execute.ts'
+import type { ApprovalDetail, RunnerStatus, ToolHost } from '../src/execute.ts'
 import { forgetOpsHost, renderOpsExec, renderOpsRead, requireOps, resolveOpsHost, runSshExec, runSshRead, runSshWrite } from '../src/ops.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -48,7 +48,7 @@ interface OpsApi {
   commands: string[]
   reads: string[]
   stats: string[]
-  modes: Array<[string | undefined, string | undefined, string | undefined]>
+  modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]>
 }
 
 const markedHome = `__DSH_OPS_HOME_BEGIN__\n/home/ops\n__DSH_OPS_HOME_END__\n`
@@ -63,7 +63,7 @@ function api(options: {
   const commands: string[] = []
   const reads: string[] = []
   const stats: string[] = []
-  const modes: Array<[string | undefined, string | undefined, string | undefined]> = []
+  const modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]> = []
   const pool = {
     exec: async (_host: HostConfig, _secret: unknown, command: string) => {
       commands.push(command)
@@ -151,11 +151,15 @@ test('requireOps denies an ask host outside danger-full-access', async () => {
 
 test('requireOps passes the escalation args to the session mode resolver', async () => {
   const { api: hostApi, modes } = api()
+  const detail = {
+    en: 'command on prod (10.0.0.1): systemctl restart nginx',
+    zh: '在 prod (10.0.0.1) 上执行：systemctl restart nginx',
+  }
   await requireOps(hostApi, host(), {}, {
     sandbox_permissions: 'danger-full-access',
     justification: 'restart nginx',
-  }, 'ssh_exec', 'remote command', 'command on prod (10.0.0.1): systemctl restart nginx')
-  assert.deepEqual(modes, [['danger-full-access', 'restart nginx', 'command on prod (10.0.0.1): systemctl restart nginx']])
+  }, 'ssh_exec', 'remote command', detail)
+  assert.deepEqual(modes, [['danger-full-access', 'restart nginx', detail]])
 })
 
 test('requireOps does not ask the user to approve workspace-write', async () => {
@@ -292,6 +296,20 @@ test('ssh_write reports update when the file already exists', async () => {
   assert.equal(value.before, 'line one\nline two\nline three\n')
   assert.equal(value.after, 'next')
   assert.match(commands[0]!, /chmod 600 /)
+})
+
+test('ssh_write does not treat an unreadable target as a new file', async () => {
+  const { api: hostApi, commands } = api({
+    mode: 'danger-full-access',
+    stat: () => {
+      throw new Error('Permission denied')
+    },
+  })
+  await assert.rejects(
+    () => runSshWrite(hostApi, host(), { file_path: '/etc/app.conf', content: 'next' }, {}),
+    /Permission denied/,
+  )
+  assert.deepEqual(commands, [])
 })
 
 test('ssh_write rejects a directory before running mv', async () => {

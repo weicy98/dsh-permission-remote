@@ -7,6 +7,7 @@ import {
   resolveCreatedPath,
   throwIfAborted,
   withSignal,
+  type ApprovalDetail,
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
@@ -83,7 +84,7 @@ export async function requireOps(
   args: OpsApprovalArgs,
   toolName: string,
   subject: string,
-  detail?: string,
+  detail?: ApprovalDetail,
 ): Promise<void> {
   if (host.opsPolicy === 'deny') throw new Error(`remote ops are disabled for SSH host ${hostLabel(host)}`)
   requireTrusted(host)
@@ -124,7 +125,10 @@ export async function runSshExec(hostApi: ToolHost, host: HostConfig, args: Reco
     args as OpsApprovalArgs,
     'ssh_exec',
     hostSubject(host, 'remote command'),
-    `command on ${hostLabel(host)}: ${clip(command)}${where}`,
+    {
+      en: `command on ${hostLabel(host)}: ${clip(command)}${where}`,
+      zh: `在 ${hostLabel(host)} 上执行：${clip(command)}${where}`,
+    },
   )
   const secret = await hostApi.secretOf(host)
   const timeoutMs = typeof args.timeoutMs === 'number' && args.timeoutMs > 0 ? args.timeoutMs : 60_000
@@ -203,7 +207,10 @@ export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Rec
     args as OpsApprovalArgs,
     'ssh_write',
     hostSubject(host, 'remote file write'),
-    `write ${clip(requestedRaw)} on ${hostLabel(host)}`,
+    {
+      en: `write ${clip(requestedRaw)} on ${hostLabel(host)}`,
+      zh: `在 ${hostLabel(host)} 上写入 ${clip(requestedRaw)}`,
+    },
   )
   const secret = await hostApi.secretOf(host)
   const requested = await resolveOpsPath(hostApi, host, secret, requestedRaw)

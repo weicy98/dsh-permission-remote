@@ -29,7 +29,16 @@ import {
   seatbeltProbeArgv,
   type RemoteFileRoots,
 } from './profile.ts'
-import { hostFactsCommand, parseHostFacts, probeOutcome, ripgrepPackage, type ProbeOutcome } from './probe.ts'
+import {
+  hostFactsCommand,
+  outputBlock,
+  parseHostFacts,
+  probeOutcome,
+  ripgrepPackage,
+  systemRipgrepCommand,
+  systemRipgrepPath,
+  type ProbeOutcome,
+} from './probe.ts'
 import { mapRemoteToLocal, resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
@@ -58,12 +67,18 @@ export interface ToolExec {
   readonly signal?: AbortSignal
 }
 
+/** A remote action named on the approval card, in both interface languages. */
+export interface ApprovalDetail {
+  readonly en: string
+  readonly zh: string
+}
+
 export interface ToolHost {
   readonly pool: SshPool
   readonly hostOf: (hostId: string) => HostConfig | undefined
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
-  readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: string) => Promise<SandboxMode>
+  readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: ApprovalDetail) => Promise<SandboxMode>
   readonly jobs?: {
     start(spec: {
       kind: string
@@ -97,14 +112,15 @@ export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretM
     const probe = await pool.exec(host, secret, shJoin(seatbeltProbeArgv()), 20_000)
     sandbox = probeOutcome(probe.timedOut ? null : probe.code, probe.timedOut, probe.stderr)
   }
-  const rgRemote = `${home}/.dsh-permission-remote/rg`
-  const system = await pool.exec(host, secret, 'command -v rg', 10_000)
+  const rgRemote = home.length > 0 ? `${home}/.dsh-permission-remote/rg` : ''
+  const system = await pool.exec(host, secret, systemRipgrepCommand(), 10_000)
   let ripgrep: RunnerStatus['ripgrep'] = 'missing'
   let ripgrepPath = ''
-  if (!system.timedOut && system.code === 0 && system.stdout.trim().length > 0) {
+  const systemPath = systemRipgrepPath(system.stdout)
+  if (!system.timedOut && system.code === 0 && systemPath.length > 0) {
     ripgrep = 'system'
-    ripgrepPath = system.stdout.trim().split('\n')[0] ?? 'rg'
-  } else {
+    ripgrepPath = systemPath
+  } else if (rgRemote.length > 0) {
     const pkg = ripgrepPackage(os, arch)
     const local = pkg === null ? null : resolveRgBinary(pkg)
     if (local !== null) {
@@ -180,19 +196,25 @@ export function buildResolveMode(ctx: {
 /** The approval card's fixed sentence does not name the remote action. */
 function presentOpsDetail(
   approver: Parameters<typeof approveEscalation>[1]['approver'],
-  detail: string | undefined,
+  detail: ApprovalDetail | undefined,
 ): Parameters<typeof approveEscalation>[1]['approver'] {
-  const line = detail?.trim() ?? ''
-  if (approver === undefined || line.length === 0) return approver
+  if (approver === undefined || detail === undefined) return approver
+  const en = detail.en.trim()
+  const zh = detail.zh.trim()
+  if (en.length === 0 && zh.length === 0) return approver
   return {
     request: req => approver.request({
       ...req,
       displayReason: {
-        en: `${req.displayReason?.en ?? req.reason}\n${line}`,
-        zh: `${req.displayReason?.zh ?? req.displayReason?.en ?? req.reason}\n${line}`,
+        en: appendLine(req.displayReason?.en ?? req.reason, en),
+        zh: appendLine(req.displayReason?.zh ?? req.displayReason?.en ?? req.reason, zh.length > 0 ? zh : en),
       },
     }),
   }
+}
+
+function appendLine(base: string, line: string): string {
+  return line.length === 0 ? base : `${base}\n${line}`
 }
 
 async function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
@@ -231,7 +253,7 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const status = await hostApi.statusOf(host)
   const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'bash', 'command')
   const command = String(args.command ?? '')
-  const timeoutMs = typeof args.timeoutMs === 'number' ? args.timeoutMs : 60_000
+  const timeoutMs = typeof args.timeoutMs === 'number' && args.timeoutMs > 0 ? args.timeoutMs : 60_000
   const workdir = typeof args.workdir === 'string'
     ? resolveRemotePath(args.workdir, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
@@ -458,10 +480,10 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
   const pattern = String(args.pattern ?? '')
-  const command = `cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`
+  const command = withSearchMarkers(`cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`)
   const result = await hostApi.pool.exec(host, secret, command, 30_000, exec?.signal)
   throwIfRgFailed(result, exec?.signal, 'glob')
-  const paths = result.stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+  const paths = searchOutputLines(result.stdout).map(line => {
     const absolute = posix.isAbsolute(line) ? line : posix.join(base, line)
     return toModelPath(absolute, route)
   })
@@ -569,6 +591,18 @@ async function commitFile(
 
 export function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw abortError()
+}
+
+/** Login-shell noise around `rg --files` is outside this block. */
+const SEARCH_BEGIN = '__DSH_SEARCH_BEGIN__'
+const SEARCH_END = '__DSH_SEARCH_END__'
+
+function withSearchMarkers(body: string): string {
+  return `printf '%s\\n' '${SEARCH_BEGIN}'; ${body}; status=$?; printf '%s\\n' '${SEARCH_END}'; exit $status`
+}
+
+function searchOutputLines(stdout: string): string[] {
+  return outputBlock(stdout, SEARCH_BEGIN, SEARCH_END).map(line => line.trim()).filter(line => line.length > 0)
 }
 
 function throwIfRgFailed(result: ExecResult, signal: AbortSignal | undefined, label: string): void {
