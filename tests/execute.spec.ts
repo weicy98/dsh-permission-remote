@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { finishBackground, runGlob, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { finishBackground, runBash, runGlob, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import type { RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -146,4 +146,23 @@ test('a missing file is still created', async () => {
   const written = await runWrite(api, route, { file_path: '/srv/app/note.txt', content: 'next' }, {})
   assert.equal(written.operation, 'create')
   assert.equal(writes, 1)
+})
+
+test('a foreground bash result survives a JSON round trip', async () => {
+  // The harness rejects a tool value holding `undefined`: the SSH layer used to
+  // pass the absent ssh2 signals straight through, so every foreground command
+  // failed with "value is not lossless JSON".
+  const api = {
+    pool: {
+      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
+      exec: async () => ({ ...killed(), code: 0, signal: null, stdout: 'ok\n' }),
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'danger-full-access' as const,
+  } satisfies ToolHost
+  const value = await runBash(api, route, { command: 'echo ok', description: 'echo' }, {})
+  assert.equal(value.exitCode, 0)
+  assert.deepEqual(JSON.parse(JSON.stringify(value)), value)
 })

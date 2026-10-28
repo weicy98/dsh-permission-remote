@@ -283,12 +283,23 @@ function connect(host: HostConfig, secret: SecretMaterial, accept: (key: Buffer)
 
 interface ExecStream {
   on(event: 'data', listener: (chunk: Buffer) => void): void
-  on(event: 'close', listener: (code: number | null, signal: string | null) => void): void
+  on(event: 'close', listener: (code?: number | null, signal?: string | null) => void): void
   stderr: { on(event: 'data', listener: (chunk: Buffer) => void): void }
   close(): void
   signal?(name: string, callback?: () => void): void
   write(chunk: Buffer | string): boolean
   end(): void
+}
+
+/**
+ * ssh2 emits `close` with only the exit code on a normal exit, so `signal` is
+ * absent there, and a channel closed without an exit status leaves `code`
+ * absent too. The harness rejects a tool value holding `undefined` because it
+ * is not lossless JSON, so both fields become `null` at this boundary.
+ */
+export function exitFields(cause: 'exit' | 'timeout' | 'cancel' | 'truncate', code?: number | null, signal?: string | null): Pick<ExecResult, 'code' | 'signal'> {
+  if (cause !== 'exit') return { code: null, signal: 'KILL' }
+  return { code: code ?? null, signal: signal ?? null }
 }
 
 function openChannel(client: Client, command: string, timeoutMs: number, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): RemoteCommand {
@@ -328,7 +339,7 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
     flushDecoder(which)
     emit(which, truncationMarker(truncationNoted))
   }
-  const finish = (code: number | null, signal: string | null) => {
+  const finish = (code?: number | null, signal?: string | null) => {
     if (settled) return
     settled = true
     flushDecoder('stdout')
@@ -336,8 +347,7 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
     clearTimeout(timer)
     clearTimeout(fallback)
     resolveDone({
-      code: cause === 'exit' ? code : null,
-      signal: cause === 'exit' ? signal : 'KILL',
+      ...exitFields(cause, code, signal),
       stdout: Buffer.concat(stdout).toString('utf8'),
       stderr: Buffer.concat(stderr).toString('utf8'),
       timedOut: cause === 'timeout',

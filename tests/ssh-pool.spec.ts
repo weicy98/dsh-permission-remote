@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { StringDecoder } from 'node:string_decoder'
 import test from 'node:test'
-import { takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
+import { exitFields, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
 
 test('channel text keeps a character split across SSH chunks', () => {
   const decoder = new StringDecoder('utf8')
@@ -18,4 +18,25 @@ test('the truncation marker is emitted once', () => {
   assert.equal(truncationMarker(noted), '\n[output truncated]')
   assert.equal(truncationMarker(noted), '')
   assert.equal(truncationMarker(noted), '')
+})
+
+test('a normal exit without an exit signal becomes null, not undefined', () => {
+  // ssh2 emits `close` with the exit code alone on a normal exit.
+  assert.deepEqual(exitFields('exit', 0, undefined), { code: 0, signal: null })
+  assert.deepEqual(exitFields('exit', 1), { code: 1, signal: null })
+})
+
+test('a channel closed without an exit status reports a null code', () => {
+  assert.deepEqual(exitFields('exit'), { code: null, signal: null })
+})
+
+test('a stopped command reports the kill signal', () => {
+  assert.deepEqual(exitFields('timeout', 0, null), { code: null, signal: 'KILL' })
+  assert.deepEqual(exitFields('cancel'), { code: null, signal: 'KILL' })
+  assert.deepEqual(exitFields('truncate'), { code: null, signal: 'KILL' })
+})
+
+test('normalized exit fields survive a JSON round trip', () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(exitFields('exit', 0))), exitFields('exit', 0))
+  assert.deepEqual(JSON.parse(JSON.stringify(exitFields('exit'))), exitFields('exit'))
 })
