@@ -5,7 +5,7 @@ import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { Config, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
+import { Config, connectionKeyChanged, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
 import {
   buildResolveMode,
   installBubblewrap,
@@ -187,14 +187,19 @@ class Core {
       const previous = current?.kind === 'grant' && isPayload(current.payload) ? current.payload : {}
       return { kind: 'grant', payload: grantPayload(material, previous) }
     })
+    // The live session authenticated with the previous credential.
+    this.forgetStatus(hostId)
   }
 
   async saveHost(host: HostConfig): Promise<void> {
     assertHostId(host.id)
+    const previous = this.config.hosts.find(item => item.id === host.id)
     const normalized = { ...host, opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy) }
     const hosts = this.config.hosts.filter(item => item.id !== host.id)
     this.config.hosts = [...hosts, normalized]
-    forgetOpsHost(host.id)
+    // A cached session keyed by id would keep talking to the previous machine.
+    if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
+    else forgetOpsHost(host.id)
     await this.persistHosts()
   }
 

@@ -101,6 +101,11 @@ export class SshPool {
     void current.then(live => closeLive(live)).catch(() => undefined)
   }
 
+  /** Whether a session is cached for this host id. Diagnostics and tests only. */
+  hasSession(hostId: string): boolean {
+    return this.live.has(hostId)
+  }
+
   async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<ExecResult> {
     const commandHandle = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput)
     return commandHandle.done
@@ -158,7 +163,7 @@ export class SshPool {
     return realpathOf(session, remotePath)
   }
 
-  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number }> {
+  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode: number }> {
     const session = await this.sftp(host, secret)
     return statInfo(session, remotePath)
   }
@@ -434,7 +439,7 @@ interface SftpLike {
   writeFile(path: string, data: Buffer | string, callback: (error: Error | undefined) => void): void
   realpath(path: string, callback: (error: Error | undefined, resolved: string) => void): void
   readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>) => void): void
-  stat(path: string, callback: (error: Error | undefined, stats: { size: number, isDirectory(): boolean }) => void): void
+  stat(path: string, callback: (error: Error | undefined, stats: { size: number, mode?: number, isDirectory(): boolean }) => void): void
   end(callback?: () => void): void
 }
 
@@ -470,11 +475,11 @@ async function closeLive(live: Live): Promise<void> {
   live.client.end()
 }
 
-function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number }> {
+function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode: number }> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => {
       if (error) reject(new SshFailure(error.message, 'sftp-stat'))
-      else resolve({ isDirectory: stats.isDirectory(), size: stats.size })
+      else resolve({ isDirectory: stats.isDirectory(), size: stats.size, mode: typeof stats.mode === 'number' ? stats.mode : 0 })
     })
   })
 }

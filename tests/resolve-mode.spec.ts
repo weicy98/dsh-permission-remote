@@ -9,8 +9,8 @@ function resolver(mode: SandboxMode, requests: string[] = []) {
     get: name => {
       if (name !== 'approval') return undefined
       return {
-        request: async (req: { reason: string }) => {
-          requests.push(req.reason)
+        request: async (req: { reason: string, displayReason?: { en?: string } }) => {
+          requests.push(req.displayReason?.en ?? req.reason)
           return 'allowed-once'
         },
       }
@@ -43,6 +43,32 @@ test('a narrower session asks before a wider mode', async () => {
   assert.equal(mode, 'danger-full-access')
   assert.equal(requests.length, 1)
   assert.match(requests[0]!, /restart nginx/)
+})
+
+test('an unknown sandbox mode is rejected', async () => {
+  const requests: string[] = []
+  const resolve = resolver('read-only', requests)
+  await assert.rejects(
+    () => resolve({ agent }, 'danger-full-access ', 'restart nginx', 'ssh_exec', 'remote command'),
+    /not a sandbox mode/,
+  )
+  assert.deepEqual(requests, [])
+})
+
+test('an ops approval card names the remote action', async () => {
+  const requests: string[] = []
+  const resolve = resolver('read-only', requests)
+  const mode = await resolve(
+    { agent },
+    'danger-full-access',
+    'restart nginx',
+    'ssh_exec',
+    'remote command',
+    'command on prod (10.0.0.1): systemctl restart nginx',
+  )
+  assert.equal(mode, 'danger-full-access')
+  assert.match(requests[0]!, /restart nginx/)
+  assert.match(requests[0]!, /systemctl restart nginx/)
 })
 
 test('a call without escalation args keeps the standing mode', async () => {

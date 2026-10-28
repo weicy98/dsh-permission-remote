@@ -63,7 +63,7 @@ export interface ToolHost {
   readonly hostOf: (hostId: string) => HostConfig | undefined
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
-  readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string) => Promise<SandboxMode>
+  readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: string) => Promise<SandboxMode>
   readonly jobs?: {
     start(spec: {
       kind: string
@@ -143,18 +143,22 @@ export async function effectiveMode(host: ToolHost, exec: ToolExec, args: { sand
   return host.resolveMode(exec, args.sandbox_permissions, args.justification, toolName, subject)
 }
 
+const SANDBOX_MODES: readonly SandboxMode[] = ['read-only', 'workspace-write', 'danger-full-access']
+
 export function buildResolveMode(ctx: {
   sandboxPolicy: { resolve(request?: { session?: object, mode?: SandboxMode }): { mode: SandboxMode } }
   get(name: string): unknown
 }): ToolHost['resolveMode'] {
-  return async (exec, requested, justification, toolName, subject) => {
+  return async (exec, requested, justification, toolName, subject, detail) => {
     const session = exec.agent?.session
     const standing = ctx.sandboxPolicy.resolve(session === undefined ? {} : { session }).mode
     validateEscalationArgs(requested, justification)
     if (requested === undefined || justification === undefined) return standing
-    // Asking for a narrower mode than the standing one is not an escalation.
-    // A danger-full-access session already permits the call; approving a
-    // downgrade would otherwise throw and fail a call that needs no approval.
+    if (!SANDBOX_MODES.includes(requested as SandboxMode)) {
+      throw new Error(`sandbox_permissions "${requested}" is not a sandbox mode`)
+    }
+    // A known narrower mode is not an escalation. Approving a downgrade throws
+    // and would fail a danger-full-access session that needs no approval.
     if (requested === standing) return standing
     if (!(WIDER_MODES[standing] ?? []).includes(requested as SandboxMode)) return standing
     const approved = await approveEscalation({
@@ -163,13 +167,31 @@ export function buildResolveMode(ctx: {
       effectiveMode: standing,
       subject,
     }, {
-      approver: ctx.get('approval') as Parameters<typeof approveEscalation>[1]['approver'],
+      approver: presentOpsDetail(ctx.get('approval') as Parameters<typeof approveEscalation>[1]['approver'], detail),
       agent: exec.agent,
       callId: exec.callId ?? '',
       toolName,
       signal: exec.signal,
     })
     return approved
+  }
+}
+
+/** The approval card's fixed sentence does not name the remote action. */
+function presentOpsDetail(
+  approver: Parameters<typeof approveEscalation>[1]['approver'],
+  detail: string | undefined,
+): Parameters<typeof approveEscalation>[1]['approver'] {
+  const line = detail?.trim() ?? ''
+  if (approver === undefined || line.length === 0) return approver
+  return {
+    request: req => approver.request({
+      ...req,
+      displayReason: {
+        en: `${req.displayReason?.en ?? req.reason}\n${line}`,
+        zh: `${req.displayReason?.zh ?? req.displayReason?.en ?? req.reason}\n${line}`,
+      },
+    }),
   }
 }
 

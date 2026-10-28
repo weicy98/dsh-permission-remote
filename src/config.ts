@@ -56,6 +56,20 @@ export function normalizeOpsPolicy(value: unknown): OpsPolicy {
   return value === 'trust' || value === 'deny' ? value : 'ask'
 }
 
+/**
+ * Whether the fields the SSH handshake reads changed. A cached session keyed by
+ * host id would otherwise keep talking to the previous machine, and the cached
+ * probe result would keep describing it. `name`, `fingerprint` and `opsPolicy`
+ * are not part of the handshake, so renaming keeps the session.
+ */
+export function connectionKeyChanged(previous: HostConfig, next: HostConfig): boolean {
+  return previous.host !== next.host
+    || previous.port !== next.port
+    || previous.username !== next.username
+    || previous.auth !== next.auth
+    || previous.privateKeyPath !== next.privateKeyPath
+}
+
 export interface PluginConfig {
   hosts: HostConfig[]
   maxConnections: number

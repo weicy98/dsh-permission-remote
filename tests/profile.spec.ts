@@ -78,6 +78,13 @@ test('seatbelt bash enters the workdir before sandbox-exec', () => {
 
 test('a confined write replaces the target by rename, and does not truncate it first', () => {
   const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file')
+  assert.match(script, /if test -d '\/srv\/app\/file'/)
   assert.match(script, /cat > '\/srv\/app\/\.dsh-tmp' && mv -f '\/srv\/app\/\.dsh-tmp' '\/srv\/app\/file'/)
   assert.doesNotMatch(script, /cat > '\/srv\/app\/file'/)
+  assert.doesNotMatch(script, /chmod/)
+})
+
+test('a replacement can restore the previous permission bits', () => {
+  const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file', 0o100600)
+  assert.match(script, /chmod 600 '\/srv\/app\/file'/)
 })

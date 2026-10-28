@@ -142,9 +142,14 @@ export function globArgv(rg: string, pattern: string): string[] {
  * `mv` on one filesystem replaces the destination atomically. A dropped
  * connection leaves the temp file, not a truncated target.
  * `cat` failure removes the temp file and does not run `mv`.
+ * `mv` into an existing directory succeeds, so a directory target fails first.
+ * `mode` is the target's existing permission bits; a new file keeps the remote umask.
  */
-export function atomicWriteScript(directory: string, tmp: string, target: string): string {
-  const write = `cat > ${shJoin([tmp])} && mv -f ${shJoin([tmp, target])}`
+export function atomicWriteScript(directory: string, tmp: string, target: string, mode?: number): string {
+  const quotedTarget = shJoin([target])
+  const bits = mode === undefined ? 0 : mode & 0o7777
+  const chmod = Number.isInteger(bits) && bits > 0 ? ` && chmod ${bits.toString(8)} ${quotedTarget}` : ''
+  const write = `if test -d ${quotedTarget}; then echo 'remote path is a directory' >&2; false; else cat > ${shJoin([tmp])} && mv -f ${shJoin([tmp, target])}${chmod}; fi`
   const cleanup = `{ status=$?; rm -f ${shJoin([tmp])}; exit $status; }`
   return `mkdir -p ${shJoin([directory])} && ${write} || ${cleanup}`
 }
