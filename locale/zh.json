@@ -36,7 +36,7 @@
   "copy": "复制",
   "copied": "已复制",
   "macosNote": "macOS 使用系统自带的 sandbox-exec，无需安装。若探测失败，受限 bash 需要经审批把这一次升到完全放开。",
-  "ripgrepNote": "连接时会按远端架构上传 ripgrep。上传失败时，请在远端安装 ripgrep，使 rg 出现在 PATH 中。安装 bubblewrap 不会附带 ripgrep。",
+  "ripgrepNote": "连接时会按远端架构上传 ripgrep。本机没有该平台的构建时（例如 Windows 上的 DSH 管 Linux 远端），主机行会出现「安装 ripgrep」，按需下载并缓存对应平台的二进制；上传失败后也可以用它重试。不点这个按钮就不会联网。安装 bubblewrap 不会附带 ripgrep。",
   "directory": "远端目录",
   "up": "上一级",
   "refresh": "刷新",
@@ -70,7 +70,7 @@
   "policySaved": "远程运维策略已保存。",
   "installRipgrep": "安装 ripgrep",
   "rgRegistry": "ripgrep 下载源",
-  "rgRegistryHint": "仅在使用「安装 ripgrep」时访问。留空用 npmjs，国内可填镜像地址。",
+  "rgRegistryHint": "仅「安装 ripgrep」会读取：下载平台包所用的 npm 源。留空用 npmjs，npmjs 慢或被墙时可填镜像；只写主机名时按 https 处理。已下载的二进制离线可用。",
   "registrySaved": "下载源已保存。",
   "rgInstalled": "ripgrep 已就绪：",
   "rgStillMissing": "下载完成但远端仍不可用",
@@ -86,5 +86,7 @@
   "purgeHost": "彻底删除",
   "purgeConfirm": "将一并注销工作区：",
   "purgeConfirmAction": "确认删除",
-  "purgedHost": "已彻底删除，注销工作区数："
+  "purgedHost": "已彻底删除，注销工作区数：",
+  "rgUploadFailed": "已下载，但远端写入失败",
+  "rgInstallFailed": "ripgrep 安装失败。"
 }

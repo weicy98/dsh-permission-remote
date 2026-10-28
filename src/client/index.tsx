@@ -296,21 +296,34 @@ function Section(props: SectionProps): JSX.Element {
   /**
    * Download the ripgrep binary for this host's remote platform. Explicit: the
    * plugin never reaches the network on its own.
+   *
+   * The call already re-probes, so its `status` is the fresh one; a second
+   * `probe` would only repeat that request and drop the login banner.
    */
   async function installRg(hostId: string): Promise<void> {
     setBusy(true)
     setInstallLog(null)
     try {
       const result = await installRipgrep(ctx, hostId)
-      setStatus({ hostId, banner: '', runner: await callHost<RunnerView>(ctx, 'probe', { hostId, refresh: false }) })
-      setInstallLog({
-        hostId,
-        text: result.status.ripgrep === 'missing'
-          ? `${t('rgStillMissing')} (${result.platform} ${result.version})`
-          : `${t('rgInstalled')} ${result.platform} ${result.version} -> ${result.status.ripgrepPath}`,
-      })
+      setStatus(current => ({ hostId, banner: current?.hostId === hostId ? current.banner : '', runner: result.status }))
+      const tag = `${result.platform} ${result.version}`
+      if (result.status.ripgrep === 'uploaded') {
+        setInstallLog({ hostId, text: `${t('rgInstalled')} ${tag} -> ${result.status.ripgrepPath}` })
+        note(t('rgInstalled'))
+      } else if (result.status.ripgrep === 'upload-failed') {
+        const text = `${t('rgUploadFailed')} (${tag})`
+        setInstallLog({ hostId, text })
+        fail(text)
+      } else {
+        const text = `${t('rgStillMissing')} (${tag})`
+        setInstallLog({ hostId, text })
+        fail(text)
+      }
     } catch (error) {
-      setInstallLog({ hostId, text: error instanceof Error ? error.message : String(error) })
+      const text = error instanceof Error ? error.message : String(error)
+      setInstallLog({ hostId, text })
+      // Without this the failure lived only in the log under the host row.
+      fail(text)
     } finally {
       setBusy(false)
     }
@@ -520,7 +533,7 @@ function Section(props: SectionProps): JSX.Element {
       <div className="dsh-ssh-header">
         <h2 className="dsh-ssh-title">{t('title')}</h2>
         {tab === 'hosts'
-          ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
+          ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
           : null}
       </div>
       <nav className="dsh-ssh-tabs" role="tablist">
@@ -593,9 +606,11 @@ function Section(props: SectionProps): JSX.Element {
                       <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
                       <div className="dsh-ssh-host-meta">
                         {t('ripgrep')}: {status.runner.ripgrep}
-                        {/* Missing on a remote this machine has no build for: fetch
-                            the matching binary on request instead of failing silently. */}
-                        {status.runner.ripgrep === 'missing'
+                        {/* No usable binary yet: either this machine has no build for
+                            the remote platform, or the upload was refused. Fetching
+                            one on request is the only fix the page can offer, and it
+                            stays explicit — nothing downloads without this click. */}
+                        {status.runner.ripgrep === 'missing' || status.runner.ripgrep === 'upload-failed'
                           ? <button type="button" className="dsh-ssh-link" disabled={busy} onClick={() => void installRg(host.id)}>{t('installRipgrep')}</button>
                           : null}
                       </div>

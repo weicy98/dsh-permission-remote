@@ -36,7 +36,7 @@
   "copy": "Copy",
   "copied": "Copied",
   "macosNote": "macOS uses the system sandbox-exec. There is nothing to install. If the probe fails, confined bash needs a one-shot approval up to full access.",
-  "ripgrepNote": "On connect, ripgrep is uploaded for the remote architecture. If that fails, install ripgrep on the remote so rg is on PATH. Installing bubblewrap does not install ripgrep.",
+  "ripgrepNote": "On connect, ripgrep is uploaded for the remote architecture. When this machine has no build for that platform — a Windows DSH managing a Linux remote, for example — the host row offers \"Install ripgrep\", which downloads the matching binary and caches it. It is also the fallback after a failed upload. Nothing is downloaded until you press that button. Installing bubblewrap does not install ripgrep.",
   "directory": "Remote directory",
   "up": "Up",
   "refresh": "Refresh",
@@ -70,7 +70,7 @@
   "policySaved": "Remote ops policy saved.",
   "installRipgrep": "Install ripgrep",
   "rgRegistry": "ripgrep download source",
-  "rgRegistryHint": "Used only by Install ripgrep. Leave empty for npmjs; set a mirror where it is slow.",
+  "rgRegistryHint": "Only read by \"Install ripgrep\": the npm source the platform package is downloaded from. Leave it empty for npmjs, or set a mirror where npmjs is slow or blocked. A bare host name is used over https. Cached binaries keep working offline.",
   "registrySaved": "Download source saved.",
   "rgInstalled": "ripgrep ready:",
   "rgStillMissing": "Downloaded, but the remote still reports it missing",
@@ -86,5 +86,7 @@
   "purgeHost": "Delete permanently",
   "purgeConfirm": "Workspaces to unregister:",
   "purgeConfirmAction": "Delete permanently",
-  "purgedHost": "Deleted permanently; workspaces unregistered:"
+  "purgedHost": "Deleted permanently; workspaces unregistered:",
+  "rgUploadFailed": "Downloaded, but the remote refused the upload",
+  "rgInstallFailed": "ripgrep install failed."
 }

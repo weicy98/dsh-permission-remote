@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import type { WorkspaceLike } from '../src/workspaces.ts'
-
-const env = { DSH_HOME: '/tmp/dsh-host-lifecycle' }
 
 function host(overrides: Partial<HostConfig> = {}): HostConfig {
   return {
@@ -250,4 +249,70 @@ test('manual tagging strips a prefix that belongs to a deleted host', async () =
   await core.saveHost(host({ id: 'host1', name: '', host: '10.0.0.9' }))
   await core.tagWorkspaces('host1', row.id)
   assert.equal(registry.rows[0]!.title, '10.0.0.9 · app')
+})
+
+test('the live config keeps its volatile getters after any settings write', () => {
+  // Guessing that spreading the config object only changed one field is what
+  // broke this before: a spread copies getters as values, so the host list
+  // stopped reaching the volatile ref and the tagging switch froze.
+  const tagRef = createVolatile(true)
+  const raw = { hosts: createVolatile([]), deletedHosts: createVolatile([]), tagWorkspaceTitles: tagRef }
+  const config = readConfig(raw)
+  config.hosts = [host()]
+  assert.equal(config.hosts.length, 1)
+
+  updateVolatile(tagRef, createVolatile(false))
+  assert.equal(config.tagWorkspaceTitles, false)
+})
+
+test('forgetting a probe result leaves the pooled SSH session alone', async () => {
+  // `forgetStatus` closes the connection, which cancels whatever the agent is
+  // running on the remote. An install that only refreshes a status line has to
+  // use the narrower call.
+  const core = build(new FakeRegistry())
+  const invalidated = watchInvalidate(core)
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async () => ({ code: 0, stdout: '', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false })
+  try {
+    await core.probe('host1')
+    const cached = new Map((core as unknown as { status: Map<string, unknown> }).status)
+    assert.equal(cached.has('host1'), true)
+
+    core.forgetProbe('host1')
+
+    assert.equal((core as unknown as { status: Map<string, unknown> }).status.has('host1'), false)
+    assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('installing ripgrep for an unsupported platform fails without touching the session', async () => {
+  const core = build(new FakeRegistry())
+  const invalidated = watchInvalidate(core)
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async () => ({ code: 0, stdout: 'FreeBSD\nx86_64\n/tmp\n/tmp\n/home/dev\n', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false })
+  try {
+    await assert.rejects(() => core.installRipgrep('host1'), /no ripgrep build for/)
+    assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('installing ripgrep without a remote home fails before downloading', async () => {
+  const core = build(new FakeRegistry())
+  const invalidated = watchInvalidate(core)
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  // A relative home is not usable, so the upload path would never run.
+  fakePool.exec = async () => ({ code: 0, stdout: 'Linux\nx86_64\n/tmp\n/tmp\nrelative-home\n', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false })
+  try {
+    await assert.rejects(() => core.installRipgrep('host1'), /did not report an absolute \$HOME/)
+    assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
 })

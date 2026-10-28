@@ -16,7 +16,9 @@ export interface RunnerView {
   os: 'linux' | 'darwin' | 'other'
   sandbox: { available: boolean, reason: string }
   sandboxTool: 'bwrap' | 'sandbox-exec' | 'none'
-  ripgrep: 'uploaded' | 'system' | 'missing'
+  /** `upload-failed`: the binary exists here but the remote refused it. */
+  ripgrep: 'uploaded' | 'system' | 'missing' | 'upload-failed'
+  ripgrepPath: string
   install: { id: string, title: string, auto: string, manual: string } | null
 }
 
@@ -99,11 +101,8 @@ export async function writeRgRegistry(ctx: ClientFace, registry: string, revisio
 export interface RipgrepInstall {
   platform: string
   version: string
-  path: string
-  status: {
-    ripgrep: 'uploaded' | 'system' | 'missing'
-    ripgrepPath: string
-  }
+  /** The re-probe taken right after the binary was cached. */
+  status: RunnerView
 }
 
 /** Forget a deleted host and unregister its workspaces. Remote files stay. */

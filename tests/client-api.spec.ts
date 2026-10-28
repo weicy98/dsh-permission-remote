@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { callHost, readWorkspaces, type ClientFace } from '../src/client/api.ts'
+import { callHost, readWorkspaces, writeRgRegistry, type ClientFace } from '../src/client/api.ts'
 
 interface Recorded {
   readonly endpoint: string
@@ -61,4 +61,26 @@ test('a failed call surfaces the gateway message', async () => {
     remote: { settings: { async describe() { return { namespaces: [] } }, async mutate() { return undefined } } },
   } as unknown as ClientFace
   await assert.rejects(() => callHost(face, 'listWorkspaces'), /gateway\/arguments-invalid/)
+})
+
+test('saving the download source sets one volatile path with the loaded revision', async () => {
+  const mutations: Array<{ ns: string, ops: unknown, revision: unknown }> = []
+  const face = {
+    connection: { rpc: { async call() { return { ok: true, value: {} } } } },
+    remote: {
+      settings: {
+        async describe() { return { namespaces: [] } },
+        async mutate(ns: string, ops: unknown, revision: unknown) {
+          mutations.push({ ns, ops, revision })
+        },
+      },
+    },
+  } as unknown as ClientFace
+  await writeRgRegistry(face, 'https://mirror.example.test', 7)
+  // The host only ever reads this field; the settings write is the one path.
+  assert.deepEqual(mutations, [{
+    ns: 'permission-remote',
+    ops: [{ op: 'set', path: ['rgRegistry'], value: 'https://mirror.example.test' }],
+    revision: 7,
+  }])
 })

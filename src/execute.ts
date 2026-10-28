@@ -1,10 +1,11 @@
 import { randomBytes } from 'node:crypto'
-import { homedir } from 'node:os'
-import { chmodSync, existsSync, readFileSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join, posix } from 'node:path'
+import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { FsError } from '@deepseek-ai/dsh-fs'
+import { dshCachePath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import {
   SandboxUnavailableError,
   WIDER_MODES,
@@ -55,7 +56,7 @@ export interface RunnerStatus {
   readonly os: 'linux' | 'darwin' | 'other'
   readonly sandbox: ProbeOutcome
   readonly sandboxTool: 'bwrap' | 'sandbox-exec' | 'none'
-  readonly ripgrep: 'uploaded' | 'system' | 'missing'
+  readonly ripgrep: 'uploaded' | 'system' | 'missing' | 'upload-failed'
   readonly ripgrepPath: string
   readonly roots: RemoteFileRoots
   readonly install: DistroInstall | null
@@ -132,14 +133,24 @@ export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretM
     ripgrepPath = systemPath
   } else if (rgRemote.length > 0) {
     const pkg = ripgrepPackage(os, arch)
-    const platform = rgPlatformOf(os, arch)
-    const local = pkg === null || platform === null ? null : resolveRgBinary(pkg, rgCachePath(platform))
-    if (local !== null) {
-      await pool.sftpUpload(host, secret, local, rgRemote)
-      const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
-      if (check.code === 0) {
-        ripgrep = 'uploaded'
-        ripgrepPath = rgRemote
+    if (pkg !== null) {
+      const local = resolveRgBinary(pkg, rgPlatformOf(os, arch) ?? undefined)
+      if (local !== null) {
+        // A failed upload must not take the whole probe down: the sandbox
+        // verdict is still useful, and `upload-failed` tells the operator the
+        // binary exists but the remote refused it.
+        try {
+          await pool.sftpUpload(host, secret, local, rgRemote)
+          const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
+          if (check.code === 0) {
+            ripgrep = 'uploaded'
+            ripgrepPath = rgRemote
+          } else {
+            ripgrep = 'upload-failed'
+          }
+        } catch {
+          ripgrep = 'upload-failed'
+        }
       }
     }
   }
@@ -163,28 +174,55 @@ export async function installBubblewrap(pool: SshPool, host: HostConfig, secret:
  *
  * A package manager only installs the platform package matching this host, so a
  * Windows machine managing a Linux remote resolves nothing. The install button
- * caches the downloaded binary instead; that copy is used when resolution fails.
+ * caches the downloaded binary instead, and that copy is used when resolution
+ * fails. The installed package still wins: an environment that already worked
+ * keeps behaving the same way.
  */
-function resolveRgBinary(pkg: string, cachePath: string): string | null {
+export function resolveRgBinary(pkg: string, platform?: string, env: NodeJS.ProcessEnv = process.env): string | null {
   try {
     return require.resolve(`${pkg}/bin/rg`)
   } catch {
-    return existsSync(cachePath) ? cachePath : null
+    if (platform === undefined) return null
+    for (const candidate of rgCachePaths(platform, env)) {
+      if (existsSync(candidate)) return candidate
+    }
+    return null
   }
+}
+
+/**
+ * Candidate cache paths for one remote platform, newest layout first.
+ *
+ * `<DSH_HOME>/cache` is the harness cache root. The older layout put the binary
+ * under `<DSH_HOME>/remote`, which is also the remote-workspace placeholder
+ * namespace, so that spelling is only read for binaries downloaded before the
+ * move and is never written to again.
+ */
+export function rgCachePaths(platform: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = resolveDshHome(undefined, env)
+  return [
+    dshCachePath({ dshHome: home }, 'ripgrep', platform, 'rg'),
+    join(home, 'remote', 'ripgrep', platform, 'rg'),
+  ]
 }
 
 /** Where a downloaded binary for one remote platform is cached. */
 export function rgCachePath(platform: string, env: NodeJS.ProcessEnv = process.env): string {
-  const home = env.DSH_HOME ? String(env.DSH_HOME) : join(homedir(), '.dsh')
-  return join(home, 'remote', 'ripgrep', platform, 'rg')
+  return rgCachePaths(platform, env)[0]!
 }
 
-/** Store a fetched binary and make it executable; returns the cached path. */
+/**
+ * Store a fetched binary and make it executable; returns the cached path.
+ *
+ * The write is atomic so a probe running at the same moment (or a second
+ * install for the same platform) never uploads a half-written file.
+ */
 export async function cacheRgBinary(platform: string, binary: Buffer, env: NodeJS.ProcessEnv = process.env): Promise<string> {
   const target = rgCachePath(platform, env)
-  await mkdir(join(target, '..'), { recursive: true })
-  await writeFile(target, binary)
-  chmodSync(target, 0o755)
+  // `writeFileAtomic` creates the parent directory at `dirMode` and renames the
+  // finished temp file onto the target, so a concurrent probe never uploads a
+  // partially written binary.
+  await writeFileAtomic(target, binary, { mode: 0o755, dirMode: 0o700 })
   return target
 }
 
@@ -508,7 +546,7 @@ export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const status = await hostApi.statusOf(host)
-  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host')
+  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host; click "Install ripgrep" on its host row in the SSH settings, or install ripgrep on the remote so rg is on PATH')
   const base = typeof args.path === 'string'
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd
@@ -528,7 +566,7 @@ export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const status = await hostApi.statusOf(host)
-  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host')
+  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host; click "Install ripgrep" on its host row in the SSH settings, or install ripgrep on the remote so rg is on PATH')
   const base = typeof args.path === 'string'
     ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
     : route.remoteCwd

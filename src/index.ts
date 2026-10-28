@@ -109,7 +109,9 @@ class SshApi extends TypertRemoteService {
     const host = this.core.requireHost(input.hostId)
     const status = await this.core.probe(input.hostId)
     const result = await installBubblewrap(this.core.pool, host, await this.core.secret(host), status)
-    this.core.forgetStatus(input.hostId)
+    // Drop the cached probe only. `forgetStatus` would also close the pooled
+    // session and cancel whatever the agent is running on the remote.
+    this.core.forgetProbe(input.hostId)
     const next = await this.core.probe(input.hostId)
     return { ok: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr, status: next }
   }
@@ -119,14 +121,9 @@ class SshApi extends TypertRemoteService {
    * upload path works on a machine whose package manager only installed its own
    * platform package. Explicit: nothing downloads until this is called.
    */
-  async installRipgrep(input: { hostId: string }): Promise<{ ok: true, platform: string, version: string, path: string, status: RunnerStatus }> {
+  async installRipgrep(input: { hostId: string }): Promise<{ ok: true, platform: string, version: string, status: RunnerStatus }> {
     const result = await this.core.installRipgrep(input.hostId)
     return { ok: true, ...result }
-  }
-
-  async saveRgRegistry(input: { rgRegistry: string }): Promise<{ ok: true, rgRegistry: string }> {
-    const value = this.core.saveRgRegistry(input.rgRegistry)
-    return { ok: true, rgRegistry: value }
   }
 
   async listDir(input: { hostId: string, path: string }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
@@ -322,10 +319,24 @@ export class Core {
     await this.persistHosts()
   }
 
+  /**
+   * Drop everything derived from a connection that no longer applies: the
+   * cached probe, the pooled session, and the cached remote home. Connecting is
+   * interrupted, so an agent command running on that session is killed.
+   */
   forgetStatus(hostId: string): void {
     this.status.delete(hostId)
     this.pool.invalidate(hostId)
     forgetOpsHost(hostId)
+  }
+
+  /**
+   * Forget only the cached probe result. Used after a change on the remote that
+   * leaves the session valid (a package install, a new uploaded binary), so a
+   * running command is not cancelled just to refresh a status line.
+   */
+  forgetProbe(hostId: string): void {
+    this.status.delete(hostId)
   }
 
   async secret(host: HostConfig): Promise<SecretMaterial> {
@@ -404,28 +415,25 @@ export class Core {
   }
 
   /** Fetch and cache the ripgrep binary for this host's remote platform. */
-  async installRipgrep(hostId: string): Promise<{ platform: string, version: string, path: string, status: RunnerStatus }> {
+  async installRipgrep(hostId: string): Promise<{ platform: string, version: string, status: RunnerStatus }> {
     const host = this.requireHost(hostId)
     const facts = await remoteFacts(this.pool, host, await this.secret(host))
     const platform = rgPlatformOf(facts.os, facts.arch)
     if (platform === null) {
       throw new Error(`no ripgrep build for ${facts.os}/${facts.arch}; install ripgrep on the remote so rg is on PATH`)
     }
+    // The upload needs an absolute home to place the binary under. Without one
+    // the probe never tries, so downloading would only fail a second time.
+    if (facts.home.length === 0) {
+      throw new Error('the remote did not report an absolute $HOME, so rg cannot be placed there; install ripgrep on the remote so rg is on PATH')
+    }
     const fetched = await fetchRgBinary({ registry: this.config.rgRegistry, platform })
-    const cached = await cacheRgBinary(platform, fetched.binary)
-    // The cached copy only matters if the probe looks again.
-    this.forgetStatus(hostId)
-    const next = await this.probe(hostId, true)
-    return { platform, version: fetched.version, path: cached, status: next }
-  }
-
-  /** Store the registry used for downloads; empty restores the default. */
-  saveRgRegistry(value: string): string {
-    const next = value.trim()
-    const patch: Record<string, unknown> = { rgRegistry: next }
-    this.config = { ...this.config, rgRegistry: next } as PluginConfig
-    void this.ctx.settings.update('permission-remote', patch).catch(() => undefined)
-    return next
+    await cacheRgBinary(platform, fetched.binary)
+    // Only the cached probe result is stale; `forgetStatus` would also drop the
+    // pooled SSH session and kill any command running on it.
+    this.forgetProbe(hostId)
+    const next = await this.probe(hostId)
+    return { platform, version: fetched.version, status: next }
   }
 
   probe(hostId: string, refresh = false): Promise<RunnerStatus> {
@@ -477,7 +485,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'saveRgRegistry', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({
