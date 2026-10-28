@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { Config, readConfig, type HostConfig } from '../src/config.ts'
+import { Config, connectionKeyChanged, readConfig, type HostConfig } from '../src/config.ts'
 
 const host = (id: string): HostConfig => ({
   id,
@@ -47,4 +47,25 @@ test('a host saved before opsPolicy existed defaults to ask', () => {
 test('readConfig keeps an explicit opsPolicy', () => {
   const config = readConfig({ hosts: [host('h1'), { ...host('h2'), opsPolicy: 'deny' }] })
   assert.deepEqual(config.hosts.map(item => item.opsPolicy), ['ask', 'deny'])
+})
+
+test('changing a handshake field invalidates the cached session', () => {
+  const base = host('h1')
+  for (const patch of [
+    { host: '10.0.0.99' },
+    { port: 2222 },
+    { username: 'other' },
+    { auth: 'password' as const },
+    { privateKeyPath: '/home/u/.ssh/id_ed25519' },
+  ]) {
+    assert.equal(connectionKeyChanged(base, { ...base, ...patch }), true, JSON.stringify(patch))
+  }
+})
+
+test('renaming or retitling a host keeps the cached session', () => {
+  const base = host('h1')
+  assert.equal(connectionKeyChanged(base, { ...base, name: 'prod' }), false)
+  assert.equal(connectionKeyChanged(base, { ...base, opsPolicy: 'trust' }), false)
+  assert.equal(connectionKeyChanged(base, { ...base, fingerprint: 'SHA256:abc' }), false)
+  assert.equal(connectionKeyChanged(base, base), false)
 })

@@ -99,3 +99,13 @@ test('an empty password is stored and still omits the other field', async () => 
   await api.saveSecret({ hostId, password: '' })
   assert.deepEqual(record()?.payload, { password: '' })
 })
+
+test('rotating a password replaces the stored value', async () => {
+  // The live session authenticated with the previous credential, so saving a
+  // new one must also drop the cached session; this covers the stored half.
+  const { api, record } = plugin()
+  await api.saveHost(host())
+  await api.saveSecret({ hostId, password: 'old-pass' })
+  await api.saveSecret({ hostId, password: 'new-pass' })
+  assert.deepEqual(record()?.payload, { password: 'new-pass' })
+})

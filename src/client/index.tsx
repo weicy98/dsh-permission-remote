@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, readHosts, type ClientFace, type HostView, type RunnerView } from './api.ts'
+import { callHost, readHosts, readWorkspaces, type ClientFace, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -62,14 +62,20 @@ function Section(props: SectionProps): JSX.Element {
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
   const [busy, setBusy] = useState(false)
   const [pendingTrust, setPendingTrust] = useState('')
+  const [workspaces, setWorkspaces] = useState<RemoteWorkspaceView[]>([])
+  const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
 
   async function reload(): Promise<void> {
     const loaded = await readHosts(ctx)
     setHosts(loaded.hosts)
   }
 
+  async function reloadWorkspaces(): Promise<void> {
+    setWorkspaces(await readWorkspaces(ctx))
+  }
+
   useEffect(() => {
-    void reload().catch(error => fail(error))
+    void Promise.all([reload(), reloadWorkspaces()]).catch(error => fail(error))
   }, [])
 
   function fail(error: unknown): void {
@@ -87,25 +93,45 @@ function Section(props: SectionProps): JSX.Element {
     setMessage('')
     try {
       const id = draft.id || newId()
-      const next = { ...draft, id, port: Number(draft.port) || 22 }
+      const port = Number(draft.port) || 22
+      const previous = hosts.find(item => item.id === id)
+      // A different machine at this address must prove its key again.
+      const moved = previous !== undefined && (previous.host !== draft.host || previous.port !== port)
+      const next = { ...draft, id, port, fingerprint: moved ? '' : draft.fingerprint }
       await callHost(ctx, 'saveHost', next)
       setDraft(next)
       if (next.auth === 'password' || secret.trim().length > 0) {
         await callHost(ctx, 'saveSecret', {
           hostId: id,
-          password: next.auth === 'password' ? secret : undefined,
+          password: next.auth === 'password' && secret.trim().length > 0 ? secret : undefined,
           passphrase: next.auth === 'key' && secret.trim().length > 0 ? secret : undefined,
         })
       }
       setSecret('')
       setDraft(blankHost())
-      await reload()
-      note(t('saved'))
+      if (moved && selected === id) setStatus(null)
+      await Promise.all([reload(), reloadWorkspaces()])
+      note(moved ? `${t('saved')} ${t('retrust')}` : t('saved'))
     } catch (error) {
       fail(error)
     } finally {
       setBusy(false)
     }
+  }
+
+  function beginEdit(host: HostView): void {
+    setDraft({ ...host })
+    setSecret('')
+    setPendingTrust('')
+    setMessage('')
+    setTone('ok')
+    const form = document.getElementById('dsh-ssh-form')
+    if (form !== null && typeof form.scrollIntoView === 'function') form.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }
+
+  function cancelEdit(): void {
+    setDraft(blankHost())
+    setSecret('')
   }
 
   async function test(host: HostView): Promise<void> {
@@ -182,7 +208,8 @@ function Section(props: SectionProps): JSX.Element {
         setStatus(null)
         setEntries([])
       }
-      await reload()
+      if (draft.id === hostId) cancelEdit()
+      await Promise.all([reload(), reloadWorkspaces()])
     } catch (error) {
       fail(error)
     } finally {
@@ -192,6 +219,7 @@ function Section(props: SectionProps): JSX.Element {
 
   async function browse(hostId: string, path: string): Promise<void> {
     setBusy(true)
+    setSelected(hostId)
     try {
       const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'listDir', { hostId, path })
       setDir(listed.path)
@@ -206,8 +234,35 @@ function Section(props: SectionProps): JSX.Element {
   async function createWorkspace(hostId: string, path: string): Promise<void> {
     setBusy(true)
     try {
-      const created = await callHost<{ path: string }>(ctx, 'createWorkspace', { hostId, path })
-      note(`${t('workspaceCreated')} ${created.path}`)
+      const created = await callHost<{ path: string, title?: string }>(ctx, 'createWorkspace', { hostId, path })
+      note(`${t('workspaceCreated')} ${created.title ?? created.path}`)
+      await reloadWorkspaces()
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function tagWorkspaces(hostId?: string, workspaceId?: string): Promise<void> {
+    setBusy(true)
+    try {
+      const tagged = await callHost<{ items?: RemoteWorkspaceView[] }>(ctx, 'tagWorkspaces', { hostId, workspaceId })
+      if (Array.isArray(tagged.items)) setWorkspaces(tagged.items)
+      note(t('taggedSidebar'))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeWorkspace(workspaceId: string): Promise<void> {
+    setBusy(true)
+    try {
+      await callHost(ctx, 'removeWorkspace', { workspaceId })
+      await reloadWorkspaces()
+      note(t('workspaceRemoved'))
     } catch (error) {
       fail(error)
     } finally {
@@ -216,6 +271,13 @@ function Section(props: SectionProps): JSX.Element {
   }
 
   const current = hosts.find(item => item.id === selected)
+  const crumbs = dir.split('/').filter(Boolean)
+  const byHost = new Map<string, RemoteWorkspaceView[]>()
+  for (const workspace of workspaces) {
+    const rows = byHost.get(workspace.hostId)
+    if (rows === undefined) byHost.set(workspace.hostId, [workspace])
+    else rows.push(workspace)
+  }
 
   return (
     <section className="dsh-ssh-page">
@@ -224,34 +286,110 @@ function Section(props: SectionProps): JSX.Element {
       {message.length > 0 ? <p className="dsh-ssh-status" data-tone={tone === 'warn' ? 'warn' : undefined}>{message}</p> : null}
       {hosts.length > 0 ? (
         <ul className="dsh-ssh-hosts">
-          {hosts.map(host => (
-            <li key={host.id} className="dsh-ssh-host">
-              <div>
-                <div className="dsh-ssh-host-name">{host.name || host.host}</div>
-                <div className="dsh-ssh-host-meta">{host.username}@{host.host}:{host.port}</div>
-              </div>
-              <div className="dsh-ssh-row-actions">
-                <select
-                  className="dsh-ssh-select dsh-ssh-policy"
-                  aria-label={t('opsPolicy')}
-                  value={host.opsPolicy ?? 'ask'}
-                  disabled={busy}
-                  onChange={event => void savePolicy(host, event.target.value as HostView['opsPolicy'])}
-                >
-                  <option value="ask">{t('opsAsk')}</option>
-                  <option value="trust">{t('opsTrust')}</option>
-                  <option value="deny">{t('opsDeny')}</option>
-                </select>
-                <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void test(host)}>{t('test')}</button>
-                <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, '/')}>{t('browse')}</button>
-                <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
-              </div>
-            </li>
-          ))}
+          {hosts.map(host => {
+            const owned = byHost.get(host.id) ?? []
+            const expanded = openWorkspaces[host.id] ?? owned.length > 0
+            return (
+              <li key={host.id} className="dsh-ssh-host" data-editing={draft.id === host.id ? 'true' : undefined}>
+                <div className="dsh-ssh-host-head">
+                  <div className="dsh-ssh-host-identity">
+                    <div className="dsh-ssh-host-name">{host.name || host.host}</div>
+                    <div className="dsh-ssh-host-meta">{host.username}@{host.host}:{host.port}</div>
+                  </div>
+                  <div className="dsh-ssh-row-actions">
+                    <select
+                      className="dsh-ssh-select dsh-ssh-policy"
+                      aria-label={t('opsPolicy')}
+                      value={host.opsPolicy ?? 'ask'}
+                      disabled={busy}
+                      onChange={event => void savePolicy(host, event.target.value as HostView['opsPolicy'])}
+                    >
+                      <option value="ask">{t('opsAsk')}</option>
+                      <option value="trust">{t('opsTrust')}</option>
+                      <option value="deny">{t('opsDeny')}</option>
+                    </select>
+                    <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => beginEdit(host)}>{t('edit')}</button>
+                    <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void test(host)}>{t('test')}</button>
+                    <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, '/')}>{t('browse')}</button>
+                    <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
+                  </div>
+                </div>
+                <div className="dsh-ssh-workspaces">
+                  <div className="dsh-ssh-workspaces-head">
+                    <button
+                      type="button"
+                      className="dsh-ssh-disclosure"
+                      aria-expanded={expanded}
+                      onClick={() => setOpenWorkspaces({ ...openWorkspaces, [host.id]: !expanded })}
+                    >
+                      <span className="dsh-ssh-chevron" data-open={expanded ? 'true' : undefined} aria-hidden="true">▸</span>
+                      <span>{t('workspaces')}</span>
+                      <span className="dsh-ssh-count">{owned.length}</span>
+                    </button>
+                    <button type="button" className="dsh-ssh-button" disabled={busy || owned.length === 0} onClick={() => void tagWorkspaces(host.id)}>{t('tagSidebar')}</button>
+                  </div>
+                  {expanded ? (
+                    owned.length > 0 ? (
+                      <ul className="dsh-ssh-workspace-list">
+                        {owned.map(workspace => (
+                          <li key={workspace.workspaceId} className="dsh-ssh-workspace">
+                            <div className="dsh-ssh-workspace-text">
+                              <span className="dsh-ssh-workspace-title" title={workspace.title}>{workspace.title}</span>
+                              <span className="dsh-ssh-workspace-path" title={workspace.remotePath}>{workspace.remotePath}</span>
+                            </div>
+                            <div className="dsh-ssh-inline">
+                              <span className="dsh-ssh-workspace-meta">{workspace.sessions} {t('sessions')}</span>
+                              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeWorkspace(workspace.workspaceId)}>{t('unregister')}</button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : <p className="dsh-ssh-note dsh-ssh-workspaces-empty">{t('noWorkspaces')}</p>
+                  ) : null}
+                </div>
+              </li>
+            )
+          })}
         </ul>
       ) : null}
-      <form className="dsh-ssh-card" onSubmit={event => { event.preventDefault(); void saveDraft() }}>
-        <div className="dsh-ssh-legend">{t('addHost')}</div>
+      {hosts.length > 0 ? <p className="dsh-ssh-note">{t('workspacesNote')}</p> : null}
+      {selected.length > 0 && current !== undefined ? (
+        <div className="dsh-ssh-browser">
+          <div className="dsh-ssh-browser-head">
+            <div className="dsh-ssh-browser-heading">
+              <span className="dsh-ssh-legend">{t('directory')}</span>
+              <span className="dsh-ssh-browser-host">{current.name || current.host}</span>
+            </div>
+            <div className="dsh-ssh-inline">
+              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(selected, parentDir(dir))}>{t('up')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(selected, dir)}>{t('refresh')}</button>
+              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void createWorkspace(selected, dir)}>{t('createWorkspace')}</button>
+            </div>
+          </div>
+          <div className="dsh-ssh-breadcrumb">
+            <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(selected, '/')}>/</button>
+            {crumbs.map((name, index) => (
+              <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
+                <span className="dsh-ssh-crumb-sep">/</span>
+                <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(selected, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
+              </span>
+            ))}
+          </div>
+          <ul className="dsh-ssh-dirs">
+            {entries.map(entry => (
+              <li key={entry.path}>
+                <button type="button" className="dsh-ssh-dir" disabled={busy} onClick={() => void browse(selected, entry.path)}>
+                  <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
+                  <span className="dsh-ssh-dir-name">{entry.name}</span>
+                </button>
+              </li>
+            ))}
+            {entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
+          </ul>
+        </div>
+      ) : null}
+      <form id="dsh-ssh-form" className="dsh-ssh-card" data-editing={draft.id.length > 0 ? 'true' : undefined} onSubmit={event => { event.preventDefault(); void saveDraft() }}>
+        <div className="dsh-ssh-legend">{draft.id.length > 0 ? t('editHost') : t('addHost')}</div>
         <div className="dsh-ssh-grid">
           <Field label={t('name')} value={draft.name} onChange={value => setDraft({ ...draft, name: value })} />
           <Field label={t('address')} value={draft.host} onChange={value => setDraft({ ...draft, host: value })} />
@@ -280,7 +418,9 @@ function Section(props: SectionProps): JSX.Element {
         </label>
         <p className="dsh-ssh-note">{t('opsNote')}</p>
         <Field label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
+        {draft.id.length > 0 ? <p className="dsh-ssh-note">{t('secretKeep')}</p> : null}
         <div className="dsh-ssh-actions">
+          {draft.id.length > 0 ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={cancelEdit}>{t('cancel')}</button> : null}
           <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0}>{t('save')}</button>
         </div>
       </form>
@@ -288,7 +428,7 @@ function Section(props: SectionProps): JSX.Element {
         ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void trust(current)}>{t('trust')} {pendingTrust}</button>
         : null}
       {status !== null && current !== undefined ? (
-        <div className="dsh-ssh-host">
+        <div className="dsh-ssh-host dsh-ssh-status-row">
           <div>
             <div className="dsh-ssh-host-name">{t('sandbox')}: {status.sandboxTool} {status.sandbox.available ? t('available') : `${t('unavailable')} (${status.sandbox.reason})`}</div>
             <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.ripgrep}</div>
@@ -313,22 +453,6 @@ function Section(props: SectionProps): JSX.Element {
       </div>
       <p className="dsh-ssh-note">{t('macosNote')}</p>
       <p className="dsh-ssh-note">{t('ripgrepNote')}</p>
-      {selected.length > 0 ? (
-        <div>
-          <h3 className="dsh-ssh-section-title">{t('directory')} {dir}</h3>
-          <div className="dsh-ssh-inline">
-            {dir !== '/' ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(selected, parentDir(dir))}>{t('up')}</button> : null}
-            <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void createWorkspace(selected, dir)}>{t('createWorkspace')}</button>
-          </div>
-          <ul className="dsh-ssh-dirs">
-            {entries.map(entry => (
-              <li key={entry.path}>
-                <button type="button" className="dsh-ssh-button dsh-ssh-dir" disabled={busy} onClick={() => void browse(selected, entry.path)}>{entry.name}</button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
     </section>
   )
 }

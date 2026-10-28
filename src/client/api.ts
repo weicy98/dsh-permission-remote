@@ -20,6 +20,17 @@ export interface RunnerView {
   install: { id: string, title: string, auto: string, manual: string } | null
 }
 
+/** One registered workspace that lives on an SSH host. */
+export interface RemoteWorkspaceView {
+  hostId: string
+  workspaceId: string
+  title: string
+  remotePath: string
+  placeholderPath: string
+  sessions: number
+  createdAt: string
+}
+
 export interface RpcResult<T> {
   ok: boolean
   value?: T
@@ -55,8 +66,19 @@ export async function writeHosts(ctx: ClientFace, hosts: HostView[], revision: n
   await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['hosts'], value: hosts }], revision)
 }
 
-export async function callHost<T>(ctx: ClientFace, method: string, input: unknown): Promise<T> {
-  const result = await ctx.connection.rpc.call('/api', `sshPermission/${method}`, { args: { input } })
+/**
+ * The gateway rejects an argument the descriptor does not declare, so a method
+ * declared without parameters must be called with no `input` field at all.
+ */
+export async function callHost<T>(ctx: ClientFace, method: string, input?: unknown): Promise<T> {
+  const result = await ctx.connection.rpc.call('/api', `sshPermission/${method}`, {
+    args: input === undefined ? {} : { input },
+  })
   if (!result.ok) throw new Error(result.error?.message ?? `${method} failed`)
   return result.value as T
+}
+
+export async function readWorkspaces(ctx: ClientFace): Promise<RemoteWorkspaceView[]> {
+  const listed = await callHost<{ items?: RemoteWorkspaceView[] }>(ctx, 'listWorkspaces')
+  return Array.isArray(listed.items) ? listed.items : []
 }

@@ -35,6 +35,11 @@ export const Config = Schema.object({
   // host row is dropped from describe() and every save is a silent no-op.
   hosts: Schema.array(Host).default([]).volatile(),
   maxConnections: Schema.natural().min(1).max(32).default(4),
+  /**
+   * DSH's sidebar has no slot on a workspace row, so the owning server is
+   * written into the workspace title. Off keeps the titles untouched.
+   */
+  tagWorkspaceTitles: Schema.boolean().default(true),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -73,6 +78,7 @@ export function connectionKeyChanged(previous: HostConfig, next: HostConfig): bo
 export interface PluginConfig {
   hosts: HostConfig[]
   maxConnections: number
+  tagWorkspaceTitles: boolean
 }
 
 type HostRef = Volatile<unknown>
@@ -111,14 +117,15 @@ export function readConfig(raw: unknown): PluginConfig {
   const parsed = Config({
     ...record,
     hosts: copyHostRows(isHostRef(incoming) ? incoming.get() : incoming),
-  }) as { hosts?: unknown, maxConnections?: number }
+  }) as { hosts?: unknown, maxConnections?: number, tagWorkspaceTitles?: boolean }
   const maxConnections = parsed.maxConnections ?? 4
+  const tagWorkspaceTitles = parsed.tagWorkspaceTitles !== false
   const ref = isHostRef(incoming) ? incoming : parsed.hosts
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections)
-  return { hosts: asHostArray(ref), maxConnections }
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tagWorkspaceTitles)
+  return { hosts: asHostArray(ref), maxConnections, tagWorkspaceTitles }
 }
 
-function viewConfig(ref: HostRef, maxConnections: number): PluginConfig {
+function viewConfig(ref: HostRef, maxConnections: number, tagWorkspaceTitles: boolean): PluginConfig {
   return {
     get hosts() {
       return asHostArray(ref.get()).map(host => ({ ...host }))
@@ -127,5 +134,6 @@ function viewConfig(ref: HostRef, maxConnections: number): PluginConfig {
       commitHosts(ref, value)
     },
     maxConnections,
+    tagWorkspaceTitles,
   }
 }

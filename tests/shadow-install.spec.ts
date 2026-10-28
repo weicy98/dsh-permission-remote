@@ -78,6 +78,25 @@ test('ending the agent effect lets the same agent install again', async () => {
   assert.equal(registered, first * 2)
 })
 
+test('ops tools publish object JSON Schemas and reject missing arguments', async () => {
+  const ctx = plugin()
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, parameters: { type?: string, properties?: object, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const { agent } = agentFor('/tmp/not-a-remote-workspace', () => () => undefined)
+  agent.ctx.tools.register = ((definition: { name: string, parameters: { type?: string, properties?: object, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
+    tools.push(definition)
+    return () => undefined
+  }) as typeof agent.ctx.tools.register
+  await created(ctx, agent)
+  const exec = tools.find(tool => tool.name === 'ssh_exec')
+  const hosts = tools.find(tool => tool.name === 'ssh_hosts')
+  assert.equal(exec?.parameters.type, 'object')
+  assert.deepEqual(exec?.parameters.required, ['host', 'command'])
+  assert.equal(hosts?.parameters.type, 'object')
+  assert.deepEqual(hosts?.parameters.properties, {})
+  await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
+})
+
 test('an existing remote agent that cannot be shadowed fails plugin load', () => {
   const ctx = plugin()
   const { agent } = agentFor(remoteCwd, () => {

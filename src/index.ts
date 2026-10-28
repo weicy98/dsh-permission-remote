@@ -3,6 +3,7 @@ import { basename } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
+import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { Config, connectionKeyChanged, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
@@ -23,10 +24,20 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { sniffImage } from './image.ts'
-import { opsHostView, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
+import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
 import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
 import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
+import {
+  hostTag,
+  remoteWorkspaces,
+  tagRemoteWorkspaces,
+  tagWorkspace,
+  taggedTitle,
+  textOrUndefined,
+  type RemoteWorkspaceView,
+  type WorkspaceRegistryLike,
+} from './workspaces.ts'
 
 export const name = 'dsh-permission-remote'
 export const inject = ['sandboxPolicy', 'tools', 'settings', 'credentials', 'workspaceRegistry']
@@ -49,7 +60,7 @@ interface HostContext {
     readRecord(key: ReturnType<typeof credentialKey>): Promise<CredentialRecord | undefined>
     modifyRecord(key: ReturnType<typeof credentialKey>, mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>): Promise<CredentialRecord | undefined>
   }
-  workspaceRegistry: { create(dir: string, title?: string): Promise<unknown> }
+  workspaceRegistry: WorkspaceRegistryLike
   get(service: string): unknown
   on(event: 'agent/created', listener: (payload: { agent: AgentLike }) => void): () => void
   effect(dispose: () => void): void
@@ -101,16 +112,31 @@ class SshApi extends TypertRemoteService {
     return { path: input.path || '/', entries }
   }
 
-  async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string }> {
+  async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string, title: string }> {
     const host = this.core.requireHost(input.hostId)
     const info = await this.core.pool.sftpStat(host, await this.core.secret(host), input.path)
     if (!info.isDirectory) throw new Error(`remote path is not a directory: ${input.path}`)
     const local = mapRemoteToLocal(input.hostId, input.path)
     if (local === null) throw new Error('remote path must be absolute')
     await mkdir(local, { recursive: true })
-    const title = input.title?.trim() || basename(input.path)
-    await this.core.workspaces.create(local, title)
-    return { path: local }
+    const title = taggedTitle(host, input.title?.trim() || basename(input.path))
+    const workspace = await this.core.workspaces.create(local, title)
+    const tagged = await tagWorkspace(host, workspace)
+    return { path: local, title: tagged }
+  }
+
+  async listWorkspaces(): Promise<{ items: RemoteWorkspaceView[] }> {
+    return { items: this.core.listWorkspaces() }
+  }
+
+  async tagWorkspaces(input: { hostId?: string, workspaceId?: string }): Promise<{ items: RemoteWorkspaceView[] }> {
+    await this.core.tagWorkspaces(textOrUndefined(input.hostId), textOrUndefined(input.workspaceId))
+    return this.listWorkspaces()
+  }
+
+  async removeWorkspace(input: { workspaceId: string }): Promise<{ ok: true }> {
+    await this.core.workspaces.delete(input.workspaceId)
+    return { ok: true }
   }
 
   async saveHost(input: HostConfig): Promise<{ ok: true }> {
@@ -137,10 +163,28 @@ class Core {
   constructor(
     private readonly ctx: HostContext,
     config: PluginConfig,
-    readonly workspaces: HostContext['workspaceRegistry'],
+    readonly workspaces: WorkspaceRegistryLike,
   ) {
     this.config = config
     this.pool = new SshPool(config.maxConnections)
+  }
+
+  listWorkspaces(): RemoteWorkspaceView[] {
+    return remoteWorkspaces(this.workspaces.list())
+  }
+
+  async tagWorkspaces(hostId?: string, workspaceId?: string, previousTag?: string): Promise<number> {
+    return tagRemoteWorkspaces(this.config.hosts, this.workspaces.list(), { hostId, workspaceId, previousTag })
+  }
+
+  /**
+   * Existing workspaces are relabelled once at load, so the sidebar names their
+   * server without the operator re-creating anything.
+   */
+  async autoTagWorkspaces(): Promise<void> {
+    if (!this.config.tagWorkspaceTitles) return
+    const changed = await this.tagWorkspaces()
+    if (changed > 0) this.ctx.logger?.info(`[@dsh-permission-remote] tagged ${changed} workspace title(s) with their SSH host`)
   }
 
   requireHost(hostId: string): HostConfig {
@@ -195,12 +239,17 @@ class Core {
     assertHostId(host.id)
     const previous = this.config.hosts.find(item => item.id === host.id)
     const normalized = { ...host, opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy) }
-    const hosts = this.config.hosts.filter(item => item.id !== host.id)
-    this.config.hosts = [...hosts, normalized]
+    // Editing keeps the row where it is; a new host is appended.
+    this.config.hosts = previous === undefined
+      ? [...this.config.hosts, normalized]
+      : this.config.hosts.map(item => item.id === host.id ? normalized : item)
     // A cached session keyed by id would keep talking to the previous machine.
     if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
     else forgetOpsHost(host.id)
     await this.persistHosts()
+    if (previous === undefined || previous.name === normalized.name) return
+    if (!this.config.tagWorkspaceTitles) return
+    await this.tagWorkspaces(normalized.id, undefined, hostTag(previous))
   }
 
   async deleteHost(hostId: string): Promise<void> {
@@ -269,7 +318,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({
@@ -332,6 +381,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   if (typeof agents?.list === 'function') {
     for (const agent of agents.list()) attach(agent)
   }
+  void core.autoTagWorkspaces().catch(error => {
+    ctx.logger?.warn(`[@dsh-permission-remote] workspace title tagging failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
   ctx.logger?.info('[@dsh-permission-remote] loaded')
 }
 
@@ -468,11 +520,29 @@ const textOutput = (render: (value: Record<string, unknown>) => string) => ({
  * Ops tools are registered for every agent, so a session whose workspace is
  * local can still act on a configured SSH host. Each call names its host.
  */
+function publishOpsTool(tool: {
+  name: string
+  description: string
+  parameters: ParameterSchemaSpec
+  output: object
+  execute: (args: unknown, exec: ToolExec) => Promise<unknown>
+}): object {
+  const parameters = parameterSchemaSpecToJsonSchema(tool.parameters)
+  return {
+    ...tool,
+    parameters,
+    async execute(args: unknown, exec: ToolExec) {
+      const violations = validateArgs(tool.parameters, args)
+      if (violations.length > 0) throw new ToolArgsError(violations)
+      return tool.execute(args, exec)
+    },
+  }
+}
+
 function opsTools(core: Core): object[] {
   const hostApi = core.toolHost(undefined)
   const pick = (args: Record<string, unknown>) => core.requireOpsHost(String(args.host ?? ''))
-  return [
-    {
+  return [publishOpsTool({
       name: 'ssh_hosts',
       description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, or ssh_write when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands and writes, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
       parameters: {},
@@ -484,8 +554,7 @@ function opsTools(core: Core): object[] {
       async execute() {
         return { hosts: core.listHosts().map(host => opsHostView(host)) }
       },
-    },
-    {
+    }), publishOpsTool({
       name: 'ssh_exec',
       description: 'Run a command on a configured SSH host as the remote login user. This is for ops on a machine that is not your current workspace. The remote command is not sandboxed locally: on an "ask" host it runs only with danger-full-access, either from this session\'s mode or a one-shot approval. Retry with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. sudo only works without a password prompt (sudo -n).',
       parameters: {
@@ -495,40 +564,30 @@ function opsTools(core: Core): object[] {
         timeoutMs: { type: 'number', description: 'Command timeout in milliseconds; defaults to 60000' },
         ...OPS_ESCALATION,
       },
-      output: textOutput(value => {
-        const host = value.host as ReturnType<typeof opsHostView> | undefined
-        const stdout = (value.stdout as { text?: string } | undefined)?.text ?? ''
-        const stderr = (value.stderr as { text?: string } | undefined)?.text ?? ''
-        return `${stdout}${stderr}\n[${host === undefined ? 'remote host' : host.name || host.address}: exit code: ${value.exitCode ?? 'null'}]`
-      }),
+      output: textOutput(renderOpsExec),
       execute(args: unknown, exec: ToolExec) {
         const record = args as Record<string, unknown>
         const host = pick(record)
         return runSshExec(hostApi, host, record, exec)
       },
-    },
-    {
+    }), publishOpsTool({
       name: 'ssh_read',
-      description: 'Read a file from a configured SSH host without a shell. Use an absolute remote path or one that starts with "~/" (expanded against the remote home). Reads are allowed on any host whose ops policy is not "deny".',
+      description: 'Read a file from a configured SSH host without a shell. Use an absolute remote path or one that starts with "~/" (expanded against the remote home). Reads are allowed on any host whose ops policy is not "deny". The text result includes the line range and whether more lines follow.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         file_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },
         offset: { type: 'number', description: '1-based first line to return; defaults to 1' },
         limit: { type: 'number', description: 'Maximum lines to return; defaults to 2000' },
       },
-      output: textOutput(value => {
-        const lines = Array.isArray(value.lines) ? value.lines as Array<{ number: number, text: string }> : []
-        return lines.map(line => `${line.number}|${line.text}`).join('\n')
-      }),
+      output: textOutput(renderOpsRead),
       execute(args: unknown, exec: ToolExec) {
         const record = args as Record<string, unknown>
         const host = pick(record)
         return runSshRead(hostApi, host, record, exec)
       },
-    },
-    {
+    }), publishOpsTool({
       name: 'ssh_write',
-      description: 'Replace a file on a configured SSH host. The new content is written to a temp file in the same directory and renamed with mv -f, so a dropped connection does not truncate the original. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied.',
+      description: 'Replace a file on a configured SSH host. The new content is written to a temp file in the same directory and renamed with mv -f, so a dropped connection does not truncate the original. An existing directory is rejected. Replacing a file keeps its permission bits; a new file is created with the remote umask. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         file_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },
@@ -544,6 +603,5 @@ function opsTools(core: Core): object[] {
         const host = pick(record)
         return runSshWrite(hostApi, host, record, exec)
       },
-    },
-  ]
+    })]
 }
