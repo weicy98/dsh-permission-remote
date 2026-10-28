@@ -150,7 +150,7 @@ const CSS = `
   color: var(--dsw-alias-label-primary);
 }
 .dsh-ssh-tab[data-active] {
-  background: var(--dsw-alias-bg-l3);
+  background: var(--dsw-alias-bg-layer-3);
   color: var(--dsw-alias-label-primary);
   font-weight: 500;
 }
@@ -262,7 +262,7 @@ const CSS = `
   padding: 10px 12px;
   border-radius: var(--dsw-radius-lg);
   border: 0.5px solid var(--dsw-alias-settings-card-stroke);
-  background: var(--dsw-alias-bg-l2);
+  background: var(--dsw-alias-bg-layer-2);
 }
 .dsh-ssh-fingerprint {
   font-family: var(--ds-font-family-code, ui-monospace, monospace);
@@ -270,7 +270,7 @@ const CSS = `
   word-break: break-all;
   padding: 2px 6px;
   border-radius: var(--dsw-radius-sm);
-  background: var(--dsw-alias-bg-l3);
+  background: var(--dsw-alias-bg-layer-3);
 }
 .dsh-ssh-workspaces {
   display: flex;
@@ -437,7 +437,7 @@ const CSS = `
 .dsh-ssh-button[data-primary="true"] {
   border-color: transparent;
   background: var(--dsw-alias-brand-primary);
-  color: var(--dsw-alias-label-invert, #fff);
+  color: var(--dsw-alias-label-primary-inverted, #fff);
 }
 .dsh-ssh-section-title {
   margin: 4px 0 0;
