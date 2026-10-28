@@ -163,7 +163,7 @@ export class SshPool {
     return realpathOf(session, remotePath)
   }
 
-  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode: number }> {
+  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number }> {
     const session = await this.sftp(host, secret)
     return statInfo(session, remotePath)
   }
@@ -475,11 +475,16 @@ async function closeLive(live: Live): Promise<void> {
   live.client.end()
 }
 
-function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode: number }> {
+/**
+ * `mode` stays `undefined` when the server does not report it: a fabricated `0`
+ * would be indistinguishable from a real `000` and would chmod the file to
+ * nothing. A new file then keeps the remote umask.
+ */
+function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number }> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => {
       if (error) reject(new SshFailure(error.message, 'sftp-stat'))
-      else resolve({ isDirectory: stats.isDirectory(), size: stats.size, mode: typeof stats.mode === 'number' ? stats.mode : 0 })
+      else resolve({ isDirectory: stats.isDirectory(), size: stats.size, mode: typeof stats.mode === 'number' ? stats.mode : undefined })
     })
   })
 }

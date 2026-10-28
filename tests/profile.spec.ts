@@ -88,3 +88,13 @@ test('a replacement can restore the previous permission bits', () => {
   const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file', 0o100600)
   assert.match(script, /chmod 600 '\/srv\/app\/file'/)
 })
+
+test('mode 000 is a real mode and is restored instead of falling back to umask', () => {
+  const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file', 0o100000)
+  assert.match(script, /chmod 0 '\/srv\/app\/file'/)
+})
+
+test('an unreported mode leaves the new file on the remote umask', () => {
+  const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file', undefined)
+  assert.doesNotMatch(script, /chmod/)
+})
