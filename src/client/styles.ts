@@ -127,32 +127,38 @@ const CSS = `
 .dsh-ssh-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
-  padding-bottom: 6px;
+  gap: 2px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
 }
 .dsh-ssh-tab {
   appearance: none;
-  border: 0;
   background: transparent;
   color: var(--dsw-alias-label-secondary);
   font: inherit;
   font-size: 13px;
-  padding: 5px 10px;
-  border-radius: var(--dsw-radius-md);
+  padding: 6px 10px;
+  /* A transparent underline reserves the space so switching tabs does not
+     shift the text, and the negative margin lets the active line sit exactly
+     on the container rule instead of floating above it. */
+  border: 0;
+  border-bottom: 2px solid transparent; /* after border:0, so it survives */
+  border-radius: 0;
+  margin-bottom: -1px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 .dsh-ssh-tab:hover:not([data-active]) {
-  background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary);
 }
+/* An underline only. A filled pill read as a heavy control sitting on a page
+   that is otherwise flat, and the theme's layer backgrounds are all one white
+   in its light variant so a fill could not carry the state anyway. */
 .dsh-ssh-tab[data-active] {
-  background: var(--dsw-alias-bg-layer-3);
   color: var(--dsw-alias-label-primary);
   font-weight: 500;
+  border-bottom-color: var(--dsw-alias-brand-primary);
 }
 .dsh-ssh-danger {
   color: var(--dsw-alias-state-warn-label);
@@ -163,11 +169,15 @@ const CSS = `
 }
 /* Title and its action read as one group on the left rather than the button
    floating at the far edge of a wide settings page. */
+/* The add button only exists on the hosts tab, and it is taller than the title
+   alone; a fixed row height keeps the content below from shifting when the tab
+   changes. */
 .dsh-ssh-header {
   display: flex;
   align-items: center;
   justify-content: flex-start;
   gap: 10px;
+  min-height: 28px;
 }
 /* The add/edit form is a modal so it never sits between the host list and the
    page bottom. The backdrop pseudo-element dims the list without unmounting it. */
@@ -321,6 +331,14 @@ const CSS = `
   font-size: 11px;
   line-height: 16px;
   text-align: center;
+}
+/* In a tab the count is a quiet hint, not a pill; the filled variant was the
+   heaviest thing in an otherwise flat tab row. */
+.dsh-ssh-tab .dsh-ssh-count {
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  line-height: inherit;
 }
 .dsh-ssh-workspace-list {
   display: flex;
