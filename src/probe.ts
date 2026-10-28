@@ -3,6 +3,7 @@
  * A binary that exists while user namespaces are disabled is still unavailable.
  */
 import { posix } from 'node:path'
+import { rgPackageName, rgPlatformOf } from './rg-fetch.ts'
 
 export interface ProbeOutcome {
   readonly available: boolean
@@ -144,12 +145,13 @@ export function remoteArchOf(machine: string): RemoteArch {
   return 'other'
 }
 
-/** npm optional package that ships the ripgrep binary for one remote. */
+/**
+ * npm optional package that ships the ripgrep binary for one remote.
+ *
+ * Delegates to the one platform table in `rg-fetch.ts`: the package name and the
+ * download target must never disagree about which platforms exist.
+ */
 export function ripgrepPackage(os: RemoteOs, arch: RemoteArch): string | null {
-  if (arch === 'other' || os === 'other') return null
-  if (os === 'linux' && arch === 'x64') return '@vscode/ripgrep-linux-x64'
-  if (os === 'linux' && arch === 'arm64') return '@vscode/ripgrep-linux-arm64'
-  if (os === 'darwin' && arch === 'x64') return '@vscode/ripgrep-darwin-x64'
-  if (os === 'darwin' && arch === 'arm64') return '@vscode/ripgrep-darwin-arm64'
-  return null
+  const platform = rgPlatformOf(os, arch)
+  return platform === null ? null : rgPackageName(platform)
 }
