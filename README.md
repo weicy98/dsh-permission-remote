@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-permission-remote
    - Alpine：`sudo apk add bubblewrap`
    - macOS 使用系统自带的 `sandbox-exec`，没有安装按钮。探测失败时，受限 bash 需要经审批把这一次升到 `danger-full-access`。
 4. **ripgrep。** `glob` / `grep` 需要远端有 `rg`。连接时会按远端架构上传随插件带上的二进制。本机没有该平台的包时（典型是 Windows 上的 DSH 管 Linux 远端，包管理器只装本平台的 `@vscode/ripgrep-win32-x64`），主机行会出现「安装 ripgrep」：按远端平台从 npm 源下载 `@vscode/ripgrep-<platform>`，取出 `package/bin/rg` 缓存到 `$DSH_HOME/cache/ripgrep/<platform>/rg`，再重新探测；上传被远端拒绝时也用同一个按钮重试。只有点这个按钮才联网，下载源在设置页填（留空用 npmjs，可填镜像）。都不想用的话，可以在远端自己安装 ripgrep，让 `rg` 出现在 `PATH` 里。
-5. **创建工作区。** 在同一页浏览远端目录，把当前目录作成工作区。它会出现在原来的工作区列表里。左侧文件列表和终端仍显示你这台电脑上的目录，远端文件要在对话的执行结果里看。
+5. **创建工作区。** 在同一页浏览远端目录，把当前目录作成工作区。它会出现在原来的工作区列表里。左侧文件列表仍是本机的占位目录，远端文件要在对话的执行结果里看；右侧栏终端会连到远端，见下面「侧栏终端」。
 6. **查看各台服务器的工作区。** 每台主机下面有「已添加的工作区」，列出从这台机器创建的工作区、远端目录和会话数。可以只从 DSH 列表移除（远端文件不动），也可以把侧栏标题重新标注。
 7. **侧栏认主机。** DSH 的侧栏工作区行只显示标题、没有可挂标记的 slot，所以插件把主机名写进标题：`服务器 · 目录名`。加载时只标注标题仍是目录名的那些；你改过的名字不会被自动改写，可以随时用该主机下的「标注侧栏标题」手动重标——它会给该主机的全部工作区标注，并把旧服务器的前缀换成当前的。设置页的开关（`tagWorkspaceTitles`）可以整体关掉标注，重新打开时会立即标注一遍。
 8. **删除与恢复主机。** 删除主机只是把它从列表移走，工作区仍然注册在 DSH 里，标题保留原前缀。设置页的「已删除的主机」分组里可以「恢复主机」（配置和指纹都还在），也可以逐个「注销工作区」。
@@ -88,9 +88,21 @@ dsh plugin --profile web add dsh-permission-remote
 - 目前没有上传和下载工具
 - 网络中断时，正在执行的远端命令会失败；已经写入的文件留在远端，不会回滚
 
+## 侧栏终端
+
+在远端工作区里，右侧栏的终端连的是那台服务器，不是你这台电脑：新建终端时 shell 菜单里列的是远端 `$SHELL` 和远端装了的 `bash` / `zsh` / `fish` / `sh`，标签名带主机名（`lo · zsh`）。缩放、滚屏、复制、刷新页面后重连都由 DSH 原来的终端界面负责。
+
+几点要注意：
+
+- **权限。** 侧栏终端是远端登录用户自己的 shell，和本地会话里的侧栏终端一样**不套 bubblewrap**，也不按按键走 Agent 审批。闸门只有「这台主机的指纹已经信任」。要按当前权限档位跑命令，用对话里的 `bash` 工具。
+- **连接是共享的。** 一个标签页一条 SSH 通道，和文件传输、远端命令共用这台主机的那一条连接。OpenSSH 默认 `MaxSessions 10`，而 DSH 每个会话最多 8 个终端。通道占满时新标签页会报这台主机拒绝再开一个 SSH 会话；只关侧栏终端不一定腾得出名额，也可以在远端调高 `MaxSessions`。
+- **不跟随后续的 `working_directory`。** 已经开着的终端留在打开时那个远端目录；新开的用当时的目录。占位子目录不存在时，新建终端会先把它建出来，这样不会退回工作区根。建不出来时仍由 DSH 退回工作区根。
+- **断线即结束。** 连接断了终端就结束，不会自动重连，也没有回滚：关掉标签页重开一个即可。
+- **只有侧栏接上了。** 模型侧的 `terminal_open` 在远端工作区里会直接报错并提示改用 `bash` 或侧栏终端——它请求的是本机 PTY 后端，会把 shell 开在你这台电脑的占位目录里。`terminal_send` / `terminal_read` / `terminal_list` 不动：它们操作的是已经存在的终端。
+
 ## 使用上要注意
 
-对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表和终端还是你自己的电脑，里面看不到远端工程。
+对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表还是本机的占位目录，里面看不到远端工程；右侧栏终端见上一节，它连的是远端。
 
 模型用「运行代码」，或者会话要读取项目里的 `AGENTS.md` 时，读到的也是你电脑上的这个工作区目录，不是远端那一份。
 
@@ -143,7 +155,17 @@ Linux bash confinement needs bubblewrap. The settings page can install it with `
 
 `glob` and `grep` need ripgrep on the remote; the plugin uploads a matching binary when it has one. A package manager installs only its own platform's package, so a Windows DSH managing a Linux remote has no Linux binary to upload. The host row then offers “Install ripgrep”: it downloads `@vscode/ripgrep-<platform>` for the remote from the configured npm source (empty means npmjs; a mirror works), takes `package/bin/rg` out of the tarball, caches it at `$DSH_HOME/cache/ripgrep/<platform>/rg`, and re-probes. The same button retries after a remote refused the upload. Nothing reaches the network unless that button is pressed. Alternatively install ripgrep on the remote so `rg` is on `PATH`.
 
-In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list and the terminal on the left still show your own computer.
+In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list on the left is still the local placeholder directory.
+
+### Sidebar terminal
+
+The right sidebar's terminal on a remote workspace connects to that host, not to your computer: the shell menu lists the remote `$SHELL` plus whichever of `bash`, `zsh`, `fish`, and `sh` the host has, and each tab is named after the server (`lo · zsh`). Resize, scrollback, copy, and reattachment after a page reload stay with DSH's own terminal UI.
+
+- **Permissions.** A sidebar terminal is the remote login user's own shell. Like the local sidebar terminal it is **not** wrapped in bubblewrap and does not prompt per keystroke; the only gate is a trusted host fingerprint. Use the `bash` tool when a command should follow the session's permission mode.
+- **One shared connection.** Each tab is one SSH channel on this host's single connection, shared with file transfer and remote commands. OpenSSH defaults to `MaxSessions 10` and DSH allows 8 terminals per session. A full connection makes the next tab fail because the host refused another SSH session; closing a sidebar terminal may not free a slot. Raise `MaxSessions` on the remote when it does not.
+- **No follow on `working_directory`.** An open terminal keeps the remote directory it started in; a new tab uses the current one. A missing placeholder subdirectory is created before the terminal opens, so the session does not fall back to the workspace root. If that directory cannot be created, DSH restores the workspace root as usual.
+- **A dropped connection ends the terminal.** There is no reconnect and no rollback; open a new tab.
+- **Sidebar only.** `terminal_open` refuses in a remote workspace and points at `bash` or the sidebar terminal: it asks the local PTY backend for a shell, which would open on your own computer inside the placeholder directory. `terminal_send`, `terminal_read`, and `terminal_list` are untouched; they operate on terminals that already exist.
 
 ### Remote ops from an ordinary workspace
 

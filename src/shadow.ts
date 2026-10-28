@@ -7,8 +7,18 @@
  * returns the wrapper and recurses.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory'] as const
+export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
+
+/**
+ * Why `terminal_open` refuses on a remote workspace.
+ *
+ * It asks the local PTY backend for a shell, so it would hand the model a
+ * prompt on this computer inside the placeholder directory while the sidebar
+ * terminal is already on the SSH host. Until a remote PTY backend exists,
+ * saying so beats pretending; the same sentence is the test's expectation.
+ */
+export const TERMINAL_OPEN_REFUSED = 'terminal_open is not available in a remote workspace: the local PTY backend would open a shell on this computer, not on the SSH host. Use bash for a one-shot command, or open the sidebar terminal (it connects to the remote host) for an interactive shell.'
 
 export interface OfficialTool<TArgs = unknown, TExec = unknown, TResult = unknown> {
   readonly execute: (args: TArgs, exec: TExec) => Promise<TResult> | TResult

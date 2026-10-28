@@ -102,6 +102,38 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
 })
 
+test('terminal_open refuses on a remote workspace and still calls the local tool', async () => {
+  const ctx = plugin()
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const official: string[] = []
+  const { agent } = agentFor(remoteCwd, () => () => undefined)
+  const toolsApi = agent.ctx.tools as { get: (name: string) => { execute: () => Promise<string> } | undefined, register: typeof agent.ctx.tools.register }
+  toolsApi.get = (name: string) => {
+    if (name !== 'terminal_open' && name !== 'bash') return undefined
+    return {
+      execute: async () => {
+        official.push(name)
+        return 'official'
+      },
+    }
+  }
+  agent.ctx.tools.register = ((definition: { name: string, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
+    tools.push(definition)
+    return () => undefined
+  }) as typeof agent.ctx.tools.register
+  await created(ctx, agent)
+
+  const open = tools.find(tool => tool.name === 'terminal_open')
+  assert.ok(open)
+  await assert.rejects(() => open.execute({}, { agent }), /terminal_open is not available in a remote workspace/)
+  assert.deepEqual(official, [])
+
+  const local = await open.execute({}, { agent: { session: { header: { cwd: '/tmp/project' } } } })
+  assert.equal(local, 'official')
+  assert.deepEqual(official, ['terminal_open'])
+})
+
 test('an existing remote agent that cannot be shadowed fails plugin load', () => {
   const ctx = plugin()
   const { agent } = agentFor(remoteCwd, () => {

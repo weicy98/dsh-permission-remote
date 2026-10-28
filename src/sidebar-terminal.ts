@@ -7,6 +7,7 @@
  * stays on the local provider. Both services are cordis proxies, so the
  * replacement is installed on `symbols.original` and removed by deleting that own property.
  */
+import { mkdir } from 'node:fs/promises'
 import { PassThrough, type Readable } from 'node:stream'
 import { symbols } from '@deepseek-ai/cordis'
 import type { HostConfig } from './config.ts'
@@ -51,6 +52,11 @@ interface ShellHost {
   config?: { shellCandidates?: readonly string[] }
   shells(agent: { session?: object }, signal: AbortSignal): Promise<SidebarShell[]>
   create(agent: { session?: object }, request: CreateRequest, signal: AbortSignal): Promise<unknown>
+  /**
+   * Official `create` calls this before `spawnTerminal`. `workingDirectory.ensure`
+   * runs inside it, so a missing placeholder has to be created here.
+   */
+  spawn?(agent: { session?: object }, owner: unknown, request: CreateRequest, signal: AbortSignal): Promise<unknown>
 }
 
 interface CreateRequest {
@@ -132,13 +138,15 @@ export function installSidebarBridge(ctx: BridgeContext, core: SidebarCore): (()
   const terminal = unwrap(terminalService) as ShellHost
   const subprocess = unwrap(subprocessService) as SpawnHost
   const directories = directoryService as WorkingDirectoryService
-  if (Object.hasOwn(subprocess, 'spawnTerminal') || Object.hasOwn(terminal, 'shells') || Object.hasOwn(terminal, 'create')) {
+  if (Object.hasOwn(subprocess, 'spawnTerminal') || Object.hasOwn(terminal, 'shells') || Object.hasOwn(terminal, 'create') || Object.hasOwn(terminal, 'spawn')) {
     ctx.logger?.warn('[@dsh-permission-remote] sidebar bridge already installed')
     return undefined
   }
   const originalSpawn = subprocess.spawnTerminal.bind(subprocess)
   const originalShells = terminal.shells.bind(terminal)
   const originalCreate = terminal.create.bind(terminal)
+  const spawnSession = terminal.spawn
+  const originalSessionSpawn = typeof spawnSession === 'function' ? spawnSession.bind(terminal) : undefined
 
   subprocess.spawnTerminal = async spec => {
     if (!isSidebarTerminal(spec)) return originalSpawn(spec)
@@ -164,11 +172,37 @@ export function installSidebarBridge(ctx: BridgeContext, core: SidebarCore): (()
     }
     return originalCreate(agent, request, signal)
   }
+  if (originalSessionSpawn !== undefined) {
+    terminal.spawn = async (agent, owner, request, signal) => {
+      await materializeRemotePlaceholder(directories, agent)
+      return originalSessionSpawn(agent, owner, request, signal)
+    }
+  }
   return () => {
     Reflect.deleteProperty(subprocess, 'spawnTerminal')
     Reflect.deleteProperty(terminal, 'shells')
     Reflect.deleteProperty(terminal, 'create')
+    Reflect.deleteProperty(terminal, 'spawn')
   }
+}
+
+/**
+ * `TerminalController.spawn` calls `workingDirectory.ensure` before `spawnTerminal`.
+ * `ensure` restores the workspace root when the session directory is missing, and
+ * tells the conversation. Creating that directory first keeps the new terminal
+ * in the directory the session is already using. A failure leaves `ensure` to
+ * report the same problem it would have reported on its own.
+ */
+async function materializeRemotePlaceholder(directories: WorkingDirectoryService, agent: { session?: object }): Promise<void> {
+  if (agent.session === undefined) return
+  let cwd: string
+  try {
+    cwd = directories.get(agent.session)
+  } catch {
+    return
+  }
+  if (routeByCwd(cwd).kind !== 'remote') return
+  await mkdir(cwd, { recursive: true }).catch(() => undefined)
 }
 
 async function openRemoteTerminal(core: SidebarCore, route: RemoteRoute, spec: SidebarSpawnSpec): Promise<SshTerminalHandle> {
@@ -229,6 +263,8 @@ export class SshTerminalHandle {
   private readonly pending = new Set<Promise<unknown>>()
   /** Writes blocked on `drain`. A dead connection must release them or `terminate` never returns. */
   private readonly wakeups: Array<() => void> = []
+  /** The channel is paused because the screen consumer is behind. */
+  private paused = false
   private stopTransport: () => void = () => undefined
   private resolveDone: (exit: TerminalExit) => void = () => undefined
   private rejectDone: (error: Error) => void = () => undefined
@@ -242,6 +278,7 @@ export class SshTerminalHandle {
       this.rejectDone = reject
     })
     this.stopTransport = onTransportClosed(error => this.finish(error))
+    this.output.on('drain', () => this.resume())
     channel.on('data', chunk => this.push(chunk))
     channel.stderr?.on('data', chunk => this.push(chunk))
     channel.on('close', (code, signal) => {
@@ -307,20 +344,46 @@ export class SshTerminalHandle {
     }))
   }
 
+  /**
+   * Close the channel first, then wait for in-flight calls.
+   *
+   * A remote program that never reads stdin (`sleep`, a stopped job, a pager)
+   * leaves the channel window full, so `write` parks on `drain` indefinitely.
+   * `close()` is the only thing that can release it: it ends the channel, the
+   * `close` event runs `finish`, and `finish` wakes every blocked write. Waiting
+   * on `pending` first would deadlock against that.
+   */
   async terminate(): Promise<void> {
-    await Promise.allSettled([...this.pending])
     try {
       this.channel.close()
     } catch (error) {
       this.finish(error instanceof Error ? error : new Error(String(error)))
     }
+    await Promise.allSettled([...this.pending])
     await this.done.then(() => undefined, () => undefined)
   }
 
+  /**
+   * Forward bytes, pausing the channel while the screen consumer is behind.
+   *
+   * `output` is read by the controller's headless emulator. A `PassThrough`
+   * nobody drains would buffer without bound — one `yes` or `journalctl -f`
+   * fills it in seconds — so the channel is paused until `drain`, exactly as the
+   * local provider does.
+   */
   private push(chunk: Buffer | string): void {
     if (this.settled || this.output.writableEnded) return
     const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
-    this.output.write(bytes)
+    if (!this.output.write(bytes) && !this.paused && !this.settled) {
+      this.paused = true
+      this.channel.pause?.()
+    }
+  }
+
+  private resume(): void {
+    if (!this.paused) return
+    this.paused = false
+    if (!this.settled) this.channel.resume?.()
   }
 
   private track<T>(work: Promise<T>): Promise<T> {

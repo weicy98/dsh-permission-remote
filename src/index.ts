@@ -29,7 +29,7 @@ import {
 import { sniffImage } from './image.ts'
 import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
 import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
-import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
+import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import {
@@ -556,6 +556,12 @@ const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<Return
     if (directories === undefined || exec.agent === undefined) throw new Error('working_directory requires an agent Session')
     return directories.set(exec.agent, directory, exec.signal)
   }),
+  // A local PTY backend would open a shell inside the placeholder directory
+  // while the sidebar terminal is already on the server. Refuse instead of
+  // handing the model a prompt that is not where the Session is.
+  terminal_open: async () => {
+    throw new Error(TERMINAL_OPEN_REFUSED)
+  },
 }
 
 export function apply(rawCtx: Context, rawConfig?: unknown): void {

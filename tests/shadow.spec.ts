@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { dispatchShadow, planShadows } from '../src/shadow.ts'
+import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows } from '../src/shadow.ts'
 
 test('shadow plans close over the official execute captured before register', async () => {
   const calls: string[] = []
@@ -29,4 +29,13 @@ test('a remote cwd does not call the captured official execute', async () => {
   }, true, async () => 'remote', {}, {})
   assert.equal(result, 'remote')
   assert.equal(officialCalls, 0)
+})
+
+test('a remote session refuses terminal_open instead of opening a local shell', async () => {
+  assert.match(TERMINAL_OPEN_REFUSED, /open a shell on this computer/)
+  assert.match(TERMINAL_OPEN_REFUSED, /sidebar terminal/)
+  // The plan still exists, so the refusal happens per call, when the cwd is
+  // known, rather than at install time.
+  const plans = planShadows(name => name === 'terminal_open' || name === 'bash' ? { execute: async () => 'local' } : undefined)
+  assert.deepEqual(plans.map(plan => plan.name), ['bash', 'terminal_open'])
 })

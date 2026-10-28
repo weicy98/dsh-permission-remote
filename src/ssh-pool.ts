@@ -102,6 +102,10 @@ export interface PtyChannel {
   signal(name: string): void
   close(): void
   once?(event: 'drain', listener: () => void): void
+  /** Stop reading from the socket while the screen consumer is behind. */
+  pause?(): void
+  /** Resume reading after `drain`. */
+  resume?(): void
 }
 
 export interface OpenPty {
@@ -464,13 +468,29 @@ export function exitFields(cause: 'exit' | 'timeout' | 'cancel' | 'truncate', co
   return { code: code ?? null, signal: signal ?? null }
 }
 
+/**
+ * OpenSSH 9.x answers a failed `session_open` — the usual cause is `MaxSessions` —
+ * with reason 2 and the default description "open failed". The packet does not
+ * carry the configured limit. "administratively prohibited" is a different
+ * refusal and is left unchanged.
+ */
+const SESSION_TABLE_FULL = /channel open failure:\s*open failed/i
+
+export function channelLimitMessage(error: unknown): SshFailure | undefined {
+  if (!(error instanceof Error) || !SESSION_TABLE_FULL.test(error.message)) return undefined
+  return new SshFailure(
+    'this host refused another SSH session. File transfer and remote commands share this connection, so closing a sidebar terminal may not free a slot. Close one of those, or raise MaxSessions in the remote sshd_config.',
+    'pty',
+  )
+}
+
 function execPty(client: Client, request: PtyRequest): Promise<PtyChannel> {
   return new Promise((resolve, reject) => {
     client.exec(request.command, {
       pty: { term: request.term, cols: request.cols, rows: request.rows },
     }, (error, stream) => {
       if (error) {
-        reject(new SshFailure(error.message, 'pty'))
+        reject(channelLimitMessage(error) ?? new SshFailure(error.message, 'pty'))
         return
       }
       resolve(stream as unknown as PtyChannel)

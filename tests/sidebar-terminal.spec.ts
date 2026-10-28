@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { Context, symbols } from '@deepseek-ai/cordis'
@@ -16,7 +19,11 @@ import {
   type SidebarShell,
   type SidebarSpawnSpec,
 } from '../src/sidebar-terminal.ts'
-import type { PtyRequest } from '../src/ssh-pool.ts'
+import { channelLimitMessage, SshFailure, type PtyRequest } from '../src/ssh-pool.ts'
+
+// Opening a sidebar terminal creates the placeholder directory, so the tests
+// must not touch the operator's real ~/.dsh/remote tree.
+process.env.DSH_SSH_REMOTE_ROOT = mkdtempSync(join(tmpdir(), 'dsh-sidebar-terminal-'))
 
 function host(): HostConfig {
   return {
@@ -164,10 +171,42 @@ class Directories {
   }
 }
 
-function harness() {
-  const terminal = new Terminals()
-  const subprocess = new LocalSpawn()
-  const directories = new Directories()
+/** Same order as `TerminalController.spawn`: `ensure`, then `spawnTerminal`. */
+class EnsuringController extends Terminals {
+  readonly fallbacks: string[] = []
+
+  constructor(private readonly directories: Directories, private readonly subprocess: LocalSpawn) {
+    super()
+  }
+
+  async spawn(agent: { session?: { header?: { cwd?: string } } }, _owner: unknown, request: { cols?: number, rows?: number }, signal: AbortSignal): Promise<unknown> {
+    const current = this.directories.get(agent.session ?? {})
+    let cwd = current
+    if (!isDirectory(current)) {
+      this.fallbacks.push(current)
+      cwd = agent.session?.header?.cwd ?? current
+      this.directories.cwd = cwd
+    }
+    return this.subprocess.spawnTerminal(sidebarSpec(cwd, {
+      cols: typeof request.cols === 'number' ? request.cols : 80,
+      rows: typeof request.rows === 'number' ? request.rows : 24,
+      signal,
+    }))
+  }
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function harness(overrides: { terminal?: Terminals, directories?: Directories, subprocess?: LocalSpawn } = {}) {
+  const terminal = overrides.terminal ?? new Terminals()
+  const subprocess = overrides.subprocess ?? new LocalSpawn()
+  const directories = overrides.directories ?? new Directories()
   const warnings: string[] = []
   const pty: PtyRequest[] = []
   const gate: { error?: Error } = {}
@@ -479,16 +518,13 @@ test('a full write buffer resolves on drain, or when the connection dies', async
     return () => undefined
   })
   const writeError = handle.write('ls\n').then(() => undefined, (error: Error) => error)
-  let terminated = false
-  const terminating = handle.terminate().then(() => { terminated = true })
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(terminated, false)
+  // A dead transport releases the parked write even though no `drain` arrives.
   notify(new Error('connection closed'))
   const closed = await writeError
   assert.ok(closed)
   assert.match(closed.message, /terminal is closed/)
-  await terminating
-  assert.equal(terminated, true)
+  await handle.terminate()
 
   const full = new FullChannel()
   const immediate = new SshTerminalHandle(full, () => () => undefined)
@@ -653,4 +689,142 @@ test('apply installs the bridge when the terminal services appear', async () => 
   const shells = await terminal.shells({ session: {} }, signal)
   assert.equal(shells[0]!.path, '/bin/local-zsh')
   assert.equal(terminal.shellCalls.length, 1)
+})
+
+class PausableChannel extends FakeChannel {
+  paused = 0
+  resumed = 0
+  private drain: (() => void) | undefined
+
+  override write(data: string): boolean {
+    super.write(data)
+    // The first write always reports a full buffer, so the reader must pause.
+    return false
+  }
+
+  once(_event: 'drain', listener: () => void): void {
+    this.drain = listener
+  }
+
+  pause(): void {
+    this.paused += 1
+  }
+
+  resume(): void {
+    this.resumed += 1
+  }
+
+  releaseDrain(): void {
+    this.drain?.()
+  }
+}
+
+test('terminate closes the channel before waiting for blocked writes', async () => {
+  // A remote program that never reads stdin keeps the window full, so `write`
+  // parks on `drain` forever. `close()` is the only thing that can release it,
+  // and it must therefore run first; otherwise closing the tab hangs.
+  const channel = new BlockingChannel()
+  const handle = new SshTerminalHandle(channel, () => () => undefined)
+  const writing = handle.write('a large paste').then(() => 'resolved', (error: Error) => error)
+  await new Promise(resolve => setImmediate(resolve))
+  const terminating = handle.terminate()
+  const outcome = await Promise.race([
+    terminating.then(() => 'terminate resolved'),
+    new Promise(resolve => setTimeout(() => resolve('terminate still hanging'), 500)),
+  ])
+  assert.equal(outcome, 'terminate resolved')
+  assert.equal(channel.closed, 1)
+  const writeResult = await writing
+  assert.ok(writeResult instanceof Error)
+  assert.match(writeResult.message, /terminal is closed/)
+})
+
+test('a slow screen reader pauses the channel and resumes it on drain', async () => {
+  const channel = new PausableChannel()
+  const handle = new SshTerminalHandle(channel, () => () => undefined)
+  // Stop reading so the PassThrough buffer fills up.
+  handle.output.pause()
+  for (let i = 0; i < 400; i += 1) channel.emitData(Buffer.alloc(64 * 1024, 0x61))
+  assert.equal(channel.paused > 0, true, 'the channel must be paused once the buffer is full')
+  const pausedBefore = channel.paused
+  const resumedBefore = channel.resumed
+  const collected: Buffer[] = []
+  handle.output.on('data', chunk => collected.push(Buffer.from(chunk)))
+  handle.output.resume()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(channel.resumed > resumedBefore, true, 'draining the buffer must resume the channel')
+  assert.equal(channel.paused, pausedBefore)
+  channel.emitClose(0, null)
+  await handle.terminate()
+  assert.ok(Buffer.concat(collected).length > 0)
+})
+
+test('a closed handle stops pausing the channel', async () => {
+  const channel = new PausableChannel()
+  const handle = new SshTerminalHandle(channel, () => () => undefined)
+  handle.output.pause()
+  channel.emitData(Buffer.alloc(64 * 1024, 0x61))
+  channel.emitClose(0, null)
+  await handle.terminate()
+  const pausedAfter = channel.paused
+  channel.emitData(Buffer.alloc(64 * 1024, 0x62))
+  assert.equal(channel.paused, pausedAfter)
+})
+
+test('a full channel-open failure names the sshd session limit', () => {
+  // OpenSSH sends reason 2 and the default description "open failed" when
+  // session_open fails. The packet does not say what MaxSessions is set to.
+  const limited = channelLimitMessage(new Error('(SSH) Channel open failure: open failed'))
+  assert.ok(limited)
+  assert.equal(limited.message.includes('10'), false)
+  assert.match(limited.message, /File transfer and remote commands/)
+  assert.match(limited.message, /MaxSessions/)
+  assert.equal(limited.stage, 'pty')
+
+  assert.equal(channelLimitMessage(new Error('(SSH) Channel open failure: administratively prohibited')), undefined)
+  assert.equal(channelLimitMessage(new Error('All configured authentication methods failed')), undefined)
+  assert.equal(channelLimitMessage(new SshFailure('pty allocation aborted', 'pty')), undefined)
+  assert.equal(channelLimitMessage('not an error'), undefined)
+})
+
+test('sidebar spawn creates a missing placeholder before ensure falls back', async () => {
+  const root = remotePlaceholder('/remote/src')
+  mkdirSync(root, { recursive: true })
+  const nested = join(root, 'lib')
+  assert.equal(existsSync(nested), false)
+  const directories = new Directories()
+  directories.cwd = nested
+  const subprocess = new LocalSpawn()
+  const terminal = new EnsuringController(directories, subprocess)
+  const box = harness({ terminal, directories, subprocess })
+  assert.equal(Object.hasOwn(terminal, 'spawn'), true)
+
+  await terminal.spawn({ session: { header: { cwd: root } } }, {}, { cols: 80, rows: 24 }, signal)
+
+  assert.equal(isDirectory(nested), true)
+  assert.deepEqual(terminal.fallbacks, [])
+  assert.equal(box.pty.length, 1)
+  assert.equal(box.pty[0]!.command, sidebarCommand('/remote/src/lib', ['/bin/zsh', '-l', '-i']))
+  box.remove!()
+  assert.equal(Object.hasOwn(terminal, 'spawn'), false)
+})
+
+test('a placeholder that cannot be created still opens at the restored root', async () => {
+  const root = remotePlaceholder('/remote/src')
+  mkdirSync(root, { recursive: true })
+  const blocked = join(root, 'not-a-directory')
+  writeFileSync(blocked, 'x')
+  const nested = join(blocked, 'lib')
+  const directories = new Directories()
+  directories.cwd = nested
+  const subprocess = new LocalSpawn()
+  const terminal = new EnsuringController(directories, subprocess)
+  const box = harness({ terminal, directories, subprocess })
+
+  await terminal.spawn({ session: { header: { cwd: root } } }, {}, { cols: 80, rows: 24 }, signal)
+
+  assert.deepEqual(terminal.fallbacks, [nested])
+  assert.equal(existsSync(nested), false)
+  assert.equal(box.pty.length, 1)
+  assert.equal(box.pty[0]!.command, sidebarCommand('/remote/src', ['/bin/zsh', '-l', '-i']))
 })
