@@ -106,6 +106,12 @@ export interface RipgrepInstall {
   }
 }
 
+/** Forget a deleted host and unregister its workspaces. Remote files stay. */
+export async function purgeHost(ctx: ClientFace, hostId: string): Promise<{ workspaces: number }> {
+  const result = await callHost<{ workspaces?: number }>(ctx, 'purgeHost', { hostId })
+  return { workspaces: result.workspaces ?? 0 }
+}
+
 /** Download the ripgrep binary for this host's remote platform, then re-probe. */
 export async function installRipgrep(ctx: ClientFace, hostId: string): Promise<RipgrepInstall> {
   return callHost<RipgrepInstall>(ctx, 'installRipgrep', { hostId })

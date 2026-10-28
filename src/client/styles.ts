@@ -124,6 +124,47 @@ const CSS = `
   cursor: not-allowed;
   opacity: 0.5;
 }
+.dsh-ssh-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  padding-bottom: 6px;
+}
+.dsh-ssh-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 10px;
+  border-radius: var(--dsw-radius-md);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.dsh-ssh-tab:hover:not([data-active]) {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-ssh-tab[data-active] {
+  background: var(--dsw-alias-bg-l3);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+.dsh-ssh-tab[data-active] .dsh-ssh-count {
+  background: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-invert);
+}
+.dsh-ssh-danger {
+  color: var(--dsw-alias-state-warn-label);
+  border-color: var(--dsw-alias-state-warn-label);
+}
+.dsh-ssh-danger-note {
+  color: var(--dsw-alias-state-warn-label);
+}
 .dsh-ssh-header {
   display: flex;
   align-items: center;

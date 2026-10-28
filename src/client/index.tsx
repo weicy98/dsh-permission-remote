@@ -1,13 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, installRipgrep, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, createTarget, draftPortValid, mergeEditedHost, parentDir, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
 
 const NS = 'permission-remote'
+
+type TabId = 'hosts' | 'deleted' | 'settings' | 'help'
+
+/** The page mixes unrelated concerns; each tab owns one. */
+const TABS: ReadonlyArray<{ id: TabId, label: string }> = [
+  { id: 'hosts', label: 'tabHosts' },
+  { id: 'deleted', label: 'tabDeleted' },
+  { id: 'settings', label: 'tabSettings' },
+  { id: 'help', label: 'tabHelp' },
+]
 
 const MANUAL = [
   { title: 'Debian/Ubuntu', command: 'sudo apt-get update && sudo apt-get install -y bubblewrap' },
@@ -85,6 +95,10 @@ function Section(props: SectionProps): JSX.Element {
   const [tagTitles, setTagTitles] = useState(true)
   const [rgRegistry, setRgRegistry] = useState('')
   const [revision, setRevision] = useState(0)
+  /** Which tab is showing. The page holds four unrelated groups of controls. */
+  const [tab, setTab] = useState<TabId>('hosts')
+  /** Host awaiting the second click on Purge; guards a destructive action. */
+  const [purgeTarget, setPurgeTarget] = useState('')
 
   async function reload(): Promise<HostView[]> {
     const loaded = await readHosts(ctx)
@@ -425,6 +439,36 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  /**
+   * Switch tabs, dropping transient state that belongs to the tab being left:
+   * a half-filled dialog and the directory browser are both scoped to a host
+   * row that is only on screen in the hosts tab.
+   */
+  function switchTab(next: TabId): void {
+    setTab(next)
+    setPurgeTarget('')
+    if (next === 'hosts') return
+    setFormOpen(false)
+    setBrowsing('')
+    setEntries([])
+    setDir('/')
+    setListed(false)
+  }
+
+  async function purgeHost(hostId: string): Promise<void> {
+    setBusy(true)
+    try {
+      const result = await purgeHostRequest(ctx, hostId)
+      setPurgeTarget('')
+      await Promise.all([reload(), reloadWorkspaces()])
+      note(`${t('purgedHost')} ${result.workspaces}`)
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function restoreHost(hostId: string): Promise<void> {
     setBusy(true)
     try {
@@ -475,11 +519,32 @@ function Section(props: SectionProps): JSX.Element {
     <section className="dsh-ssh-page">
       <div className="dsh-ssh-header">
         <h2 className="dsh-ssh-title">{t('title')}</h2>
-        <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
+        {tab === 'hosts'
+          ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
+          : null}
       </div>
-      <p className="dsh-ssh-intro">{t('description')}</p>
+      <nav className="dsh-ssh-tabs" role="tablist">
+        {TABS.map(item => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            className="dsh-ssh-tab"
+            aria-selected={tab === item.id}
+            data-active={tab === item.id ? 'true' : undefined}
+            onClick={() => switchTab(item.id)}
+          >
+            {t(item.label)}
+            {item.id === 'hosts' && hosts.length > 0 ? <span className="dsh-ssh-count">{hosts.length}</span> : null}
+            {item.id === 'deleted' && orphans.size > 0 ? <span className="dsh-ssh-count">{orphans.size}</span> : null}
+          </button>
+        ))}
+      </nav>
       {message.length > 0 ? <p className="dsh-ssh-status" data-tone={tone === 'warn' ? 'warn' : undefined}>{message}</p> : null}
-      {hosts.length > 0 ? (
+      {tab === 'hosts' ? (
+        <>
+          <p className="dsh-ssh-intro">{t('description')}</p>
+          {hosts.length > 0 ? (
         <ul className="dsh-ssh-hosts">
           {hosts.map(host => {
             const owned = byHost.get(host.id) ?? []
@@ -570,7 +635,11 @@ function Section(props: SectionProps): JSX.Element {
           })}
         </ul>
       ) : null}
-      {hosts.length > 0 ? <p className="dsh-ssh-note">{t('workspacesNote')}</p> : null}
+          {hosts.length > 0 ? <p className="dsh-ssh-note">{t('workspacesNote')}</p> : null}
+        </>
+      ) : null}
+      {tab === 'settings' ? (
+        <>
       <label className="dsh-ssh-toggle">
         <input
           type="checkbox"
@@ -598,10 +667,12 @@ function Section(props: SectionProps): JSX.Element {
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRegistry()}>{t('save')}</button>
         <span className="dsh-ssh-note">{t('rgRegistryHint')}</span>
       </div>
-      {orphans.size > 0 ? (
+        </>
+      ) : null}
+      {tab === 'deleted' ? (
         <div className="dsh-ssh-deleted">
-          <h3 className="dsh-ssh-section-title">{t('deletedHosts')}</h3>
           <p className="dsh-ssh-note">{t('deletedHostsNote')}</p>
+          {orphans.size === 0 ? <p className="dsh-ssh-empty">{t('deletedEmpty')}</p> : null}
           <ul className="dsh-ssh-hosts">
             {[...orphans.entries()].map(([hostId, rows]) => {
               const tombstone = deleted.find(item => item.id === hostId)
@@ -622,6 +693,24 @@ function Section(props: SectionProps): JSX.Element {
                         title={tombstone === undefined ? t('restoreUnavailable') : undefined}
                         onClick={() => void restoreHost(hostId)}
                       >{t('restoreHost')}</button>
+                      {/* Destructive and unrecoverable, so it asks once more. */}
+                      {purgeTarget === hostId
+                        ? <>
+                            <span className="dsh-ssh-note dsh-ssh-danger-note">
+                              {t('purgeConfirm')} {rows.length}
+                              {rows.some(row => row.sessions > 0)
+                                ? ` · ${rows.reduce((sum, row) => sum + row.sessions, 0)} ${t('sessions')}`
+                                : ''}
+                            </span>
+                            <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setPurgeTarget('')}>{t('cancel')}</button>
+                            <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void purgeHost(hostId)}>{t('purgeConfirmAction')}</button>
+                          </>
+                        : <button
+                            type="button"
+                            className="dsh-ssh-button"
+                            disabled={busy}
+                            onClick={() => setPurgeTarget(hostId)}
+                          >{t('purgeHost')}</button>}
                     </div>
                   </div>
                   {rows.length > 0 ? (
@@ -635,7 +724,7 @@ function Section(props: SectionProps): JSX.Element {
           </ul>
         </div>
       ) : null}
-      {browsingHost !== undefined ? (
+      {tab === 'hosts' && browsingHost !== undefined ? (
         <div className="dsh-ssh-browser">
           <div className="dsh-ssh-browser-head">
             <div className="dsh-ssh-browser-heading">
@@ -713,8 +802,10 @@ function Section(props: SectionProps): JSX.Element {
           </div>
         </form>
       </dialog>
-      <h3 className="dsh-ssh-section-title">{t('manualTitle')}</h3>
-      <div className="dsh-ssh-manual">
+      {tab === 'help' ? (
+        <>
+          <h3 className="dsh-ssh-section-title">{t('manualTitle')}</h3>
+          <div className="dsh-ssh-manual">
         {MANUAL.map(item => (
           <div key={item.title} className="dsh-ssh-command">
             <div className="dsh-ssh-command-text">
@@ -724,9 +815,11 @@ function Section(props: SectionProps): JSX.Element {
             <button type="button" className="dsh-ssh-button" onClick={() => void navigator.clipboard.writeText(item.command)}>{t('copy')}</button>
           </div>
         ))}
-      </div>
-      <p className="dsh-ssh-note">{t('macosNote')}</p>
-      <p className="dsh-ssh-note">{t('ripgrepNote')}</p>
+        </div>
+          <p className="dsh-ssh-note">{t('macosNote')}</p>
+          <p className="dsh-ssh-note">{t('ripgrepNote')}</p>
+        </>
+      ) : null}
     </section>
   )
 }

@@ -162,6 +162,12 @@ class SshApi extends TypertRemoteService {
     return { ok: await this.core.removeWorkspace(input.hostId, input.workspaceId) }
   }
 
+  /** Forget a deleted host completely, unregistering its workspaces. */
+  async purgeHost(input: { hostId: string }): Promise<{ ok: true, workspaces: number }> {
+    const result = await this.core.purgeHost(input.hostId)
+    return { ok: true, workspaces: result.workspaces }
+  }
+
   async restoreHost(input: { hostId: string }): Promise<{ ok: true }> {
     await this.core.restoreHost(input.hostId)
     return { ok: true }
@@ -229,6 +235,37 @@ export class Core {
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     await this.persistHosts()
+  }
+
+  /**
+   * Drop the tombstone and unregister every workspace left under that host.
+   *
+   * The workspaces must go too: they resolve through a host id that would no
+   * longer exist anywhere, so they could never be opened or deleted again.
+   * Remote files are not touched.
+   */
+  async purgeHost(hostId: string): Promise<{ workspaces: number }> {
+    assertHostId(hostId)
+    if (this.config.hosts.some(item => item.id === hostId)) {
+      throw new Error(`SSH host ${hostId} is still configured; remove it from the list first`)
+    }
+    const tombstone = this.config.deletedHosts.some(item => item.host.id === hostId)
+    const owned = this.listWorkspaces().filter(item => item.hostId === hostId)
+    if (!tombstone && owned.length === 0) {
+      throw new Error(`SSH host ${hostId} is not in the deleted list`)
+    }
+    let removed = 0
+    for (const workspace of owned) {
+      if (await this.workspaces.delete(workspace.workspaceId)) removed += 1
+    }
+    if (tombstone) {
+      this.config.deletedHosts = this.config.deletedHosts.filter(item => item.host.id !== hostId)
+      await this.persistHosts()
+    }
+    this.pool.invalidate(hostId)
+    this.status.delete(hostId)
+    forgetOpsHost(hostId)
+    return { workspaces: removed }
   }
 
   /**
@@ -440,7 +477,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'saveRgRegistry', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'saveRgRegistry', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({

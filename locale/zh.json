@@ -77,5 +77,14 @@
   "installOk": "bubblewrap 已可用。",
   "installNoEffect": "命令报告成功，但远端沙箱仍不可用。",
   "installFailed": "安装失败。",
-  "installNoOutput": "（命令没有输出）"
+  "installNoOutput": "（命令没有输出）",
+  "tabHosts": "主机",
+  "tabDeleted": "已删除",
+  "tabSettings": "设置",
+  "tabHelp": "帮助",
+  "deletedEmpty": "没有已删除的主机。",
+  "purgeHost": "彻底删除",
+  "purgeConfirm": "将一并注销工作区：",
+  "purgeConfirmAction": "确认删除",
+  "purgedHost": "已彻底删除，注销工作区数："
 }

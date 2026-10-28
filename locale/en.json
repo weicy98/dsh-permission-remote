@@ -77,5 +77,14 @@
   "installOk": "bubblewrap is available.",
   "installNoEffect": "The command reported success, but the remote sandbox is still unavailable.",
   "installFailed": "Install failed.",
-  "installNoOutput": "(the command printed nothing)"
+  "installNoOutput": "(the command printed nothing)",
+  "tabHosts": "Hosts",
+  "tabDeleted": "Deleted",
+  "tabSettings": "Settings",
+  "tabHelp": "Help",
+  "deletedEmpty": "No deleted hosts.",
+  "purgeHost": "Delete permanently",
+  "purgeConfirm": "Workspaces to unregister:",
+  "purgeConfirmAction": "Delete permanently",
+  "purgedHost": "Deleted permanently; workspaces unregistered:"
 }

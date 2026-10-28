@@ -154,6 +154,35 @@ test('a deleted host can be restored and cannot be restored twice', async () => 
   await assert.rejects(() => core.restoreHost('host1'), /already configured/)
 })
 
+test('purging a deleted host drops it and unregisters its workspaces', async () => {
+  const registry = new FakeRegistry()
+  remoteWorkspace(registry, 'host1', '/srv/app', 'app')
+  remoteWorkspace(registry, 'host1', '/srv/lib', 'lib')
+  remoteWorkspace(registry, 'host2', '/srv/other', 'other')
+  const updates: Array<Record<string, unknown>> = []
+  const core = build(registry, updates, [host(), host({ id: 'host2', host: '10.0.0.2' })])
+  await core.deleteHost('host1')
+
+  const result = await core.purgeHost('host1')
+
+  assert.equal(result.workspaces, 2)
+  assert.deepEqual(core.listDeletedHosts(), [])
+  // Only the purged host's workspaces go; the configured host keeps its own.
+  assert.deepEqual(core.listWorkspaces().map(item => item.hostId), ['host2'])
+  assert.deepEqual(registry.rows.map(item => item.title), ['other'])
+  assert.deepEqual(updates.at(-1)?.deletedHosts, [])
+})
+
+test('purging refuses a host that is still configured', async () => {
+  const core = build(new FakeRegistry())
+  await assert.rejects(() => core.purgeHost('host1'), /still configured/)
+})
+
+test('purging an unknown host reports it is not in the deleted list', async () => {
+  const core = build(new FakeRegistry())
+  await assert.rejects(() => core.purgeHost('host9'), /not in the deleted list/)
+})
+
 test('a deleted host that still has workspaces stays restorable past the spare cap', async () => {
   const registry = new FakeRegistry()
   remoteWorkspace(registry, 'kept', '/srv/app', 'app')
