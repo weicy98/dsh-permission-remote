@@ -239,6 +239,11 @@ const CSS = `
   flex-direction: column;
   gap: 10px;
 }
+/* The row holding the open picker: a brand edge ties the card to its host, so
+   scrolling a long list cannot make it look attached to a neighbour. */
+.dsh-ssh-host[data-browsing="true"] {
+  border-color: var(--dsw-alias-brand-primary);
+}
 .dsh-ssh-host-head {
   display: flex;
   align-items: center;
@@ -510,14 +515,17 @@ const CSS = `
   max-height: 280px;
   overflow-y: auto;
 }
+/* The picker renders inside the host card, so it is a sunken section of that
+   card rather than a second card: a nested card border read as an unrelated
+   panel, and its own padding pushed the listing down. */
 .dsh-ssh-browser {
   display: flex;
   flex-direction: column;
   gap: 10px;
   border: 0.5px solid var(--dsw-alias-settings-card-stroke);
-  border-radius: var(--dsw-radius-xl);
-  background: var(--dsw-alias-settings-card-fill);
-  padding: 14px 16px;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-bg-layer-1);
+  padding: 12px;
 }
 .dsh-ssh-browser-head {
   display: flex;
@@ -532,12 +540,41 @@ const CSS = `
   gap: 8px;
   min-width: 0;
 }
+.dsh-ssh-browser-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .dsh-ssh-browser-host {
   color: var(--dsw-alias-label-tertiary);
   font-size: 12px;
   line-height: 18px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dsh-ssh-browser-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dsh-ssh-search {
+  /* The shared input rule is width: 100%, which in this flex row would push the
+     match count out of view; the filter row sizes the box instead. */
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+}
+/* The count only appears while filtering, so it must not shift the box width. */
+.dsh-ssh-filter-count {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 18px;
   white-space: nowrap;
 }
 .dsh-ssh-breadcrumb {
@@ -598,9 +635,21 @@ const CSS = `
 .dsh-ssh-dir:hover:not(:disabled) {
   background: var(--dsw-alias-interactive-bg-hover);
 }
+/* Keyboard highlight: an outline keeps it distinct from a hovered row, and it
+   still applies while a listing loads and the rows are :disabled. */
+.dsh-ssh-dir[data-active="true"] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  outline: 1px solid var(--dsw-alias-brand-primary);
+  outline-offset: -1px;
+}
 .dsh-ssh-dir:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+/* A loading listing still shows which row Enter would open, so the outline
+   must not be dimmed away with the rest of the disabled row. */
+.dsh-ssh-dir[data-active="true"]:disabled {
+  opacity: 1;
 }
 .dsh-ssh-dir-icon {
   flex: none;

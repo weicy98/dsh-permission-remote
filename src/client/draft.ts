@@ -81,6 +81,50 @@ export function createTarget(browsing: string, listed: boolean): string | null {
   return browsing.length > 0 && listed ? browsing : null
 }
 
+/**
+ * Name filter for the directory listing, applied as the user types. Matching is
+ * case-insensitive and trims the query; an empty query keeps the whole listing
+ * (the same array, so a cleared box costs no extra work).
+ *
+ * Only names are matched: every entry's `path` contains the current directory,
+ * so matching paths would make any substring of that directory match
+ * everything. Filtering stays local — a keystroke must not wait for the remote.
+ */
+export function filterEntries<T extends { name: string }>(entries: readonly T[], query: string): readonly T[] {
+  const needle = query.trim().toLowerCase()
+  if (needle.length === 0) return entries
+  return entries.filter(entry => entry.name.toLowerCase().includes(needle))
+}
+
+/**
+ * Keep a highlighted row valid after the list changed under it. The filter can
+ * shrink the listing while a row is highlighted, and an index past the end
+ * would silently drop the highlight; clamping to the last row keeps the
+ * keyboard user's place instead of losing it.
+ */
+export function clampActive(current: number, count: number): number {
+  if (count <= 0) return -1
+  if (current < 0) return -1
+  return Math.min(current, count - 1)
+}
+
+/**
+ * Move the highlighted row by `delta` (normally ±1).
+ *
+ * `-1` means "nothing highlighted": moving down from there starts at the first
+ * row and moving up starts at the last one, which is what a keyboard user
+ * expects from a list with no selection yet. The ends clamp rather than wrap —
+ * wrapping makes a long listing jump and hides that you reached the end.
+ */
+export function stepActive(current: number, delta: number, count: number): number {
+  if (count <= 0) return -1
+  if (current < 0) return delta > 0 ? 0 : count - 1
+  // Clamp here rather than through `clampActive`: -1 means "nothing
+  // highlighted" for that helper, so walking up off the first row would clear
+  // the highlight instead of staying on it.
+  return Math.min(Math.max(current + delta, 0), count - 1)
+}
+
 /** Parent of a remote POSIX directory; `/` for the root. */
 export function parentDir(dir: string): string {
   const trimmed = dir.replace(/\/+$/, '')

@@ -1,0 +1,80 @@
+      {tab === 'hosts' && browsingHost !== undefined ? (
+        <div className="dsh-ssh-browser">
+          <div className="dsh-ssh-browser-head">
+            <div className="dsh-ssh-browser-heading">
+              <span className="dsh-ssh-legend">{t('directory')}</span>
+              <span className="dsh-ssh-browser-host">{browsingHost.name || browsingHost.host}</span>
+            </div>
+            <div className="dsh-ssh-inline">
+              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(browsing, parentDir(dir))}>{t('up')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(browsing, dir)}>{t('refresh')}</button>
+              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
+            </div>
+          </div>
+          <div className="dsh-ssh-breadcrumb">
+            <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, '/')}>/</button>
+            {crumbs.map((name, index) => (
+              <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
+                <span className="dsh-ssh-crumb-sep">/</span>
+                <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
+              </span>
+            ))}
+          </div>
+          {/* Local filter over the entries already listed. It never disables
+              and never calls the remote, so typing stays responsive even while
+              a listing is in flight; it filters whatever entries are committed. */}
+          <div className="dsh-ssh-browser-filter">
+            <input
+              ref={searchRef}
+              className="dsh-ssh-input dsh-ssh-search"
+              type="search"
+              role="combobox"
+              aria-expanded="true"
+              aria-controls="dsh-ssh-dirs"
+              aria-autocomplete="list"
+              aria-activedescendant={highlighted >= 0 ? `dsh-ssh-dir-${highlighted}` : undefined}
+              value={filter}
+              aria-label={t('filter')}
+              placeholder={t('filterPlaceholder')}
+              autoComplete="off"
+              spellCheck={false}
+              onChange={event => {
+                setFilter(event.target.value)
+                // The old highlight belongs to the previous set of names.
+                setActive(-1)
+              }}
+              onKeyDown={onSearchKeyDown}
+            />
+            {filter.trim().length > 0 && entries.length > 0
+              ? <span className="dsh-ssh-filter-count">{visible.length} / {entries.length}</span>
+              : null}
+          </div>
+          {/* Focus stays in the input (the combobox), so the arrow key moves a
+              highlight and not the caret: the input's `aria-activedescendant`
+              is what announces the row, and `aria-selected` marks it in the list.
+              Rows stay real buttons, so Tab + Enter keeps working without this. */}
+          <ul id="dsh-ssh-dirs" className="dsh-ssh-dirs" role="listbox" aria-label={t('directory')}>
+            {visible.map((entry, index) => (
+              <li key={entry.path} role="none">
+                <button
+                  ref={node => { rowRefs.current[index] = node }}
+                  id={`dsh-ssh-dir-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === highlighted}
+                  className="dsh-ssh-dir"
+                  data-active={index === highlighted ? 'true' : undefined}
+                  disabled={busy}
+                  onClick={() => void browse(browsing, entry.path)}
+                  onMouseEnter={() => setActive(index)}
+                >
+                  <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
+                  <span className="dsh-ssh-dir-name">{entry.name}</span>
+                </button>
+              </li>
+            ))}
+            {entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
+            {entries.length > 0 && visible.length === 0 ? <li className="dsh-ssh-empty">{t('noMatch')}</li> : null}
+          </ul>
+        </div>
+      ) : null}

@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
-import { blankDraft, createTarget, draftPortValid, mergeEditedHost, parentDir, toDraft, type Draft } from './draft.ts'
+import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -87,6 +87,26 @@ function Section(props: SectionProps): JSX.Element {
   const [installLog, setInstallLog] = useState<{ hostId: string, text: string } | null>(null)
   const [dir, setDir] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
+  /**
+   * Typed filter for the listing, applied while typing. It narrows the names
+   * already on screen, so it is local state, not a remote query: each keystroke
+   * costs no round trip. A new listing resets it, because the next directory is
+   * a different set of names and a stale query would hide all of them.
+   */
+  const [filter, setFilter] = useState('')
+  /**
+   * Highlighted row of the listing, as an index into the filtered rows and not
+   * into `entries`: the filter can shrink the list while a row is highlighted,
+   * so `-1` means nothing is highlighted and the index is clamped at render.
+   * It is separate from DOM focus, because the arrow keys must keep focus in
+   * the filter box — otherwise a keypress would leave the field you are typing
+   * in just to move one row.
+   */
+  const [active, setActive] = useState(-1)
+  const searchRef = useRef<HTMLInputElement | null>(null)
+  const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
+  /** The open picker's card, scrolled into view when a host is opened. */
+  const panelRef = useRef<HTMLDivElement | null>(null)
   const [busy, setBusy] = useState(false)
   const [pendingTrust, setPendingTrust] = useState<{ hostId: string, fingerprint: string } | null>(null)
   const [workspaces, setWorkspaces] = useState<RemoteWorkspaceView[]>([])
@@ -380,12 +400,7 @@ function Section(props: SectionProps): JSX.Element {
     setBusy(true)
     try {
       await callHost(ctx, 'deleteHost', { hostId })
-      if (browsing === hostId) {
-        setBrowsing('')
-        setEntries([])
-        setDir('/')
-        setListed(false)
-      }
+      if (browsing === hostId) closeBrowser()
       if (status?.hostId === hostId) setStatus(null)
       if (pendingTrust?.hostId === hostId) setPendingTrust(null)
       if (installLog?.hostId === hostId) setInstallLog(null)
@@ -407,6 +422,13 @@ function Section(props: SectionProps): JSX.Element {
       setDir(listed.path)
       setEntries(listed.entries)
       setListed(true)
+      // A refresh keeps a query on the same directory useful; walking to another
+      // directory — or to another host at the same path — does not, since none of
+      // those names are on screen under the query any more.
+      if (listed.path !== dir || hostId !== browsing) {
+        setFilter('')
+        setActive(-1)
+      }
     } catch (error) {
       fail(error)
     } finally {
@@ -414,11 +436,24 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  /** Close the picker without touching the host or the remote. */
+  function closeBrowser(): void {
+    setBrowsing('')
+    setEntries([])
+    setDir('/')
+    setListed(false)
+    setFilter('')
+    setActive(-1)
+  }
+
   async function createWorkspace(hostId: string, path: string): Promise<void> {
     setBusy(true)
     try {
       const created = await callHost<{ path: string, title?: string }>(ctx, 'createWorkspace', { hostId, path })
       note(`${t('workspaceCreated')} ${created.title ?? created.path}`)
+      // The picker's job is done once its directory is a workspace; leaving it
+      // open hid the new row and made the click look like it failed.
+      closeBrowser()
       await reloadWorkspaces()
     } catch (error) {
       fail(error)
@@ -462,10 +497,7 @@ function Section(props: SectionProps): JSX.Element {
     setPurgeTarget('')
     if (next === 'hosts') return
     setFormOpen(false)
-    setBrowsing('')
-    setEntries([])
-    setDir('/')
-    setListed(false)
+    closeBrowser()
   }
 
   async function purgeHost(hostId: string): Promise<void> {
@@ -495,9 +527,107 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  const browsingHost = hosts.find(item => item.id === browsing)
+  /**
+   * Keyboard navigation for the listing, handled on the filter box only.
+   *
+   * Scoping it to the input matters: the same panel holds Up, Refresh, and
+   * "use this directory", and a panel-wide Enter would hijack those buttons and
+   * enter a directory instead of pressing them. Rows are real buttons, so Tab
+   * plus Enter already works there without help.
+   */
+  function onSearchKeyDown(event: ReactKeyboardEvent<HTMLInputElement>): void {
+    const count = visible.length
+    if (event.key === 'Escape') {
+      // `type=search` clears itself in some browsers but not others, so do it
+      // explicitly; only when there is nothing to clear does Esc give up focus.
+      if (filter.length > 0) {
+        event.preventDefault()
+        setFilter('')
+        setActive(-1)
+        return
+      }
+      event.preventDefault()
+      searchRef.current?.blur()
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      if (count === 0) return
+      // The caret cannot move vertically in a single-line input, so the arrow is
+      // free to mean "next row" here, which is what a search box in a picker does.
+      event.preventDefault()
+      setActive(current => stepActive(clampActive(current, count), event.key === 'ArrowDown' ? 1 : -1, count))
+      return
+    }
+    if (event.key === 'Enter') {
+      if (highlighted < 0 || busy) return
+      event.preventDefault()
+      const entry = visible[highlighted]
+      if (entry !== undefined) void browse(browsing, entry.path)
+      return
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      if (count === 0) return
+      event.preventDefault()
+      setActive(event.key === 'Home' ? 0 : count - 1)
+    }
+  }
+
   const target = createTarget(browsing, listed)
   const crumbs = dir.split('/').filter(Boolean)
+  // The listing is filtered locally as the box is typed; `filter` never reaches
+  // the remote, so every keystroke is instant even on a slow link.
+  const visible = filterEntries(entries, filter)
+  // Derived, not stored: the filter can shrink `visible` between keystrokes, and
+  // deriving keeps the highlight on a real row without another effect.
+  const highlighted = clampActive(active, visible.length)
+
+  /**
+   * `/` focuses the filter box, the convention every file picker uses. It is a
+   * plain key, so it must stay inert inside any text field or contenteditable
+   * and must not fight the browser/OS shortcuts that come with a modifier.
+   */
+  useEffect(() => {
+    function onKeyDown(event: globalThis.KeyboardEvent): void {
+      // Bare `/` is reserved by the shell for its command menu, so this only
+      // claims the key on the settings page — the command menu is not there —
+      // and never with a modifier or after another handler took the event.
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return
+      // Only the picker's own box is a target: closing it leaves the empty panel
+      // out of the DOM, so the ref check doubles as "is the picker open".
+      if (tab !== 'hosts' || searchRef.current === null) return
+      const target = event.target
+      if (target instanceof HTMLElement) {
+        const tag = target.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return
+      }
+      // Take the key only when the picker is on screen, and prevent the default
+      // so the browser's quick-find does not also open.
+      event.preventDefault()
+      searchRef.current.focus()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [tab, browsing])
+
+  // Keep the highlighted row visible when it moves past the list's scroll box.
+  useEffect(() => {
+    if (highlighted < 0) return
+    rowRefs.current[highlighted]?.scrollIntoView({ block: 'nearest' })
+  }, [highlighted])
+
+  /**
+   * The picker opens inside the host row that was clicked, which may be far
+   * below the fold on a long list; without this the click still looks inert.
+   * Keyed on the host, not on the directory, so walking into a subdirectory
+   * does not re-scroll the page under the user.
+   */
+  useEffect(() => {
+    if (browsing.length === 0) return
+    // The card opens under a button that may be near the top edge, so scroll it
+    // into view instead of trusting the browser to reveal a collapsed insert.
+    panelRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [browsing])
+
   const byHost = new Map<string, RemoteWorkspaceView[]>()
   for (const workspace of workspaces) {
     const rows = byHost.get(workspace.hostId)
@@ -527,6 +657,108 @@ function Section(props: SectionProps): JSX.Element {
       </div>
     </li>
   )
+
+  /**
+   * The directory picker, rendered inside the host row it belongs to.
+   *
+   * It used to sit after the whole host list, so opening it on the first host
+   * pushed the panel past every other row and off-screen — the click appeared
+   * to do nothing. Anchoring it to the row keeps it next to the button that
+   * opened it, and matches how the trust and probe panels already behave.
+   */
+  /**
+   * The directory picker, rendered inside the host row it belongs to.
+   *
+   * It used to sit after the whole host list, so opening it on the first host
+   * pushed the panel below every other row and off-screen — the click looked
+   * like it did nothing. Anchoring it to the row keeps it under the button that
+   * opened it, matching how the trust and probe panels already behave.
+   */
+  function renderBrowser(host: HostView): JSX.Element {
+    return (
+      <div className="dsh-ssh-browser" ref={panelRef}>
+        <div className="dsh-ssh-browser-head">
+          <div className="dsh-ssh-browser-heading">
+            <span className="dsh-ssh-legend">{t('directory')}</span>
+            <span className="dsh-ssh-browser-host">{host.name || host.host}</span>
+          </div>
+          <div className="dsh-ssh-browser-tools">
+            <div className="dsh-ssh-inline">
+              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(host.id, parentDir(dir))}>{t('up')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, dir)}>{t('refresh')}</button>
+              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
+            </div>
+            <button type="button" className="dsh-ssh-close" aria-label={t('closeBrowser')} title={t('closeBrowser')} disabled={busy} onClick={closeBrowser}>×</button>
+          </div>
+        </div>
+        <div className="dsh-ssh-breadcrumb">
+          <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(host.id, '/')}>/</button>
+          {crumbs.map((name, index) => (
+            <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
+              <span className="dsh-ssh-crumb-sep">/</span>
+              <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(host.id, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
+            </span>
+          ))}
+        </div>
+        {/* Local filter over the entries already listed. It never disables and
+            never calls the remote, so typing stays responsive while a listing
+            is in flight; it filters whatever entries are committed. */}
+        <div className="dsh-ssh-browser-filter">
+          <input
+            ref={searchRef}
+            className="dsh-ssh-input dsh-ssh-search"
+            type="search"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="dsh-ssh-dirs"
+            aria-autocomplete="list"
+            aria-activedescendant={highlighted >= 0 ? `dsh-ssh-dir-${highlighted}` : undefined}
+            value={filter}
+            aria-label={t('filter')}
+            placeholder={t('filterPlaceholder')}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={event => {
+              setFilter(event.target.value)
+              // The old highlight belongs to the previous set of names.
+              setActive(-1)
+            }}
+            onKeyDown={onSearchKeyDown}
+          />
+          {filter.trim().length > 0 && entries.length > 0
+            ? <span className="dsh-ssh-filter-count">{visible.length} / {entries.length}</span>
+            : null}
+        </div>
+        {/* Focus stays in the input (the combobox), so an arrow key moves a
+            highlight and not the caret: the input's `aria-activedescendant` is
+            what announces the row, and `aria-selected` marks it in the list.
+            Rows stay real buttons, so Tab + Enter keeps working without this. */}
+        <ul id="dsh-ssh-dirs" className="dsh-ssh-dirs" role="listbox" aria-label={t('directory')}>
+          {visible.map((entry, index) => (
+            <li key={entry.path} role="none">
+              <button
+                ref={node => { rowRefs.current[index] = node }}
+                id={`dsh-ssh-dir-${index}`}
+                type="button"
+                role="option"
+                aria-selected={index === highlighted}
+                className="dsh-ssh-dir"
+                data-active={index === highlighted ? 'true' : undefined}
+                disabled={busy}
+                onClick={() => void browse(host.id, entry.path)}
+                onMouseEnter={() => setActive(index)}
+              >
+                <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
+                <span className="dsh-ssh-dir-name">{entry.name}</span>
+              </button>
+            </li>
+          ))}
+          {entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
+          {entries.length > 0 && visible.length === 0 ? <li className="dsh-ssh-empty">{t('noMatch')}</li> : null}
+        </ul>
+      </div>
+    )
+  }
 
   return (
     <section className="dsh-ssh-page">
@@ -563,7 +795,7 @@ function Section(props: SectionProps): JSX.Element {
             const owned = byHost.get(host.id) ?? []
             const expanded = openWorkspaces[host.id] ?? true
             return (
-              <li key={host.id} className="dsh-ssh-host" data-editing={draft.id === host.id ? 'true' : undefined}>
+              <li key={host.id} className="dsh-ssh-host" data-editing={draft.id === host.id ? 'true' : undefined} data-browsing={browsing === host.id ? 'true' : undefined}>
                 <div className="dsh-ssh-host-head">
                   <div className="dsh-ssh-host-identity">
                     <div className="dsh-ssh-host-name">{host.name || host.host}</div>
@@ -583,10 +815,25 @@ function Section(props: SectionProps): JSX.Element {
                     </select>
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => beginEdit(host)}>{t('edit')}</button>
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void test(host)}>{t('test')}</button>
-                    <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, '/')}>{t('browse')}</button>
+                    <button
+                      type="button"
+                      className="dsh-ssh-button"
+                      aria-expanded={browsing === host.id}
+                      disabled={busy}
+                      onClick={() => {
+                        // Toggle: a second click closes. Another host always
+                        // starts at root, so a path that only existed on the
+                        // previous machine is never requested.
+                        if (browsing === host.id) closeBrowser()
+                        else void browse(host.id, '/')
+                      }}
+                    >{t('browse')}</button>
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
                   </div>
                 </div>
+                {/* The picker belongs to this row too: at page level it landed
+                    below the whole list and off-screen for the first host. */}
+                {browsing === host.id ? renderBrowser(host) : null}
                 {/* Trust and probe output belong to the row they describe: the
                     add/edit form sits between the list and the page bottom, so a
                     panel down there was off-screen while operating a host. */}
@@ -736,41 +983,6 @@ function Section(props: SectionProps): JSX.Element {
                 </li>
               )
             })}
-          </ul>
-        </div>
-      ) : null}
-      {tab === 'hosts' && browsingHost !== undefined ? (
-        <div className="dsh-ssh-browser">
-          <div className="dsh-ssh-browser-head">
-            <div className="dsh-ssh-browser-heading">
-              <span className="dsh-ssh-legend">{t('directory')}</span>
-              <span className="dsh-ssh-browser-host">{browsingHost.name || browsingHost.host}</span>
-            </div>
-            <div className="dsh-ssh-inline">
-              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(browsing, parentDir(dir))}>{t('up')}</button>
-              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(browsing, dir)}>{t('refresh')}</button>
-              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
-            </div>
-          </div>
-          <div className="dsh-ssh-breadcrumb">
-            <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, '/')}>/</button>
-            {crumbs.map((name, index) => (
-              <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
-                <span className="dsh-ssh-crumb-sep">/</span>
-                <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
-              </span>
-            ))}
-          </div>
-          <ul className="dsh-ssh-dirs">
-            {entries.map(entry => (
-              <li key={entry.path}>
-                <button type="button" className="dsh-ssh-dir" disabled={busy} onClick={() => void browse(browsing, entry.path)}>
-                  <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
-                  <span className="dsh-ssh-dir-name">{entry.name}</span>
-                </button>
-              </li>
-            ))}
-            {entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
           </ul>
         </div>
       ) : null}

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostView } from '../src/client/api.ts'
-import { blankDraft, createTarget, draftPort, draftPortValid, mergeEditedHost, parentDir, toDraft } from '../src/client/draft.ts'
+import { blankDraft, clampActive, createTarget, draftPort, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft } from '../src/client/draft.ts'
 
 function host(overrides: Partial<HostView> = {}): HostView {
   return {
@@ -78,4 +78,44 @@ test('parentDir stops at the root', () => {
   assert.equal(parentDir('/srv/app'), '/srv')
   assert.equal(parentDir('/srv'), '/')
   assert.equal(parentDir('/'), '/')
+})
+
+test('the directory filter matches names, ignoring case and surrounding space', () => {
+  const entries = [{ name: 'src' }, { name: 'node_modules' }, { name: 'SourceMaps' }]
+  assert.deepEqual(filterEntries(entries, 'SO').map(entry => entry.name), ['SourceMaps'])
+  assert.deepEqual(filterEntries(entries, '  SOURCE ').map(entry => entry.name), ['SourceMaps'])
+  // A cleared box must not filter anything out.
+  assert.equal(filterEntries(entries, ''), entries)
+  assert.equal(filterEntries(entries, '   '), entries)
+  // No match is a real result; the list renders its own empty message for it.
+  assert.deepEqual(filterEntries(entries, 'zzz'), [])
+})
+
+test('the directory filter never matches on the encoded path', () => {
+  // Every entry's path begins with the current directory, so matching paths
+  // would make any query that is a substring of that directory match all rows.
+  const entries = [{ name: 'src', path: '/home/me/code/src' }, { name: 'lib', path: '/home/me/code/lib' }]
+  assert.deepEqual(filterEntries(entries, 'code'), [])
+})
+
+test('arrow keys start at an end and clamp instead of wrapping', () => {
+  // -1 is "nothing highlighted": down starts at the first row, up at the last.
+  assert.equal(stepActive(-1, 1, 3), 0)
+  assert.equal(stepActive(-1, -1, 3), 2)
+  assert.equal(stepActive(0, 1, 3), 1)
+  assert.equal(stepActive(2, 1, 3), 2)
+  assert.equal(stepActive(0, -1, 3), 0)
+})
+
+test('an empty listing has no highlighted row', () => {
+  assert.equal(stepActive(-1, 1, 0), -1)
+  assert.equal(stepActive(2, -1, 0), -1)
+  assert.equal(clampActive(4, 0), -1)
+})
+
+test('a highlighted row is clamped when the filter shrinks the list', () => {
+  // Index 4 was valid before a keystroke narrowed the listing to two rows.
+  assert.equal(clampActive(4, 2), 1)
+  assert.equal(clampActive(1, 2), 1)
+  assert.equal(clampActive(-1, 2), -1)
 })
