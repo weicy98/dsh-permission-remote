@@ -51,6 +51,12 @@ export const Config = Schema.object({
    * written into the workspace title. Off keeps the titles untouched.
    */
   tagWorkspaceTitles: Schema.boolean().default(true).volatile(),
+  /**
+   * npm registry used when fetching a ripgrep binary for a remote platform this
+   * machine does not have installed. Empty means the default npmjs registry.
+   * A mirror is usually needed where npmjs.org is slow or blocked.
+   */
+  rgRegistry: Schema.string().default('').volatile(),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -96,6 +102,7 @@ export interface PluginConfig {
   deletedHosts: DeletedHost[]
   readonly maxConnections: number
   readonly tagWorkspaceTitles: boolean
+  readonly rgRegistry: string
 }
 
 type HostRef = Volatile<unknown>
@@ -144,22 +151,26 @@ export function readConfig(raw: unknown): PluginConfig {
   const deletedRef = refOf(record.deletedHosts)
   const tagRef = refOf(record.tagWorkspaceTitles)
   const tagDefault = record.tagWorkspaceTitles !== false
+  const registryRef = refOf(record.rgRegistry)
+  const registryDefault = typeof record.rgRegistry === 'string' ? record.rgRegistry : ''
   const parsed = Config({
     ...record,
     hosts: copyHostRows(hostRef !== undefined ? hostRef.get() : record.hosts),
     deletedHosts: copyDeletedRows(deletedRef !== undefined ? deletedRef.get() : record.deletedHosts),
     // A volatile reference cannot be validated; resolve it to a value first.
     tagWorkspaceTitles: tagRef !== undefined ? tagRef.get() !== false : tagDefault,
+    rgRegistry: registryRef !== undefined ? String(registryRef.get() ?? '') : registryDefault,
   }) as unknown as { hosts?: unknown, deletedHosts?: unknown, maxConnections?: number }
   const maxConnections = parsed.maxConnections ?? 4
   const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
+  const registry = (): string => String(registryRef === undefined ? registryDefault : registryRef.get() ?? '').trim()
   const ref = hostRef ?? parsed.hosts
   // `Config()` returns volatile wrappers for volatile fields even when the
   // input was a plain array, so prefer the parsed reference when present.
   const deletedRowRef = deletedRef ?? refOf(parsed.deletedHosts)
   const deletedRows = copyDeletedRows(deletedRowRef !== undefined ? deletedRowRef.get() : record.deletedHosts) ?? []
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, deletedRowRef, deletedRows)
-  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault }
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, deletedRowRef, deletedRows)
+  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry() }
 }
 
 function refOf(value: unknown): HostRef | undefined {
@@ -170,6 +181,7 @@ function viewConfig(
   ref: HostRef,
   maxConnections: number,
   tagWorkspaceTitles: () => boolean,
+  rgRegistry: () => string,
   deletedRef: HostRef | undefined,
   deletedRows: DeletedHost[],
 ): PluginConfig {
@@ -194,6 +206,9 @@ function viewConfig(
     maxConnections,
     get tagWorkspaceTitles() {
       return tagWorkspaceTitles()
+    },
+    get rgRegistry() {
+      return rgRegistry()
     },
   }
 }

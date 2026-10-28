@@ -67,5 +67,11 @@
   "opsTrust": "Trust",
   "opsDeny": "Deny",
   "opsNote": "Ask: in an ordinary workspace, reading remote files needs no prompt, while commands and writes need a one-shot danger-full-access approval. Trust: commands and writes run without a prompt. Deny: this host accepts no remote ops at all.",
-  "policySaved": "Remote ops policy saved."
+  "policySaved": "Remote ops policy saved.",
+  "installRipgrep": "Install ripgrep",
+  "rgRegistry": "ripgrep download source",
+  "rgRegistryHint": "Used only by Install ripgrep. Leave empty for npmjs; set a mirror where it is slow.",
+  "registrySaved": "Download source saved.",
+  "rgInstalled": "ripgrep ready:",
+  "rgStillMissing": "Downloaded, but the remote still reports it missing"
 }

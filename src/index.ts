@@ -6,10 +6,13 @@ import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { fetchRgBinary, rgPlatformOf } from './rg-fetch.ts'
 import { Config, connectionKeyChanged, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
 import {
   buildResolveMode,
   installBubblewrap,
+  cacheRgBinary,
+  remoteFacts,
   probeHost,
   runBash,
   runEdit,
@@ -104,6 +107,21 @@ class SshApi extends TypertRemoteService {
     this.core.forgetStatus(input.hostId)
     const next = await this.core.probe(input.hostId)
     return { code: result.code, stdout: result.stdout, stderr: result.stderr, status: next }
+  }
+
+  /**
+   * Fetch a ripgrep binary for the remote platform and cache it here, so the
+   * upload path works on a machine whose package manager only installed its own
+   * platform package. Explicit: nothing downloads until this is called.
+   */
+  async installRipgrep(input: { hostId: string }): Promise<{ ok: true, platform: string, version: string, path: string, status: RunnerStatus }> {
+    const result = await this.core.installRipgrep(input.hostId)
+    return { ok: true, ...result }
+  }
+
+  async saveRgRegistry(input: { rgRegistry: string }): Promise<{ ok: true, rgRegistry: string }> {
+    const value = this.core.saveRgRegistry(input.rgRegistry)
+    return { ok: true, rgRegistry: value }
   }
 
   async listDir(input: { hostId: string, path: string }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
@@ -343,6 +361,31 @@ export class Core {
     })
   }
 
+  /** Fetch and cache the ripgrep binary for this host's remote platform. */
+  async installRipgrep(hostId: string): Promise<{ platform: string, version: string, path: string, status: RunnerStatus }> {
+    const host = this.requireHost(hostId)
+    const facts = await remoteFacts(this.pool, host, await this.secret(host))
+    const platform = rgPlatformOf(facts.os, facts.arch)
+    if (platform === null) {
+      throw new Error(`no ripgrep build for ${facts.os}/${facts.arch}; install ripgrep on the remote so rg is on PATH`)
+    }
+    const fetched = await fetchRgBinary({ registry: this.config.rgRegistry, platform })
+    const cached = await cacheRgBinary(platform, fetched.binary)
+    // The cached copy only matters if the probe looks again.
+    this.forgetStatus(hostId)
+    const next = await this.probe(hostId, true)
+    return { platform, version: fetched.version, path: cached, status: next }
+  }
+
+  /** Store the registry used for downloads; empty restores the default. */
+  saveRgRegistry(value: string): string {
+    const next = value.trim()
+    const patch: Record<string, unknown> = { rgRegistry: next }
+    this.config = { ...this.config, rgRegistry: next } as PluginConfig
+    void this.ctx.settings.update('permission-remote', patch).catch(() => undefined)
+    return next
+  }
+
   probe(hostId: string, refresh = false): Promise<RunnerStatus> {
     if (refresh) this.status.delete(hostId)
     const cached = this.status.get(hostId)
@@ -392,7 +435,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'saveRgRegistry', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({

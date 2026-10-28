@@ -96,6 +96,34 @@ const CSS = `
   justify-content: flex-end;
   gap: 8px;
 }
+.dsh-ssh-registry {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.dsh-ssh-registry > .dsh-ssh-field {
+  flex: 1 1 240px;
+}
+.dsh-ssh-registry > .dsh-ssh-note {
+  flex-basis: 100%;
+}
+/* Inline action inside a meta line: reads as a link, not a card button. */
+.dsh-ssh-link {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin-left: 8px;
+  color: var(--dsw-alias-brand-primary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.dsh-ssh-link:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
 .dsh-ssh-header {
   display: flex;
   align-items: center;

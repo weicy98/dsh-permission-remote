@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, readHosts, readWorkspaces, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, installRipgrep, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, createTarget, draftPortValid, mergeEditedHost, parentDir, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
@@ -83,12 +83,14 @@ function Section(props: SectionProps): JSX.Element {
   const [deleted, setDeleted] = useState<DeletedHostView[]>([])
   const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
   const [tagTitles, setTagTitles] = useState(true)
+  const [rgRegistry, setRgRegistry] = useState('')
   const [revision, setRevision] = useState(0)
 
   async function reload(): Promise<HostView[]> {
     const loaded = await readHosts(ctx)
     setHosts(loaded.hosts)
     setTagTitles(loaded.tagWorkspaceTitles)
+    setRgRegistry(loaded.rgRegistry)
     setRevision(loaded.revision)
     return loaded.hosts
   }
@@ -255,6 +257,46 @@ function Section(props: SectionProps): JSX.Element {
       setStatus({ hostId: host.id, banner: '', runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
     } catch (error) {
       fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Save the npm registry; empty restores npmjs. */
+  async function saveRegistry(): Promise<void> {
+    setBusy(true)
+    try {
+      await writeRgRegistry(ctx, rgRegistry.trim(), revision)
+      const saved = await readHosts(ctx)
+      setRgRegistry(saved.rgRegistry)
+      setRevision(saved.revision)
+      note(t('registrySaved'))
+    } catch (error) {
+      await reload().catch(() => undefined)
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Download the ripgrep binary for this host's remote platform. Explicit: the
+   * plugin never reaches the network on its own.
+   */
+  async function installRg(hostId: string): Promise<void> {
+    setBusy(true)
+    setInstallLog(null)
+    try {
+      const result = await installRipgrep(ctx, hostId)
+      setStatus({ hostId, banner: '', runner: await callHost<RunnerView>(ctx, 'probe', { hostId, refresh: false }) })
+      setInstallLog({
+        hostId,
+        text: result.status.ripgrep === 'missing'
+          ? `${t('rgStillMissing')} (${result.platform} ${result.version})`
+          : `${t('rgInstalled')} ${result.platform} ${result.version} -> ${result.status.ripgrepPath}`,
+      })
+    } catch (error) {
+      setInstallLog({ hostId, text: error instanceof Error ? error.message : String(error) })
     } finally {
       setBusy(false)
     }
@@ -469,7 +511,14 @@ function Section(props: SectionProps): JSX.Element {
                         ? <div className="dsh-ssh-host-meta dsh-ssh-banner" title={status.banner}>{status.banner}</div>
                         : null}
                       <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
-                      <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.runner.ripgrep}</div>
+                      <div className="dsh-ssh-host-meta">
+                        {t('ripgrep')}: {status.runner.ripgrep}
+                        {/* Missing on a remote this machine has no build for: fetch
+                            the matching binary on request instead of failing silently. */}
+                        {status.runner.ripgrep === 'missing'
+                          ? <button type="button" className="dsh-ssh-link" disabled={busy} onClick={() => void installRg(host.id)}>{t('installRipgrep')}</button>
+                          : null}
+                      </div>
                     </div>
                     {status.runner.os === 'linux' && !status.runner.sandbox.available
                       ? <button type="button" className="dsh-ssh-button" disabled={busy || status.runner.install === null} onClick={() => void install(host.id)}>{t('install')}</button>
@@ -517,6 +566,23 @@ function Section(props: SectionProps): JSX.Element {
         <span>{t('tagTitles')}</span>
         <span className="dsh-ssh-note">{t('tagTitlesHint')}</span>
       </label>
+      {/* Only used by the explicit ripgrep install; empty means npmjs. */}
+      <div className="dsh-ssh-registry">
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-registry">
+          <span className="dsh-ssh-label">{t('rgRegistry')}</span>
+          <input
+            id="dsh-ssh-registry"
+            className="dsh-ssh-input"
+            type="text"
+            value={rgRegistry}
+            placeholder="https://registry.npmjs.org"
+            disabled={busy}
+            onChange={event => setRgRegistry(event.target.value)}
+          />
+        </label>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRegistry()}>{t('save')}</button>
+        <span className="dsh-ssh-note">{t('rgRegistryHint')}</span>
+      </div>
       {orphans.size > 0 ? (
         <div className="dsh-ssh-deleted">
           <h3 className="dsh-ssh-section-title">{t('deletedHosts')}</h3>

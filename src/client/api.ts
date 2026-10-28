@@ -54,7 +54,7 @@ export interface RpcResult<T> {
 
 export interface SettingsNamespace {
   ns: string
-  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean }
+  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean, rgRegistry?: string }
   revision: number
 }
 
@@ -71,6 +71,7 @@ const NS = 'permission-remote'
 export interface HostSettings {
   hosts: HostView[]
   tagWorkspaceTitles: boolean
+  rgRegistry: string
   revision: number
 }
 
@@ -82,11 +83,32 @@ export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   const hosts = Array.isArray(row?.value?.hosts) ? row.value.hosts : []
   // Older host builds have no such field; tagging is their default.
   const tagWorkspaceTitles = row?.value?.tagWorkspaceTitles !== false
-  return { hosts, tagWorkspaceTitles, revision: row?.revision ?? 0 }
+  const rgRegistry = typeof row?.value?.rgRegistry === 'string' ? row.value.rgRegistry : ''
+  return { hosts, tagWorkspaceTitles, rgRegistry, revision: row?.revision ?? 0 }
 }
 
 export async function writeTagWorkspaceTitles(ctx: ClientFace, enabled: boolean, revision: number): Promise<void> {
   await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['tagWorkspaceTitles'], value: enabled }], revision)
+}
+
+/** Store the npm registry used to fetch a ripgrep binary; empty restores npmjs. */
+export async function writeRgRegistry(ctx: ClientFace, registry: string, revision: number): Promise<void> {
+  await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['rgRegistry'], value: registry }], revision)
+}
+
+export interface RipgrepInstall {
+  platform: string
+  version: string
+  path: string
+  status: {
+    ripgrep: 'uploaded' | 'system' | 'missing'
+    ripgrepPath: string
+  }
+}
+
+/** Download the ripgrep binary for this host's remote platform, then re-probe. */
+export async function installRipgrep(ctx: ClientFace, hostId: string): Promise<RipgrepInstall> {
+  return callHost<RipgrepInstall>(ctx, 'installRipgrep', { hostId })
 }
 
 /**

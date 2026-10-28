@@ -67,5 +67,11 @@
   "opsTrust": "信任",
   "opsDeny": "禁止",
   "opsNote": "询问：普通工作区读取远端文件不弹卡，执行命令和写文件需要一次 danger-full-access 审批。信任：命令和写入不再弹卡。禁止：这台主机不执行任何远程运维操作。",
-  "policySaved": "远程运维策略已保存。"
+  "policySaved": "远程运维策略已保存。",
+  "installRipgrep": "安装 ripgrep",
+  "rgRegistry": "ripgrep 下载源",
+  "rgRegistryHint": "仅在使用「安装 ripgrep」时访问。留空用 npmjs，国内可填镜像地址。",
+  "registrySaved": "下载源已保存。",
+  "rgInstalled": "ripgrep 已就绪：",
+  "rgStillMissing": "下载完成但远端仍不可用"
 }

@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { chmodSync, existsSync, readFileSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { posix } from 'node:path'
+import { join, posix } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import {
   SandboxUnavailableError,
@@ -34,11 +36,13 @@ import {
   outputBlock,
   parseHostFacts,
   probeOutcome,
+  type HostFacts,
   ripgrepPackage,
   systemRipgrepCommand,
   systemRipgrepPath,
   type ProbeOutcome,
 } from './probe.ts'
+import { rgPlatformOf } from './rg-fetch.ts'
 import { mapRemoteToLocal, resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
@@ -93,6 +97,12 @@ export interface ToolHost {
 const denialMarker = sandboxDenialMarker
 const hintMarker = escalationHintMarker
 
+/** Remote kernel and machine type, without the rest of a full probe. */
+export async function remoteFacts(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<HostFacts> {
+  const uname = await pool.exec(host, secret, hostFactsCommand(), 20_000)
+  return parseHostFacts(uname.stdout)
+}
+
 export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RunnerStatus> {
   const uname = await pool.exec(host, secret, hostFactsCommand(), 20_000)
   const facts = parseHostFacts(uname.stdout)
@@ -122,7 +132,8 @@ export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretM
     ripgrepPath = systemPath
   } else if (rgRemote.length > 0) {
     const pkg = ripgrepPackage(os, arch)
-    const local = pkg === null ? null : resolveRgBinary(pkg)
+    const platform = rgPlatformOf(os, arch)
+    const local = pkg === null || platform === null ? null : resolveRgBinary(pkg, rgCachePath(platform))
     if (local !== null) {
       await pool.sftpUpload(host, secret, local, rgRemote)
       const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
@@ -147,12 +158,34 @@ export async function installBubblewrap(pool: SshPool, host: HostConfig, secret:
   return pool.exec(host, secret, status.install.auto, 180_000)
 }
 
-function resolveRgBinary(pkg: string): string | null {
+/**
+ * A ripgrep binary for the remote platform.
+ *
+ * A package manager only installs the platform package matching this host, so a
+ * Windows machine managing a Linux remote resolves nothing. The install button
+ * caches the downloaded binary instead; that copy is used when resolution fails.
+ */
+function resolveRgBinary(pkg: string, cachePath: string): string | null {
   try {
     return require.resolve(`${pkg}/bin/rg`)
   } catch {
-    return null
+    return existsSync(cachePath) ? cachePath : null
   }
+}
+
+/** Where a downloaded binary for one remote platform is cached. */
+export function rgCachePath(platform: string, env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.DSH_HOME ? String(env.DSH_HOME) : join(homedir(), '.dsh')
+  return join(home, 'remote', 'ripgrep', platform, 'rg')
+}
+
+/** Store a fetched binary and make it executable; returns the cached path. */
+export async function cacheRgBinary(platform: string, binary: Buffer, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const target = rgCachePath(platform, env)
+  await mkdir(join(target, '..'), { recursive: true })
+  await writeFile(target, binary)
+  chmodSync(target, 0o755)
+  return target
 }
 
 export async function effectiveMode(host: ToolHost, exec: ToolExec, args: { sandbox_permissions?: string, justification?: string }, toolName: string, subject: string): Promise<SandboxMode> {
