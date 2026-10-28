@@ -4,6 +4,7 @@ import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
+import { shellProbeCommand, type SidebarShell } from '../src/sidebar-terminal.ts'
 import type { WorkspaceLike } from '../src/workspaces.ts'
 
 function host(overrides: Partial<HostConfig> = {}): HostConfig {
@@ -297,6 +298,68 @@ test('installing ripgrep for an unsupported platform fails without touching the 
   try {
     await assert.rejects(() => core.installRipgrep('host1'), /no ripgrep build for/)
     assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('shell discovery is dropped when the host is forgotten, renamed, or deleted', async () => {
+  const registry = new FakeRegistry()
+  const core = build(registry)
+  const shells: SidebarShell[] = [{ path: '/bin/zsh', name: 'dev · zsh', args: ['-l', '-i'] }]
+  core.primeShells('host1', shells)
+  core.forgetProbe('host1')
+  assert.equal(core.hasShells('host1'), true)
+
+  core.forgetStatus('host1')
+  assert.equal(core.hasShells('host1'), false)
+
+  core.primeShells('host1', shells)
+  await core.saveHost({ ...host(), name: 'renamed' })
+  assert.equal(core.hasShells('host1'), false)
+
+  core.primeShells('host1', [{ path: '/bin/zsh', name: 'renamed · zsh', args: ['-l', '-i'] }])
+  await core.deleteHost('host1')
+  assert.equal(core.hasShells('host1'), false)
+})
+
+test('saving a secret drops the sidebar shell list', async () => {
+  const core = build(new FakeRegistry())
+  core.primeShells('host1', [{ path: '/bin/zsh', name: 'dev · zsh', args: ['-l', '-i'] }])
+  await core.saveSecret('host1', { password: 'next' })
+  assert.equal(core.hasShells('host1'), false)
+})
+
+test('a shell probe is cached until it fails or the list is empty', async () => {
+  const core = build(new FakeRegistry())
+  const commands: string[] = []
+  let attempt = 0
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async (_host: unknown, _secret: unknown, command: string) => {
+    commands.push(command)
+    attempt += 1
+    if (attempt === 1) throw new Error('channel refused')
+    if (attempt === 2) return { code: 0, stdout: 'hello\nHAVE bash\n', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false }
+    return { code: 0, stdout: 'noise\nSHELL /bin/zsh\nHAVE /bin/zsh\nHAVE /bin/bash\n', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false }
+  }
+  try {
+    await assert.rejects(() => core.loadShells('host1', ['zsh', 'bash', 'pwsh']), /channel refused/)
+    assert.equal(core.hasShells('host1'), false)
+    await assert.rejects(() => core.loadShells('host1', ['zsh']), /no interactive shell found on dev/)
+    assert.equal(core.hasShells('host1'), false)
+    const first = core.loadShells('host1', ['zsh', 'bash', 'pwsh'])
+    const second = core.loadShells('host1', ['zsh'])
+    assert.equal(first, second)
+    const shells = await first
+    assert.equal(commands.length, 3)
+    assert.equal(commands[2], shellProbeCommand(['zsh', 'bash', 'pwsh']))
+    assert.equal(shells[0]!.path, '/bin/zsh')
+    assert.equal(shells[0]!.name, 'dev · zsh')
+    assert.deepEqual(shells[0]!.args, ['-l', '-i'])
+    assert.equal(shells[1]!.path, '/bin/bash')
+    assert.equal(shells[1]!.name, 'dev · bash')
+    assert.equal(core.hasShells('host1'), true)
   } finally {
     fakePool.exec = original
   }

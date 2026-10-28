@@ -694,7 +694,10 @@ export function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T
   return new Promise((resolve, reject) => {
     const fail = () => reject(abortError())
     signal.addEventListener('abort', fail, { once: true })
-    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', fail))
+    // `.finally` would forward every rejection into a second promise nobody
+    // observes; dsh exits on an unhandled rejection. Detach on both outcomes.
+    const detach = () => signal.removeEventListener('abort', fail)
+    work.then(resolve, reject).then(detach, detach)
   })
 }
 

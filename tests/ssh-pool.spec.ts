@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { StringDecoder } from 'node:string_decoder'
 import test from 'node:test'
-import { SshPool, exitFields, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
+import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
+import { SshPool, SSH_KEEPALIVE_INTERVAL_MS, exitFields, sshConnectOptions, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
 
 test('channel text keeps a character split across SSH chunks', () => {
   const decoder = new StringDecoder('utf8')
@@ -39,6 +40,43 @@ test('a stopped command reports the kill signal', () => {
 test('normalized exit fields survive a JSON round trip', () => {
   assert.deepEqual(JSON.parse(JSON.stringify(exitFields('exit', 0))), exitFields('exit', 0))
   assert.deepEqual(JSON.parse(JSON.stringify(exitFields('exit'))), exitFields('exit'))
+})
+
+test('connect sends SSH keepalives on the shared connection', async () => {
+  const host = {
+    id: 'host1',
+    name: 'dev',
+    host: '10.0.0.5',
+    port: 22,
+    username: 'me',
+    auth: 'key' as const,
+    privateKeyPath: '',
+    fingerprint: 'SHA256:abc',
+    opsPolicy: 'ask' as const,
+  }
+  assert.equal(sshConnectOptions(host).keepaliveInterval, SSH_KEEPALIVE_INTERVAL_MS)
+  assert.equal(sshConnectOptions(host).readyTimeout, 20_000)
+  const seen: ConnectConfig[] = []
+  const original = Client.prototype.connect
+  Client.prototype.connect = function (this: Client, options: ConnectConfig) {
+    seen.push(options)
+    this.emit('error', new Error('stopped before the network'))
+    return this
+  } as typeof Client.prototype.connect
+  try {
+    const pool = new SshPool(1)
+    await assert.rejects(() => pool.exec(host, {}, 'true', 1000), /stopped before the network/)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0]!.keepaliveInterval, 15_000)
+    assert.equal(seen[0]!.host, '10.0.0.5')
+    assert.equal(seen[0]!.port, 22)
+    assert.equal(seen[0]!.username, 'me')
+    assert.equal(seen[0]!.readyTimeout, 20_000)
+    assert.equal(seen[0]!.hostHash, 'sha256')
+    assert.equal(typeof seen[0]!.hostVerifier, 'function')
+  } finally {
+    Client.prototype.connect = original
+  }
 })
 
 test('a saved host drops its cached session before the next connection', () => {

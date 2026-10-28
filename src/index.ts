@@ -30,6 +30,7 @@ import { sniffImage } from './image.ts'
 import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
 import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
 import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
+import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import {
   createdWorkspaceTitle,
@@ -190,6 +191,7 @@ export class Core {
   readonly pool: SshPool
   private config: PluginConfig
   private readonly status = new Map<string, Promise<RunnerStatus>>()
+  private readonly shellLists = new Map<string, Promise<SidebarShell[]>>()
 
   constructor(
     private readonly ctx: HostContext,
@@ -321,13 +323,47 @@ export class Core {
 
   /**
    * Drop everything derived from a connection that no longer applies: the
-   * cached probe, the pooled session, and the cached remote home. Connecting is
-   * interrupted, so an agent command running on that session is killed.
+   * cached probe, the pooled session, the cached remote home, and the sidebar
+   * shell list. Connecting is interrupted, so an agent command running on that
+   * session is killed.
    */
   forgetStatus(hostId: string): void {
     this.status.delete(hostId)
     this.pool.invalidate(hostId)
     forgetOpsHost(hostId)
+    this.forgetShells(hostId)
+  }
+
+  /** Drop the sidebar shell menu for one host. The label includes the server name. */
+  forgetShells(hostId: string): void {
+    this.shellLists.delete(hostId)
+  }
+
+  /** Seed the sidebar shell list without dialing. Diagnostics and tests only. */
+  primeShells(hostId: string, shells: SidebarShell[]): void {
+    this.shellLists.set(hostId, Promise.resolve(shells))
+  }
+
+  /** Whether a sidebar shell list is cached. Diagnostics and tests only. */
+  hasShells(hostId: string): boolean {
+    return this.shellLists.has(hostId)
+  }
+
+  loadShells(hostId: string, candidates: readonly string[]): Promise<SidebarShell[]> {
+    const cached = this.shellLists.get(hostId)
+    if (cached !== undefined) return cached
+    const pending = (async () => {
+      const host = this.requireHost(hostId)
+      const result = await this.pool.exec(host, await this.secret(host), shellProbeCommand(candidates), 20_000)
+      const shells = parseShellProbe(result.stdout, hostTag(host))
+      if (shells.length === 0) throw new Error(`no interactive shell found on ${hostTag(host)}`)
+      return shells
+    })()
+    this.shellLists.set(hostId, pending)
+    pending.catch(() => {
+      if (this.shellLists.get(hostId) === pending) this.shellLists.delete(hostId)
+    })
+    return pending
   }
 
   /**
@@ -367,6 +403,8 @@ export class Core {
     // A cached session keyed by id would keep talking to the previous machine.
     if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
     else forgetOpsHost(host.id)
+    // A rename keeps the connection. The shell menu still caches `host · zsh`.
+    this.forgetShells(normalized.id)
     await this.persistHosts()
     // The sidebar prefix follows the server name, or the address when unnamed.
     if (previous === undefined) return
@@ -399,6 +437,7 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    this.forgetShells(hostId)
     await this.persistHosts()
   }
 
@@ -529,6 +568,15 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     for (const unregister of unregisters) unregister()
     unregisters.clear()
     void core.pool.dispose()
+  })
+  rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
+    const remove = installSidebarBridge(bridged, core)
+    if (remove === undefined) return
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
+    })
   })
   void api
 
