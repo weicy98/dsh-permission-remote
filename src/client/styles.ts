@@ -154,10 +154,6 @@ const CSS = `
   color: var(--dsw-alias-label-primary);
   font-weight: 500;
 }
-.dsh-ssh-tab[data-active] .dsh-ssh-count {
-  background: var(--dsw-alias-brand-primary);
-  color: var(--dsw-alias-label-invert);
-}
 .dsh-ssh-danger {
   color: var(--dsw-alias-state-warn-label);
   border-color: var(--dsw-alias-state-warn-label);
@@ -165,11 +161,13 @@ const CSS = `
 .dsh-ssh-danger-note {
   color: var(--dsw-alias-state-warn-label);
 }
+/* Title and its action read as one group on the left rather than the button
+   floating at the far edge of a wide settings page. */
 .dsh-ssh-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  justify-content: flex-start;
+  gap: 10px;
 }
 /* The add/edit form is a modal so it never sits between the host list and the
    page bottom. The backdrop pseudo-element dims the list without unmounting it. */
