@@ -96,10 +96,11 @@ const CSS = `
   justify-content: flex-end;
   gap: 8px;
 }
-.dsh-ssh-toolbar {
+.dsh-ssh-header {
   display: flex;
-  justify-content: flex-end;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 /* The add/edit form is a modal so it never sits between the host list and the
    page bottom. The backdrop pseudo-element dims the list without unmounting it. */
@@ -170,6 +171,12 @@ const CSS = `
 }
 .dsh-ssh-host-identity {
   min-width: 0;
+}
+.dsh-ssh-banner {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 42ch;
 }
 .dsh-ssh-status-row {
   flex-direction: row;

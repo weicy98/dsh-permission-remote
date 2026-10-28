@@ -71,7 +71,9 @@ function Section(props: SectionProps): JSX.Element {
   const [listed, setListed] = useState(false)
   // Each panel is tagged with its host and rendered inside that host's row, so
   // probing one host never shows another host's probe or fingerprint offer.
-  const [status, setStatus] = useState<{ hostId: string, runner: RunnerView } | null>(null)
+  // `banner` is the greeting the remote printed; it belongs beside the probe
+  // result it arrived with, not in the page-level message.
+  const [status, setStatus] = useState<{ hostId: string, runner: RunnerView, banner: string } | null>(null)
   const [installLog, setInstallLog] = useState<{ hostId: string, text: string } | null>(null)
   const [dir, setDir] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
@@ -220,13 +222,20 @@ function Section(props: SectionProps): JSX.Element {
     try {
       const offered = await callHost<{ fingerprint: string, trusted: boolean, banner: string }>(ctx, 'testConnection', { hostId: host.id })
       if (!offered.trusted) {
+        // The row shows the offer and the fingerprint; the page message would
+        // repeat both. A stale probe from the previous host must go too.
         setPendingTrust({ hostId: host.id, fingerprint: offered.fingerprint })
-        setTone('warn')
-        setMessage(`${t('untrusted')} ${offered.fingerprint}`)
+        setMessage('')
         return
       }
-      note(offered.banner.length > 0 ? `${t('connected')} ${offered.banner}` : t('connected'))
-      setStatus({ hostId: host.id, runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
+      // One result block: the row's own status panel. Writing the same outcome
+      // to the page message showed it twice.
+      setMessage('')
+      setStatus({
+        hostId: host.id,
+        banner: offered.banner,
+        runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }),
+      })
     } catch (error) {
       fail(error)
     } finally {
@@ -243,7 +252,7 @@ function Section(props: SectionProps): JSX.Element {
       setPendingTrust(null)
       await reload()
       note(t('trusted'))
-      setStatus({ hostId: host.id, runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
+      setStatus({ hostId: host.id, banner: '', runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
     } catch (error) {
       fail(error)
     } finally {
@@ -256,7 +265,7 @@ function Section(props: SectionProps): JSX.Element {
     setInstallLog(null)
     try {
       const result = await callHost<{ code: number | null, stdout: string, stderr: string, status: RunnerView }>(ctx, 'installDeps', { hostId })
-      setStatus({ hostId, runner: result.status })
+      setStatus({ hostId, banner: '', runner: result.status })
       setInstallLog({ hostId, text: [result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}` })
     } catch (error) {
       setInstallLog({ hostId, text: error instanceof Error ? error.message : String(error) })
@@ -407,12 +416,12 @@ function Section(props: SectionProps): JSX.Element {
 
   return (
     <section className="dsh-ssh-page">
-      <h2 className="dsh-ssh-title">{t('title')}</h2>
-      <p className="dsh-ssh-intro">{t('description')}</p>
-      {message.length > 0 ? <p className="dsh-ssh-status" data-tone={tone === 'warn' ? 'warn' : undefined}>{message}</p> : null}
-      <div className="dsh-ssh-toolbar">
+      <div className="dsh-ssh-header">
+        <h2 className="dsh-ssh-title">{t('title')}</h2>
         <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
       </div>
+      <p className="dsh-ssh-intro">{t('description')}</p>
+      {message.length > 0 ? <p className="dsh-ssh-status" data-tone={tone === 'warn' ? 'warn' : undefined}>{message}</p> : null}
       {hosts.length > 0 ? (
         <ul className="dsh-ssh-hosts">
           {hosts.map(host => {
@@ -456,6 +465,9 @@ function Section(props: SectionProps): JSX.Element {
                 {status !== null && status.hostId === host.id ? (
                   <div className="dsh-ssh-status-row">
                     <div>
+                      {status.banner.length > 0
+                        ? <div className="dsh-ssh-host-meta dsh-ssh-banner" title={status.banner}>{status.banner}</div>
+                        : null}
                       <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
                       <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.runner.ripgrep}</div>
                     </div>
