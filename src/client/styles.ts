@@ -126,6 +126,26 @@ const CSS = `
   flex-wrap: wrap;
   gap: 8px 12px;
 }
+/* Sits directly under the host row it belongs to, so the offer stays visible
+   while the operator works on that host instead of at the page bottom. */
+.dsh-ssh-trust {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-radius: var(--dsw-radius-lg);
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  background: var(--dsw-alias-bg-l2);
+}
+.dsh-ssh-fingerprint {
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  font-size: 12px;
+  word-break: break-all;
+  padding: 2px 6px;
+  border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-bg-l3);
+}
 .dsh-ssh-workspaces {
   display: flex;
   flex-direction: column;

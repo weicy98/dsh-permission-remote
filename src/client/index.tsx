@@ -63,14 +63,13 @@ function Section(props: SectionProps): JSX.Element {
   const [secret, setSecret] = useState('')
   const [message, setMessage] = useState('')
   const [tone, setTone] = useState<'ok' | 'warn'>('ok')
-  // `focused` owns the status/trust panel; `browsing` owns the directory panel.
-  const [focused, setFocused] = useState('')
+  // `browsing` owns the directory panel; status and trust render inside their host row.
   const [browsing, setBrowsing] = useState('')
   const [listed, setListed] = useState(false)
-  // Both are tagged with their host: showing one host's probe (or offering to
-  // trust its fingerprint) while another host is focused would mislabel them.
+  // Each panel is tagged with its host and rendered inside that host's row, so
+  // probing one host never shows another host's probe or fingerprint offer.
   const [status, setStatus] = useState<{ hostId: string, runner: RunnerView } | null>(null)
-  const [installLog, setInstallLog] = useState('')
+  const [installLog, setInstallLog] = useState<{ hostId: string, text: string } | null>(null)
   const [dir, setDir] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
   const [busy, setBusy] = useState(false)
@@ -193,11 +192,10 @@ function Section(props: SectionProps): JSX.Element {
   async function test(host: HostView): Promise<void> {
     setBusy(true)
     setMessage('')
-    setFocused(host.id)
     // Nothing from the previous host may stay on screen while this one is probed.
     setStatus(null)
     setPendingTrust(null)
-    setInstallLog('')
+    setInstallLog(null)
     try {
       const offered = await callHost<{ fingerprint: string, trusted: boolean, banner: string }>(ctx, 'testConnection', { hostId: host.id })
       if (!offered.trusted) {
@@ -234,13 +232,13 @@ function Section(props: SectionProps): JSX.Element {
 
   async function install(hostId: string): Promise<void> {
     setBusy(true)
-    setInstallLog('')
+    setInstallLog(null)
     try {
       const result = await callHost<{ code: number | null, stdout: string, stderr: string, status: RunnerView }>(ctx, 'installDeps', { hostId })
       setStatus({ hostId, runner: result.status })
-      setInstallLog([result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}`)
+      setInstallLog({ hostId, text: [result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}` })
     } catch (error) {
-      setInstallLog(error instanceof Error ? error.message : String(error))
+      setInstallLog({ hostId, text: error instanceof Error ? error.message : String(error) })
     } finally {
       setBusy(false)
     }
@@ -274,12 +272,9 @@ function Section(props: SectionProps): JSX.Element {
         setDir('/')
         setListed(false)
       }
-      if (focused === hostId) {
-        setFocused('')
-        setInstallLog('')
-      }
       if (status?.hostId === hostId) setStatus(null)
       if (pendingTrust?.hostId === hostId) setPendingTrust(null)
+      if (installLog?.hostId === hostId) setInstallLog(null)
       if (draft.id === hostId) cancelEdit()
       await Promise.all([reload(), reloadWorkspaces()])
     } catch (error) {
@@ -356,7 +351,6 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  const focusedHost = hosts.find(item => item.id === focused)
   const browsingHost = hosts.find(item => item.id === browsing)
   const target = createTarget(browsing, listed)
   const crumbs = dir.split('/').filter(Boolean)
@@ -425,6 +419,30 @@ function Section(props: SectionProps): JSX.Element {
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
                   </div>
                 </div>
+                {/* Trust and probe output belong to the row they describe: the
+                    add/edit form sits between the list and the page bottom, so a
+                    panel down there was off-screen while operating a host. */}
+                {pendingTrust !== null && pendingTrust.hostId === host.id
+                  ? <div className="dsh-ssh-trust">
+                      <span className="dsh-ssh-note">{t('untrusted')}</span>
+                      <code className="dsh-ssh-fingerprint">{pendingTrust.fingerprint}</code>
+                      <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void trust(host)}>{t('trust')}</button>
+                    </div>
+                  : null}
+                {status !== null && status.hostId === host.id ? (
+                  <div className="dsh-ssh-status-row">
+                    <div>
+                      <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
+                      <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.runner.ripgrep}</div>
+                    </div>
+                    {status.runner.os === 'linux' && !status.runner.sandbox.available
+                      ? <button type="button" className="dsh-ssh-button" disabled={busy || status.runner.install === null} onClick={() => void install(host.id)}>{t('install')}</button>
+                      : null}
+                  </div>
+                ) : null}
+                {installLog !== null && installLog.hostId === host.id
+                  ? <pre className="dsh-ssh-log">{installLog.text}</pre>
+                  : null}
                 <div className="dsh-ssh-workspaces">
                   <div className="dsh-ssh-workspaces-head">
                     <button
@@ -571,21 +589,6 @@ function Section(props: SectionProps): JSX.Element {
           <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0 || !draftPortValid(draft)}>{t('save')}</button>
         </div>
       </form>
-      {pendingTrust !== null && focusedHost !== undefined && pendingTrust.hostId === focusedHost.id
-        ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void trust(focusedHost)}>{t('trust')} {pendingTrust.fingerprint}</button>
-        : null}
-      {status !== null && focusedHost !== undefined && status.hostId === focusedHost.id ? (
-        <div className="dsh-ssh-host dsh-ssh-status-row">
-          <div>
-            <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
-            <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.runner.ripgrep}</div>
-          </div>
-          {status.runner.os === 'linux' && !status.runner.sandbox.available
-            ? <button type="button" className="dsh-ssh-button" disabled={busy || status.runner.install === null} onClick={() => void install(focusedHost.id)}>{t('install')}</button>
-            : null}
-        </div>
-      ) : null}
-      {installLog.length > 0 ? <pre className="dsh-ssh-log">{installLog}</pre> : null}
       <h3 className="dsh-ssh-section-title">{t('manualTitle')}</h3>
       <div className="dsh-ssh-manual">
         {MANUAL.map(item => (
