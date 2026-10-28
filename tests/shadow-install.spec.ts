@@ -81,19 +81,24 @@ test('ending the agent effect lets the same agent install again', async () => {
 test('ops tools publish object JSON Schemas and reject missing arguments', async () => {
   const ctx = plugin()
   apply(ctx, { hosts: [], maxConnections: 4 })
-  const tools: Array<{ name: string, parameters: { type?: string, properties?: object, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const tools: Array<{ name: string, parameters: { type?: string, properties?: Record<string, { enum?: string[] }>, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
   const { agent } = agentFor('/tmp/not-a-remote-workspace', () => () => undefined)
-  agent.ctx.tools.register = ((definition: { name: string, parameters: { type?: string, properties?: object, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
+  agent.ctx.tools.register = ((definition: { name: string, parameters: { type?: string, properties?: Record<string, { enum?: string[] }>, required?: string[] }, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
     tools.push(definition)
     return () => undefined
   }) as typeof agent.ctx.tools.register
   await created(ctx, agent)
   const exec = tools.find(tool => tool.name === 'ssh_exec')
+  const write = tools.find(tool => tool.name === 'ssh_write')
   const hosts = tools.find(tool => tool.name === 'ssh_hosts')
   assert.equal(exec?.parameters.type, 'object')
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
   assert.deepEqual(hosts?.parameters.properties, {})
+  // Only danger-full-access opens the ops approval card; narrower modes would
+  // send the model into a retry that can never succeed.
+  assert.deepEqual(exec?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
+  assert.deepEqual(write?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
 })
 

@@ -228,6 +228,29 @@ const CSS = `
 .dsh-ssh-workspaces-empty {
   padding: 2px 2px 4px;
 }
+.dsh-ssh-toggle {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+.dsh-ssh-toggle input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+.dsh-ssh-toggle .dsh-ssh-note {
+  flex-basis: 100%;
+  padding-left: 22px;
+}
+.dsh-ssh-deleted {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .dsh-ssh-host-name {
   min-width: 0;
   font-size: 14px;

@@ -20,6 +20,16 @@ export interface RunnerView {
   install: { id: string, title: string, auto: string, manual: string } | null
 }
 
+/** A host the operator removed; its workspaces are still registered. */
+export interface DeletedHostView {
+  id: string
+  name: string
+  address: string
+  username: string
+  port: number
+  deletedAt: string
+}
+
 /** One registered workspace that lives on an SSH host. */
 export interface RemoteWorkspaceView {
   hostId: string
@@ -31,6 +41,11 @@ export interface RemoteWorkspaceView {
   createdAt: string
 }
 
+export interface WorkspaceListing {
+  items: RemoteWorkspaceView[]
+  deleted: DeletedHostView[]
+}
+
 export interface RpcResult<T> {
   ok: boolean
   value?: T
@@ -39,7 +54,7 @@ export interface RpcResult<T> {
 
 export interface SettingsNamespace {
   ns: string
-  value: { hosts?: HostView[], maxConnections?: number }
+  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean }
   revision: number
 }
 
@@ -53,17 +68,25 @@ export interface ClientFace {
 
 const NS = 'permission-remote'
 
-export async function readHosts(ctx: ClientFace): Promise<{ hosts: HostView[], revision: number }> {
+export interface HostSettings {
+  hosts: HostView[]
+  tagWorkspaceTitles: boolean
+  revision: number
+}
+
+export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   const response = await ctx.remote.settings.describe()
   const described = response.value ?? response
   const namespaces = described.namespaces ?? []
   const row = namespaces.find(item => item.ns === NS)
   const hosts = Array.isArray(row?.value?.hosts) ? row.value.hosts : []
-  return { hosts, revision: row?.revision ?? 0 }
+  // Older host builds have no such field; tagging is their default.
+  const tagWorkspaceTitles = row?.value?.tagWorkspaceTitles !== false
+  return { hosts, tagWorkspaceTitles, revision: row?.revision ?? 0 }
 }
 
-export async function writeHosts(ctx: ClientFace, hosts: HostView[], revision: number): Promise<void> {
-  await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['hosts'], value: hosts }], revision)
+export async function writeTagWorkspaceTitles(ctx: ClientFace, enabled: boolean, revision: number): Promise<void> {
+  await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['tagWorkspaceTitles'], value: enabled }], revision)
 }
 
 /**
@@ -78,7 +101,10 @@ export async function callHost<T>(ctx: ClientFace, method: string, input?: unkno
   return result.value as T
 }
 
-export async function readWorkspaces(ctx: ClientFace): Promise<RemoteWorkspaceView[]> {
-  const listed = await callHost<{ items?: RemoteWorkspaceView[] }>(ctx, 'listWorkspaces')
-  return Array.isArray(listed.items) ? listed.items : []
+export async function readWorkspaces(ctx: ClientFace): Promise<WorkspaceListing> {
+  const listed = await callHost<{ items?: RemoteWorkspaceView[], deleted?: DeletedHostView[] }>(ctx, 'listWorkspaces')
+  return {
+    items: Array.isArray(listed.items) ? listed.items : [],
+    deleted: Array.isArray(listed.deleted) ? listed.deleted : [],
+  }
 }

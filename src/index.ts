@@ -29,12 +29,12 @@ import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
 import { dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import {
+  createdWorkspaceTitle,
   hostTag,
   remoteWorkspaces,
   tagRemoteWorkspaces,
-  tagWorkspace,
-  taggedTitle,
   textOrUndefined,
+  type DeletedHostView,
   type RemoteWorkspaceView,
   type WorkspaceRegistryLike,
 } from './workspaces.ts'
@@ -119,23 +119,28 @@ class SshApi extends TypertRemoteService {
     const local = mapRemoteToLocal(input.hostId, input.path)
     if (local === null) throw new Error('remote path must be absolute')
     await mkdir(local, { recursive: true })
-    const title = taggedTitle(host, input.title?.trim() || basename(input.path))
+    const requested = input.title?.trim() || basename(input.path)
+    const title = createdWorkspaceTitle(host, requested, this.core.taggingEnabled)
     const workspace = await this.core.workspaces.create(local, title)
-    const tagged = await tagWorkspace(host, workspace)
-    return { path: local, title: tagged }
+    // `create` keeps an existing record's title; only a new row carries ours.
+    return { path: local, title: workspace.title }
   }
 
-  async listWorkspaces(): Promise<{ items: RemoteWorkspaceView[] }> {
-    return { items: this.core.listWorkspaces() }
+  async listWorkspaces(): Promise<{ items: RemoteWorkspaceView[], deleted: DeletedHostView[] }> {
+    return { items: this.core.listWorkspaces(), deleted: this.core.listDeletedHosts() }
   }
 
-  async tagWorkspaces(input: { hostId?: string, workspaceId?: string }): Promise<{ items: RemoteWorkspaceView[] }> {
-    await this.core.tagWorkspaces(textOrUndefined(input.hostId), textOrUndefined(input.workspaceId))
-    return this.listWorkspaces()
+  async tagWorkspaces(input: { hostId?: string, workspaceId?: string }): Promise<{ items: RemoteWorkspaceView[], deleted: DeletedHostView[], changed: number }> {
+    const changed = await this.core.tagWorkspaces(textOrUndefined(input.hostId), textOrUndefined(input.workspaceId))
+    return { items: this.core.listWorkspaces(), deleted: this.core.listDeletedHosts(), changed }
   }
 
-  async removeWorkspace(input: { workspaceId: string }): Promise<{ ok: true }> {
-    await this.core.workspaces.delete(input.workspaceId)
+  async removeWorkspace(input: { hostId: string, workspaceId: string }): Promise<{ ok: boolean }> {
+    return { ok: await this.core.removeWorkspace(input.hostId, input.workspaceId) }
+  }
+
+  async restoreHost(input: { hostId: string }): Promise<{ ok: true }> {
+    await this.core.restoreHost(input.hostId)
     return { ok: true }
   }
 
@@ -155,7 +160,7 @@ class SshApi extends TypertRemoteService {
   }
 }
 
-class Core {
+export class Core {
   readonly pool: SshPool
   private config: PluginConfig
   private readonly status = new Map<string, Promise<RunnerStatus>>()
@@ -173,13 +178,59 @@ class Core {
     return remoteWorkspaces(this.workspaces.list())
   }
 
-  async tagWorkspaces(hostId?: string, workspaceId?: string, previousTag?: string): Promise<number> {
-    return tagRemoteWorkspaces(this.config.hosts, this.workspaces.list(), { hostId, workspaceId, previousTag })
+  /** Whether workspace titles carry the server name. */
+  get taggingEnabled(): boolean {
+    return this.config.tagWorkspaceTitles
+  }
+
+  /** Hosts the operator removed, newest first. */
+  listDeletedHosts(): DeletedHostView[] {
+    return this.config.deletedHosts.map(row => ({
+      id: row.host.id,
+      name: row.host.name.trim() || row.host.host,
+      address: row.host.host,
+      username: row.host.username,
+      port: row.host.port,
+      deletedAt: row.deletedAt,
+    }))
+  }
+
+  async restoreHost(hostId: string): Promise<void> {
+    assertHostId(hostId)
+    if (this.config.hosts.some(item => item.id === hostId)) throw new Error(`SSH host ${hostId} is already configured`)
+    const row = this.config.deletedHosts.find(item => item.host.id === hostId)
+    if (row === undefined) throw new Error(`SSH host ${hostId} cannot be restored; add it again`)
+    this.config.hosts = [...this.config.hosts, { ...row.host }]
+    this.config.deletedHosts = this.config.deletedHosts.filter(item => item.host.id !== hostId)
+    this.pool.invalidate(hostId)
+    this.status.delete(hostId)
+    forgetOpsHost(hostId)
+    await this.persistHosts()
   }
 
   /**
-   * Existing workspaces are relabelled once at load, so the sidebar names their
-   * server without the operator re-creating anything.
+   * Remove one workspace registration. Unknown ids and ids that belong to a
+   * different host fail instead of reporting a success that did nothing.
+   */
+  async removeWorkspace(hostId: string, workspaceId: string): Promise<boolean> {
+    const row = this.listWorkspaces().find(item => item.workspaceId === workspaceId)
+    if (row === undefined) return false
+    if (row.hostId !== hostId) throw new Error(`workspace ${workspaceId} does not belong to SSH host ${hostId}`)
+    return this.workspaces.delete(workspaceId)
+  }
+
+  async tagWorkspaces(hostId?: string, workspaceId?: string, previousTag?: string): Promise<number> {
+    // A deleted host's prefix must still be recognised so manual tagging
+    // replaces it instead of stacking a second one.
+    const known = [...this.config.hosts, ...this.config.deletedHosts.map(row => row.host)]
+    return tagRemoteWorkspaces(this.config.hosts, this.workspaces.list(), { hostId, workspaceId, previousTag, knownHosts: known })
+  }
+
+  /**
+   * On every load, prefix a title that is empty or still exactly the remote
+   * directory's name. A title the operator changed stays. A title set back to
+   * that directory name is prefixed again, because it is indistinguishable
+   * from a workspace that was never tagged.
    */
   async autoTagWorkspaces(): Promise<void> {
     if (!this.config.tagWorkspaceTitles) return
@@ -239,7 +290,6 @@ class Core {
     assertHostId(host.id)
     const previous = this.config.hosts.find(item => item.id === host.id)
     const normalized = { ...host, opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy) }
-    // Editing keeps the row where it is; a new host is appended.
     this.config.hosts = previous === undefined
       ? [...this.config.hosts, normalized]
       : this.config.hosts.map(item => item.id === host.id ? normalized : item)
@@ -247,12 +297,33 @@ class Core {
     if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
     else forgetOpsHost(host.id)
     await this.persistHosts()
-    if (previous === undefined || previous.name === normalized.name) return
+    // The sidebar prefix follows the server name, or the address when unnamed.
+    if (previous === undefined) return
+    const previousTag = hostTag(previous)
+    const nextTag = hostTag(normalized)
+    if (previousTag === nextTag) return
     if (!this.config.tagWorkspaceTitles) return
-    await this.tagWorkspaces(normalized.id, undefined, hostTag(previous))
+    await this.tagWorkspaces(normalized.id, undefined, previousTag)
   }
 
   async deleteHost(hostId: string): Promise<void> {
+    const removed = this.config.hosts.find(item => item.id === hostId)
+    if (removed !== undefined) {
+      // Keep the row so the settings page can restore it; its workspaces stay.
+      // Hosts that still have workspaces are not dropped to make room for the
+      // newest 20 deletes that have none.
+      const rows = [
+        { host: removed, deletedAt: new Date().toISOString() },
+        ...this.config.deletedHosts.filter(item => item.host.id !== hostId),
+      ]
+      const withWorkspaces = new Set(this.listWorkspaces().map(item => item.hostId))
+      let spare = 0
+      this.config.deletedHosts = rows.filter(row => {
+        if (withWorkspaces.has(row.host.id)) return true
+        spare += 1
+        return spare <= 20
+      })
+    }
     this.config.hosts = this.config.hosts.filter(item => item.id !== hostId)
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
@@ -266,7 +337,10 @@ class Core {
       this.ctx.logger?.warn('[@dsh-permission-remote] settings row "permission-remote" is missing; the host list changed in memory but was not persisted')
       return
     }
-    await this.ctx.settings.update(String(row.ns), { hosts: this.config.hosts })
+    await this.ctx.settings.update(String(row.ns), {
+      hosts: this.config.hosts,
+      deletedHosts: this.config.deletedHosts,
+    })
   }
 
   probe(hostId: string, refresh = false): Promise<RunnerStatus> {
@@ -318,7 +392,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'saveSecret', 'saveHost', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({
@@ -484,17 +558,27 @@ function capturedSchema(ctx: HostContext, toolName: string, agent: object): obje
 }
 
 function fallbackSchema(toolName: string): object {
-  if (toolName !== 'bash') return { description: toolName, parameters: {}, output: { schema: { type: 'object' }, render: () => [{ type: 'text', text: '' }] } }
+  if (toolName !== 'bash') {
+    return {
+      description: toolName,
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [{ type: 'text', text: '' }] },
+    }
+  }
   return {
     description: 'Execute a bash command on the remote workspace.',
     parameters: {
-      command: { type: 'string', required: true },
-      description: { type: 'string', required: true },
-      timeoutMs: { type: 'number' },
-      workdir: { type: 'string' },
-      run_in_background: { type: 'boolean' },
-      sandbox_permissions: { type: 'string', enum: [...ESCALATION_TARGETS] },
-      justification: { type: 'string' },
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        description: { type: 'string' },
+        timeoutMs: { type: 'number' },
+        workdir: { type: 'string' },
+        run_in_background: { type: 'boolean' },
+        sandbox_permissions: { type: 'string', enum: [...ESCALATION_TARGETS] },
+        justification: { type: 'string' },
+      },
+      required: ['command', 'description'],
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
@@ -506,8 +590,13 @@ function fallbackSchema(toolName: string): object {
   }
 }
 
+/**
+ * Ops commands run unconfined on the remote, so `danger-full-access` is the
+ * only escalation that `requireOps` accepts. Advertising narrower modes would
+ * send the model into a retry that never opens an approval card.
+ */
 const OPS_ESCALATION = {
-  sandbox_permissions: { type: 'string', enum: [...ESCALATION_TARGETS] },
+  sandbox_permissions: { type: 'string', enum: ['danger-full-access'] },
   justification: { type: 'string' },
 } as const
 

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, readHosts, readWorkspaces, type ClientFace, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, readHosts, readWorkspaces, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { blankDraft, createTarget, draftPortValid, mergeEditedHost, parentDir, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -24,6 +25,13 @@ interface SectionProps {
 interface LocaleApi {
   register(ns: string, lang: string, dict: Record<string, string>): () => void
   bind(ns: string): (key: string) => string
+}
+
+/** `tagWorkspaces` returns the refreshed rows together with how many changed. */
+interface WorkspaceTagResult {
+  items?: RemoteWorkspaceView[]
+  deleted?: DeletedHostView[]
+  changed?: number
 }
 
 export function apply(ctx: ClientFace & {
@@ -51,31 +59,79 @@ export function apply(ctx: ClientFace & {
 function Section(props: SectionProps): JSX.Element {
   const { ctx, t } = props
   const [hosts, setHosts] = useState<HostView[]>([])
-  const [draft, setDraft] = useState<HostView>(blankHost())
+  const [draft, setDraft] = useState<Draft>(blankDraft())
   const [secret, setSecret] = useState('')
   const [message, setMessage] = useState('')
   const [tone, setTone] = useState<'ok' | 'warn'>('ok')
-  const [selected, setSelected] = useState('')
-  const [status, setStatus] = useState<RunnerView | null>(null)
+  // `focused` owns the status/trust panel; `browsing` owns the directory panel.
+  const [focused, setFocused] = useState('')
+  const [browsing, setBrowsing] = useState('')
+  const [listed, setListed] = useState(false)
+  // Both are tagged with their host: showing one host's probe (or offering to
+  // trust its fingerprint) while another host is focused would mislabel them.
+  const [status, setStatus] = useState<{ hostId: string, runner: RunnerView } | null>(null)
   const [installLog, setInstallLog] = useState('')
   const [dir, setDir] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
   const [busy, setBusy] = useState(false)
-  const [pendingTrust, setPendingTrust] = useState('')
+  const [pendingTrust, setPendingTrust] = useState<{ hostId: string, fingerprint: string } | null>(null)
   const [workspaces, setWorkspaces] = useState<RemoteWorkspaceView[]>([])
+  const [deleted, setDeleted] = useState<DeletedHostView[]>([])
   const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
+  const [tagTitles, setTagTitles] = useState(true)
+  const [revision, setRevision] = useState(0)
 
-  async function reload(): Promise<void> {
+  async function reload(): Promise<HostView[]> {
     const loaded = await readHosts(ctx)
     setHosts(loaded.hosts)
+    setTagTitles(loaded.tagWorkspaceTitles)
+    setRevision(loaded.revision)
+    return loaded.hosts
+  }
+
+  async function toggleTagTitles(enabled: boolean): Promise<void> {
+    setBusy(true)
+    try {
+      await writeTagWorkspaceTitles(ctx, enabled, revision)
+      setTagTitles(enabled)
+      const saved = await readHosts(ctx)
+      setRevision(saved.revision)
+      // Enabling the switch should label the existing workspaces now, not on
+      // the next plugin load.
+      if (enabled) {
+        const tagged = await callHost<WorkspaceTagResult>(ctx, 'tagWorkspaces', {})
+        const changed = tagged.changed ?? 0
+        note(changed > 0 ? `${changed} ${t('titlesUpdated')}` : t('tagToggleSaved'))
+      } else {
+        note(t('tagToggleSaved'))
+      }
+      await reloadWorkspaces()
+    } catch (error) {
+      // A stale revision means another tab wrote first; re-read and let the user retry.
+      await reload().catch(() => undefined)
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Workspace rows and tombstones always arrive together. */
+  function applyTagged(tagged: WorkspaceTagResult): number {
+    if (Array.isArray(tagged.items)) setWorkspaces(tagged.items)
+    if (Array.isArray(tagged.deleted)) setDeleted(tagged.deleted)
+    return tagged.changed ?? 0
   }
 
   async function reloadWorkspaces(): Promise<void> {
-    setWorkspaces(await readWorkspaces(ctx))
+    const listed = await readWorkspaces(ctx)
+    setWorkspaces(listed.items)
+    setDeleted(listed.deleted)
   }
 
   useEffect(() => {
-    void Promise.all([reload(), reloadWorkspaces()]).catch(error => fail(error))
+    // A host without the newer workspace RPC still has to list and save hosts.
+    void reload().catch(error => fail(error))
+    void reloadWorkspaces().catch(() => setWorkspaces([]))
   }, [])
 
   function fail(error: unknown): void {
@@ -93,13 +149,13 @@ function Section(props: SectionProps): JSX.Element {
     setMessage('')
     try {
       const id = draft.id || newId()
-      const port = Number(draft.port) || 22
-      const previous = hosts.find(item => item.id === id)
-      // A different machine at this address must prove its key again.
-      const moved = previous !== undefined && (previous.host !== draft.host || previous.port !== port)
-      const next = { ...draft, id, port, fingerprint: moved ? '' : draft.fingerprint }
+      const latest = hosts.find(item => item.id === id)
+      const next = mergeEditedHost(latest, { ...draft, id })
+      const moved = latest !== undefined && (latest.host !== next.host || latest.port !== next.port)
       await callHost(ctx, 'saveHost', next)
-      setDraft(next)
+      // Remember the generated id before the credential call: a failure there
+      // would make the retry mint a second host row for the same server.
+      setDraft(current => ({ ...current, id }))
       if (next.auth === 'password' || secret.trim().length > 0) {
         await callHost(ctx, 'saveSecret', {
           hostId: id,
@@ -108,8 +164,8 @@ function Section(props: SectionProps): JSX.Element {
         })
       }
       setSecret('')
-      setDraft(blankHost())
-      if (moved && selected === id) setStatus(null)
+      setDraft(blankDraft())
+      if (moved && status?.hostId === id) setStatus(null)
       await Promise.all([reload(), reloadWorkspaces()])
       note(moved ? `${t('saved')} ${t('retrust')}` : t('saved'))
     } catch (error) {
@@ -120,9 +176,9 @@ function Section(props: SectionProps): JSX.Element {
   }
 
   function beginEdit(host: HostView): void {
-    setDraft({ ...host })
+    setDraft(toDraft(host))
     setSecret('')
-    setPendingTrust('')
+    setPendingTrust(null)
     setMessage('')
     setTone('ok')
     const form = document.getElementById('dsh-ssh-form')
@@ -130,25 +186,28 @@ function Section(props: SectionProps): JSX.Element {
   }
 
   function cancelEdit(): void {
-    setDraft(blankHost())
+    setDraft(blankDraft())
     setSecret('')
   }
 
   async function test(host: HostView): Promise<void> {
     setBusy(true)
     setMessage('')
-    setSelected(host.id)
+    setFocused(host.id)
+    // Nothing from the previous host may stay on screen while this one is probed.
+    setStatus(null)
+    setPendingTrust(null)
+    setInstallLog('')
     try {
       const offered = await callHost<{ fingerprint: string, trusted: boolean, banner: string }>(ctx, 'testConnection', { hostId: host.id })
       if (!offered.trusted) {
-        setPendingTrust(offered.fingerprint)
+        setPendingTrust({ hostId: host.id, fingerprint: offered.fingerprint })
         setTone('warn')
         setMessage(`${t('untrusted')} ${offered.fingerprint}`)
         return
       }
-      setPendingTrust('')
       note(offered.banner.length > 0 ? `${t('connected')} ${offered.banner}` : t('connected'))
-      setStatus(await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }))
+      setStatus({ hostId: host.id, runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
     } catch (error) {
       fail(error)
     } finally {
@@ -157,14 +216,15 @@ function Section(props: SectionProps): JSX.Element {
   }
 
   async function trust(host: HostView): Promise<void> {
-    if (pendingTrust.trim().length === 0) return
+    // The offered fingerprint belongs to the host it was issued for.
+    if (pendingTrust === null || pendingTrust.hostId !== host.id) return
     setBusy(true)
     try {
-      await callHost(ctx, 'trustFingerprint', { hostId: host.id, fingerprint: pendingTrust })
-      setPendingTrust('')
+      await callHost(ctx, 'trustFingerprint', { hostId: host.id, fingerprint: pendingTrust.fingerprint })
+      setPendingTrust(null)
       await reload()
       note(t('trusted'))
-      setStatus(await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }))
+      setStatus({ hostId: host.id, runner: await callHost<RunnerView>(ctx, 'probe', { hostId: host.id, refresh: true }) })
     } catch (error) {
       fail(error)
     } finally {
@@ -177,7 +237,7 @@ function Section(props: SectionProps): JSX.Element {
     setInstallLog('')
     try {
       const result = await callHost<{ code: number | null, stdout: string, stderr: string, status: RunnerView }>(ctx, 'installDeps', { hostId })
-      setStatus(result.status)
+      setStatus({ hostId, runner: result.status })
       setInstallLog([result.stdout, result.stderr].filter(Boolean).join('\n') || `exit ${result.code ?? 'null'}`)
     } catch (error) {
       setInstallLog(error instanceof Error ? error.message : String(error))
@@ -191,8 +251,13 @@ function Section(props: SectionProps): JSX.Element {
     try {
       await callHost(ctx, 'saveHost', { ...host, opsPolicy })
       await reload()
+      // Keep an open edit form in step with the policy just saved on the card.
+      setDraft(current => current.id === host.id ? { ...current, opsPolicy } : current)
       note(t('policySaved'))
     } catch (error) {
+      // The select is controlled by the loaded host. Reload shows the saved
+      // policy, or the previous one when the save did not land.
+      await reload().catch(() => undefined)
       fail(error)
     } finally {
       setBusy(false)
@@ -203,11 +268,18 @@ function Section(props: SectionProps): JSX.Element {
     setBusy(true)
     try {
       await callHost(ctx, 'deleteHost', { hostId })
-      if (selected === hostId) {
-        setSelected('')
-        setStatus(null)
+      if (browsing === hostId) {
+        setBrowsing('')
         setEntries([])
+        setDir('/')
+        setListed(false)
       }
+      if (focused === hostId) {
+        setFocused('')
+        setInstallLog('')
+      }
+      if (status?.hostId === hostId) setStatus(null)
+      if (pendingTrust?.hostId === hostId) setPendingTrust(null)
       if (draft.id === hostId) cancelEdit()
       await Promise.all([reload(), reloadWorkspaces()])
     } catch (error) {
@@ -219,11 +291,13 @@ function Section(props: SectionProps): JSX.Element {
 
   async function browse(hostId: string, path: string): Promise<void> {
     setBusy(true)
-    setSelected(hostId)
     try {
       const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'listDir', { hostId, path })
+      // Only commit once the listing succeeded: a failure keeps the previous host.
+      setBrowsing(hostId)
       setDir(listed.path)
       setEntries(listed.entries)
+      setListed(true)
     } catch (error) {
       fail(error)
     } finally {
@@ -247,9 +321,8 @@ function Section(props: SectionProps): JSX.Element {
   async function tagWorkspaces(hostId?: string, workspaceId?: string): Promise<void> {
     setBusy(true)
     try {
-      const tagged = await callHost<{ items?: RemoteWorkspaceView[] }>(ctx, 'tagWorkspaces', { hostId, workspaceId })
-      if (Array.isArray(tagged.items)) setWorkspaces(tagged.items)
-      note(t('taggedSidebar'))
+      const changed = applyTagged(await callHost<WorkspaceTagResult>(ctx, 'tagWorkspaces', { hostId, workspaceId }))
+      note(changed > 0 ? `${changed} ${t('titlesUpdated')}` : t('titlesUnchanged'))
     } catch (error) {
       fail(error)
     } finally {
@@ -257,12 +330,12 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  async function removeWorkspace(workspaceId: string): Promise<void> {
+  async function removeWorkspace(hostId: string, workspaceId: string): Promise<void> {
     setBusy(true)
     try {
-      await callHost(ctx, 'removeWorkspace', { workspaceId })
+      const removed = await callHost<{ ok?: boolean }>(ctx, 'removeWorkspace', { hostId, workspaceId })
       await reloadWorkspaces()
-      note(t('workspaceRemoved'))
+      note(removed.ok === false ? t('workspaceGone') : t('workspaceRemoved'))
     } catch (error) {
       fail(error)
     } finally {
@@ -270,7 +343,22 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  const current = hosts.find(item => item.id === selected)
+  async function restoreHost(hostId: string): Promise<void> {
+    setBusy(true)
+    try {
+      await callHost(ctx, 'restoreHost', { hostId })
+      await Promise.all([reload(), reloadWorkspaces()])
+      note(t('restoredHost'))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const focusedHost = hosts.find(item => item.id === focused)
+  const browsingHost = hosts.find(item => item.id === browsing)
+  const target = createTarget(browsing, listed)
   const crumbs = dir.split('/').filter(Boolean)
   const byHost = new Map<string, RemoteWorkspaceView[]>()
   for (const workspace of workspaces) {
@@ -278,6 +366,29 @@ function Section(props: SectionProps): JSX.Element {
     if (rows === undefined) byHost.set(workspace.hostId, [workspace])
     else rows.push(workspace)
   }
+  // Workspaces whose host is no longer configured stay registered in DSH, and a
+  // removed host may own none at all. Both belong under "deleted hosts", or the
+  // host could never be restored from the settings page.
+  const orphans = new Map<string, RemoteWorkspaceView[]>()
+  for (const [hostId, rows] of byHost) {
+    if (hosts.every(host => host.id !== hostId)) orphans.set(hostId, rows)
+  }
+  for (const row of deleted) {
+    if (hosts.every(host => host.id !== row.id) && !orphans.has(row.id)) orphans.set(row.id, [])
+  }
+
+  const workspaceRow = (workspace: RemoteWorkspaceView): JSX.Element => (
+    <li key={workspace.workspaceId} className="dsh-ssh-workspace">
+      <div className="dsh-ssh-workspace-text">
+        <span className="dsh-ssh-workspace-title" title={workspace.title}>{workspace.title}</span>
+        <span className="dsh-ssh-workspace-path" title={workspace.remotePath}>{workspace.remotePath}</span>
+      </div>
+      <div className="dsh-ssh-inline">
+        <span className="dsh-ssh-workspace-meta">{workspace.sessions} {t('sessions')}</span>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeWorkspace(workspace.hostId, workspace.workspaceId)}>{t('unregister')}</button>
+      </div>
+    </li>
+  )
 
   return (
     <section className="dsh-ssh-page">
@@ -288,7 +399,7 @@ function Section(props: SectionProps): JSX.Element {
         <ul className="dsh-ssh-hosts">
           {hosts.map(host => {
             const owned = byHost.get(host.id) ?? []
-            const expanded = openWorkspaces[host.id] ?? owned.length > 0
+            const expanded = openWorkspaces[host.id] ?? true
             return (
               <li key={host.id} className="dsh-ssh-host" data-editing={draft.id === host.id ? 'true' : undefined}>
                 <div className="dsh-ssh-host-head">
@@ -331,18 +442,7 @@ function Section(props: SectionProps): JSX.Element {
                   {expanded ? (
                     owned.length > 0 ? (
                       <ul className="dsh-ssh-workspace-list">
-                        {owned.map(workspace => (
-                          <li key={workspace.workspaceId} className="dsh-ssh-workspace">
-                            <div className="dsh-ssh-workspace-text">
-                              <span className="dsh-ssh-workspace-title" title={workspace.title}>{workspace.title}</span>
-                              <span className="dsh-ssh-workspace-path" title={workspace.remotePath}>{workspace.remotePath}</span>
-                            </div>
-                            <div className="dsh-ssh-inline">
-                              <span className="dsh-ssh-workspace-meta">{workspace.sessions} {t('sessions')}</span>
-                              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeWorkspace(workspace.workspaceId)}>{t('unregister')}</button>
-                            </div>
-                          </li>
-                        ))}
+                        {owned.map(workspaceRow)}
                       </ul>
                     ) : <p className="dsh-ssh-note dsh-ssh-workspaces-empty">{t('noWorkspaces')}</p>
                   ) : null}
@@ -353,32 +453,79 @@ function Section(props: SectionProps): JSX.Element {
         </ul>
       ) : null}
       {hosts.length > 0 ? <p className="dsh-ssh-note">{t('workspacesNote')}</p> : null}
-      {selected.length > 0 && current !== undefined ? (
+      <label className="dsh-ssh-toggle">
+        <input
+          type="checkbox"
+          checked={tagTitles}
+          disabled={busy}
+          onChange={event => void toggleTagTitles(event.target.checked)}
+        />
+        <span>{t('tagTitles')}</span>
+        <span className="dsh-ssh-note">{t('tagTitlesHint')}</span>
+      </label>
+      {orphans.size > 0 ? (
+        <div className="dsh-ssh-deleted">
+          <h3 className="dsh-ssh-section-title">{t('deletedHosts')}</h3>
+          <p className="dsh-ssh-note">{t('deletedHostsNote')}</p>
+          <ul className="dsh-ssh-hosts">
+            {[...orphans.entries()].map(([hostId, rows]) => {
+              const tombstone = deleted.find(item => item.id === hostId)
+              return (
+                <li key={hostId} className="dsh-ssh-host">
+                  <div className="dsh-ssh-host-head">
+                    <div className="dsh-ssh-host-identity">
+                      <div className="dsh-ssh-host-name">{tombstone?.name ?? hostId}</div>
+                      <div className="dsh-ssh-host-meta">
+                        {tombstone === undefined ? hostId : `${tombstone.username}@${tombstone.address}:${tombstone.port} · ${t('hostRemoved')}`}
+                      </div>
+                    </div>
+                    <div className="dsh-ssh-row-actions">
+                      <button
+                        type="button"
+                        className="dsh-ssh-button"
+                        disabled={busy || tombstone === undefined}
+                        title={tombstone === undefined ? t('restoreUnavailable') : undefined}
+                        onClick={() => void restoreHost(hostId)}
+                      >{t('restoreHost')}</button>
+                    </div>
+                  </div>
+                  {rows.length > 0 ? (
+                    <ul className="dsh-ssh-workspace-list">
+                      {rows.map(workspaceRow)}
+                    </ul>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      ) : null}
+      {browsingHost !== undefined ? (
         <div className="dsh-ssh-browser">
           <div className="dsh-ssh-browser-head">
             <div className="dsh-ssh-browser-heading">
               <span className="dsh-ssh-legend">{t('directory')}</span>
-              <span className="dsh-ssh-browser-host">{current.name || current.host}</span>
+              <span className="dsh-ssh-browser-host">{browsingHost.name || browsingHost.host}</span>
             </div>
             <div className="dsh-ssh-inline">
-              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(selected, parentDir(dir))}>{t('up')}</button>
-              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(selected, dir)}>{t('refresh')}</button>
-              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void createWorkspace(selected, dir)}>{t('createWorkspace')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(browsing, parentDir(dir))}>{t('up')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(browsing, dir)}>{t('refresh')}</button>
+              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
             </div>
           </div>
           <div className="dsh-ssh-breadcrumb">
-            <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(selected, '/')}>/</button>
+            <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, '/')}>/</button>
             {crumbs.map((name, index) => (
               <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
                 <span className="dsh-ssh-crumb-sep">/</span>
-                <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(selected, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
+                <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(browsing, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
               </span>
             ))}
           </div>
           <ul className="dsh-ssh-dirs">
             {entries.map(entry => (
               <li key={entry.path}>
-                <button type="button" className="dsh-ssh-dir" disabled={busy} onClick={() => void browse(selected, entry.path)}>
+                <button type="button" className="dsh-ssh-dir" disabled={busy} onClick={() => void browse(browsing, entry.path)}>
                   <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
                   <span className="dsh-ssh-dir-name">{entry.name}</span>
                 </button>
@@ -391,12 +538,12 @@ function Section(props: SectionProps): JSX.Element {
       <form id="dsh-ssh-form" className="dsh-ssh-card" data-editing={draft.id.length > 0 ? 'true' : undefined} onSubmit={event => { event.preventDefault(); void saveDraft() }}>
         <div className="dsh-ssh-legend">{draft.id.length > 0 ? t('editHost') : t('addHost')}</div>
         <div className="dsh-ssh-grid">
-          <Field label={t('name')} value={draft.name} onChange={value => setDraft({ ...draft, name: value })} />
-          <Field label={t('address')} value={draft.host} onChange={value => setDraft({ ...draft, host: value })} />
+          <Field id="dsh-ssh-name" label={t('name')} value={draft.name} onChange={value => setDraft({ ...draft, name: value })} />
+          <Field id="dsh-ssh-host" label={t('address')} value={draft.host} onChange={value => setDraft({ ...draft, host: value })} />
         </div>
         <div className="dsh-ssh-grid">
-          <Field label={t('port')} value={String(draft.port)} onChange={value => setDraft({ ...draft, port: Number(value) || 22 })} />
-          <Field label={t('user')} value={draft.username} onChange={value => setDraft({ ...draft, username: value })} />
+          <Field id="dsh-ssh-port" label={t('port')} value={draft.port} onChange={value => setDraft({ ...draft, port: value.replace(/[^0-9]/g, '') })} />
+          <Field id="dsh-ssh-user" label={t('user')} value={draft.username} onChange={value => setDraft({ ...draft, username: value })} />
         </div>
         <label className="dsh-ssh-field" htmlFor="dsh-ssh-auth">
           <span className="dsh-ssh-label">{t('auth')}</span>
@@ -406,7 +553,7 @@ function Section(props: SectionProps): JSX.Element {
           </select>
         </label>
         {draft.auth === 'key'
-          ? <Field label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
+          ? <Field id="dsh-ssh-key" label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
           : null}
         <label className="dsh-ssh-field" htmlFor="dsh-ssh-policy">
           <span className="dsh-ssh-label">{t('opsPolicy')}</span>
@@ -417,24 +564,24 @@ function Section(props: SectionProps): JSX.Element {
           </select>
         </label>
         <p className="dsh-ssh-note">{t('opsNote')}</p>
-        <Field label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
+        <Field id="dsh-ssh-secret" label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
         {draft.id.length > 0 ? <p className="dsh-ssh-note">{t('secretKeep')}</p> : null}
         <div className="dsh-ssh-actions">
           {draft.id.length > 0 ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={cancelEdit}>{t('cancel')}</button> : null}
-          <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0}>{t('save')}</button>
+          <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0 || !draftPortValid(draft)}>{t('save')}</button>
         </div>
       </form>
-      {pendingTrust.length > 0 && current !== undefined
-        ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void trust(current)}>{t('trust')} {pendingTrust}</button>
+      {pendingTrust !== null && focusedHost !== undefined && pendingTrust.hostId === focusedHost.id
+        ? <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={() => void trust(focusedHost)}>{t('trust')} {pendingTrust.fingerprint}</button>
         : null}
-      {status !== null && current !== undefined ? (
+      {status !== null && focusedHost !== undefined && status.hostId === focusedHost.id ? (
         <div className="dsh-ssh-host dsh-ssh-status-row">
           <div>
-            <div className="dsh-ssh-host-name">{t('sandbox')}: {status.sandboxTool} {status.sandbox.available ? t('available') : `${t('unavailable')} (${status.sandbox.reason})`}</div>
-            <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.ripgrep}</div>
+            <div className="dsh-ssh-host-name">{t('sandbox')}: {status.runner.sandboxTool} {status.runner.sandbox.available ? t('available') : `${t('unavailable')} (${status.runner.sandbox.reason})`}</div>
+            <div className="dsh-ssh-host-meta">{t('ripgrep')}: {status.runner.ripgrep}</div>
           </div>
-          {status.os === 'linux' && !status.sandbox.available
-            ? <button type="button" className="dsh-ssh-button" disabled={busy || status.install === null} onClick={() => void install(current.id)}>{t('install')}</button>
+          {status.runner.os === 'linux' && !status.runner.sandbox.available
+            ? <button type="button" className="dsh-ssh-button" disabled={busy || status.runner.install === null} onClick={() => void install(focusedHost.id)}>{t('install')}</button>
             : null}
         </div>
       ) : null}
@@ -457,25 +604,13 @@ function Section(props: SectionProps): JSX.Element {
   )
 }
 
-function Field(props: { label: string, value: string, secret?: boolean, onChange: (value: string) => void }): JSX.Element {
-  const id = `dsh-ssh-${props.label}`
+function Field(props: { id: string, label: string, value: string, secret?: boolean, onChange: (value: string) => void }): JSX.Element {
   return (
-    <label className="dsh-ssh-field" htmlFor={id}>
+    <label className="dsh-ssh-field" htmlFor={props.id}>
       <span className="dsh-ssh-label">{props.label}</span>
-      <input id={id} className="dsh-ssh-input" type={props.secret ? 'password' : 'text'} value={props.value} onChange={event => props.onChange(event.target.value)} />
+      <input id={props.id} className="dsh-ssh-input" type={props.secret ? 'password' : 'text'} value={props.value} onChange={event => props.onChange(event.target.value)} />
     </label>
   )
-}
-
-function blankHost(): HostView {
-  return { id: '', name: '', host: '', port: 22, username: '', auth: 'key', privateKeyPath: '', fingerprint: '', opsPolicy: 'ask' }
-}
-
-function parentDir(dir: string): string {
-  const trimmed = dir.replace(/\/+$/, '')
-  const slash = trimmed.lastIndexOf('/')
-  if (slash <= 0) return '/'
-  return trimmed.slice(0, slash)
 }
 
 function newId(): string {

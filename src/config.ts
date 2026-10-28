@@ -30,16 +30,27 @@ const Host = Schema.object({
   opsPolicy: OpsPolicy,
 })
 
+const DeletedHost = Schema.object({
+  host: Host,
+  deletedAt: Schema.string().default(''),
+})
+
 export const Config = Schema.object({
   // Settings only lists and writes fields marked volatile. Without this, the
   // host row is dropped from describe() and every save is a silent no-op.
   hosts: Schema.array(Host).default([]).volatile(),
+  /**
+   * Hosts removed from the settings list. Their workspaces stay registered, so
+   * the settings page keeps showing them under "deleted hosts" and can restore
+   * the host or unregister a single workspace.
+   */
+  deletedHosts: Schema.array(DeletedHost).default([]).volatile(),
   maxConnections: Schema.natural().min(1).max(32).default(4),
   /**
    * DSH's sidebar has no slot on a workspace row, so the owning server is
    * written into the workspace title. Off keeps the titles untouched.
    */
-  tagWorkspaceTitles: Schema.boolean().default(true),
+  tagWorkspaceTitles: Schema.boolean().default(true).volatile(),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -75,10 +86,16 @@ export function connectionKeyChanged(previous: HostConfig, next: HostConfig): bo
     || previous.privateKeyPath !== next.privateKeyPath
 }
 
+export interface DeletedHost {
+  host: HostConfig
+  deletedAt: string
+}
+
 export interface PluginConfig {
   hosts: HostConfig[]
-  maxConnections: number
-  tagWorkspaceTitles: boolean
+  deletedHosts: DeletedHost[]
+  readonly maxConnections: number
+  readonly tagWorkspaceTitles: boolean
 }
 
 type HostRef = Volatile<unknown>
@@ -101,8 +118,18 @@ function copyHostRows(value: unknown): HostConfig[] | undefined {
   return asHostArray(value).map(item => ({ ...item }))
 }
 
+function copyDeletedRows(value: unknown): DeletedHost[] | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) throw new Error('deleted SSH host list is not an array')
+  return (value as DeletedHost[]).map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))
+}
+
 function commitHosts(ref: HostRef, hosts: HostConfig[]): void {
   updateVolatile(ref, createVolatile(hosts.map(host => ({ ...host }))))
+}
+
+function commitDeleted(ref: HostRef, rows: DeletedHost[]): void {
+  updateVolatile(ref, createVolatile(rows.map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt }))))
 }
 
 /**
@@ -113,19 +140,39 @@ function commitHosts(ref: HostRef, hosts: HostConfig[]): void {
  */
 export function readConfig(raw: unknown): PluginConfig {
   const record = isRecord(raw) ? raw : {}
-  const incoming = record.hosts
+  const hostRef = refOf(record.hosts)
+  const deletedRef = refOf(record.deletedHosts)
+  const tagRef = refOf(record.tagWorkspaceTitles)
+  const tagDefault = record.tagWorkspaceTitles !== false
   const parsed = Config({
     ...record,
-    hosts: copyHostRows(isHostRef(incoming) ? incoming.get() : incoming),
-  }) as { hosts?: unknown, maxConnections?: number, tagWorkspaceTitles?: boolean }
+    hosts: copyHostRows(hostRef !== undefined ? hostRef.get() : record.hosts),
+    deletedHosts: copyDeletedRows(deletedRef !== undefined ? deletedRef.get() : record.deletedHosts),
+    // A volatile reference cannot be validated; resolve it to a value first.
+    tagWorkspaceTitles: tagRef !== undefined ? tagRef.get() !== false : tagDefault,
+  }) as unknown as { hosts?: unknown, deletedHosts?: unknown, maxConnections?: number }
   const maxConnections = parsed.maxConnections ?? 4
-  const tagWorkspaceTitles = parsed.tagWorkspaceTitles !== false
-  const ref = isHostRef(incoming) ? incoming : parsed.hosts
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tagWorkspaceTitles)
-  return { hosts: asHostArray(ref), maxConnections, tagWorkspaceTitles }
+  const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
+  const ref = hostRef ?? parsed.hosts
+  // `Config()` returns volatile wrappers for volatile fields even when the
+  // input was a plain array, so prefer the parsed reference when present.
+  const deletedRowRef = deletedRef ?? refOf(parsed.deletedHosts)
+  const deletedRows = copyDeletedRows(deletedRowRef !== undefined ? deletedRowRef.get() : record.deletedHosts) ?? []
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, deletedRowRef, deletedRows)
+  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault }
 }
 
-function viewConfig(ref: HostRef, maxConnections: number, tagWorkspaceTitles: boolean): PluginConfig {
+function refOf(value: unknown): HostRef | undefined {
+  return isVolatile(value) ? value : undefined
+}
+
+function viewConfig(
+  ref: HostRef,
+  maxConnections: number,
+  tagWorkspaceTitles: () => boolean,
+  deletedRef: HostRef | undefined,
+  deletedRows: DeletedHost[],
+): PluginConfig {
   return {
     get hosts() {
       return asHostArray(ref.get()).map(host => ({ ...host }))
@@ -133,7 +180,20 @@ function viewConfig(ref: HostRef, maxConnections: number, tagWorkspaceTitles: bo
     set hosts(value: HostConfig[]) {
       commitHosts(ref, value)
     },
+    get deletedHosts() {
+      return deletedRef === undefined
+        ? deletedRows
+        : copyDeletedRows(deletedRef.get()) ?? []
+    },
+    set deletedHosts(value: DeletedHost[]) {
+      // Silently dropping the tombstone would lose the only way back to the
+      // host, so an unwritable config is an error rather than a no-op.
+      if (deletedRef === undefined) throw new Error('the deleted SSH host list is not writable in this config')
+      commitDeleted(deletedRef, value)
+    },
     maxConnections,
-    tagWorkspaceTitles,
+    get tagWorkspaceTitles() {
+      return tagWorkspaceTitles()
+    },
   }
 }
