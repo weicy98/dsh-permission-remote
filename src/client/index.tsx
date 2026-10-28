@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, readHosts, readWorkspaces, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
@@ -60,6 +60,9 @@ function Section(props: SectionProps): JSX.Element {
   const { ctx, t } = props
   const [hosts, setHosts] = useState<HostView[]>([])
   const [draft, setDraft] = useState<Draft>(blankDraft())
+  /** The add/edit form is a dialog; nothing renders it until opened. */
+  const [formOpen, setFormOpen] = useState(false)
+  const dialogRef = useRef<HTMLDialogElement | null>(null)
   const [secret, setSecret] = useState('')
   const [message, setMessage] = useState('')
   const [tone, setTone] = useState<'ok' | 'warn'>('ok')
@@ -133,6 +136,14 @@ function Section(props: SectionProps): JSX.Element {
     void reloadWorkspaces().catch(() => setWorkspaces([]))
   }, [])
 
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (dialog === null) return
+    // `open` alone is a static element: no backdrop, no focus trap, no Esc.
+    if (formOpen && !dialog.open) dialog.showModal()
+    if (!formOpen && dialog.open) dialog.close()
+  }, [formOpen])
+
   function fail(error: unknown): void {
     setTone('warn')
     setMessage(error instanceof Error ? error.message : String(error))
@@ -164,6 +175,7 @@ function Section(props: SectionProps): JSX.Element {
       }
       setSecret('')
       setDraft(blankDraft())
+      setFormOpen(false)
       if (moved && status?.hostId === id) setStatus(null)
       await Promise.all([reload(), reloadWorkspaces()])
       note(moved ? `${t('saved')} ${t('retrust')}` : t('saved'))
@@ -174,19 +186,28 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  function beginAdd(): void {
+    setDraft(blankDraft())
+    setSecret('')
+    setPendingTrust(null)
+    setMessage('')
+    setTone('ok')
+    setFormOpen(true)
+  }
+
   function beginEdit(host: HostView): void {
     setDraft(toDraft(host))
     setSecret('')
     setPendingTrust(null)
     setMessage('')
     setTone('ok')
-    const form = document.getElementById('dsh-ssh-form')
-    if (form !== null && typeof form.scrollIntoView === 'function') form.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    setFormOpen(true)
   }
 
   function cancelEdit(): void {
     setDraft(blankDraft())
     setSecret('')
+    setFormOpen(false)
   }
 
   async function test(host: HostView): Promise<void> {
@@ -389,6 +410,9 @@ function Section(props: SectionProps): JSX.Element {
       <h2 className="dsh-ssh-title">{t('title')}</h2>
       <p className="dsh-ssh-intro">{t('description')}</p>
       {message.length > 0 ? <p className="dsh-ssh-status" data-tone={tone === 'warn' ? 'warn' : undefined}>{message}</p> : null}
+      <div className="dsh-ssh-toolbar">
+        <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
+      </div>
       {hosts.length > 0 ? (
         <ul className="dsh-ssh-hosts">
           {hosts.map(host => {
@@ -553,42 +577,49 @@ function Section(props: SectionProps): JSX.Element {
           </ul>
         </div>
       ) : null}
-      <form id="dsh-ssh-form" className="dsh-ssh-card" data-editing={draft.id.length > 0 ? 'true' : undefined} onSubmit={event => { event.preventDefault(); void saveDraft() }}>
-        <div className="dsh-ssh-legend">{draft.id.length > 0 ? t('editHost') : t('addHost')}</div>
-        <div className="dsh-ssh-grid">
-          <Field id="dsh-ssh-name" label={t('name')} value={draft.name} onChange={value => setDraft({ ...draft, name: value })} />
-          <Field id="dsh-ssh-host" label={t('address')} value={draft.host} onChange={value => setDraft({ ...draft, host: value })} />
-        </div>
-        <div className="dsh-ssh-grid">
-          <Field id="dsh-ssh-port" label={t('port')} value={draft.port} onChange={value => setDraft({ ...draft, port: value.replace(/[^0-9]/g, '') })} />
-          <Field id="dsh-ssh-user" label={t('user')} value={draft.username} onChange={value => setDraft({ ...draft, username: value })} />
-        </div>
-        <label className="dsh-ssh-field" htmlFor="dsh-ssh-auth">
-          <span className="dsh-ssh-label">{t('auth')}</span>
-          <select id="dsh-ssh-auth" className="dsh-ssh-select" value={draft.auth} onChange={event => setDraft({ ...draft, auth: event.target.value === 'password' ? 'password' : 'key' })}>
-            <option value="key">{t('authKey')}</option>
-            <option value="password">{t('authPassword')}</option>
-          </select>
-        </label>
-        {draft.auth === 'key'
-          ? <Field id="dsh-ssh-key" label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
-          : null}
-        <label className="dsh-ssh-field" htmlFor="dsh-ssh-policy">
-          <span className="dsh-ssh-label">{t('opsPolicy')}</span>
-          <select id="dsh-ssh-policy" className="dsh-ssh-select" value={draft.opsPolicy} onChange={event => setDraft({ ...draft, opsPolicy: event.target.value as HostView['opsPolicy'] })}>
-            <option value="ask">{t('opsAsk')}</option>
-            <option value="trust">{t('opsTrust')}</option>
-            <option value="deny">{t('opsDeny')}</option>
-          </select>
-        </label>
-        <p className="dsh-ssh-note">{t('opsNote')}</p>
-        <Field id="dsh-ssh-secret" label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
-        {draft.id.length > 0 ? <p className="dsh-ssh-note">{t('secretKeep')}</p> : null}
-        <div className="dsh-ssh-actions">
-          {draft.id.length > 0 ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={cancelEdit}>{t('cancel')}</button> : null}
-          <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0 || !draftPortValid(draft)}>{t('save')}</button>
-        </div>
-      </form>
+      <dialog ref={dialogRef} className="dsh-ssh-dialog" aria-label={draft.id.length > 0 ? t('editHost') : t('addHost')} onCancel={event => { event.preventDefault(); if (!busy) cancelEdit() }}>
+        {/* The list stays in view behind the dialog, so a host card is still
+            reachable while the form is open. */}
+        <form id="dsh-ssh-form" className="dsh-ssh-card" data-editing={draft.id.length > 0 ? 'true' : undefined} onSubmit={event => { event.preventDefault(); void saveDraft() }}>
+          <div className="dsh-ssh-dialog-head">
+            <div className="dsh-ssh-legend">{draft.id.length > 0 ? t('editHost') : t('addHost')}</div>
+            <button type="button" className="dsh-ssh-close" aria-label={t('cancel')} title={t('cancel')} disabled={busy} onClick={cancelEdit}>×</button>
+          </div>
+          <div className="dsh-ssh-grid">
+            <Field id="dsh-ssh-name" label={t('name')} value={draft.name} onChange={value => setDraft({ ...draft, name: value })} />
+            <Field id="dsh-ssh-host" label={t('address')} value={draft.host} onChange={value => setDraft({ ...draft, host: value })} />
+          </div>
+          <div className="dsh-ssh-grid">
+            <Field id="dsh-ssh-port" label={t('port')} value={draft.port} onChange={value => setDraft({ ...draft, port: value.replace(/[^0-9]/g, '') })} />
+            <Field id="dsh-ssh-user" label={t('user')} value={draft.username} onChange={value => setDraft({ ...draft, username: value })} />
+          </div>
+          <label className="dsh-ssh-field" htmlFor="dsh-ssh-auth">
+            <span className="dsh-ssh-label">{t('auth')}</span>
+            <select id="dsh-ssh-auth" className="dsh-ssh-select" value={draft.auth} onChange={event => setDraft({ ...draft, auth: event.target.value === 'password' ? 'password' : 'key' })}>
+              <option value="key">{t('authKey')}</option>
+              <option value="password">{t('authPassword')}</option>
+            </select>
+          </label>
+          {draft.auth === 'key'
+            ? <Field id="dsh-ssh-key" label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
+            : null}
+          <label className="dsh-ssh-field" htmlFor="dsh-ssh-policy">
+            <span className="dsh-ssh-label">{t('opsPolicy')}</span>
+            <select id="dsh-ssh-policy" className="dsh-ssh-select" value={draft.opsPolicy} onChange={event => setDraft({ ...draft, opsPolicy: event.target.value as HostView['opsPolicy'] })}>
+              <option value="ask">{t('opsAsk')}</option>
+              <option value="trust">{t('opsTrust')}</option>
+              <option value="deny">{t('opsDeny')}</option>
+            </select>
+          </label>
+          <p className="dsh-ssh-note">{t('opsNote')}</p>
+          <Field id="dsh-ssh-secret" label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
+          {draft.id.length > 0 ? <p className="dsh-ssh-note">{t('secretKeep')}</p> : null}
+          <div className="dsh-ssh-actions">
+            <button type="button" className="dsh-ssh-button" disabled={busy} onClick={cancelEdit}>{t('cancel')}</button>
+            <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || draft.host.trim().length === 0 || draft.username.trim().length === 0 || !draftPortValid(draft)}>{t('save')}</button>
+          </div>
+        </form>
+      </dialog>
       <h3 className="dsh-ssh-section-title">{t('manualTitle')}</h3>
       <div className="dsh-ssh-manual">
         {MANUAL.map(item => (

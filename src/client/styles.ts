@@ -96,6 +96,58 @@ const CSS = `
   justify-content: flex-end;
   gap: 8px;
 }
+.dsh-ssh-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* The add/edit form is a modal so it never sits between the host list and the
+   page bottom. The backdrop pseudo-element dims the list without unmounting it. */
+.dsh-ssh-dialog {
+  margin: auto;
+  padding: 0;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  max-width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  box-shadow: 0 24px 64px rgb(0 0 0 / 32%);
+}
+.dsh-ssh-dialog::backdrop {
+  background: rgb(0 0 0 / 32%);
+}
+.dsh-ssh-dialog > .dsh-ssh-card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.dsh-ssh-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.dsh-ssh-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 20px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--dsw-radius-sm);
+  cursor: pointer;
+}
+.dsh-ssh-close:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-ssh-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
 .dsh-ssh-hosts {
   display: flex;
   flex-direction: column;
