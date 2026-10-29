@@ -24,13 +24,13 @@ dsh plugin --profile web add dsh-permission-remote
 
 也可以用本机目录：`dsh plugin --profile web add /绝对路径/dsh-permission-remote`。
 
-然后重启 `dsh web` 并硬刷新页面。设置里会出现 **SSH 主机**。
+然后重启 `dsh web` 并硬刷新页面。设置里会出现 **SSH 主机**，左侧栏上方也会多一个 **SSH 主机** 图标（在「插件」和「定时任务」之后），点它直接在中间打开同一页，右上角的「返回会话」回到对话。两个入口是同一份界面和同一份配置。
 
 ![SSH hosts](docs/images/ssh-hosts.png)
 
 ## 用法
 
-1. **添加主机。** 设置 → SSH 主机。填写地址、端口、用户，以及私钥路径或口令。口令和私钥口令只写入 DSH 凭据存储；私钥只记录本机路径。已保存的主机可以点 **编辑** 改地址、端口、用户、认证方式和运维策略；改地址或端口会清掉旧指纹，需要重新测试并信任。
+1. **添加主机。** 从两个地方都能进来：左侧栏的 **SSH 主机** 图标，或 设置 → SSH 主机。填写地址、端口、用户，以及私钥路径或口令。口令和私钥口令只写入 DSH 凭据存储；私钥只记录本机路径。已保存的主机可以点 **编辑** 改地址、端口、用户、认证方式和运维策略；改地址或端口会清掉旧指纹，需要重新测试并信任。
 2. **测试并信任。** 第一次连接会给出主机指纹。确认后再信任，随后用只读沙箱 profile 真跑一次 `true`。
 3. **沙箱依赖。** Linux 上没有可用的 bubblewrap 时，可以点 **安装远端沙箱依赖**。按钮按发行版执行 `sudo -n`，避免卡在密码提示。页上同时有可复制的自行安装命令：
    - Debian/Ubuntu：`sudo apt-get update && sudo apt-get install -y bubblewrap`
@@ -145,7 +145,7 @@ No `pnpm-workspace.yaml` edit. The SSH library ships inside the plugin, so insta
 
 A local checkout also works: `dsh plugin --profile web add /absolute/path/to/dsh-permission-remote`.
 
-Restart `dsh web` and hard-refresh. Add a host, trust its fingerprint, then browse a remote directory and create a workspace. **Browse** opens the picker inside that host's row, right under the button you pressed (press it again to close), not below the whole list. Creating a workspace closes the picker so the new row is visible. A filter box above the listing narrows the listed names as you type, without a remote round trip; it clears when you walk to another directory and survives a refresh of the same one. Keyboard: `/` focuses the filter (only on the SSH hosts page, and a literal `/` still types inside any field), ↑/↓ move the highlight, Enter opens the highlighted directory, Esc clears the query first and then leaves the box, Home/End jump to the ends. Passwords stay in the DSH credential store. Private keys are referenced by local path. A saved host can be **edited** to change its address, port, user, authentication, or ops policy; changing the address or port clears the stored fingerprint, so trust the new host key again.
+Restart `dsh web` and hard-refresh. **SSH hosts** appears in Settings, and an **SSH hosts** icon joins the top of the left sidebar (after Plugins and the task manager): it opens the same page in the centre column, and **Back to session** at the top right returns to the conversation. Both entries are one UI over one configuration. Add a host, trust its fingerprint, then browse a remote directory and create a workspace. **Browse** opens the picker inside that host's row, right under the button you pressed (press it again to close), not below the whole list. Creating a workspace closes the picker so the new row is visible. A filter box above the listing narrows the listed names as you type, without a remote round trip; it clears when you walk to another directory and survives a refresh of the same one. Keyboard: `/` focuses the filter (only on the SSH hosts page, and a literal `/` still types inside any field), ↑/↓ move the highlight, Enter opens the highlighted directory, Esc clears the query first and then leaves the box, Home/End jump to the ends. Passwords stay in the DSH credential store. Private keys are referenced by local path. A saved host can be **edited** to change its address, port, user, authentication, or ops policy; changing the address or port clears the stored fingerprint, so trust the new host key again.
 
 Each host lists the workspaces created from it, with the remote directory and session count. Unregistering removes the row from DSH only; files on the host stay. DSH renders a sidebar workspace row from its title and exposes no slot on that row, so the plugin writes the server into the title as `server · directory`. Load-time tagging touches only titles that are still the directory name; a name you changed is left alone, and each host has a “Tag sidebar titles” button that prefixes every workspace under it, replacing an old server prefix. The Settings switch (`tagWorkspaceTitles`) turns tagging off entirely; turning it back on labels the existing workspaces right away.
 

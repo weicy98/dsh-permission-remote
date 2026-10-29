@@ -92,5 +92,7 @@
   "purgeConfirmAction": "Delete permanently",
   "purgedHost": "Deleted permanently; workspaces unregistered:",
   "rgUploadFailed": "Downloaded, but the remote refused the upload",
-  "rgInstallFailed": "ripgrep install failed."
+  "rgInstallFailed": "ripgrep install failed.",
+  "panel": "SSH hosts",
+  "backToSession": "Back to session"
 }

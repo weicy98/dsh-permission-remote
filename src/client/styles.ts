@@ -1,6 +1,31 @@
 const PLUGIN_ID = 'dsh-permission-remote'
 
 const CSS = `
+/* The main-panel wrapper: the centre column is the whole panel, so the scroll
+   box and the desktop title-bar clearance belong here, not to the settings
+   card the page was written as. */
+.dsh-ssh-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  padding: calc(24px + var(--dsh-frame-top-clearance, 0px)) 28px 32px max(28px, var(--dsh-frame-leading-clearance, 0px));
+}
+.dsh-ssh-panel-inner {
+  width: 100%;
+  max-width: 960px;
+  min-width: 0;
+  margin: 0 auto;
+}
+/* In the panel the page is the only thing on screen, so it may use the full
+   inner width; the settings shell keeps its narrower card. */
+.dsh-ssh-panel .dsh-ssh-page {
+  max-width: none;
+}
 .dsh-ssh-page {
   display: flex;
   flex-direction: column;
@@ -178,6 +203,11 @@ const CSS = `
   justify-content: flex-start;
   gap: 10px;
   min-height: 28px;
+}
+/* The way back sits at the far end, away from Add host, so the header keeps
+   its grouping and the button is not one mis-click from adding a host. */
+.dsh-ssh-close-panel {
+  margin-left: auto;
 }
 /* The add/edit form is a modal so it never sits between the host list and the
    page bottom. The backdrop pseudo-element dims the list without unmounting it. */

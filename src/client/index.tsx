@@ -9,6 +9,13 @@ export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'loca
 
 const NS = 'permission-remote'
 
+/**
+ * One id for the sidebar row and the main panel it selects. The sidebar
+ * resolves an icon row's id against the layout's keyed `main` slot, so a row
+ * without a matching key throws on click instead of opening anything.
+ */
+const PANEL_ID = 'permission-remote'
+
 type TabId = 'hosts' | 'deleted' | 'settings' | 'help'
 
 /** The page mixes unrelated concerns; each tab owns one. */
@@ -27,9 +34,26 @@ const MANUAL = [
 ] as const
 
 interface SectionProps {
-  close: () => void
+  /** Supplied by the settings shell only; the main panel has none. */
+  close?: () => void
   ctx: ClientFace
   t: (key: string) => string
+  /** Present only in the main panel, where it returns to the conversation. */
+  onClose?: () => void
+}
+
+/**
+ * The sidebar row draws the glyph only: `size` is the requested square edge,
+ * `active` marks the selected row and is carried by the shell, not by us.
+ */
+interface PanelIconProps {
+  size: number
+  active: boolean
+}
+
+/** The main panel's own close affordance, from the layout navigation face. */
+interface LayoutApi {
+  selectPanel(id: string | null): void
 }
 
 interface LocaleApi {
@@ -48,9 +72,10 @@ export function apply(ctx: ClientFace & {
   locale: LocaleApi
   slots: {
     inject(name: string, register: () => () => void): () => void
-    register(options: object, component: (props: SectionProps) => JSX.Element): () => void
+    register<P>(options: object, component: (props: P) => JSX.Element): () => void
   }
   effect(dispose: () => void, label?: string): void
+  get?(name: string): unknown
 }): void {
   installStyles()
   ctx.effect(() => ctx.locale.register(NS, 'zh', zh), 'dsh-permission-remote: zh')
@@ -64,10 +89,83 @@ export function apply(ctx: ClientFace & {
     locale: NS,
     inject: () => ({ ctx }),
   }, Section)), 'dsh-permission-remote: settings section')
+
+  // The panel pair is optional: a host without the sidebar/list contracts
+  // still gets the settings section above, and `inject` simply never fires.
+  ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
+    name: 'main',
+    key: PANEL_ID,
+    locale: NS,
+    inject: () => ({ ctx, onClose: closePanel }),
+  }, PanelPage)), 'dsh-permission-remote: main panel')
+  ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+    name: 'sidebar.panellist',
+    id: PANEL_ID,
+    // Plugins is 0 and the task manager 10; sit after them, before the rest.
+    order: 30,
+    label: () => nav('panel'),
+    locale: NS,
+  }, PanelIcon)), 'dsh-permission-remote: sidebar panel')
+
+  /** `null` returns to the current conversation without touching the Session. */
+  function closePanel(): void {
+    const layout = typeof ctx.get === 'function' ? ctx.get('layout') : undefined
+    const select = (layout as LayoutApi | undefined)?.selectPanel
+    if (typeof select === 'function') select.call(layout, null)
+  }
+}
+
+/**
+ * The sidebar glyph: a terminal prompt over a server rack, drawn at the edge
+ * the shell asks for. Stroke width 1 matches the shipped panel icons, and
+ * `currentColor` lets the row's hover/selected states drive the colour.
+ */
+function PanelIcon({ size }: PanelIconProps): JSX.Element {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <rect x="1.5" y="1.5" width="13" height="5" rx="1.5" />
+      <rect x="1.5" y="9.5" width="13" height="5" rx="1.5" />
+      <path d="M4 4h.01M4 12h.01M6.5 4h2M6.5 12h2" />
+    </svg>
+  )
+}
+
+/**
+ * The main panel's frame. The centre column is the whole panel, so it owns
+ * the scroll box and the desktop title-bar clearance itself; the settings
+ * page underneath is a fixed-width card and would touch both edges here.
+ *
+ * `onClose` travels through untouched: Section reads it to know it is in the
+ * panel and to render the way back.
+ */
+function PanelPage(props: SectionProps): JSX.Element {
+  return (
+    <div className="dsh-ssh-panel">
+      <div className="dsh-ssh-panel-inner">
+        <Section {...props} />
+      </div>
+    </div>
+  )
 }
 
 function Section(props: SectionProps): JSX.Element {
   const { ctx, t } = props
+  /**
+   * In the main panel there is no surrounding shell to close, so the way back
+   * is our own. The settings shell is the only owner that supplies `close`.
+   */
+  const panel = typeof props.onClose === 'function'
   const [hosts, setHosts] = useState<HostView[]>([])
   const [draft, setDraft] = useState<Draft>(blankDraft())
   /** The add/edit form is a dialog; nothing renders it until opened. */
@@ -766,6 +864,11 @@ function Section(props: SectionProps): JSX.Element {
         <h2 className="dsh-ssh-title">{t('title')}</h2>
         {tab === 'hosts'
           ? <button type="button" className="dsh-ssh-button" disabled={busy} onClick={beginAdd}>{t('addHost')}</button>
+          : null}
+        {/* The settings shell supplies its own close; a main panel has none, so
+            offer the way back to the conversation it was opened from. */}
+        {panel
+          ? <button type="button" className="dsh-ssh-button dsh-ssh-close-panel" onClick={() => props.onClose?.()}>{t('backToSession')}</button>
           : null}
       </div>
       <nav className="dsh-ssh-tabs" role="tablist">
