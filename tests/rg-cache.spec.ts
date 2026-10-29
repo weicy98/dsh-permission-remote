@@ -118,6 +118,55 @@ function refusedUploadPool(script: Array<[string, { code: number, stdout?: strin
   } as unknown as SshPool
 }
 
+/** Commands answer as scripted. Uploads are counted and never performed. */
+function scriptedPool(script: Array<[string, { code: number, stdout?: string, timedOut?: boolean }]>): SshPool & { uploads: number } {
+  const pool = {
+    uploads: 0,
+    async exec(_host: HostConfig, _secret: unknown, command: string) {
+      for (const [needle, answer] of script) {
+        if (command.includes(needle)) {
+          return { code: answer.code, stdout: answer.stdout ?? '', stderr: '', timedOut: answer.timedOut === true, signal: null, stdoutTruncated: false, stderrTruncated: false }
+        }
+      }
+      return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null, stdoutTruncated: false, stderrTruncated: false }
+    },
+    async sftpUpload(): Promise<void> {
+      pool.uploads += 1
+    },
+  }
+  return pool as unknown as SshPool & { uploads: number }
+}
+
+const linuxFacts: [string, { code: number, stdout: string }] = ['__DSH_FACTS_BEGIN__', { code: 0, stdout: '__DSH_FACTS_BEGIN__\nLinux\nx86_64\n/tmp\n/tmp\n/home/dev\n__DSH_FACTS_END__\n' }]
+
+test('a binary already on the remote counts when this machine has nothing to upload', async () => {
+  const pool = scriptedPool([
+    linuxFacts,
+    ['__DSH_RG_BEGIN__', { code: 1 }],
+    ['.dsh-permission-remote/rg', { code: 0, stdout: 'ripgrep 14.1.0\n' }],
+    ['bwrap', { code: 0 }],
+    ['/etc/os-release', { code: 0, stdout: 'ID=ubuntu\n' }],
+  ])
+  const status = await probeHost(pool, host, {}, () => null)
+  assert.equal(status.ripgrep, 'uploaded')
+  assert.equal(status.ripgrepPath, '/home/dev/.dsh-permission-remote/rg')
+  assert.equal(pool.uploads, 0)
+  assert.equal(status.sandbox.available, true)
+})
+
+test('a missing placed binary stays missing and does not upload', async () => {
+  const pool = scriptedPool([
+    linuxFacts,
+    ['__DSH_RG_BEGIN__', { code: 1 }],
+    ['.dsh-permission-remote/rg', { code: 127, stdout: '' }],
+    ['bwrap', { code: 0 }],
+  ])
+  const status = await probeHost(pool, host, {}, () => null)
+  assert.equal(status.ripgrep, 'missing')
+  assert.equal(status.ripgrepPath, '')
+  assert.equal(pool.uploads, 0)
+})
+
 test('a refused upload reports upload-failed instead of failing the probe', async () => {
   const { env, dispose } = await scratchHome()
   const previous = process.env.DSH_HOME

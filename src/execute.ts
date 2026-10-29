@@ -104,7 +104,12 @@ export async function remoteFacts(pool: SshPool, host: HostConfig, secret: Secre
   return parseHostFacts(uname.stdout)
 }
 
-export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RunnerStatus> {
+export async function probeHost(
+  pool: SshPool,
+  host: HostConfig,
+  secret: SecretMaterial,
+  resolveBinary: (pkg: string, platform?: string) => string | null = (pkg, platform) => resolveRgBinary(pkg, platform),
+): Promise<RunnerStatus> {
   const uname = await pool.exec(host, secret, hostFactsCommand(), 20_000)
   const facts = parseHostFacts(uname.stdout)
   const { os, arch } = facts
@@ -133,24 +138,36 @@ export async function probeHost(pool: SshPool, host: HostConfig, secret: SecretM
     ripgrepPath = systemPath
   } else if (rgRemote.length > 0) {
     const pkg = ripgrepPackage(os, arch)
-    if (pkg !== null) {
-      const local = resolveRgBinary(pkg, rgPlatformOf(os, arch) ?? undefined)
-      if (local !== null) {
-        // A failed upload must not take the whole probe down: the sandbox
-        // verdict is still useful, and `upload-failed` tells the operator the
-        // binary exists but the remote refused it.
-        try {
-          await pool.sftpUpload(host, secret, local, rgRemote)
-          const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
-          if (check.code === 0) {
-            ripgrep = 'uploaded'
-            ripgrepPath = rgRemote
-          } else {
-            ripgrep = 'upload-failed'
-          }
-        } catch {
+    const local = pkg === null ? null : resolveBinary(pkg, rgPlatformOf(os, arch) ?? undefined)
+    if (local !== null) {
+      // A failed upload must not take the whole probe down: the sandbox
+      // verdict is still useful, and `upload-failed` tells the operator the
+      // binary exists but the remote refused it.
+      try {
+        await pool.sftpUpload(host, secret, local, rgRemote)
+        const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
+        if (!check.timedOut && check.code === 0) {
+          ripgrep = 'uploaded'
+          ripgrepPath = rgRemote
+        } else {
           ripgrep = 'upload-failed'
         }
+      } catch {
+        ripgrep = 'upload-failed'
+      }
+    } else {
+      // Another control host may already have placed the binary. This machine
+      // has nothing to upload (a Windows DSH has no Linux package), and the
+      // placed file is not on PATH, so `command -v rg` cannot see it.
+      try {
+        const check = await pool.exec(host, secret, `${shJoin([rgRemote])} --version`, 15_000)
+        if (!check.timedOut && check.code === 0) {
+          ripgrep = 'uploaded'
+          ripgrepPath = rgRemote
+        }
+      } catch {
+        // A missing file or a dropped channel leaves ripgrep missing. The
+        // sandbox verdict above still stands.
       }
     }
   }
