@@ -28,7 +28,18 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
-import { isValidHostId, mapRemoteToLocal, routeByCwd } from './router.ts'
+import { isValidHostId, mapRemoteToLocal, routeByCwd, type Route } from './router.ts'
+import {
+  PWSH_SECTION,
+  REMOTE_POSIX_SECTION,
+  isUnknownRestrictError,
+  isWindowsShell,
+  remotePosixPrompt,
+  sameShellSurface,
+  shellSurfacePlan,
+  windowsShellGuardReason,
+  withoutWindowsShells,
+} from './shell-surface.ts'
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
@@ -71,8 +82,31 @@ interface HostContext {
   logger?: { info(message: string): void, warn(message: string): void }
 }
 
+interface PromptToolsAssembly {
+  tools: ReadonlyArray<{ name: string }>
+}
+
+interface PromptAssembleContext {
+  scope?: object
+}
+
+interface AgentContext {
+  tools: HostContext['tools'] & {
+    restrict(filter: { deny: readonly string[] }): () => void
+    guard(guard: (execution: { readonly name: string, readonly agent?: ToolExec['agent'] }) => string | undefined): () => void
+  }
+  systemPrompt: {
+    section(section: { name: string, order: number, text: string | (() => string) }): () => void
+    getSectionOrder(name: string): number
+  }
+  get(service: string): unknown
+  on(event: 'session/event', listener: (session: unknown, event: { type: string, data?: { cwd?: string } }) => void): () => void
+  on(event: 'system-prompt/assemble', listener: (assembly: PromptToolsAssembly, context: PromptAssembleContext, next: () => Promise<PromptToolsAssembly>) => Promise<PromptToolsAssembly>): () => void
+  effect(dispose: () => void): void
+}
+
 interface AgentLike {
-  ctx: HostContext & { tools: HostContext['tools'] }
+  ctx: AgentContext
   session?: { header?: { cwd?: string }, id?: string }
 }
 
@@ -571,8 +605,12 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const unregisters = new Set<() => void>()
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => () => {
-    for (const unregister of unregisters) unregister()
+    // One agent disposer must not skip the remaining agents or the pool.
+    const failure = settleDisposers([...unregisters])
     unregisters.clear()
+    if (failure !== undefined) {
+      ctx.logger?.warn(`[@dsh-permission-remote] plugin cleanup failed: ${errorText(failure)}`)
+    }
     void core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
@@ -609,21 +647,28 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
 }
 
 function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void): boolean {
-  const cwd = agent.session?.header?.cwd
-  const initial = routeByCwd(cwd)
+  const headerCwd = agent.session?.header?.cwd
+  // Seed events do not emit `session/event`. The live directory, not the
+  // original project in `header.cwd`, decides the first shell surface.
+  const opened = routeByCwd(effectiveCwd(ctx, { agent }, headerCwd))
   const disposers: Array<() => void> = []
+  let disposeDynamic = (): void => {}
   try {
     const plans = planShadows(name => agent.ctx.tools.get(name, agent))
+    const hasOfficialBash = plans.some(plan => plan.name === 'bash' && plan.official !== undefined)
     const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
     for (const plan of plans) {
-      if (plan.official === undefined && !(plan.name === 'bash' && initial.kind === 'remote')) continue
+      // A preset with no bash used to register the fallback here for the
+      // agent's whole life. That wrapper stays after the session returns to
+      // a local directory and then throws. The dynamic shell surface owns it.
+      if (plan.official === undefined) continue
       const official = plan.official
       const runner = RUNNERS[plan.name]
       disposers.push(agent.ctx.tools.register(withRemoteTimeout({
-        ...capturedSchema(agent.ctx, plan.name, agent),
+        ...capturedSchema(agent.ctx.tools, plan.name, agent),
         name: plan.name,
         async execute(args: unknown, exec: ToolExec) {
-          const current = routeByCwd(effectiveCwd(ctx, exec, cwd))
+          const current = routeByCwd(effectiveCwd(ctx, exec, headerCwd))
           if (current.kind !== 'remote') {
             return dispatchShadow(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, false, async () => {
               throw new Error('dsh-permission-remote: local call has no official tool')
@@ -633,10 +678,16 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
         },
       })))
     }
+    const surface = installRemoteShellSurface(ctx, agent, host, headerCwd, hasOfficialBash, disposers)
+    disposeDynamic = surface.disposeDynamic
+    surface.sync(opened)
   } catch (error) {
-    for (const unregister of disposers) unregister()
-    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${error instanceof Error ? error.message : String(error)}`)
-    if (initial.kind === 'remote') throw error
+    const cleanup = releaseShadows(disposeDynamic, disposers)
+    ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${errorText(error)}`)
+    if (cleanup !== undefined) {
+      ctx.logger?.warn(`[@dsh-permission-remote] shadow cleanup failed for agent ${agentLabel(agent)}: ${errorText(cleanup)}`)
+    }
+    if (opened.kind === 'remote') throw error
     return false
   }
   try {
@@ -649,9 +700,19 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
   const drop = () => {
     if (dropped) return
     dropped = true
-    for (const unregister of disposers) unregister()
+    // Mark dropped before disposing so a second unload does not start again.
+    // Each disposer still runs: one throw must not leave the guard or the
+    // schema filter attached, or leave this agent in `seen`.
+    const failure = releaseShadows(disposeDynamic, disposers)
     unregisters.delete(drop)
-    forget()
+    try {
+      forget()
+    } catch (error) {
+      ctx.logger?.warn(`[@dsh-permission-remote] shadow cleanup failed for agent ${agentLabel(agent)}: ${errorText(error)}`)
+    }
+    if (failure !== undefined) {
+      ctx.logger?.warn(`[@dsh-permission-remote] shadow cleanup failed for agent ${agentLabel(agent)}: ${errorText(failure)}`)
+    }
   }
   unregisters.add(drop)
   try {
@@ -659,10 +720,186 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
   } catch (error) {
     drop()
     ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${error instanceof Error ? error.message : String(error)}`)
-    if (initial.kind === 'remote') throw error
+    if (opened.kind === 'remote') throw error
     return false
   }
   return true
+}
+
+/**
+ * Permanent pieces follow the agent. The dynamic pieces are replaced together
+ * when the cwd enters or leaves a remote workspace, because a same-scope
+ * `tool:pwsh` cannot be registered twice and a bash fallback with no official
+ * tool must not outlive the remote cwd.
+ */
+function installRemoteShellSurface(
+  ctx: HostContext,
+  agent: AgentLike,
+  host: ToolHost,
+  headerCwd: string | undefined,
+  hasOfficialBash: boolean,
+  disposers: Array<() => void>,
+): { sync(route: Route): void, disposeDynamic(): void } {
+  const dynamic: Array<() => void> = []
+  let applied: Route = { kind: 'local' }
+  const remoteNow = (): boolean => routeByCwd(effectiveCwd(ctx, { agent }, headerCwd)).kind === 'remote'
+  const disposeDynamic = (): void => {
+    const current = dynamic.splice(0, dynamic.length)
+    let failure: unknown
+    for (let index = current.length - 1; index >= 0; index -= 1) {
+      try {
+        current[index]!()
+      } catch (error) {
+        failure ??= error
+      }
+    }
+    if (failure !== undefined) throw failure
+  }
+  const applyDynamic = (route: Route): void => {
+    const plan = shellSurfacePlan(route, hasOfficialBash)
+    const added: Array<() => void> = []
+    try {
+      for (const name of plan.deny) {
+        try {
+          added.push(agent.ctx.tools.restrict({ deny: [name] }))
+        } catch (error) {
+          if (!isUnknownRestrictError(error)) throw error
+        }
+      }
+      if (plan.shadowPwshPrompt) {
+        added.push(agent.ctx.systemPrompt.section({
+          name: PWSH_SECTION,
+          order: agent.ctx.systemPrompt.getSectionOrder('TOOL_PWSH'),
+          text: '',
+        }))
+      }
+      if (plan.bashFallback) {
+        added.push(agent.ctx.tools.register(withRemoteTimeout({
+          ...fallbackSchema('bash'),
+          name: 'bash',
+          async execute(args: unknown, exec: ToolExec) {
+            const current = routeByCwd(effectiveCwd(ctx, exec, headerCwd))
+            if (current.kind !== 'remote') {
+              return dispatchShadow(undefined, false, async () => {
+                throw new Error('dsh-permission-remote: local call has no official tool')
+              }, args, exec)
+            }
+            return RUNNERS.bash(host, current, args as Record<string, unknown>, exec, ctx)
+          },
+        })))
+      }
+    } catch (error) {
+      for (let index = added.length - 1; index >= 0; index -= 1) {
+        try {
+          added[index]!()
+        } catch {
+          // A disposer failure must not hide the restrict or section error.
+        }
+      }
+      throw error
+    }
+    dynamic.push(...added)
+  }
+  const sync = (route: Route): void => {
+    const next = shellSurfacePlan(route, hasOfficialBash)
+    if (sameShellSurface(next, shellSurfacePlan(applied, hasOfficialBash))) {
+      applied = route
+      return
+    }
+    // Detach first. The next `tool:pwsh` cannot share this scope with the
+    // one still registered. A failed enter restores the previous set. A
+    // failed leave does not: the directory change is already committed, and
+    // putting the remote bash fallback back would hide the local shells.
+    const previous = applied
+    let removed = false
+    try {
+      disposeDynamic()
+      removed = true
+      applyDynamic(route)
+      applied = route
+    } catch (error) {
+      if (!removed || route.kind !== 'remote') {
+        applied = { kind: 'local' }
+        throw error
+      }
+      try {
+        disposeDynamic()
+        applyDynamic(previous)
+        applied = previous
+      } catch {
+        applied = { kind: 'local' }
+      }
+      throw error
+    }
+  }
+
+  disposers.push(agent.ctx.tools.guard(execution => {
+    if (!isWindowsShell(execution.name)) return undefined
+    return windowsShellGuardReason(routeByCwd(effectiveCwd(ctx, execution, headerCwd)).kind === 'remote')
+  }))
+  disposers.push(agent.ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const assembled = await next()
+    // Preset assembly passes the agent object as `scope`. Another agent's
+    // assembly must not be filtered by this session's directory.
+    if (context.scope !== undefined && context.scope !== agent) return assembled
+    if (!remoteNow()) return assembled
+    return { ...assembled, tools: withoutWindowsShells(assembled.tools, true) }
+  }))
+  // Official `tool:bash` stays. This section is empty on a local cwd, so
+  // renderPrompt drops it. `complete: true` personas replace sections after
+  // the waterfall; the schema filter above still runs on `assembly.tools`.
+  disposers.push(agent.ctx.systemPrompt.section({
+    name: REMOTE_POSIX_SECTION,
+    order: agent.ctx.systemPrompt.getSectionOrder('TOOL_BASH') + 5,
+    text: () => remotePosixPrompt(remoteNow()),
+  }))
+  disposers.push(agent.ctx.on('session/event', (_session, event) => {
+    if (event.type !== 'working-directory/change') return
+    if (typeof event.data?.cwd !== 'string') return
+    const route = routeByCwd(event.data.cwd)
+    try {
+      sync(route)
+    } catch (error) {
+      const remoteMounted = shellSurfacePlan(applied, hasOfficialBash).remote
+      if (route.kind === 'remote' && !remoteMounted) {
+        const bash = hasOfficialBash
+          ? 'The preset bash tool is still registered.'
+          : 'No bash tool was registered.'
+        ctx.logger?.warn(`[@dsh-permission-remote] remote shell surface was not mounted for agent ${agentLabel(agent)}: ${errorText(error)}. Windows shells stay off the native tool list and cannot run. ${bash} A later working-directory change retries.`)
+        return
+      }
+      ctx.logger?.warn(`[@dsh-permission-remote] shell surface sync failed for agent ${agentLabel(agent)}: ${errorText(error)}`)
+    }
+  }))
+  return { sync, disposeDynamic }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** Run every disposer. The first failure is returned after the rest finish. */
+function settleDisposers(disposers: ReadonlyArray<() => void>): unknown {
+  let failure: unknown
+  for (let index = disposers.length - 1; index >= 0; index -= 1) {
+    try {
+      disposers[index]!()
+    } catch (error) {
+      failure ??= error
+    }
+  }
+  return failure
+}
+
+function releaseShadows(disposeDynamic: () => void, disposers: Array<() => void>): unknown {
+  let failure: unknown
+  try {
+    disposeDynamic()
+  } catch (error) {
+    failure = error
+  }
+  const permanent = settleDisposers(disposers)
+  return failure ?? permanent
 }
 
 function agentLabel(agent: AgentLike): string {
@@ -697,8 +934,8 @@ function effectiveCwd(ctx: HostContext, exec: ToolExec, fallback: string | undef
   return session?.header?.cwd ?? fallback
 }
 
-function capturedSchema(ctx: HostContext, toolName: string, agent: object): object {
-  const official = ctx.tools.get(toolName, agent)
+function capturedSchema(tools: HostContext['tools'], toolName: string, agent: object): object {
+  const official = tools.get(toolName, agent)
   if (official === undefined) return fallbackSchema(toolName)
   const { execute: _execute, ...rest } = official as object & { execute?: unknown }
   return rest

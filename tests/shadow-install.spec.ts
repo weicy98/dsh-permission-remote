@@ -22,7 +22,14 @@ function agentFor(cwd: string, register: () => () => void) {
       tools: {
         get: () => ({ execute: async () => 'official' }),
         register,
+        restrict: () => () => undefined,
+        guard: () => () => undefined,
       },
+      systemPrompt: {
+        section: () => () => undefined,
+        getSectionOrder: () => 1000,
+      },
+      on: () => () => undefined,
       get: () => undefined,
       effect: (execute: () => unknown) => {
         const dispose = execute()

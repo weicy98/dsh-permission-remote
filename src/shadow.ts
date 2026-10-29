@@ -28,7 +28,10 @@ export interface ShadowPlan<TArgs = unknown, TExec = unknown, TResult = unknown>
   readonly name: RoutedToolName
   /** Official execute, absent when the preset does not publish this tool. */
   readonly official: OfficialTool<TArgs, TExec, TResult>['execute'] | undefined
-  /** bash is still registered on a remote session when the host platform hid tool-bash. */
+  /**
+   * True for bash. A preset without bash still produces a plan; the shell
+   * surface registers that fallback only while the session cwd is remote.
+   */
   readonly required: boolean
 }
 

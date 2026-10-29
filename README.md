@@ -104,6 +104,8 @@ dsh plugin --profile web add dsh-permission-remote
 
 对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表还是本机的占位目录，里面看不到远端工程；右侧栏终端见上一节，它连的是远端。
 
+DSH 本身跑在 Windows 上时，远端工作区的对话只暴露远端 `bash`。`pwsh`、`powershell`、`cmd` 不会出现在原生工具列表里，官方那段 Windows 进程结束说明（`tool:pwsh`）在停在这个工作区时也会被盖住。回到本机目录后，这些 Windows 工具和原来的说明恢复。`minimal` 这类把提示词写成完整 persona 的预设不会被改写；挡住 Windows shell 的是工具列表过滤和执行守卫。内置预设的 `pwsh` 在祖先层，进入远端时会被从原生工具列表和 `ptc` SDK 正文里去掉。注册在 agent 本层的 `pwsh` 去不掉：SDK 正文仍可能列出它，原生列表会被滤掉，调用会被拒绝。文件工具的参数继续用工具返回的占位路径。
+
 模型用「运行代码」，或者会话要读取项目里的 `AGENTS.md` 时，读到的也是你电脑上的这个工作区目录，不是远端那一份。
 
 目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用上面的 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write`。
@@ -156,6 +158,8 @@ Linux bash confinement needs bubblewrap. The settings page can install it with `
 `glob` and `grep` need ripgrep on the remote; the plugin uploads a matching binary when it has one. A package manager installs only its own platform's package, so a Windows DSH managing a Linux remote has no Linux binary to upload. The host row then offers “Install ripgrep”: it downloads `@vscode/ripgrep-<platform>` for the remote from the configured npm source (empty means npmjs; a mirror works), takes `package/bin/rg` out of the tarball, caches it at `$DSH_HOME/cache/ripgrep/<platform>/rg`, and re-probes. The same button retries after a remote refused the upload. Nothing reaches the network unless that button is pressed. Alternatively install ripgrep on the remote so `rg` is on `PATH`.
 
 In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list on the left is still the local placeholder directory.
+
+When DSH itself is running on Windows, a remote workspace exposes only the remote `bash` tool. `pwsh`, `powershell`, and `cmd` stay off the native tool list, and the static `tool:pwsh` note about Windows process termination is covered while the session remains on that workspace. Returning to a local directory restores those Windows tools and the original note. A `complete: true` persona such as `minimal` is not rewritten; the tool-list filter and an execution guard keep the Windows shells from running. A built-in preset's `pwsh` sits on an ancestor scope, so entering a remote workspace removes it from the native tool list and from the `ptc` SDK text. A `pwsh` registered on the agent scope itself cannot be removed that way: the SDK text may still name it, the native list is filtered, and the call is denied. File-tool arguments keep the placeholder paths the tools already return.
 
 ### Sidebar terminal
 
