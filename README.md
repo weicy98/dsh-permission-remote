@@ -6,7 +6,7 @@
 
 ## 安装
 
-前置：DSH `0.2.1-rc.3`、`web` profile、Node `>= 22.5`。仓库：[weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote)。
+前置：DSH `>=0.2.1-rc.3 <0.3.0`、`web` profile、Node `>= 22.5`。仓库：[weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote)。
 
 从 GitHub 安装：
 
@@ -159,7 +159,7 @@ npm run build
 
 SSH remote workspaces for the DSH web GUI. On a workspace created from **Settings → SSH hosts**, the standard tools `bash`, `read`, `write`, `edit`, `read_image`, `glob`, and `grep` run on that Linux or macOS host. The session keeps its existing Permissions selector and approval card.
 
-Requires DSH `0.2.1-rc.3`, the `web` profile, and Node `>= 22.5`. Source: [weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote).
+Requires DSH `>=0.2.1-rc.3 <0.3.0`, the `web` profile, and Node `>= 22.5`. Source: [weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote).
 
 From GitHub:
 

@@ -37,7 +37,7 @@
   ],
   "engines": {
     "node": ">=22.5",
-    "dsh": "0.2.1-rc.3"
+    "dsh": ">=0.2.1-rc.3 <0.3.0"
   },
   "dsh": {
     "bundle": {
@@ -67,21 +67,23 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/cosmokit": "^1.8.6",
-    "@deepseek-ai/dsh-atomic-write": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-credentials": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-fs": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-home-paths": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-sandbox": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-settings": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-atomic-write": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-fs": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-home-paths": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-sandbox": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-settings": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.3 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.1-rc.3 <0.3.0",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/react": "~18.3.1",
+    "@types/semver": "^7.8.0",
     "@types/ssh2": "^1.15.5",
     "esbuild": "^0.25.9",
+    "semver": "^7.8.5",
     "typescript": "^5.9.3"
   }
 }
