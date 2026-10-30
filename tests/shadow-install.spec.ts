@@ -28,6 +28,8 @@ function agentFor(cwd: string, register: () => () => void) {
       systemPrompt: {
         section: () => () => undefined,
         getSectionOrder: () => 1000,
+        context: () => () => undefined,
+        getContextOrder: () => 100,
       },
       on: () => () => undefined,
       get: () => undefined,
@@ -148,4 +150,81 @@ test('an existing remote agent that cannot be shadowed fails plugin load', () =>
   })
   ctx.provide('agents', { list: () => [agent] })
   assert.throws(() => apply(ctx, { hosts: [], maxConnections: 4 }), /register failed/)
+})
+
+test('working_directory output carries the remote directory as an optional field', async () => {
+  const ctx = plugin()
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  interface Captured {
+    name: string
+    output?: {
+      schema?: { type?: string, additionalProperties?: boolean, required?: string[], properties?: Record<string, { description?: string }> }
+      render?: (args: unknown, value: { cwd?: unknown, remote?: unknown }) => Array<{ type: string, text: string }>
+    }
+  }
+  const tools: Captured[] = []
+  const { agent } = agentFor(remoteCwd, () => () => undefined)
+  agent.ctx.tools.register = ((definition: unknown) => {
+    tools.push(definition as Captured)
+    return () => undefined
+  }) as typeof agent.ctx.tools.register
+  await created(ctx, agent)
+
+  const wd = tools.find(tool => tool.name === 'working_directory')
+  assert.ok(wd?.output?.render)
+  const render = wd!.output!.render!
+  assert.equal(render({}, { cwd: 'C:/x', remote: '/srv/app' })[0]?.text, 'C:/x\n(remote: /srv/app)')
+  assert.equal(render({}, { cwd: 'C:/x' })[0]?.text, 'C:/x')
+  assert.deepEqual(wd!.output!.schema?.required, ['cwd'])
+  // With no official output available, the fallback still describes `cwd` and
+  // keeps the closed object shape; `remote` stays optional.
+  assert.equal(wd!.output!.schema?.type, 'object')
+  assert.equal(wd!.output!.schema?.additionalProperties, false)
+  assert.equal(wd!.output!.schema?.properties?.cwd?.description, 'Current absolute working directory.')
+  assert.ok(wd!.output!.schema?.properties?.remote)
+})
+
+test('working_directory merges remote into the real official schema, not a replacement', async () => {
+  const ctx = plugin()
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  interface Captured {
+    name: string
+    output?: {
+      schema?: { type?: string, additionalProperties?: boolean, required?: string[], properties?: Record<string, { description?: string }> }
+      render?: (args: unknown, value: { cwd?: unknown, remote?: unknown }) => Array<{ type: string, text: string }>
+    }
+  }
+  const tools: Captured[] = []
+  const { agent } = agentFor(remoteCwd, () => () => undefined)
+  const official = {
+    description: 'Read or change the calling Session working directory.',
+    parameters: { type: 'object', properties: { cd: { type: 'string' } }, additionalProperties: false },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { cwd: { type: 'string', description: 'Current absolute working directory.' } },
+        required: ['cwd'],
+      },
+      render: () => [{ type: 'text', text: 'official' }],
+    },
+    execute: async () => 'official',
+  }
+  const baseGet = agent.ctx.tools.get
+  agent.ctx.tools.get = ((name: string) => name === 'working_directory' ? official : baseGet()) as typeof agent.ctx.tools.get
+  agent.ctx.tools.register = ((definition: unknown) => {
+    tools.push(definition as Captured)
+    return () => undefined
+  }) as typeof agent.ctx.tools.register
+  await created(ctx, agent)
+
+  const schema = tools.find(tool => tool.name === 'working_directory')?.output?.schema
+  assert.ok(schema)
+  assert.equal(schema!.type, 'object')
+  assert.equal(schema!.additionalProperties, false)
+  // The official property and its description survive the merge.
+  assert.equal(schema!.properties?.cwd?.description, 'Current absolute working directory.')
+  assert.ok(schema!.properties?.remote)
+  // `remote` is optional: required still lists only cwd.
+  assert.deepEqual(schema!.required, ['cwd'])
 })

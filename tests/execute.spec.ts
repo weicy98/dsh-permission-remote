@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { finishBackground, runBash, runGlob, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { finishBackground, runBash, runGlob, runWorkingDirectory, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import type { RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -343,4 +346,79 @@ test('a file write does not load startup files', async () => {
   assert.equal(written.operation, 'create')
   assert.doesNotMatch(command, /__dsh_login/)
   assert.doesNotMatch(command, /--noprofile/)
+})
+
+test('working_directory reports the remote directory alongside the placeholder', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-wd-'))
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    // A symlinked directory: sftpRealpath returns the canonical path, which
+    // differs from both the requested path and the placeholder it maps to.
+    // Returning the requested path instead would let a regression that skips
+    // the realpath call still pass.
+    const canonical = '/srv/app/real-src'
+    const requestedPaths: string[] = []
+    let realpaths = 0
+    const api = {
+      pool: {
+        sftpRealpath: async (_host: HostConfig, _secret: unknown, requested: string) => {
+          realpaths += 1
+          requestedPaths.push(requested)
+          return canonical
+        },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+    } as unknown as ToolHost
+    const setCalls: string[] = []
+    const setDirectory = async (directory: string): Promise<string> => {
+      setCalls.push(directory)
+      return `/canonical-${setCalls.length}`
+    }
+
+    const changed = await runWorkingDirectory(api, route, { cd: '/srv/app/src' }, { agent: {} }, setDirectory)
+    // `remote` is the sftpRealpath result, never the requested path.
+    assert.equal(changed.remote, canonical)
+    // `cwd` is whatever `setDirectory` committed, not the placeholder it was handed.
+    assert.equal(changed.cwd, '/canonical-1')
+    assert.equal(setCalls.length, 1)
+    assert.equal(realpaths, 1)
+    // `resolveRemotePath` turned `cd: '/srv/app/src'` into the path we confirm.
+    assert.deepEqual(requestedPaths, ['/srv/app/src'])
+
+    // The handed path must live under the temp root we set, not the default
+    // `~/.dsh/remote`. Otherwise a mapping regression would still pass here and
+    // leave a directory behind that `rm(root)` cannot clean up.
+    const handed = setCalls[0]!
+    assert.ok(handed.startsWith(root), `setDirectory received ${handed}, expected a path under ${root}`)
+    assert.equal((await stat(handed)).isDirectory(), true)
+
+    const read = await runWorkingDirectory(api, route, {}, { agent: {} }, setDirectory)
+    assert.equal(read.cwd, route.placeholderCwd)
+    assert.equal(read.remote, route.remoteCwd)
+    // Reading the current directory must not dial the host or move the session.
+    assert.equal(setCalls.length, 1)
+    assert.equal(realpaths, 1)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('working_directory rejects a remote directory that does not exist', async () => {
+  const api = {
+    pool: {
+      sftpRealpath: async () => {
+        throw new Error('ENOENT')
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+  } as unknown as ToolHost
+  await assert.rejects(
+    () => runWorkingDirectory(api, route, { cd: '/srv/app/missing' }, { agent: {} }, async () => '/canonical'),
+    /directory does not exist on the remote host: \/srv\/app\/missing/,
+  )
 })

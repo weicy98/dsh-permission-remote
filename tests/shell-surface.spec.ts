@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   REMOTE_POSIX_PROMPT,
+  REMOTE_WORKSPACE_CONTEXT,
   WINDOWS_SHELL_DENIED,
   WINDOWS_SHELLS,
   isUnknownRestrictError,
   isWindowsShell,
   remotePosixPrompt,
+  remoteWorkspaceContextText,
   sameShellSurface,
   shellSurfacePlan,
   windowsShellGuardReason,
@@ -61,4 +63,30 @@ test('the remote prompt names POSIX bash and does not repeat the Windows termina
   assert.equal(windowsShellGuardReason(true), WINDOWS_SHELL_DENIED)
   assert.match(WINDOWS_SHELL_DENIED, /Windows machine where DSH is running/)
   assert.match(WINDOWS_SHELL_DENIED, /Use bash/)
+})
+
+test('the runtime context names the real remote directory and empties locally', () => {
+  const text = remoteWorkspaceContextText(remote)
+  // JSON.stringify keeps the path quoted, matching the cwd line's style.
+  assert.match(text, /"\/srv\/app"/)
+  assert.match(text, /placeholder/)
+  // Commands are covered too, not just file tools: a complete persona drops
+  // remote-posix-shell, so this context is the only per-turn instruction.
+  assert.match(text, /bash runs on that SSH host/)
+  assert.match(text, /never the local placeholder/)
+  assert.equal(remoteWorkspaceContextText({ kind: 'local' }), '')
+  assert.equal(REMOTE_WORKSPACE_CONTEXT, 'remote-workspace:directory')
+})
+
+test('the runtime context quotes a path with spaces and braces literally', () => {
+  const tricky: Route = {
+    kind: 'remote',
+    hostId: 'host1',
+    remoteCwd: '/srv/a b/{{cwd}}',
+    placeholderCwd: '/tmp/placeholder',
+  }
+  const text = remoteWorkspaceContextText(tricky)
+  // The quoted form keeps the path one literal token; `interpolate: false`
+  // keeps `{{cwd}}` from being read as a prompt variable.
+  assert.ok(text.includes(JSON.stringify('/srv/a b/{{cwd}}')), text)
 })

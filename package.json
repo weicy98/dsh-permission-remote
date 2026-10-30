@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",

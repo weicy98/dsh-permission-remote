@@ -74,6 +74,19 @@ export function remotePosixPrompt(remote: boolean): string {
   return remote ? REMOTE_POSIX_PROMPT : ''
 }
 
+/** Required runtime-context contribution: the placeholder's real remote directory. */
+export const REMOTE_WORKSPACE_CONTEXT = 'remote-workspace:directory'
+
+/**
+ * Text for the per-turn runtime context. Local returns '' so the snapshot drops
+ * it. JSON.stringify keeps spaces and `{{` literal (the context is registered
+ * with `interpolate: false`, so no variable expansion sees it either).
+ */
+export function remoteWorkspaceContextText(route: Route): string {
+  if (route.kind !== 'remote') return ''
+  return `This workspace is a remote directory on an SSH host. The session's working directory is a local placeholder that maps to the real remote directory ${JSON.stringify(route.remoteCwd)}. File tools keep returning placeholder paths — pass those back unchanged. bash runs on that SSH host, so in commands use that quoted remote directory for absolute paths, never the local placeholder.`
+}
+
 export function windowsShellGuardReason(remote: boolean): string | undefined {
   return remote ? WINDOWS_SHELL_DENIED : undefined
 }

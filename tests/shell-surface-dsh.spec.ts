@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { createScope, scopeOf, scopeTarget, type Scope } from '@deepseek-ai/dsh-scope'
-import { SystemPrompt, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import { SystemPrompt, renderPrompt, renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import { ToolRuntime, defineTool } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
@@ -119,11 +119,12 @@ async function boot() {
     })
   }
 
-  async function rendered(agent: HostAgent): Promise<{ tools: string[], prompt: string }> {
+  async function rendered(agent: HostAgent): Promise<{ tools: string[], prompt: string, context: string }> {
     const assembly = await ctx.systemPrompt.assemble({ scope: agent })
     return {
       tools: assembly.tools.map(tool => tool.name),
       prompt: renderPrompt(assembly),
+      context: renderContextSnapshot(assembly),
     }
   }
 
@@ -160,12 +161,14 @@ test('hiding an ancestor pwsh does not blank the static tool:pwsh section', asyn
     assert.match(remote.prompt, /POSIX host/)
     assert.match(remote.prompt, /Check the \[exit code: N\] marker/)
     assert.doesNotMatch(remote.prompt, /On Windows a killed process settles/)
+    assert.match(remote.context, /\/srv\/app/)
     assert.equal(agent.session.header.cwd, remoteCwd)
 
     const untouched = await host.rendered(other)
     assert.equal(untouched.tools.includes('pwsh'), true)
     assert.equal(untouched.tools.includes('bash'), false)
     assert.match(untouched.prompt, /On Windows a killed process settles/)
+    assert.doesNotMatch(untouched.context, /\/srv\/app/)
 
     host.emitCwd(agent, localCwd)
     assert.equal(agent.session.header.cwd, remoteCwd)
@@ -174,6 +177,7 @@ test('hiding an ancestor pwsh does not blank the static tool:pwsh section', asyn
     assert.equal(left.tools.includes('bash'), false)
     assert.match(left.prompt, /On Windows a killed process settles/)
     assert.doesNotMatch(left.prompt, /POSIX host/)
+    assert.doesNotMatch(left.context, /\/srv\/app/)
     const otherAfter = await host.rendered(other)
     assert.equal(otherAfter.tools.includes('bash'), false)
 
@@ -182,6 +186,7 @@ test('hiding an ancestor pwsh does not blank the static tool:pwsh section', asyn
     assert.equal(again.tools.includes('bash'), true)
     assert.equal(again.tools.includes('pwsh'), false)
     assert.doesNotMatch(again.prompt, /On Windows a killed process settles/)
+    assert.match(again.context, /\/srv\/app/)
     assert.equal((await host.rendered(other)).tools.includes('bash'), false)
   } finally {
     await host.close()
@@ -203,6 +208,9 @@ test('a complete persona keeps the filtered tool list and drops every section', 
     const assembly = await host.ctx.systemPrompt.assemble({ scope: agent })
     assert.deepEqual(assembly.sections.map(section => section.name), ['persona:minimal'])
     assert.equal(renderPrompt(assembly), 'MINIMAL PERSONA')
+    // A complete persona collapses sections only; the required remote-directory
+    // context still reaches the model in the same runtime snapshot.
+    assert.match(renderContextSnapshot(assembly), /\/srv\/app/)
     assert.equal(assembly.tools.some(tool => tool.name === 'pwsh'), false)
     assert.equal(assembly.tools.some(tool => tool.name === 'bash'), true)
   } finally {
@@ -273,3 +281,25 @@ function thrownDeny(agent: HostAgent, name: string): unknown {
     return error
   }
 }
+
+test('the remote directory context sits right after the working-directory context', async () => {
+  const host = await boot()
+  try {
+    host.preset.systemPrompt.context({
+      name: 'working-directory:current',
+      order: host.preset.systemPrompt.getContextOrder('WORKING_DIRECTORY'),
+      required: true,
+      interpolate: false,
+      text: 'Current working directory: "PLACEHOLDER".',
+    })
+    const agent = await host.makeAgent('ordered', remoteCwd)
+    await host.created(agent)
+    const view = await host.rendered(agent)
+    const cwdAt = view.context.indexOf('Current working directory: "PLACEHOLDER".')
+    const remoteAt = view.context.indexOf('/srv/app')
+    assert.ok(cwdAt >= 0, 'the working-directory context is present')
+    assert.ok(remoteAt > cwdAt, 'the remote directory follows it in the same snapshot')
+  } finally {
+    await host.close()
+  }
+})

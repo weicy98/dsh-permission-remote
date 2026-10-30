@@ -627,8 +627,8 @@ export async function runWorkingDirectory(
   args: Record<string, unknown>,
   exec: ToolExec,
   setDirectory: (directory: string) => Promise<string>,
-): Promise<{ cwd: string }> {
-  if (args.cd === undefined || args.cd === '') return { cwd: route.placeholderCwd }
+): Promise<{ cwd: string, remote: string }> {
+  if (args.cd === undefined || args.cd === '') return { cwd: route.placeholderCwd, remote: route.remoteCwd }
   const requested = resolveRemotePath(String(args.cd), route.remoteCwd, route.placeholderCwd)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
@@ -643,7 +643,7 @@ export async function runWorkingDirectory(
   await mkdir(local, { recursive: true })
   if (exec.agent === undefined) throw new Error('working_directory requires an agent Session')
   const cwd = await setDirectory(local)
-  return { cwd }
+  return { cwd, remote }
 }
 
 export async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {

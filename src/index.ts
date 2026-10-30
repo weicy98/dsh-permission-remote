@@ -33,9 +33,11 @@ import { childDirectoryPath, isValidHostId, mapRemoteToLocal, routeByCwd, type R
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
+  REMOTE_WORKSPACE_CONTEXT,
   isUnknownRestrictError,
   isWindowsShell,
   remotePosixPrompt,
+  remoteWorkspaceContextText,
   sameShellSurface,
   shellSurfacePlan,
   windowsShellGuardReason,
@@ -97,8 +99,10 @@ interface AgentContext {
     guard(guard: (execution: { readonly name: string, readonly agent?: ToolExec['agent'] }) => string | undefined): () => void
   }
   systemPrompt: {
-    section(section: { name: string, order: number, text: string | (() => string) }): () => void
+    section(section: { name: string, order: number, text: string | (() => string), complete?: boolean }): () => void
     getSectionOrder(name: string): number
+    context(context: { name: string, order: number, text: string | ((context: unknown) => string), required?: boolean, interpolate?: boolean }): () => void
+    getContextOrder(name: string): number
   }
   get(service: string): unknown
   on(event: 'session/event', listener: (session: unknown, event: { type: string, data?: { cwd?: string } }) => void): () => void
@@ -730,8 +734,9 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
       if (plan.official === undefined) continue
       const official = plan.official
       const runner = RUNNERS[plan.name]
-      disposers.push(agent.ctx.tools.register(withRemoteTimeout({
-        ...capturedSchema(agent.ctx.tools, plan.name, agent),
+      const base = capturedSchema(agent.ctx.tools, plan.name, agent) as Record<string, unknown>
+      const definition: Record<string, unknown> = {
+        ...base,
         name: plan.name,
         async execute(args: unknown, exec: ToolExec) {
           const current = routeByCwd(effectiveCwd(ctx, exec, headerCwd))
@@ -742,7 +747,9 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           }
           return runner(host, current, args as Record<string, unknown>, exec, ctx)
         },
-      })))
+      }
+      if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
+      disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
     const surface = installRemoteShellSurface(ctx, agent, host, headerCwd, hasOfficialBash, disposers)
     disposeDynamic = surface.disposeDynamic
@@ -808,7 +815,8 @@ function installRemoteShellSurface(
 ): { sync(route: Route): void, disposeDynamic(): void } {
   const dynamic: Array<() => void> = []
   let applied: Route = { kind: 'local' }
-  const remoteNow = (): boolean => routeByCwd(effectiveCwd(ctx, { agent }, headerCwd)).kind === 'remote'
+  const currentRoute = (): Route => routeByCwd(effectiveCwd(ctx, { agent }, headerCwd))
+  const remoteNow = (): boolean => currentRoute().kind === 'remote'
   const disposeDynamic = (): void => {
     const current = dynamic.splice(0, dynamic.length)
     let failure: unknown
@@ -919,6 +927,26 @@ function installRemoteShellSurface(
     order: agent.ctx.systemPrompt.getSectionOrder('TOOL_BASH') + 5,
     text: () => remotePosixPrompt(remoteNow()),
   }))
+  // A required runtime context, not a prompt section: it sits beside
+  // `Current working directory` in the same per-turn snapshot, survives a
+  // complete persona (which only collapses sections), and changes only the
+  // snapshot — never the system-prompt prefix — when the directory changes.
+  // Guard the call so a host whose systemPrompt predates the context API (or
+  // lacks the WORKING_DIRECTORY placement) still installs the remote shell
+  // surface: the feature degrades, the agent works.
+  const contextOrder = typeof agent.ctx.systemPrompt.getContextOrder === 'function'
+    ? agent.ctx.systemPrompt.getContextOrder('WORKING_DIRECTORY')
+    : undefined
+  if (typeof agent.ctx.systemPrompt.context === 'function'
+    && typeof contextOrder === 'number' && Number.isFinite(contextOrder)) {
+    disposers.push(agent.ctx.systemPrompt.context({
+      name: REMOTE_WORKSPACE_CONTEXT,
+      order: contextOrder + 1,
+      required: true,
+      interpolate: false,
+      text: () => remoteWorkspaceContextText(currentRoute()),
+    }))
+  }
   disposers.push(agent.ctx.on('session/event', (_session, event) => {
     if (event.type !== 'working-directory/change') return
     if (typeof event.data?.cwd !== 'string') return
@@ -1005,6 +1033,39 @@ function capturedSchema(tools: HostContext['tools'], toolName: string, agent: ob
   if (official === undefined) return fallbackSchema(toolName)
   const { execute: _execute, ...rest } = official as object & { execute?: unknown }
   return rest
+}
+
+const DEFAULT_WORKING_DIRECTORY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { cwd: { type: 'string', description: 'Current absolute working directory.' } },
+  required: ['cwd'],
+}
+
+/**
+ * The official `{ cwd }` output with an added optional `remote`. Keeping
+ * `remote` optional lets an old `{ cwd }` record validate; `render` falls back
+ * to the single cwd line for a local call that carries no remote directory.
+ */
+function workingDirectoryOutput(official: unknown): object {
+  const base = (official ?? {}) as { schema?: Record<string, unknown>, render?: unknown }
+  const schema = (base.schema ?? DEFAULT_WORKING_DIRECTORY_SCHEMA) as Record<string, unknown> & { properties?: Record<string, unknown> }
+  return {
+    ...base,
+    schema: {
+      ...schema,
+      properties: {
+        ...(schema.properties ?? {}),
+        remote: { type: 'string', description: 'The real directory on the SSH host that this placeholder path maps to.' },
+      },
+    },
+    render: (_args: unknown, value: { cwd?: unknown, remote?: unknown }) => [{
+      type: 'text',
+      text: typeof value?.remote === 'string' && value.remote.length > 0
+        ? `${String(value.cwd)}\n(remote: ${value.remote})`
+        : String(value?.cwd ?? ''),
+    }],
+  }
 }
 
 function fallbackSchema(toolName: string): object {

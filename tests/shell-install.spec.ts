@@ -4,7 +4,7 @@ import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
-import { PWSH_SECTION, REMOTE_POSIX_SECTION, WINDOWS_SHELL_DENIED } from '../src/shell-surface.ts'
+import { PWSH_SECTION, REMOTE_POSIX_SECTION, REMOTE_WORKSPACE_CONTEXT, WINDOWS_SHELL_DENIED } from '../src/shell-surface.ts'
 
 const remoteCwd = mapRemoteToLocal('host1', '/srv/app')!
 const localCwd = '/tmp/local-project'
@@ -25,6 +25,15 @@ interface RegisteredSection {
   active: boolean
 }
 
+interface RegisteredContext {
+  name: string
+  order: number
+  text: string | ((context: unknown) => string)
+  required?: boolean
+  interpolate?: boolean
+  active: boolean
+}
+
 interface SurfaceOptions {
   headerCwd: string
   liveCwd?: string
@@ -35,6 +44,8 @@ interface SurfaceOptions {
   restrictError?: (name: string) => Error | undefined
   /** The first dynamic `tool:pwsh` disposer deactivates, then throws once. */
   failSectionDispose?: boolean
+  /** Simulate a host whose systemPrompt predates the runtime-context API. */
+  noContextApi?: boolean
 }
 
 function surface(options: SurfaceOptions) {
@@ -65,6 +76,7 @@ function surface(options: SurfaceOptions) {
 
   const tools: RegisteredTool[] = []
   const sections: RegisteredSection[] = []
+  const contexts: RegisteredContext[] = []
   const denies: string[] = []
   const restrictCalls: string[] = []
   const guards: Array<{ active: boolean, fn: (execution: { name: string, agent?: object }) => string | undefined }> = []
@@ -132,6 +144,17 @@ function surface(options: SurfaceOptions) {
           if (name === 'TOOL_BASH') return 1000
           throw new Error(`unknown section order ${name}`)
         },
+        ...options.noContextApi === true ? {} : {
+          context: (spec: { name: string, order: number, text: string | ((context: unknown) => string), required?: boolean, interpolate?: boolean }) => {
+            const entry: RegisteredContext = { name: spec.name, order: spec.order, text: spec.text, required: spec.required, interpolate: spec.interpolate, active: true }
+            contexts.push(entry)
+            return () => { entry.active = false }
+          },
+          getContextOrder: (name: string) => {
+            if (name === 'WORKING_DIRECTORY') return 100
+            throw new Error(`unknown context order ${name}`)
+          },
+        },
       },
       on: (event: string, fn: (...args: unknown[]) => unknown) => {
         const entry = { event, active: true, fn }
@@ -149,6 +172,8 @@ function surface(options: SurfaceOptions) {
   const activeTools = (name?: string) => tools.filter(tool => tool.active && (name === undefined || tool.name === name))
   const activeSections = (name?: string) => sections.filter(section => section.active && (name === undefined || section.name === name))
   const textOf = (section: RegisteredSection): string => typeof section.text === 'function' ? section.text() : section.text
+  const activeContexts = (name?: string) => contexts.filter(context => context.active && (name === undefined || context.name === name))
+  const contextTextOf = (context: RegisteredContext): string => typeof context.text === 'function' ? context.text(undefined) : context.text
   const render = (): string => {
     const byName = new Map<string, string>([['tool:bash', OFFICIAL_BASH], [PWSH_SECTION, OFFICIAL_PWSH]])
     for (const section of activeSections()) byName.set(section.name, textOf(section))
@@ -186,6 +211,8 @@ function surface(options: SurfaceOptions) {
     cleanups,
     activeTools,
     activeSections,
+    activeContexts,
+    contextTextOf,
     render,
     emit,
     guard,
@@ -438,4 +465,27 @@ test('agent destroy and plugin unload can install the shell surface again', asyn
   await session.created()
   assert.equal(session.activeTools('bash').length, 1)
   assert.deepEqual(session.denies, ['pwsh', 'powershell', 'cmd'])
+})
+
+test('a remote install adds a required runtime context naming the remote directory', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false })
+  await session.created()
+  const found = session.activeContexts(REMOTE_WORKSPACE_CONTEXT)
+  assert.equal(found.length, 1)
+  const context = found[0]!
+  assert.equal(context.order, 101)
+  assert.equal(context.required, true)
+  assert.equal(context.interpolate, false)
+  assert.match(session.contextTextOf(context), /\/srv\/app/)
+
+  session.emit('working-directory/change', localCwd)
+  assert.equal(session.contextTextOf(context), '')
+})
+
+test('a host without the runtime-context API still installs the remote shell surface', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, noContextApi: true })
+  await session.created()
+  assert.equal(session.activeTools('bash').length, 1)
+  assert.equal(session.activeContexts().length, 0)
+  assert.match(session.render(), /POSIX host/)
 })
