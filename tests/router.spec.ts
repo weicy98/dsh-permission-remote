@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { isValidHostId, mapRemoteToLocal, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
 
 const env = { DSH_HOME: '/tmp/dsh-home' }
 
@@ -52,4 +52,27 @@ test('host ids use the credential-key grammar', () => {
   assert.equal(isValidHostId('Host'), false)
   assert.equal(isValidHostId('host.name'), false)
   assert.equal(mapRemoteToLocal('Host', '/srv/app', env), null)
+})
+
+test('a new folder name becomes one child of the listed directory', () => {
+  assert.deepEqual(childDirectoryPath('/', 'proj'), { path: '/proj' })
+  assert.deepEqual(childDirectoryPath('/home/u', 'proj'), { path: '/home/u/proj' })
+  // A trailing slash on the parent must not double the separator.
+  assert.deepEqual(childDirectoryPath('/home/u/', 'proj'), { path: '/home/u/proj' })
+  // Spaces are part of the name, but a tab-only name is empty after trimming.
+  assert.deepEqual(childDirectoryPath('/home/u', '  my dir  '), { path: '/home/u/my dir' })
+})
+
+test('a new folder name that would leave the listed directory is refused', () => {
+  // A separator would create a tree the picker never listed.
+  assert.deepEqual(childDirectoryPath('/home/u', 'a/b'), { error: 'separator' })
+  assert.deepEqual(childDirectoryPath('/home/u', '/abs'), { error: 'separator' })
+  // Dot segments resolve somewhere the operator is not looking at.
+  assert.deepEqual(childDirectoryPath('/home/u', '.'), { error: 'dot' })
+  assert.deepEqual(childDirectoryPath('/home/u', '..'), { error: 'dot' })
+  assert.deepEqual(childDirectoryPath('/home/u', '   '), { error: 'empty' })
+  assert.deepEqual(childDirectoryPath('/home/u', ''), { error: 'empty' })
+  // A dot inside a longer name is a normal name.
+  assert.deepEqual(childDirectoryPath('/home/u', '.config'), { path: '/home/u/.config' })
+  assert.deepEqual(childDirectoryPath('/home/u', 'a..b'), { path: '/home/u/a..b' })
 })

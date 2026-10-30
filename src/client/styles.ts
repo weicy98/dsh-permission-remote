@@ -607,6 +607,19 @@ const CSS = `
   line-height: 18px;
   white-space: nowrap;
 }
+/* Inline create row: it sits between the filter and the listing so the names
+   already on screen stay visible while the operator picks one that is free. */
+.dsh-ssh-newfolder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dsh-ssh-newfolder-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+}
 .dsh-ssh-breadcrumb {
   display: flex;
   flex-wrap: wrap;

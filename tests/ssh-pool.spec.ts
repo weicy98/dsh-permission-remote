@@ -87,3 +87,15 @@ test('a saved host drops its cached session before the next connection', () => {
   pool.invalidate('h1')
   assert.equal(pool.hasSession('h1'), false)
 })
+
+/**
+ * `sftpMkdir` reaches the SSH channel, so the pool cannot be driven without a
+ * server. What is checkable here is the shape it depends on: ssh2's `mkdir`
+ * takes the callback as the second argument, and the vendored copy keeps that
+ * overload. A rewrite that drops it would turn every create into a silence
+ * rather than an error.
+ */
+test('the vendored SFTP client accepts mkdir(path, callback)', async () => {
+  const source = await import('node:fs').then(fs => fs.readFileSync(new URL('../vendor/ssh2/lib/protocol/SFTP.js', import.meta.url), 'utf8'))
+  assert.match(source, /mkdir\(path, attrs, cb\) \{\n(?:.*\n){0,6}\s+if \(typeof attrs === 'function'\) \{/)
+})

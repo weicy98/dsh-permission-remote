@@ -336,6 +336,16 @@ export class SshPool {
       .sort((a, b) => a.name.localeCompare(b.name))
   }
 
+  /**
+   * Create one directory. `recursive` is off by default on purpose: a picker
+   * creates a child of a directory it just listed, so a missing parent means
+   * the listing went stale and creating a deep tree would hide that.
+   */
+  async sftpMkdir(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<void> {
+    const session = await this.sftp(host, secret)
+    await makeDirectory(session, remotePath)
+  }
+
   private async sftp(host: HostConfig, secret: SecretMaterial): Promise<SftpLike> {
     const live = await this.acquire(host, secret, true)
     live.sftp ??= openSftp(live.client).catch(error => {
@@ -641,6 +651,8 @@ interface SftpLike {
   realpath(path: string, callback: (error: Error | undefined, resolved: string) => void): void
   readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>) => void): void
   stat(path: string, callback: (error: Error | undefined, stats: { size: number, mode?: number, isDirectory(): boolean }) => void): void
+  /** `attrs` is optional in ssh2: `mkdir(path, callback)` sends an empty ATTRS. */
+  mkdir(path: string, callback: (error: Error | undefined) => void): void
   end(callback?: () => void): void
   /** The underlying SFTP implementation is an EventEmitter; only `error` matters here. */
   on(event: 'error', listener: (error: Error) => void): void
@@ -717,6 +729,20 @@ function writeAll(sftp: SftpLike, remotePath: string, body: Buffer | string): Pr
   return new Promise((resolve, reject) => {
     sftp.writeFile(remotePath, body, error => {
       if (error) reject(new SshFailure(error.message, 'sftp-write'))
+      else resolve()
+    })
+  })
+}
+
+/**
+ * One `MKDIR`. The reply is a status only, so the error text is the whole
+ * diagnosis: ssh2 reports SFTP status 4 as "Failure" and OpenSSH's wording
+ * ("File exists", "Permission denied") reaches the caller unchanged.
+ */
+function makeDirectory(sftp: SftpLike, remotePath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.mkdir(remotePath, error => {
+      if (error) reject(new SshFailure(error.message, 'sftp-mkdir'))
       else resolve()
     })
   })

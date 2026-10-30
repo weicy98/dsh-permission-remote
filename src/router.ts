@@ -96,9 +96,25 @@ export function resolveRemotePath(requestedPath: string, remoteCwd: string, plac
   return posix.normalize(requestedPath)
 }
 
+/**
+ * A directory the picker may create inside `parent`, or `null` with the reason.
+ *
+ * The name is one path segment: a separator would build a tree the operator
+ * never listed, and `.`/`..` would resolve somewhere they are not looking at.
+ * Only the name is validated; whether it exists is the remote's answer, which
+ * this cannot know.
+ */
+export function childDirectoryPath(parent: string, rawName: string): { path: string } | { error: 'empty' | 'dot' | 'separator' } {
+  const name = rawName.trim()
+  if (name.length === 0) return { error: 'empty' }
+  if (name === '.' || name === '..') return { error: 'dot' }
+  if (name.includes('/') || name.includes('\0')) return { error: 'separator' }
+  const root = parent.length === 0 ? '/' : parent
+  return { path: root === '/' ? `/${name}` : `${root.replace(/\/$/, '')}/${name}` }
+}
+
 /** Spell a remote absolute path back as the local placeholder path the model already sees. */
-export function toPlaceholderPath(remotePath: string, hostId: string, env: NodeJS.ProcessEnv = process.env): string {
-  const normalized = posix.normalize(remotePath)
+export function toPlaceholderPath(remotePath: string, hostId: string, env: NodeJS.ProcessEnv = process.env): string {  const normalized = posix.normalize(remotePath)
   const local = mapRemoteToLocal(hostId, normalized, env)
   if (local === null) return normalized
   return local

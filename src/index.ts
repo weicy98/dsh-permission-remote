@@ -29,7 +29,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
-import { isValidHostId, mapRemoteToLocal, routeByCwd, type Route } from './router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, routeByCwd, type Route } from './router.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -166,6 +166,33 @@ class SshApi extends TypertRemoteService {
     const host = this.core.requireHost(input.hostId)
     const entries = await this.core.pool.sftpList(host, await this.core.secret(host), input.path || '/')
     return { path: input.path || '/', entries }
+  }
+
+  /**
+   * Create one directory below an already-listed one, then return the new
+   * listing so the picker shows it without a second round trip.
+   *
+   * The name is one path segment: a separator would create a tree the caller
+   * never listed, and `.`/`..` would escape the directory the operator is
+   * looking at.
+   */
+  async createDir(input: { hostId: string, path: string, name: string }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
+    const host = this.core.requireHost(input.hostId)
+    const parent = input.path || '/'
+    const child = childDirectoryPath(parent, input.name)
+    if ('error' in child) {
+      throw new Error(child.error === 'empty'
+        ? 'new folder name is empty'
+        : child.error === 'dot'
+          ? `"${input.name.trim()}" is not a folder name`
+          : 'new folder name must be one path segment')
+    }
+    const secret = await this.core.secret(host)
+    await this.core.pool.sftpMkdir(host, secret, child.path)
+    // The reply carries the refreshed listing: the picker shows the new row
+    // without asking again, and a name the remote accepted is never assumed.
+    const entries = await this.core.pool.sftpList(host, secret, parent)
+    return { path: parent, entries }
   }
 
   async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string, title: string }> {
@@ -597,7 +624,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'refreshLoginEnv', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'refreshLoginEnv', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({

@@ -201,6 +201,13 @@ function Section(props: SectionProps): JSX.Element {
    * in just to move one row.
    */
   const [active, setActive] = useState(-1)
+  /**
+   * New-folder row under the listing. `null` is closed; a string is the name
+   * being typed. Kept apart from `filter` so creating a folder never discards
+   * the query the operator is browsing with.
+   */
+  const [newFolder, setNewFolder] = useState<string | null>(null)
+  const newFolderRef = useRef<HTMLInputElement | null>(null)
   const searchRef = useRef<HTMLInputElement | null>(null)
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
   /** The open picker's card, scrolled into view when a host is opened. */
@@ -521,6 +528,8 @@ function Section(props: SectionProps): JSX.Element {
       if (listed.path !== dir || hostId !== browsing) {
         setFilter('')
         setActive(-1)
+        // A name typed for the previous directory does not belong to this one.
+        setNewFolder(null)
       }
     } catch (error) {
       fail(error)
@@ -537,6 +546,9 @@ function Section(props: SectionProps): JSX.Element {
     setListed(false)
     setFilter('')
     setActive(-1)
+    // The name belongs to one directory; reopening the picker elsewhere must
+    // not resurrect it.
+    setNewFolder(null)
   }
 
   async function createWorkspace(hostId: string, path: string): Promise<void> {
@@ -552,6 +564,37 @@ function Section(props: SectionProps): JSX.Element {
       fail(error)
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * Create a folder below the listed directory and show it in place.
+   *
+   * The reply carries the refreshed listing, so the new row appears without a
+   * second round trip. The picker stays open and the typed name stays in the
+   * field: creating several folders in a row is the common case, and closing
+   * the row would make the operator reopen it each time.
+   */
+  async function createFolder(hostId: string, path: string): Promise<void> {
+    const name = (newFolder ?? '').trim()
+    if (name.length === 0 || name.includes('/')) {
+      fail(t('newFolderBadName'))
+      return
+    }
+    setBusy(true)
+    try {
+      const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'createDir', { hostId, path, name })
+      setEntries(listed.entries)
+      setNewFolder('')
+      note(`${t('createdFolder')} ${name}`)
+    } catch (error) {
+      // EEXIST and permission failures arrive as the remote's own wording; name
+      // the duplicate case so a retry with the same name is explained.
+      const text = error instanceof Error ? error.message : String(error)
+      fail(/exists/i.test(text) ? t('newFolderExists') : error)
+    } finally {
+      setBusy(false)
+      newFolderRef.current?.focus()
     }
   }
 
@@ -779,6 +822,23 @@ function Section(props: SectionProps): JSX.Element {
             <div className="dsh-ssh-inline">
               <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(host.id, parentDir(dir))}>{t('up')}</button>
               <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, dir)}>{t('refresh')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button"
+                aria-expanded={newFolder !== null}
+                disabled={busy || !listed}
+                onClick={() => {
+                  // A folder is created inside the directory being listed, so
+                  // the row needs a committed listing to attach to.
+                  if (newFolder !== null) {
+                    setNewFolder(null)
+                    return
+                  }
+                  setNewFolder('')
+                  // The field mounts on this click; focus after the commit.
+                  setTimeout(() => newFolderRef.current?.focus(), 0)
+                }}
+              >{t('newFolder')}</button>
               <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
             </div>
             <button type="button" className="dsh-ssh-close" aria-label={t('closeBrowser')} title={t('closeBrowser')} disabled={busy} onClick={closeBrowser}>×</button>
@@ -822,6 +882,39 @@ function Section(props: SectionProps): JSX.Element {
             ? <span className="dsh-ssh-filter-count">{visible.length} / {entries.length}</span>
             : null}
         </div>
+        {/* The name lives in the picker, not a dialog: the operator creates a
+            folder inside the directory they are looking at, and a modal would
+            hide the listing that says whether the name is already taken. */}
+        {newFolder !== null
+          ? <form
+              className="dsh-ssh-newfolder"
+              onSubmit={event => {
+                event.preventDefault()
+                void createFolder(host.id, dir)
+              }}
+            >
+              <input
+                ref={newFolderRef}
+                className="dsh-ssh-input dsh-ssh-newfolder-input"
+                type="text"
+                value={newFolder}
+                aria-label={t('newFolderName')}
+                placeholder={t('newFolderPlaceholder')}
+                autoComplete="off"
+                spellCheck={false}
+                disabled={busy}
+                onChange={event => setNewFolder(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key !== 'Escape') return
+                  event.preventDefault()
+                  setNewFolder(null)
+                  searchRef.current?.focus()
+                }}
+              />
+              <button type="submit" className="dsh-ssh-button" data-primary="true" disabled={busy || newFolder.trim().length === 0 || newFolder.includes('/')}>{t('newFolderCreate')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => { setNewFolder(null); searchRef.current?.focus() }}>{t('newFolderCancel')}</button>
+            </form>
+          : null}
         {/* Focus stays in the input (the combobox), so an arrow key moves a
             highlight and not the caret: the input's `aria-activedescendant` is
             what announces the row, and `aria-selected` marks it in the list.
