@@ -3,9 +3,9 @@
  *
  * The form is a long-lived copy of one host row. Trusting a fingerprint updates
  * the stored row, which the form does not edit, so a later save takes `id` and
- * `fingerprint` from the latest row. `opsPolicy` is a form field, so the form's
- * value is what gets saved. A successful change on the host card copies that
- * policy back into an open form.
+ * `fingerprint` from the latest row. `opsPolicy` and `loginEnv` are form
+ * fields, so the form's values are what get saved. A successful change on the
+ * host card copies that value back into an open form.
  */
 import type { HostView } from './api.ts'
 
@@ -29,6 +29,7 @@ export function toDraft(host: HostView): Draft {
     auth: host.auth,
     privateKeyPath: host.privateKeyPath,
     opsPolicy: host.opsPolicy,
+    loginEnv: host.loginEnv === true,
   }
 }
 
@@ -42,6 +43,7 @@ export function blankDraft(): Draft {
     auth: 'key',
     privateKeyPath: '',
     opsPolicy: 'ask',
+    loginEnv: false,
   }
 }
 
@@ -73,6 +75,7 @@ export function mergeEditedHost(latest: HostView | undefined, form: Draft): Host
     privateKeyPath: form.privateKeyPath,
     fingerprint: moved ? '' : latest?.fingerprint ?? '',
     opsPolicy: form.opsPolicy,
+    loginEnv: form.loginEnv === true,
   }
 }
 

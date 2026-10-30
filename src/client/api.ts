@@ -10,6 +10,8 @@ export interface HostView {
   privateKeyPath: string
   fingerprint: string
   opsPolicy: 'ask' | 'trust' | 'deny'
+  /** Absent on rows saved before the switch existed. Treated as off. */
+  loginEnv: boolean
 }
 
 export interface RunnerView {
@@ -82,7 +84,9 @@ export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   const described = response.value ?? response
   const namespaces = described.namespaces ?? []
   const row = namespaces.find(item => item.ns === NS)
-  const hosts = Array.isArray(row?.value?.hosts) ? row.value.hosts : []
+  const listed = Array.isArray(row?.value?.hosts) ? row.value.hosts : []
+  // Rows saved before the switch existed omit it. Missing means off.
+  const hosts = listed.map(host => ({ ...host, loginEnv: host.loginEnv === true }))
   // Older host builds have no such field; tagging is their default.
   const tagWorkspaceTitles = row?.value?.tagWorkspaceTitles !== false
   const rgRegistry = typeof row?.value?.rgRegistry === 'string' ? row.value.rgRegistry : ''

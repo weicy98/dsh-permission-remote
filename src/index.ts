@@ -7,7 +7,8 @@ import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type Para
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { fetchRgBinary, rgPlatformOf } from './rg-fetch.ts'
-import { Config, connectionKeyChanged, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
+import { Config, connectionKeyChanged, normalizeLoginEnv, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
+import { LoginEnvCache, LOGIN_ENV_CAPTURE_MS, loginEnvCaptureCommand, type LoginEnvRead } from './login-env.ts'
 import {
   buildResolveMode,
   installBubblewrap,
@@ -210,6 +211,12 @@ class SshApi extends TypertRemoteService {
     return { ok: true }
   }
 
+  /** Drop the cached login environment. The next workspace command reads it again. */
+  async refreshLoginEnv(input: { hostId: string }): Promise<{ ok: true }> {
+    this.core.refreshLoginEnv(input.hostId)
+    return { ok: true }
+  }
+
   async deleteHost(input: { hostId: string }): Promise<{ ok: true }> {
     await this.core.deleteHost(input.hostId)
     return { ok: true }
@@ -226,6 +233,7 @@ export class Core {
   private config: PluginConfig
   private readonly status = new Map<string, Promise<RunnerStatus>>()
   private readonly shellLists = new Map<string, Promise<SidebarShell[]>>()
+  private readonly loginEnvs = new LoginEnvCache((hostId, signal) => this.readLoginEnv(hostId, signal))
 
   constructor(
     private readonly ctx: HostContext,
@@ -366,6 +374,16 @@ export class Core {
     this.pool.invalidate(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
+    this.loginEnvs.forget(hostId)
+  }
+
+  /**
+   * Drop the cached login environment only. The pooled SSH session stays up.
+   * The next workspace command captures again, bounded by {@link LOGIN_ENV_CAPTURE_MS}.
+   */
+  refreshLoginEnv(hostId: string): void {
+    this.requireHost(hostId)
+    this.loginEnvs.forget(hostId)
   }
 
   /** Drop the sidebar shell menu for one host. The label includes the server name. */
@@ -430,13 +448,21 @@ export class Core {
   async saveHost(host: HostConfig): Promise<void> {
     assertHostId(host.id)
     const previous = this.config.hosts.find(item => item.id === host.id)
-    const normalized = { ...host, opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy) }
+    const normalized = {
+      ...host,
+      opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy),
+      loginEnv: normalizeLoginEnv((host as { loginEnv?: unknown }).loginEnv),
+    }
     this.config.hosts = previous === undefined
       ? [...this.config.hosts, normalized]
       : this.config.hosts.map(item => item.id === host.id ? normalized : item)
     // A cached session keyed by id would keep talking to the previous machine.
     if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
-    else forgetOpsHost(host.id)
+    else {
+      forgetOpsHost(host.id)
+      // The snapshot is not part of the handshake. Drop it only when the switch flips.
+      if (previous !== undefined && (previous.loginEnv === true) !== normalized.loginEnv) this.loginEnvs.forget(host.id)
+    }
     // A rename keeps the connection. The shell menu still caches `host · zsh`.
     this.forgetShells(normalized.id)
     await this.persistHosts()
@@ -531,8 +557,21 @@ export class Core {
       secretOf: host => this.secret(host),
       statusOf: host => this.probe(host.id),
       resolveMode: buildResolveMode(this.ctx),
+      loginEnvOf: (host, signal) => this.loginEnvs.get(host.id, signal),
       jobs,
     }
+  }
+
+  /** Read startup files once. A cancelled read is not stored; a timeout is stored as empty. */
+  private async readLoginEnv(hostId: string, signal?: AbortSignal): Promise<LoginEnvRead> {
+    const host = this.requireHost(hostId)
+    const result = await this.pool.exec(host, await this.secret(host), loginEnvCaptureCommand(), LOGIN_ENV_CAPTURE_MS, signal)
+    if (signal?.aborted === true) {
+      const error = new Error('aborted')
+      error.name = 'AbortError'
+      throw error
+    }
+    return { stdout: result.stdout, timedOut: result.timedOut, stdoutTruncated: result.stdoutTruncated }
   }
 }
 
@@ -558,7 +597,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'refreshLoginEnv', 'deleteHost']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({

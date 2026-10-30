@@ -697,11 +697,46 @@ const CSS = `
   font-size: 12px;
   line-height: 18px;
 }
-.dsh-ssh-policy {
-  width: auto;
-  min-width: 92px;
-  height: 28px;
-  padding: 0 6px;
+/*
+ * A host row's non-default settings. They are named only when they differ from
+ * the defaults, so the one host that runs remote calls without approval is not
+ * hidden among nine that say "Ask each time". Clicking opens the edit dialog,
+ * where both settings live with their explanations.
+ */
+.dsh-ssh-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+.dsh-ssh-badge,
+.dsh-ssh-badge-action {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.dsh-ssh-badge[data-tone="warn"] {
+  border-color: var(--dsw-alias-state-warn-label);
+  color: var(--dsw-alias-state-warn-label);
+}
+.dsh-ssh-badge:disabled,
+.dsh-ssh-badge-action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.dsh-ssh-badge-action {
+  border-style: dashed;
+  color: var(--dsw-alias-label-tertiary);
 }
 `
 

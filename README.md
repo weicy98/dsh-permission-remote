@@ -46,6 +46,38 @@ dsh plugin --profile web add dsh-permission-remote
 
 打开这个工作区的会话后，对话和 Permissions 与本地会话相同。相对路径按远端工作目录解析。工具结果里的路径写成占位目录，模型下一轮仍用这条路径。`working_directory` 也留在这条占位路径上：切换目录会确认远端目录存在，再把会话目录改成对应的占位路径，不会改到你这台电脑上的真实目录。
 
+## 主机设置：远程调用审批与环境变量来源
+
+每台主机卡片上的两个设置都在**编辑对话框**里。卡片上平时只显示操作按钮；某一项偏离默认值时，卡片上会多出一个标签写明它，点标签直接打开编辑对话框。
+
+### 远程调用审批（默认「每次询问」）
+
+控制其他工作区里的会话用 `ssh_exec` / `ssh_write` 操作这台主机时放不放行：
+
+| 选项 | 行为 |
+|---|---|
+| 每次询问 | 执行命令和写文件各要一次 `danger-full-access` 审批（默认） |
+| 不再询问 | 直接执行，不弹卡。卡片上显示琥珀色标签「远程调用免审批」 |
+| 禁止调用 | 这台主机拒绝所有远程命令和写入。卡片上显示灰色标签「远程调用已禁止」 |
+
+读取远端文件不受这个设置影响。
+
+### 环境变量来源（默认「SSH 登录环境」）
+
+远端工作区里的 `bash` 用哪一套环境变量：
+
+| 选项 | 行为 |
+|---|---|
+| SSH 登录环境 | 沿用 SSH 登录时拿到的变量，通常只有 `/etc/environment` 里那几个（默认） |
+| 读取 bash 启动脚本 | 捕获一次启动文件导出的变量并复用。卡片上显示标签「读取 bash 启动脚本」和「重新读取环境」 |
+
+选「读取 bash 启动脚本」后，这条 SSH 连接上的第一条工作区命令会读一次启动文件：`/etc/profile`，然后 `~/.bash_profile`、`~/.bash_login`、`~/.profile` 里第一个能读的，再是 `/etc/bash.bashrc` 和 `~/.bashrc`。前面已经 source 过的 `~/.bashrc` 和 `/etc/bash.bashrc` 不会再读。读取时丢掉这些文件的输出，最多 10 秒。超时或失败时，这次连接后面的命令继续用 SSH 原来的环境，也不会反复重试。
+
+读到的变量会复用，直到断开连接、切回「SSH 登录环境」，或在卡片上点「重新读取环境」。重新读取只丢掉这份缓存，不断开 SSH；下一条工作区命令会再读一次，同样最多 10 秒。bashrc 里导出的 `PATH`（例如 nvm、cargo）会保留。如果 bashrc 把 `PATH` 设成了错误的值，之后的命令会一直用这份 `PATH`，直到重新读取、断开连接或切回。
+
+`PWD`、`OLDPWD` 和 `SHLVL` 是当前会话的状态，不会进缓存。每条命令自己的 bash 再设置它们。不读取 `~/.zshrc`。别名和函数不会保留：靠 `PATH` 找到的命令会生效，靠 shell 函数的（如 `nvm`）不会。每条用户命令仍是一个新的 bash。`ssh_exec` 不受这个设置影响，它还是 `bash -lc`。
+
+
 `workspace-write` 的文件写入在远端沙箱进程里完成：内容先进入同目录的临时文件，再 `mv -f` 换成目标文件。中途断开留下的是临时文件，原来的内容还在。`danger-full-access` 用同一步替换，但不包沙箱。
 
 ## 权限
@@ -156,6 +188,37 @@ Deleting a host only removes it from the list: its workspaces stay registered wi
 Linux bash confinement needs bubblewrap. The settings page can install it with `sudo -n`, and also shows the manual command for Debian, Fedora, Arch, and Alpine. macOS uses the system `sandbox-exec`.
 
 `glob` and `grep` need ripgrep on the remote; the plugin uploads a matching binary when it has one. A package manager installs only its own platform's package, so a Windows DSH managing a Linux remote has no Linux binary to upload. A binary already at `$HOME/.dsh-permission-remote/rg` that runs `--version` is used as-is. Otherwise the host row offers “Install ripgrep”: it downloads `@vscode/ripgrep-<platform>` for the remote from the configured npm source (empty means npmjs; a mirror works), takes `package/bin/rg` out of the tarball, caches it at `$DSH_HOME/cache/ripgrep/<platform>/rg`, and re-probes. The same button retries after a remote refused the upload. Nothing reaches the network unless that button is pressed. Alternatively install ripgrep on the remote so `rg` is on `PATH`.
+
+## Per-host settings: remote call approval and environment source
+
+Both settings live in the **edit dialog**. The card normally shows only actions; when one of them leaves its default, the card gains a label naming it, and clicking that label opens the dialog.
+
+### Remote call approval (default: ask each time)
+
+Controls whether a session in another workspace may use `ssh_exec` / `ssh_write` against this host:
+
+| Option | Behaviour |
+|---|---|
+| Ask each time | Each command and each write needs one `danger-full-access` approval (default) |
+| Do not ask | Runs directly with no prompt. The card shows an amber label: remote calls need no approval |
+| Block calls | This host refuses every remote command and write. The card shows a grey label: remote calls blocked |
+
+Reading remote files is not affected by this setting.
+
+### Environment source (default: SSH login environment)
+
+Which variables a remote workspace's `bash` runs with:
+
+| Option | Behaviour |
+|---|---|
+| SSH login environment | Keeps what SSH logged in with, usually just the few in `/etc/environment` (default) |
+| Read bash startup files | Captures the variables the startup files export once, and reuses them. The card shows the label plus Re-read environment |
+
+With Read bash startup files, the first workspace command on that SSH connection reads `/etc/profile`, the first readable of `~/.bash_profile`, `~/.bash_login`, and `~/.profile`, then `/etc/bash.bashrc` and `~/.bashrc`. A `~/.bashrc` or `/etc/bash.bashrc` that an earlier file already sourced is not read again. Output from those files is discarded. Reading stops after 10 seconds. If it times out or fails, later commands on this connection keep the SSH environment and the read is not retried.
+
+The variables are reused until the connection drops, the switch goes back to SSH login environment, or Re-read environment is pressed on the card. Re-reading drops only the cache and leaves the SSH connection up; the next workspace command reads the files again, with the same 10 second cap. `PATH` exported by bashrc, such as nvm or cargo, is kept. A bashrc that sets a bad `PATH` keeps that `PATH` for later commands until re-read, disconnect, or switching back.
+
+`PWD`, `OLDPWD`, and `SHLVL` are session state and are not cached. Each command's own bash sets them. `~/.zshrc` is not read. Aliases and functions are not kept: commands found through `PATH` work, shell functions such as `nvm` do not. Each user command is still a fresh bash. `ssh_exec` ignores this setting and stays `bash -lc`.
 
 In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list on the left is still the local placeholder directory.
 

@@ -45,6 +45,7 @@ import {
 } from './probe.ts'
 import { rgPlatformOf } from './rg-fetch.ts'
 import { mapRemoteToLocal, resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
+import { loginEnvApply } from './login-env.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
 
@@ -84,6 +85,8 @@ export interface ToolHost {
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
   readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: ApprovalDetail) => Promise<SandboxMode>
+  /** Captured Bash startup exports for this host. Empty when the capture failed or timed out. */
+  readonly loginEnvOf?: (host: HostConfig, signal?: AbortSignal) => Promise<string>
   readonly jobs?: {
     start(spec: {
       kind: string
@@ -354,7 +357,7 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   }
   throwIfAborted(exec.signal)
   const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
-  const argv = commandArgv(status, mode, roots, workdir, command)
+  const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
   const result = await hostApi.pool.exec(host, secret, argv, timeoutMs, exec.signal)
   const denied = mode !== 'danger-full-access' && sandboxDenied(result.code, result.stderr)
   return {
@@ -373,8 +376,16 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   }
 }
 
-function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, workdir: string, command: string): string {
-  const inner = ['bash', '-c', command]
+async function bashSnapshot(hostApi: ToolHost, host: HostConfig, signal?: AbortSignal): Promise<string> {
+  if (host.loginEnv !== true || hostApi.loginEnvOf === undefined) return ''
+  return hostApi.loginEnvOf(host, signal)
+}
+
+function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, workdir: string, command: string, snapshot: string): string {
+  // The snapshot is the bash -c body, so bwrap and seatbelt still confine the command.
+  // Startup files were read once, on their own, and are not sourced again here.
+  const body = snapshot.length > 0 ? loginEnvApply(snapshot, command, workdir) : command
+  const inner = ['bash', '-c', body]
   if (mode === 'danger-full-access' || !status.sandbox.available) {
     return `cd ${shJoin([workdir])} && ${shJoin(inner)}`
   }
@@ -383,7 +394,7 @@ function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileR
     return shJoin(['bwrap', ...profile, '--chdir', workdir, '--', ...inner])
   }
   const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
-  return seatbeltBashCommand(mode, writable, workdir, command)
+  return seatbeltBashCommand(mode, writable, workdir, body)
 }
 
 /** File writes bind the real temp directories. Bash keeps its private tmpfs. */
@@ -435,7 +446,7 @@ async function startBackground(
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
   const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
-  const argv = commandArgv(status, mode, roots, workdir, command)
+  const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
   const reaped = status.sandbox.available && status.sandboxTool === 'bwrap' && mode !== 'danger-full-access'
   const note = reaped ? '' : '\n[dsh-permission-remote] stopping this job closes its SSH channel; descendant processes may survive when no sandbox runner is wrapping the command'
   const id = jobs.start({

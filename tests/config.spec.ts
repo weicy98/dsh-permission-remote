@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { Config, connectionKeyChanged, readConfig, type HostConfig } from '../src/config.ts'
+import { Config, connectionKeyChanged, normalizeLoginEnv, readConfig, type HostConfig } from '../src/config.ts'
 
 const host = (id: string): HostConfig => ({
   id,
@@ -49,6 +49,23 @@ test('readConfig keeps an explicit opsPolicy', () => {
   assert.deepEqual(config.hosts.map(item => item.opsPolicy), ['ask', 'deny'])
 })
 
+test('a host saved before loginEnv existed stays off', () => {
+  const config = readConfig({ hosts: [host('h1')], maxConnections: 2 })
+  assert.equal(config.hosts[0]?.loginEnv, false)
+})
+
+test('readConfig keeps an explicit loginEnv', () => {
+  const config = readConfig({ hosts: [{ ...host('h1'), loginEnv: true }, host('h2')] })
+  assert.deepEqual(config.hosts.map(item => item.loginEnv), [true, false])
+})
+
+test('normalizeLoginEnv accepts only an explicit true', () => {
+  assert.equal(normalizeLoginEnv(true), true)
+  assert.equal(normalizeLoginEnv(false), false)
+  assert.equal(normalizeLoginEnv(undefined), false)
+  assert.equal(normalizeLoginEnv('true'), false)
+})
+
 test('changing a handshake field invalidates the cached session', () => {
   const base = host('h1')
   for (const patch of [
@@ -66,6 +83,7 @@ test('renaming or retitling a host keeps the cached session', () => {
   const base = host('h1')
   assert.equal(connectionKeyChanged(base, { ...base, name: 'prod' }), false)
   assert.equal(connectionKeyChanged(base, { ...base, opsPolicy: 'trust' }), false)
+  assert.equal(connectionKeyChanged(base, { ...base, loginEnv: true }), false)
   assert.equal(connectionKeyChanged(base, { ...base, fingerprint: 'SHA256:abc' }), false)
   assert.equal(connectionKeyChanged(base, base), false)
 })

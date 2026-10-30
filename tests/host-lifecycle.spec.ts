@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { readConfig, type HostConfig } from '../src/config.ts'
+import { LOGIN_ENV_CAPTURE_MS } from '../src/login-env.ts'
 import { Core } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import { shellProbeCommand, type SidebarShell } from '../src/sidebar-terminal.ts'
@@ -110,6 +111,125 @@ test('changing the address drops the pooled session, renaming keeps it', async (
 
   await core.saveHost({ ...host(), name: 'renamed', host: '10.0.0.9' })
   assert.deepEqual(invalidated, ['host1'])
+})
+
+test('a login-environment snapshot is read once, with its own timeout', async () => {
+  const core = build(new FakeRegistry())
+  const invalidated = watchInvalidate(core)
+  const calls: Array<{ command: string, timeoutMs: number }> = []
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async (_host: unknown, _secret: unknown, command: string, timeoutMs: number) => {
+    calls.push({ command, timeoutMs })
+    return {
+      code: 0,
+      signal: null,
+      stdout: 'declare -x FROM=1\n',
+      stderr: '',
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    }
+  }
+  try {
+    const api = core.toolHost(undefined)
+    const row = host({ loginEnv: true })
+    // The stored row is off until this save. Turning the switch on drops nothing yet.
+    await core.saveHost(row)
+    assert.equal(await api.loginEnvOf!(row), 'declare -x FROM=1\n')
+    assert.equal(await api.loginEnvOf!(row), 'declare -x FROM=1\n')
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.timeoutMs, LOGIN_ENV_CAPTURE_MS)
+    assert.match(calls[0]!.command, /--noprofile --norc -ic/)
+    assert.match(calls[0]!.command, /__dsh_hit_rc/)
+
+    await core.saveHost(host({ loginEnv: true, name: 'renamed' }))
+    assert.equal(await api.loginEnvOf!(row), 'declare -x FROM=1\n')
+    assert.equal(calls.length, 1)
+
+    await core.saveHost(host({ loginEnv: false }))
+    assert.equal(await api.loginEnvOf!(row), 'declare -x FROM=1\n')
+    assert.equal(calls.length, 2)
+    assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('a timed out login-environment read is not tried again on the same connection', async () => {
+  const core = build(new FakeRegistry())
+  let calls = 0
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async () => {
+    calls += 1
+    return {
+      code: null,
+      signal: 'KILL',
+      stdout: 'declare -x PARTIAL=1\n',
+      stderr: '',
+      timedOut: true,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    }
+  }
+  try {
+    const api = core.toolHost(undefined)
+    assert.equal(await api.loginEnvOf!(host({ loginEnv: true })), '')
+    assert.equal(await api.loginEnvOf!(host({ loginEnv: true })), '')
+    assert.equal(calls, 1)
+    core.forgetStatus('host1')
+    assert.equal(await api.loginEnvOf!(host({ loginEnv: true })), '')
+    assert.equal(calls, 2)
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('re-reading the login environment drops the snapshot and keeps the session', async () => {
+  const core = build(new FakeRegistry())
+  const invalidated = watchInvalidate(core)
+  let calls = 0
+  const fakePool = (core as unknown as { pool: { exec: unknown } }).pool
+  const original = fakePool.exec
+  fakePool.exec = async () => {
+    calls += 1
+    return {
+      code: 0,
+      signal: null,
+      stdout: 'declare -x FROM=1\ndeclare -x PWD="/old"\ndeclare -x SHLVL="7"\n',
+      stderr: '',
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    }
+  }
+  try {
+    const api = core.toolHost(undefined)
+    const row = host({ loginEnv: true })
+    await core.saveHost(row)
+    const first = await api.loginEnvOf!(row)
+    assert.equal(first, 'declare -x FROM=1\n')
+    assert.equal(calls, 1)
+    core.refreshLoginEnv('host1')
+    assert.equal(await api.loginEnvOf!(row), 'declare -x FROM=1\n')
+    assert.equal(calls, 2)
+    assert.deepEqual(invalidated, [])
+  } finally {
+    fakePool.exec = original
+  }
+})
+
+test('toggling the login environment keeps the pooled session', async () => {
+  const registry = new FakeRegistry()
+  const core = build(registry)
+  const invalidated = watchInvalidate(core)
+
+  await core.saveHost({ ...host(), loginEnv: true })
+  assert.equal(core.listHosts()[0]?.loginEnv, true)
+  await core.saveHost({ ...host(), loginEnv: 'yes' as unknown as boolean })
+  assert.equal(core.listHosts()[0]?.loginEnv, false)
+  assert.deepEqual(invalidated, [])
 })
 
 test('saving a new secret drops the session authenticated with the old one', async () => {

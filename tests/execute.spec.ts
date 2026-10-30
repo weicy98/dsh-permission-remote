@@ -211,3 +211,136 @@ test('a non-positive timeout falls back to the default instead of passing it on'
   assert.equal(value.timeoutMs, 60_000)
   assert.deepEqual(timeouts, [60_000])
 })
+
+const SNAPSHOT = 'declare -x FROM_RC=rc\n'
+
+function capturingBash(options: {
+  loginEnv?: boolean
+  snapshot?: string
+  mode?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  status?: RunnerStatus
+} = {}): { api: ToolHost, command: () => string, reads: () => number } {
+  let command = ''
+  let reads = 0
+  const api = {
+    pool: {
+      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
+      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
+        command = argv
+        return { ...killed(), code: 0, signal: null, stdout: 'ok\n' }
+      },
+      open: async (_host: HostConfig, _secret: unknown, argv: string) => {
+        command = argv
+        return { close() {}, done: Promise.resolve({ ...killed(), code: 0, signal: null }) }
+      },
+    } as unknown as SshPool,
+    hostOf: () => options.loginEnv === undefined ? host : { ...host, loginEnv: options.loginEnv },
+    secretOf: async () => ({}),
+    statusOf: async () => options.status ?? status,
+    resolveMode: async () => options.mode ?? 'danger-full-access' as const,
+    loginEnvOf: async () => {
+      reads += 1
+      return options.snapshot ?? ''
+    },
+    jobs: {
+      start(spec: { run: (job: { append: () => void }) => { cancel(): void, done: Promise<unknown> } }) {
+        spec.run({ append() {} })
+        return 'job-1'
+      },
+    },
+  } as unknown as ToolHost
+  return { api, command: () => command, reads: () => reads }
+}
+
+test('workspace bash stays a plain bash -c when login environment is off', async () => {
+  const absent = capturingBash()
+  await runBash(absent.api, route, { command: 'printf READY' }, {})
+  assert.equal(absent.command(), "cd '/srv/app' && 'bash' '-c' 'printf READY'")
+  assert.equal(absent.reads(), 0)
+
+  const explicit = capturingBash({ loginEnv: false })
+  await runBash(explicit.api, route, { command: 'printf READY' }, {})
+  assert.equal(explicit.command(), "cd '/srv/app' && 'bash' '-c' 'printf READY'")
+  assert.equal(explicit.reads(), 0)
+})
+
+test('a captured snapshot is evaled, and an empty capture leaves the command alone', async () => {
+  const ready = capturingBash({ loginEnv: true, snapshot: SNAPSHOT })
+  await runBash(ready.api, route, { command: 'printf READY' }, {})
+  const argv = ready.command()
+  assert.equal(ready.reads(), 1)
+  assert.match(argv, /eval /)
+  assert.match(argv, /FROM_RC/)
+  assert.match(argv, /printf READY/)
+  assert.doesNotMatch(argv, /--noprofile|bashrc|__dsh_hit/)
+
+  const missed = capturingBash({ loginEnv: true, snapshot: '' })
+  await runBash(missed.api, route, { command: 'printf READY' }, {})
+  assert.equal(missed.command(), "cd '/srv/app' && 'bash' '-c' 'printf READY'")
+  assert.equal(missed.reads(), 1)
+})
+
+test('a background command reuses the snapshot and does not source startup files', async () => {
+  const { api, command, reads } = capturingBash({ loginEnv: true, snapshot: SNAPSHOT })
+  const value = await runBash(api, route, { command: 'printf READY', run_in_background: true }, {})
+  assert.equal(value.kind, 'background')
+  assert.equal(reads(), 1)
+  assert.match(command(), /eval /)
+  assert.match(command(), /FROM_RC/)
+  assert.match(command(), /printf READY/)
+  assert.doesNotMatch(command(), /--noprofile|bashrc/)
+})
+
+test('the snapshot stays inside bwrap and seatbelt', async () => {
+  const bwrap = capturingBash({
+    loginEnv: true,
+    snapshot: SNAPSHOT,
+    mode: 'read-only',
+    status: { ...status, sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap' },
+  })
+  await runBash(bwrap.api, route, { command: 'printf READY' }, {})
+  assert.match(bwrap.command(), /bwrap/)
+  assert.match(bwrap.command(), /--chdir/)
+  assert.match(bwrap.command(), /FROM_RC/)
+  assert.match(bwrap.command(), /printf READY/)
+  assert.doesNotMatch(bwrap.command(), /--noprofile/)
+
+  const seatbelt = capturingBash({
+    loginEnv: true,
+    snapshot: SNAPSHOT,
+    mode: 'read-only',
+    status: { ...status, os: 'darwin', sandbox: { available: true, reason: 'ok' }, sandboxTool: 'sandbox-exec' },
+  })
+  await runBash(seatbelt.api, route, { command: 'printf READY' }, {})
+  assert.match(seatbelt.command(), /sandbox-exec/)
+  assert.match(seatbelt.command(), /FROM_RC/)
+  assert.match(seatbelt.command(), /printf READY/)
+  assert.doesNotMatch(seatbelt.command(), /--noprofile/)
+})
+
+test('a file write does not load startup files', async () => {
+  let command = ''
+  const api = {
+    pool: {
+      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
+      sftpRead: async () => {
+        throw new Error('ENOENT')
+      },
+      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
+        command = argv
+        return { ...killed(), code: 0, signal: null }
+      },
+    } as unknown as SshPool,
+    hostOf: () => ({ ...host, loginEnv: true }),
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'danger-full-access' as const,
+    loginEnvOf: async () => {
+      throw new Error('file writes must not read startup files')
+    },
+  } satisfies ToolHost
+  const written = await runWrite(api, route, { file_path: '/srv/app/note.txt', content: 'next' }, {})
+  assert.equal(written.operation, 'create')
+  assert.doesNotMatch(command, /__dsh_login/)
+  assert.doesNotMatch(command, /--noprofile/)
+})

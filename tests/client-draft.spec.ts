@@ -14,6 +14,7 @@ function host(overrides: Partial<HostView> = {}): HostView {
     privateKeyPath: '/home/me/.ssh/id_ed25519',
     fingerprint: 'SHA256:abc',
     opsPolicy: 'ask',
+    loginEnv: false,
     ...overrides,
   }
 }
@@ -45,6 +46,17 @@ test('changing the address or port drops the fingerprint', () => {
   assert.equal(mergeEditedHost(host(), changedAddress).fingerprint, '')
   const changedPort = { ...toDraft(host()), port: '2222' }
   assert.equal(mergeEditedHost(host(), changedPort).fingerprint, '')
+})
+
+test('the form keeps the login environment switch', () => {
+  assert.equal(blankDraft().loginEnv, false)
+  assert.equal(toDraft(host()).loginEnv, false)
+  assert.equal(toDraft(host({ loginEnv: true })).loginEnv, true)
+  const turnedOn = { ...toDraft(host({ loginEnv: false })), loginEnv: true }
+  assert.equal(mergeEditedHost(host({ loginEnv: false, fingerprint: 'SHA256:new' }), turnedOn).loginEnv, true)
+  // A rename must not drop a switch the form did not change.
+  const untouched = { ...toDraft(host({ loginEnv: true })), name: 'prod' }
+  assert.equal(mergeEditedHost(host({ loginEnv: true }), untouched).loginEnv, true)
 })
 
 test('a new host keeps no fingerprint and takes the form policy', () => {

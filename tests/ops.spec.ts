@@ -213,6 +213,12 @@ test('ssh_exec cds into an absolute workdir', async () => {
   assert.equal(commands[0], "cd '/var/log' && 'bash' '-lc' 'ls'")
 })
 
+test('ssh_exec ignores the workspace login environment switch', async () => {
+  const { api: hostApi, commands } = api({ mode: 'danger-full-access' })
+  await runSshExec(hostApi, host({ loginEnv: true }), { command: 'ls', workdir: '/var/log' }, {})
+  assert.equal(commands[0], "cd '/var/log' && 'bash' '-lc' 'ls'")
+})
+
 test('ssh_exec rejects a relative workdir before connecting', async () => {
   const { api: hostApi, commands } = api({ mode: 'danger-full-access' })
   await assert.rejects(() => runSshExec(hostApi, host(), { command: 'ls', workdir: 'logs' }, {}), /absolute/)

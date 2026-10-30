@@ -130,3 +130,37 @@ test('a host without the layout service closes the panel without throwing', () =
   const injected = page.options.inject?.() as { onClose?: () => void }
   assert.doesNotThrow(() => injected.onClose?.())
 })
+
+/**
+ * The host card names a setting only when it leaves the default, so the two
+ * controls that used to sit unlabelled in the action row are now read as
+ * sentences: "Remote calls need no approval", "Reads bash startup files".
+ * Rendering is out of scope (React is stubbed), so these lock the bundle text
+ * and the removal of the unlabelled selects.
+ */
+test('the host card names a non-default setting instead of offering an unlabelled select', () => {
+  const code = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  // The bare controls are gone from the action row.
+  assert.doesNotMatch(code, /dsh-ssh-policy/)
+  // A badge is derived from the stored policy, not from a select's value.
+  assert.match(code, /badgeOpsTrust/)
+  assert.match(code, /badgeOpsDeny/)
+  // The default policy produces no badge: the condition is a real comparison.
+  assert.match(code, /opsPolicy !== "ask"/)
+})
+
+test('every settings label and option answers one question in one grammar', () => {
+  const zh = JSON.parse(readFileSync(new URL('../locale/zh.json', import.meta.url), 'utf8'))
+  const en = JSON.parse(readFileSync(new URL('../locale/en.json', import.meta.url), 'utf8'))
+  // A label names the thing being set; an option names the choice. The old pair
+  // "Remote ops / Ask / Trust / Deny" named a tool category and left "Trust"
+  // without an object.
+  assert.equal(zh.opsPolicy, '远程调用审批')
+  assert.equal(zh.loginEnv, '环境变量来源')
+  for (const option of ['opsAsk', 'opsTrust', 'opsDeny']) assert.match(zh[option], /^[\u4e00-\u9fa5]+$/)
+  // Both options of the environment switch are phrases of the same shape.
+  assert.match(zh.loginOff, /环境$/)
+  assert.match(zh.loginBash, /启动脚本$/)
+  // Neither dictionary may drift: a missing key renders as the key itself.
+  assert.deepEqual(Object.keys(zh).sort(), Object.keys(en).sort())
+})

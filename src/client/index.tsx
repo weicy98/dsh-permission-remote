@@ -476,18 +476,13 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  async function savePolicy(host: HostView, opsPolicy: HostView['opsPolicy']): Promise<void> {
+  async function rereadLoginEnv(hostId: string): Promise<void> {
     setBusy(true)
     try {
-      await callHost(ctx, 'saveHost', { ...host, opsPolicy })
-      await reload()
-      // Keep an open edit form in step with the policy just saved on the card.
-      setDraft(current => current.id === host.id ? { ...current, opsPolicy } : current)
-      note(t('policySaved'))
+      // Forget the snapshot only. The next workspace command captures again.
+      await callHost(ctx, 'refreshLoginEnv', { hostId })
+      note(t('loginRereadNote'))
     } catch (error) {
-      // The select is controlled by the loaded host. Reload shows the saved
-      // policy, or the previous one when the save did not land.
-      await reload().catch(() => undefined)
       fail(error)
     } finally {
       setBusy(false)
@@ -905,17 +900,6 @@ function Section(props: SectionProps): JSX.Element {
                     <div className="dsh-ssh-host-meta">{host.username}@{host.host}:{host.port}</div>
                   </div>
                   <div className="dsh-ssh-row-actions">
-                    <select
-                      className="dsh-ssh-select dsh-ssh-policy"
-                      aria-label={t('opsPolicy')}
-                      value={host.opsPolicy ?? 'ask'}
-                      disabled={busy}
-                      onChange={event => void savePolicy(host, event.target.value as HostView['opsPolicy'])}
-                    >
-                      <option value="ask">{t('opsAsk')}</option>
-                      <option value="trust">{t('opsTrust')}</option>
-                      <option value="deny">{t('opsDeny')}</option>
-                    </select>
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => beginEdit(host)}>{t('edit')}</button>
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void test(host)}>{t('test')}</button>
                     <button
@@ -934,6 +918,39 @@ function Section(props: SectionProps): JSX.Element {
                     <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void removeHost(host.id)}>{t('remove')}</button>
                   </div>
                 </div>
+                {/* Only deviations from the defaults are named. A row that shows
+                    "Ask each time" on every host pushes the one host that runs
+                    without approval into the same gray as the rest, and the two
+                    settings are configuration, not actions, so they do not
+                    belong beside Edit/Test/Browse/Remove. The tooltip carries the
+                    explanation the dialog shows, because a badge is a summary. */}
+                {host.opsPolicy !== 'ask' || host.loginEnv === true
+                  ? <div className="dsh-ssh-badges">
+                      {host.opsPolicy !== 'ask'
+                        ? <button
+                            type="button"
+                            className="dsh-ssh-badge"
+                            data-tone={host.opsPolicy === 'trust' ? 'warn' : 'muted'}
+                            disabled={busy}
+                            title={t('opsNote')}
+                            onClick={() => beginEdit(host)}
+                          >{t(host.opsPolicy === 'trust' ? 'badgeOpsTrust' : 'badgeOpsDeny')}</button>
+                        : null}
+                      {host.loginEnv === true
+                        ? <button
+                            type="button"
+                            className="dsh-ssh-badge"
+                            data-tone="muted"
+                            disabled={busy}
+                            title={t('loginNote')}
+                            onClick={() => beginEdit(host)}
+                          >{t('loginBash')}</button>
+                        : null}
+                      {host.loginEnv === true
+                        ? <button type="button" className="dsh-ssh-badge-action" disabled={busy} title={t('loginRereadNote')} onClick={() => void rereadLoginEnv(host.id)}>{t('loginReread')}</button>
+                        : null}
+                    </div>
+                  : null}
                 {/* The picker belongs to this row too: at page level it landed
                     below the whole list and off-screen for the first host. */}
                 {browsing === host.id ? renderBrowser(host) : null}
@@ -1115,15 +1132,23 @@ function Section(props: SectionProps): JSX.Element {
           {draft.auth === 'key'
             ? <Field id="dsh-ssh-key" label={t('keyPath')} value={draft.privateKeyPath} onChange={value => setDraft({ ...draft, privateKeyPath: value })} />
             : null}
-          <label className="dsh-ssh-field" htmlFor="dsh-ssh-policy">
+          <label className="dsh-ssh-field" htmlFor="dsh-ssh-ops-approval">
             <span className="dsh-ssh-label">{t('opsPolicy')}</span>
-            <select id="dsh-ssh-policy" className="dsh-ssh-select" value={draft.opsPolicy} onChange={event => setDraft({ ...draft, opsPolicy: event.target.value as HostView['opsPolicy'] })}>
+            <select id="dsh-ssh-ops-approval" className="dsh-ssh-select" value={draft.opsPolicy} onChange={event => setDraft({ ...draft, opsPolicy: event.target.value as HostView['opsPolicy'] })}>
               <option value="ask">{t('opsAsk')}</option>
               <option value="trust">{t('opsTrust')}</option>
               <option value="deny">{t('opsDeny')}</option>
             </select>
           </label>
           <p className="dsh-ssh-note">{t('opsNote')}</p>
+          <label className="dsh-ssh-field" htmlFor="dsh-ssh-env-source">
+            <span className="dsh-ssh-label">{t('loginEnv')}</span>
+            <select id="dsh-ssh-env-source" className="dsh-ssh-select" value={draft.loginEnv ? 'on' : 'off'} onChange={event => setDraft({ ...draft, loginEnv: event.target.value === 'on' })}>
+              <option value="off">{t('loginOff')}</option>
+              <option value="on">{t('loginBash')}</option>
+            </select>
+          </label>
+          <p className="dsh-ssh-note">{t('loginNote')}</p>
           <Field id="dsh-ssh-secret" label={draft.auth === 'password' ? t('password') : t('passphrase')} value={secret} secret onChange={setSecret} />
           {draft.id.length > 0 ? <p className="dsh-ssh-note">{t('secretKeep')}</p> : null}
           <div className="dsh-ssh-actions">

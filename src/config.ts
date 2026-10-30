@@ -28,6 +28,11 @@ const Host = Schema.object({
   /** SHA-256 host key accepted by the operator. Empty until the first trust. */
   fingerprint: Schema.string().default(''),
   opsPolicy: OpsPolicy,
+  /**
+   * When true, workspace bash loads Bash login scripts and bashrc before the
+   * command and discards their output. Off keeps the sshd session environment.
+   */
+  loginEnv: Schema.boolean().default(false),
 })
 
 const DeletedHost = Schema.object({
@@ -71,6 +76,11 @@ export interface HostConfig {
   privateKeyPath: string
   fingerprint: string
   opsPolicy: OpsPolicy
+  /**
+   * Absent on rows saved before the field existed. Treated as off.
+   * `true` only when the operator turned Bash startup files on for this host.
+   */
+  loginEnv?: boolean
 }
 
 /** Hosts saved before `opsPolicy` existed are treated as `ask`. */
@@ -78,11 +88,16 @@ export function normalizeOpsPolicy(value: unknown): OpsPolicy {
   return value === 'trust' || value === 'deny' ? value : 'ask'
 }
 
+/** Anything other than an explicit `true` leaves workspace bash without startup files. */
+export function normalizeLoginEnv(value: unknown): boolean {
+  return value === true
+}
+
 /**
  * Whether the fields the SSH handshake reads changed. A cached session keyed by
  * host id would otherwise keep talking to the previous machine, and the cached
- * probe result would keep describing it. `name`, `fingerprint` and `opsPolicy`
- * are not part of the handshake, so renaming keeps the session.
+ * probe result would keep describing it. `name`, `fingerprint`, `opsPolicy`
+ * and `loginEnv` are not part of the handshake, so renaming keeps the session.
  */
 export function connectionKeyChanged(previous: HostConfig, next: HostConfig): boolean {
   return previous.host !== next.host

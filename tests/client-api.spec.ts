@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { callHost, readWorkspaces, writeRgRegistry, type ClientFace } from '../src/client/api.ts'
+import { callHost, readHosts, readWorkspaces, writeRgRegistry, type ClientFace } from '../src/client/api.ts'
 
 interface Recorded {
   readonly endpoint: string
@@ -61,6 +61,54 @@ test('a failed call surfaces the gateway message', async () => {
     remote: { settings: { async describe() { return { namespaces: [] } }, async mutate() { return undefined } } },
   } as unknown as ClientFace
   await assert.rejects(() => callHost(face, 'listWorkspaces'), /gateway\/arguments-invalid/)
+})
+
+test('a host saved before loginEnv existed is shown as off', async () => {
+  const face = {
+    connection: { rpc: { async call() { return { ok: true, value: {} } } } },
+    remote: {
+      settings: {
+        async describe() {
+          return {
+            value: {
+              namespaces: [{
+                ns: 'permission-remote',
+                revision: 4,
+                value: {
+                  hosts: [{
+                    id: 'h1',
+                    name: '',
+                    host: '10.0.0.1',
+                    port: 22,
+                    username: 'me',
+                    auth: 'key',
+                    privateKeyPath: '',
+                    fingerprint: '',
+                    opsPolicy: 'ask',
+                  }, {
+                    id: 'h2',
+                    name: '',
+                    host: '10.0.0.2',
+                    port: 22,
+                    username: 'me',
+                    auth: 'key',
+                    privateKeyPath: '',
+                    fingerprint: '',
+                    opsPolicy: 'ask',
+                    loginEnv: true,
+                  }],
+                },
+              }],
+            },
+          }
+        },
+        async mutate() { return undefined },
+      },
+    },
+  } as unknown as ClientFace
+  const loaded = await readHosts(face)
+  assert.deepEqual(loaded.hosts.map(item => item.loginEnv), [false, true])
+  assert.equal(loaded.revision, 4)
 })
 
 test('saving the download source sets one volatile path with the loaded revision', async () => {
