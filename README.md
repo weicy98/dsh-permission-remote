@@ -104,15 +104,15 @@ dsh plugin --profile web add dsh-permission-remote
 
 每台主机在设置里有一个**远程运维**策略：
 
-| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` / 添加工作区 `ssh_workspace` |
+| 策略 | 读取 `ssh_read` / 添加工作区 `ssh_workspace` | 命令 `ssh_exec` / 写入 `ssh_write` |
 |---|---|---|
 | 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，模型必须带 `sandbox_permissions: "danger-full-access"` 和理由重试后弹审批卡。卡片上有主机和截断后的命令或路径，批准只放宽这一次。其它档位不会弹卡 |
 | 信任 | 允许 | 直接执行，不弹审批 |
 | 禁止 | 拒绝 | 拒绝 |
 
-`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
+`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取和添加工作区只受「禁止」限制。
 
-`ssh_workspace` 虽然自己只做一次远端 `stat`、不改远端文件，但它和写操作同一档：注册工作区会顺手建好本机的占位目录，而 `working_directory` 接受任意已存在的目录，所以模型注册完就能用 `working_directory` 切进去，接着在那台机器上跑 `bash`、`read`、`write`。换句话说，一次注册等于把会话接到这台主机上，因此它要按命令的代价来换：本会话是 `danger-full-access`、主机被信任，或者一次写明主机和目录的审批。批准之后，新工作区里的命令仍按本会话的权限档位和远端沙箱执行。注册本身不会切换当前会话——要用 `working_directory` 切过去，或者直接打开那个工作区。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
+`ssh_workspace` 只做一次远端 `stat`，然后在本机注册工作区，不改远端文件，因此不弹审批卡。它只负责在侧栏加一条工作区，让用户自己点开——当前会话不动，所以要用它请在侧栏打开这个新工作区（会新开一个会话）。结果里不给出占位目录：占位目录一旦交给模型，模型就能用 `working_directory` 把本会话挪进那台主机，等于绕过这台主机的远程调用审批。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
 
 运维工具的前提：
 
@@ -251,15 +251,15 @@ A workspace whose directory is on your own computer can also act on a configured
 
 Each host has a **Remote ops** policy in Settings:
 
-| Policy | `ssh_read` | `ssh_exec` / `ssh_write` / `ssh_workspace` |
+| Policy | `ssh_read` / `ssh_workspace` | `ssh_exec` / `ssh_write` |
 |---|---|---|
 | Ask (default) | allowed | runs only when the session is `danger-full-access`; otherwise the first call is denied and a retry must pass `sandbox_permissions: "danger-full-access"` plus a justification. The approval card names the host and the truncated command or path, and grants this one call. Any other mode does not open a card |
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
+Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads and workspace registration are only limited by Deny.
 
-`ssh_workspace` follows the same gate as a write, not as a read, although it only stats the directory and never modifies remote files: registering creates the local placeholder directory, and `working_directory` accepts any existing directory, so after one registration the model can move this session into the placeholder and run `bash`, `read`, and `write` on that host. One registration therefore hands over remote execution, and it costs what a remote command costs — the session's `danger-full-access`, a trusted host, or one approval naming the host and the directory. Once approved, commands in the new workspace still follow this session's permission mode and the remote sandbox. Registration itself does not move the current session — use `working_directory`, or open the new workspace. Registering the same remote directory again keeps the existing row and its title, and the result says so.
+`ssh_workspace` does one remote `stat` and then registers the workspace locally, so it raises no approval card and never modifies remote files. It only adds a workspace for the user to open; the current session does not move, so use the new workspace from the sidebar (it opens in a new session). The placeholder path is not returned: once the model has it, it could hand it to `working_directory` and move this session onto that host, which would bypass the host's remote-call approval. Registering the same remote directory again keeps the existing row and its title, and the result says so.
 
 Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 

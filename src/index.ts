@@ -792,7 +792,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
  */
 function assertEnterableRemoteCwd(core: Core, route: RemoteRoute, headerCwd: string | undefined): void {
   if (core.allowsRemoteCwd(route, headerCwd)) return
-  throw new Error(`refusing to use ${route.remoteCwd} on SSH host ${route.hostId}: ${route.placeholderCwd} is a placeholder for a remote directory that no registered workspace owns. Add it with ssh_workspace (an "ask" host asks for approval first) or open the workspace from the list.`)
+  throw new Error(`refusing to use ${route.remoteCwd} on SSH host ${route.hostId}: ${route.placeholderCwd} is a placeholder for a remote directory that no registered workspace owns. Add it with ssh_workspace, or open the workspace from the list.`)
 }
 
 /**
@@ -1270,12 +1270,11 @@ function opsTools(core: Core): object[] {
       },
     }), publishOpsTool({
       name: 'ssh_workspace',
-      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, whose file and command tools then run on that machine. The directory must already exist on the host and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. The current session keeps its own directory; use working_directory to enter the new workspace, or the user can open it. Registering the workspace creates the local placeholder that working_directory needs, so this is a remote-access change, not just a list entry: on an "ask" host it runs only with danger-full-access, either from this session or a one-shot approval. Retry with sandbox_permissions "danger-full-access" and a one-sentence justification when it is denied. The title defaults to the directory name, and an existing workspace keeps its title (the result then reports created: false).',
+      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, so a session opened on it runs file and command tools on that machine. The directory must already exist and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. This only adds an entry the user opens from the workspace list — the current session keeps its own directory and does not move. Remote files are not modified. Allowed on any host whose ops policy is not "deny"; the host key must already be trusted in Settings → SSH hosts. The title defaults to the directory name; registering the same directory again keeps the existing row and its title (the result then reports created: false).',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         directory: { type: 'string', required: true, description: 'Absolute remote directory to register, or a path starting with "~/"' },
         title: { type: 'string', description: 'Sidebar title; defaults to the directory name, prefixed with the server when title tagging is on' },
-        ...OPS_ESCALATION,
       },
       output: textOutput(renderSshWorkspace),
       execute(args: unknown, exec: ToolExec) {
