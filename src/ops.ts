@@ -196,6 +196,43 @@ export function renderOpsRead(value: Record<string, unknown>): string {
   return body.length === 0 ? page : `${body}\n${page}`
 }
 
+/**
+ * Register a remote directory as a DSH workspace.
+ *
+ * The remote side only reads (`stat`), and the registration is local, so this
+ * follows the read gate rather than the command gate: a `deny` host refuses it
+ * and an untrusted host key is refused, but no approval card is raised. The
+ * remote files are never touched.
+ */
+export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
+  if (host.opsPolicy === 'deny') throw new Error(`remote ops are disabled for SSH host ${hostLabel(host)}`)
+  requireTrusted(host)
+  throwIfAborted(exec?.signal)
+  const requested = String(args.directory ?? '').trim()
+  if (requested.length === 0) throw new Error('directory is required')
+  const create = hostApi.createWorkspace
+  if (create === undefined) throw new Error('this build cannot register a workspace for an SSH host')
+  const secret = await hostApi.secretOf(host)
+  const remotePath = await resolveOpsPath(hostApi, host, secret, requested, 'directory')
+  const title = typeof args.title === 'string' ? args.title : undefined
+  const created = await create(host, remotePath, title, exec?.signal)
+  return {
+    host: opsHostView(host),
+    path: created.path,
+    remotePath: created.remotePath,
+    title: created.title,
+    // The session stays where it is. Saying so stops the model from running
+    // `bash` and expecting it on the host it just registered.
+    currentSessionChanged: false,
+  }
+}
+
+export function renderSshWorkspace(value: Record<string, unknown>): string {
+  const host = value.host as OpsHostView | undefined
+  const label = host === undefined ? 'remote host' : host.name || host.address
+  return `workspace added: ${String(value.title ?? '')} · ${String(value.remotePath ?? '')} on ${label} (placeholder ${String(value.path ?? '')}); the current session did not move`
+}
+
 export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
   const requestedRaw = String(args.file_path ?? '').trim()
   if (requestedRaw.length === 0) throw new Error('file_path is required')
@@ -247,16 +284,16 @@ function isRemoteMissing(error: unknown): boolean {
 }
 
 /** Absolute remote paths only. A leading `~/` expands against the remote home. */
-async function resolveOpsPath(hostApi: ToolHost, host: HostConfig, secret: SecretMaterial, requested: string): Promise<string> {
+async function resolveOpsPath(hostApi: ToolHost, host: HostConfig, secret: SecretMaterial, requested: string, field = 'file_path'): Promise<string> {
   const path = requested.trim()
-  if (path.length === 0) throw new Error('file_path is required')
+  if (path.length === 0) throw new Error(`${field} is required`)
   if (posix.isAbsolute(path)) return posix.normalize(path)
   if (path === '~') return remoteHome(hostApi, host, secret)
   if (path.startsWith('~/')) {
     const home = await remoteHome(hostApi, host, secret)
     return posix.normalize(posix.join(home, path.slice(2)))
   }
-  throw new Error(`file_path must be an absolute remote path or start with "~/": ${requested}`)
+  throw new Error(`${field} must be an absolute remote path or start with "~/": ${requested}`)
 }
 
 /**

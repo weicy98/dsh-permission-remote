@@ -1,5 +1,5 @@
 import { mkdir } from 'node:fs/promises'
-import { basename } from 'node:path'
+import { posix } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
@@ -23,12 +23,14 @@ import {
   runRead,
   runReadImage,
   runWrite,
+  throwIfAborted,
+  withSignal,
   type RunnerStatus,
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
 import { sniffImage } from './image.ts'
-import { opsHostView, renderOpsExec, renderOpsRead, resolveOpsHost, runSshExec, runSshRead, runSshWrite, forgetOpsHost } from './ops.ts'
+import { opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { childDirectoryPath, isValidHostId, mapRemoteToLocal, routeByCwd, type Route } from './router.ts'
 import {
   PWSH_SECTION,
@@ -201,16 +203,8 @@ class SshApi extends TypertRemoteService {
 
   async createWorkspace(input: { hostId: string, path: string, title?: string }): Promise<{ path: string, title: string }> {
     const host = this.core.requireHost(input.hostId)
-    const info = await this.core.pool.sftpStat(host, await this.core.secret(host), input.path)
-    if (!info.isDirectory) throw new Error(`remote path is not a directory: ${input.path}`)
-    const local = mapRemoteToLocal(input.hostId, input.path)
-    if (local === null) throw new Error('remote path must be absolute')
-    await mkdir(local, { recursive: true })
-    const requested = input.title?.trim() || basename(input.path)
-    const title = createdWorkspaceTitle(host, requested, this.core.taggingEnabled)
-    const workspace = await this.core.workspaces.create(local, title)
-    // `create` keeps an existing record's title; only a new row carries ours.
-    return { path: local, title: workspace.title }
+    const created = await this.core.registerWorkspace(host, input.path, input.title)
+    return { path: created.path, title: created.title }
   }
 
   async listWorkspaces(): Promise<{ items: RemoteWorkspaceView[], deleted: DeletedHostView[] }> {
@@ -581,12 +575,43 @@ export class Core {
     return pending
   }
 
+  /**
+   * Register one remote directory as a workspace: the placeholder directory is
+   * created locally, the title carries the server when tagging is on, and the
+   * workspace registry keeps an existing row's title if it already exists.
+   *
+   * Shared by the settings page and the `ssh_workspace` tool, so both entries
+   * point at the same directory and cannot disagree about the title.
+   */
+  async registerWorkspace(host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal): Promise<{ path: string, remotePath: string, title: string }> {
+    const requestedPath = remotePath.trim()
+    if (requestedPath.length === 0) throw new Error('remote path is required')
+    if (!posix.isAbsolute(requestedPath)) throw new Error(`remote path must be absolute: ${remotePath}`)
+    // `normalize` keeps a trailing slash on a directory, and the placeholder
+    // encodes the path verbatim: `/srv/app/` would create a second workspace
+    // beside `/srv/app`. Drop the slashes; `/` itself stays `/`.
+    const normalized = posix.normalize(requestedPath).replace(/\/+$/, '') || '/'
+    throwIfAborted(signal)
+    const info = await withSignal(this.pool.sftpStat(host, await this.secret(host), normalized), signal)
+    if (!info.isDirectory) throw new Error(`remote path is not a directory: ${normalized}`)
+    const local = mapRemoteToLocal(host.id, normalized)
+    if (local === null) throw new Error(`remote path must be absolute: ${normalized}`)
+    throwIfAborted(signal)
+    await mkdir(local, { recursive: true })
+    const requested = title?.trim() || posix.basename(normalized) || normalized
+    const nextTitle = createdWorkspaceTitle(host, requested, this.taggingEnabled)
+    const workspace = await this.workspaces.create(local, nextTitle)
+    // `create` keeps an existing record's title; only a new row carries ours.
+    return { path: local, remotePath: normalized, title: workspace.title }
+  }
+
   toolHost(jobs: ToolHost['jobs']): ToolHost {
     return {
       pool: this.pool,
       hostOf: id => this.config.hosts.find(item => item.id === id),
       secretOf: host => this.secret(host),
       statusOf: host => this.probe(host.id),
+      createWorkspace: (host, remotePath, title, signal) => this.registerWorkspace(host, remotePath, title, signal),
       resolveMode: buildResolveMode(this.ctx),
       loginEnvOf: (host, signal) => this.loginEnvs.get(host.id, signal),
       jobs,
@@ -1169,6 +1194,20 @@ function opsTools(core: Core): object[] {
         const record = args as Record<string, unknown>
         const host = pick(record)
         return runSshExec(hostApi, host, record, exec)
+      },
+    }), publishOpsTool({
+      name: 'ssh_workspace',
+      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, whose file and command tools then run on that machine. The directory must already exist on the host and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. This only registers a workspace: the current session keeps its own directory, so use working_directory (or open the new workspace) to run commands there. Remote files are not modified. Allowed on any host whose ops policy is not "deny", but the host key must already be trusted in Settings → SSH hosts. The title defaults to the directory name.',
+      parameters: {
+        host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
+        directory: { type: 'string', required: true, description: 'Absolute remote directory to register, or a path starting with "~/"' },
+        title: { type: 'string', description: 'Sidebar title; defaults to the directory name, prefixed with the server when title tagging is on' },
+      },
+      output: textOutput(renderSshWorkspace),
+      execute(args: unknown, exec: ToolExec) {
+        const record = args as Record<string, unknown>
+        const host = pick(record)
+        return runSshWorkspace(hostApi, host, record, exec)
       },
     }), publishOpsTool({
       name: 'ssh_read',

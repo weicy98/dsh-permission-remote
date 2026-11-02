@@ -1,7 +1,7 @@
 {
   "nav": "SSH 主机",
   "title": "SSH 主机",
-  "description": "把远端目录做成工作区。文件和命令工具在那台机器上执行，权限仍用这个会话现有的沙箱档位和审批。普通工作区也可以用 ssh_hosts / ssh_exec / ssh_read / ssh_write 对主机做运维。",
+  "description": "把远端目录做成工作区。文件和命令工具在那台机器上执行，权限仍用这个会话现有的沙箱档位和审批。普通工作区也可以用 ssh_hosts / ssh_exec / ssh_read / ssh_write 对主机做运维，用 ssh_workspace 把远端目录注册成工作区。",
   "addHost": "添加主机",
   "name": "名称",
   "address": "地址",

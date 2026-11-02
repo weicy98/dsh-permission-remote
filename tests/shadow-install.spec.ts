@@ -100,15 +100,21 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   const exec = tools.find(tool => tool.name === 'ssh_exec')
   const write = tools.find(tool => tool.name === 'ssh_write')
   const hosts = tools.find(tool => tool.name === 'ssh_hosts')
+  const workspace = tools.find(tool => tool.name === 'ssh_workspace')
   assert.equal(exec?.parameters.type, 'object')
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
   assert.deepEqual(hosts?.parameters.properties, {})
+  // Registering a workspace is a local action backed by one remote stat, so it
+  // advertises no escalation argument: there is no card to open.
+  assert.deepEqual(workspace?.parameters.required, ['host', 'directory'])
+  assert.deepEqual(Object.keys(workspace?.parameters.properties ?? {}).sort(), ['directory', 'host', 'title'])
   // Only danger-full-access opens the ops approval card; narrower modes would
   // send the model into a retry that can never succeed.
   assert.deepEqual(exec?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   assert.deepEqual(write?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
+  await assert.rejects(async () => workspace!.execute({ host: 'lo' }, {}), /invalid arguments/)
 })
 
 test('terminal_open refuses on a remote workspace and still calls the local tool', async () => {

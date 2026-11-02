@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { readConfig, type HostConfig } from '../src/config.ts'
@@ -238,6 +241,100 @@ test('saving a new secret drops the session authenticated with the old one', asy
   const invalidated = watchInvalidate(core)
   await core.saveSecret('host1', { password: 'next' })
   assert.deepEqual(invalidated, ['host1'])
+})
+
+/**
+ * Registering a workspace creates the placeholder directory under the remote
+ * root, so point that root at a temp directory: `~/.dsh/remote` may not be
+ * writable, and a test must not leave rows behind.
+ */
+async function withRemoteRoot<T>(work: (root: string) => Promise<T>): Promise<T> {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-register-'))
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    return await work(root)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+test('registering a remote directory creates a titled workspace and a placeholder', async () => {
+  await withRemoteRoot(async root => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const stats: string[] = []
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async (_host: unknown, _secret: unknown, path: string) => {
+      stats.push(path)
+      return { isDirectory: true, size: 0, mode: 0o040755 }
+    }
+    const created = await core.registerWorkspace(host(), '/srv/app')
+    assert.deepEqual(stats, ['/srv/app'])
+    assert.equal(created.remotePath, '/srv/app')
+    assert.equal(created.title, 'dev · app')
+    assert.ok(created.path.startsWith(root), `placeholder ${created.path} is outside ${root}`)
+    assert.equal((await stat(created.path)).isDirectory(), true)
+    assert.equal(registry.rows.length, 1)
+    assert.equal(registry.rows[0]!.path, created.path)
+    assert.equal(registry.rows[0]!.title, 'dev · app')
+  })
+})
+
+test('registering the same directory twice keeps one row and its title', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    const first = await core.registerWorkspace(host(), '/srv/app', 'notes')
+    const second = await core.registerWorkspace(host(), '/srv/app/', 'another')
+    assert.equal(second.path, first.path)
+    // The registry keeps the existing record's title; only a new row takes ours.
+    assert.equal(second.title, 'dev · notes')
+    assert.equal(registry.rows.length, 1)
+  })
+})
+
+test('registering without title tagging keeps the plain directory name', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry, [], [host()], { tagWorkspaceTitles: false })
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    const created = await core.registerWorkspace(host(), '/srv/app/')
+    assert.equal(created.title, 'app')
+  })
+})
+
+test('registering a directory that is a file or relative fails before creating a row', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: false, size: 24, mode: 0o100644 })
+    await assert.rejects(() => core.registerWorkspace(host(), '/srv/app/index.ts'), /not a directory/)
+    await assert.rejects(() => core.registerWorkspace(host(), 'srv/app'), /absolute/)
+    assert.deepEqual(registry.rows, [])
+  })
+})
+
+test('the ops tool host exposes the same registration as the settings page', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    const toolHost = core.toolHost(undefined)
+    const created = await toolHost.createWorkspace!(host(), '/srv/lib', 'lib')
+    assert.equal(created.title, 'dev · lib')
+    const listed = core.listWorkspaces()
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]!.remotePath, '/srv/lib')
+    assert.equal(listed[0]!.title, 'dev · lib')
+  })
 })
 
 test('deleting a host keeps its workspaces and remembers the row', async () => {
