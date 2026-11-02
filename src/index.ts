@@ -31,7 +31,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, routeByCwd, type RemoteRoute, type Route } from './router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, type RemoteRoute, type Route } from './router.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -49,7 +49,6 @@ import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import {
-  coversRemoteCwd,
   createdWorkspaceTitle,
   hostTag,
   remoteWorkspaces,
@@ -483,7 +482,9 @@ export class Core {
       ? [...this.config.hosts, normalized]
       : this.config.hosts.map(item => item.id === host.id ? normalized : item)
     // A cached session keyed by id would keep talking to the previous machine.
-    if (previous !== undefined && connectionKeyChanged(previous, normalized)) this.forgetStatus(host.id)
+    if (previous !== undefined && connectionKeyChanged(previous, normalized)) {
+      this.forgetStatus(host.id)
+    }
     else {
       forgetOpsHost(host.id)
       // The snapshot is not part of the handshake. Drop it only when the switch flips.
@@ -582,7 +583,9 @@ export class Core {
    * workspace registry keeps an existing row's title if it already exists.
    *
    * Shared by the settings page and the `ssh_workspace` tool, so both entries
-   * point at the same directory and cannot disagree about the title.
+   * point at the same real directory and cannot disagree about the title.
+   * Neither entry lets the calling session enter. A session starts there when
+   * the user opens the workspace.
    */
   async registerWorkspace(host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal): Promise<{ path: string, remotePath: string, title: string, created: boolean }> {
     if (remotePath.trim().length === 0) throw new Error('remote path is required')
@@ -590,6 +593,8 @@ export class Core {
     // placeholder of its own and register a second workspace for the same path.
     const normalized = normalizeRemoteDirectory(remotePath)
     if (normalized === null) throw new Error(`remote path must be absolute: ${remotePath}`)
+    // `/` covers every path, and workspace-write then bind-mounts the whole machine.
+    if (normalized === '/') throw new Error(`refusing to register "/": a workspace rooted at the remote filesystem root covers every path on ${hostLabel(host)}`)
     throwIfAborted(signal)
     // Read the credential first: a credential-store failure must not be
     // mistaken for a missing directory below.
@@ -607,40 +612,43 @@ export class Core {
       throw error
     }
     if (!info.isDirectory) throw new Error(`remote path is not a directory: ${normalized}`)
-    const local = mapRemoteToLocal(host.id, normalized)
-    if (local === null) throw new Error(`remote path must be absolute: ${normalized}`)
+    throwIfAborted(signal)
+    // Store the path the host names this directory. A symlink and its target
+    // are one workspace, so a later `cd .` realpath matches the stored row.
+    // A link to `/` is the same refusal as registering `/` itself. If realpath
+    // fails after stat succeeded, registration fails with that error. The
+    // default title is the real path's basename, which changes when the path
+    // was a symlink.
+    const resolved = normalizeRemoteDirectory(await withSignal(this.pool.sftpRealpath(host, secret, normalized), signal))
+    if (resolved === null) throw new Error(`remote path must be absolute: ${normalized}`)
+    if (resolved === '/') throw new Error(`refusing to register "/": a workspace rooted at the remote filesystem root covers every path on ${hostLabel(host)}`)
+    const local = mapRemoteToLocal(host.id, resolved)
+    if (local === null) throw new Error(`remote path must be absolute: ${resolved}`)
     throwIfAborted(signal)
     // The registry matches by canonical path, so a row created earlier may sit
     // under the realpath of the same directory. Ask the current listing rather
     // than comparing the placeholder spelling.
-    const existed = this.listWorkspaces().some(row => row.hostId === host.id && row.remotePath === normalized)
+    const existed = this.listWorkspaces().some(row => row.hostId === host.id && row.remotePath === resolved)
     await mkdir(local, { recursive: true })
-    const requested = title?.trim() || posix.basename(normalized) || normalized
+    const requested = title?.trim() || posix.basename(resolved) || resolved
     const nextTitle = createdWorkspaceTitle(host, requested, this.taggingEnabled)
     const workspace = await this.workspaces.create(local, nextTitle)
     // `create` keeps an existing record's title; only a new row carries ours.
-    return { path: workspace.path, remotePath: normalized, title: workspace.title, created: !existed }
+    return { path: workspace.path, remotePath: resolved, title: workspace.title, created: !existed }
   }
 
   /**
    * Whether this session may route `route` to the host.
    *
-   * Two things qualify. A registered workspace covering the directory: that is
-   * the directory the operator (or an approved `ssh_workspace` call) asked for.
-   * And a session that is already on that host: once the operator opened or
-   * entered a workspace there, walking to `/etc` with `working_directory` is
-   * ordinary navigation, not a new host. Routing cannot cross hosts, so this
-   * cannot be used to reach a second machine.
-   *
-   * What is left out is the reason for the check: a leftover placeholder (DSH
-   * keeps the directory when a workspace is deleted) must not let a *local*
-   * session step onto a host and read the filesystem.
+   * A workspace row does not qualify. Only a header already on that host does:
+   * the session was opened from that machine's workspace. A leftover
+   * placeholder under a local header is not enough. An opened session may
+   * `cd /etc` on that host. Routing cannot cross hosts.
    */
   allowsRemoteCwd(route: RemoteRoute, headerCwd: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
     const registry = this.workspaces as WorkspaceRegistryLike | undefined
     // A host build without the registry cannot be checked; keep the old routing.
     if (registry === undefined) return true
-    if (coversRemoteCwd(registry.list(), route, env)) return true
     const opened = routeByCwd(headerCwd, env)
     return opened.kind === 'remote' && opened.hostId === route.hostId
   }
@@ -706,7 +714,7 @@ function markRemote(service: SshApi): void {
   })
 }
 
-const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
+const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
   read: (host, route, args, exec) => runRead(host, route, args, exec),
   write: (host, route, args, exec) => runWrite(host, route, args, exec),
@@ -720,11 +728,6 @@ const RUNNERS: Record<RoutedToolName, (host: ToolHost, route: NonNullable<Return
   }, exec),
   glob: (host, route, args, exec) => runGlob(host, route, args, exec),
   grep: (host, route, args, exec) => runGrep(host, route, args, exec),
-  working_directory: (host, route, args, exec, ctx) => runWorkingDirectory(host, route, args, exec, async directory => {
-    const directories = ctx.get('workingDirectory') as { set(agent: object, path: string, signal?: AbortSignal): Promise<string> } | undefined
-    if (directories === undefined || exec.agent === undefined) throw new Error('working_directory requires an agent Session')
-    return directories.set(exec.agent, directory, exec.signal)
-  }),
   // A local PTY backend would open a shell inside the placeholder directory
   // while the sidebar terminal is already on the server. Refuse instead of
   // handing the model a prompt that is not where the Session is.
@@ -782,30 +785,112 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
 }
 
 /**
- * Refuse to put a session on a host for a placeholder no workspace owns.
+ * Refuse to put a session on a host it did not open.
  *
  * Routing a cwd to the remote only proves the placeholder directory exists, and
- * DSH keeps that directory when a workspace registration is deleted. Since
- * entering one hands the model a remote shell, "the directory is still there"
- * is not an authorization: a registered workspace, or a session opened inside
- * the same workspace, is.
+ * DSH keeps that directory when a workspace registration is deleted. A registry
+ * row is not permission. Only a header already on that host allows entry.
+ * The placeholder path is omitted. Naming it would hand the session the path
+ * it would have to pass to enter.
  */
 function assertEnterableRemoteCwd(core: Core, route: RemoteRoute, headerCwd: string | undefined): void {
   if (core.allowsRemoteCwd(route, headerCwd)) return
-  throw new Error(`refusing to use ${route.remoteCwd} on SSH host ${route.hostId}: ${route.placeholderCwd} is a placeholder for a remote directory that no registered workspace owns. Add it with ssh_workspace, or open the workspace from the list.`)
+  throw new Error(`refusing to use ${route.remoteCwd} on SSH host ${route.hostId}: this session was not opened on that host. Open the workspace from the list.`)
+}
+
+/** The confirmed remote directory, checked again because realpath follows links. */
+function assertResolvedRemoteCwd(core: Core, hostId: string, remotePath: string, headerCwd: string | undefined): void {
+  const local = mapRemoteToLocal(hostId, remotePath)
+  if (local === null) throw new Error('remote directory cannot be mapped to a workspace path')
+  const mapped = routeByCwd(local)
+  if (mapped.kind !== 'remote' || mapped.hostId !== hostId) {
+    throw new Error('remote directory cannot be mapped to a workspace path')
+  }
+  assertEnterableRemoteCwd(core, { kind: 'remote', hostId, remoteCwd: remotePath, placeholderCwd: local }, headerCwd)
+}
+
+/**
+ * Refuse a remote `cd` whose target is on a host this session did not open.
+ * The realpath check repeats this after links are followed, before the directory is committed.
+ */
+function assertRemoteWorkingDirectoryTarget(core: Core, route: RemoteRoute, args: Record<string, unknown>, headerCwd: string | undefined): void {
+  const requested = typeof args.cd === 'string' ? args.cd.trim() : ''
+  if (requested.length === 0) return
+  assertResolvedRemoteCwd(core, route.hostId, resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd), headerCwd)
+}
+
+/** Confirm the remote directory, then commit its placeholder. Both checks happen before the commit. */
+function commitRemoteWorkingDirectory(
+  core: Core,
+  ctx: HostContext,
+  host: ToolHost,
+  route: RemoteRoute,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+  headerCwd: string | undefined,
+): Promise<unknown> {
+  assertRemoteWorkingDirectoryTarget(core, route, args, headerCwd)
+  return runWorkingDirectory(host, route, args, exec, async directory => {
+    const directories = ctx.get('workingDirectory') as { set(agent: object, path: string, signal?: AbortSignal): Promise<string> } | undefined
+    if (directories === undefined || exec.agent === undefined) throw new Error('working_directory requires an agent Session')
+    return directories.set(exec.agent, directory, exec.signal)
+  }, remote => {
+    assertResolvedRemoteCwd(core, route.hostId, remote, headerCwd)
+  })
+}
+
+interface CanonicalFs {
+  resolve(path: string, opts?: { cwd?: string, signal?: AbortSignal }): Promise<unknown>
+  processPath(target: unknown): string
+}
+
+function canonicalFs(ctx: HostContext): CanonicalFs | undefined {
+  const fs = ctx.get('fs') as Partial<CanonicalFs> | undefined
+  if (typeof fs?.resolve !== 'function' || typeof fs.processPath !== 'function') return undefined
+  return fs as CanonicalFs
 }
 
 /**
  * A local `working_directory` call must not step into a placeholder by accident.
  *
- * The directory outlives the workspace registration, so committing it would give
- * this session a remote shell without any approval on the way. Refuse before the
- * directory is committed, which also avoids stranding the session inside it.
+ * The official service follows symlinks before it commits, so the lexical path
+ * is not the path that lands in the session. Refuse the path that would be
+ * committed, before the official tool runs. Without `fs` a local spelling can
+ * still be a symlink into a placeholder, and the official tool would commit
+ * that target. Refuse those calls. A path that is already a placeholder is
+ * checked as itself.
  */
-function assertLocalWorkingDirectory(core: Core, args: Record<string, unknown>, current: string | undefined, headerCwd: string | undefined): void {
+async function assertLocalWorkingDirectory(
+  core: Core,
+  args: Record<string, unknown>,
+  current: string | undefined,
+  headerCwd: string | undefined,
+  fs: CanonicalFs | undefined,
+  signal: AbortSignal | undefined,
+): Promise<void> {
   const requested = typeof args.cd === 'string' ? args.cd.trim() : ''
   if (requested.length === 0 || current === undefined) return
-  const route = routeByCwd(resolveLocalPath(current, requested))
+  const lexical = resolveLocalPath(current, requested)
+  if (fs === undefined) {
+    const lexicalRoute = routeByCwd(lexical)
+    if (lexicalRoute.kind === 'remote') {
+      assertEnterableRemoteCwd(core, lexicalRoute, headerCwd)
+      return
+    }
+    throw new Error('refusing to change directory: the filesystem service is unavailable, so a symlink into a remote workspace cannot be checked')
+  }
+  let canonical: string
+  try {
+    canonical = fs.processPath(await fs.resolve(requested, { cwd: current, signal }))
+  } catch (error) {
+    if (signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
+    // The official tool reports a missing local directory. A lexical
+    // placeholder is still refused here, so a failed resolve cannot skip it.
+    const lexicalRoute = routeByCwd(lexical)
+    if (lexicalRoute.kind === 'remote') assertEnterableRemoteCwd(core, lexicalRoute, headerCwd)
+    return
+  }
+  const route = routeByCwd(canonical)
   if (route.kind === 'remote') assertEnterableRemoteCwd(core, route, headerCwd)
 }
 
@@ -826,7 +911,6 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
       // a local directory and then throws. The dynamic shell surface owns it.
       if (plan.official === undefined) continue
       const official = plan.official
-      const runner = RUNNERS[plan.name]
       const base = capturedSchema(agent.ctx.tools, plan.name, agent) as Record<string, unknown>
       const definition: Record<string, unknown> = {
         ...base,
@@ -834,14 +918,16 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
         async execute(args: unknown, exec: ToolExec) {
           const cwd = effectiveCwd(ctx, exec, headerCwd)
           const current = routeByCwd(cwd)
+          const record = args as Record<string, unknown>
           if (current.kind !== 'remote') {
-            if (plan.name === 'working_directory') assertLocalWorkingDirectory(core, args as Record<string, unknown>, cwd, headerCwd)
+            if (plan.name === 'working_directory') await assertLocalWorkingDirectory(core, record, cwd, headerCwd, canonicalFs(ctx), exec.signal)
             return dispatchShadow(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, false, async () => {
               throw new Error('dsh-permission-remote: local call has no official tool')
             }, args, exec)
           }
           assertEnterableRemoteCwd(core, current, headerCwd)
-          return runner(host, current, args as Record<string, unknown>, exec, ctx)
+          if (plan.name === 'working_directory') return commitRemoteWorkingDirectory(core, ctx, host, current, record, exec, headerCwd)
+          return RUNNERS[plan.name](host, current, record, exec, ctx)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
@@ -1242,7 +1328,7 @@ function opsTools(core: Core): object[] {
   const pick = (args: Record<string, unknown>) => core.requireOpsHost(String(args.host ?? ''))
   return [publishOpsTool({
       name: 'ssh_hosts',
-      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, or ssh_write when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands and writes, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
+      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
       parameters: {},
       output: textOutput(value => {
         const hosts = Array.isArray(value.hosts) ? value.hosts as Array<ReturnType<typeof opsHostView>> : []
@@ -1270,11 +1356,12 @@ function opsTools(core: Core): object[] {
       },
     }), publishOpsTool({
       name: 'ssh_workspace',
-      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, so a session opened on it runs file and command tools on that machine. The directory must already exist and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. This only adds an entry the user opens from the workspace list — the current session keeps its own directory and does not move. Remote files are not modified. Allowed on any host whose ops policy is not "deny"; the host key must already be trusted in Settings → SSH hosts. The title defaults to the directory name; registering the same directory again keeps the existing row and its title (the result then reports created: false).',
+      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace. Opening that workspace from the list starts a session on that machine, and file and command tools in that session run there. The directory must already exist and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. The filesystem root "/" is refused. This call only adds the sidebar workspace. It does not move the current session, does not return the placeholder, and does not let this session enter that directory. On an "ask" host this needs danger-full-access, because opening the new workspace starts a session on that machine: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Remote files are not modified. The host key must already be trusted in Settings → SSH hosts. The title defaults to the directory name; registering the same directory again keeps the existing row and its title (the result then reports created: false).',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
-        directory: { type: 'string', required: true, description: 'Absolute remote directory to register, or a path starting with "~/"' },
+        directory: { type: 'string', required: true, description: 'Absolute remote directory to register, or a path starting with "~/". "/" is refused' },
         title: { type: 'string', description: 'Sidebar title; defaults to the directory name, prefixed with the server when title tagging is on' },
+        ...OPS_ESCALATION,
       },
       output: textOutput(renderSshWorkspace),
       execute(args: unknown, exec: ToolExec) {

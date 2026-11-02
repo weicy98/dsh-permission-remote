@@ -407,30 +407,99 @@ test('rendered reads say when more lines follow', () => {
   assert.match(text, /lines 1-1 of 4; more lines follow/)
 })
 
-test('ssh_workspace registers an absolute directory without a prompt', async () => {
+test('ssh_workspace on a trust host registers without a prompt and hides the placeholder', async () => {
   const { api: hostApi, workspaces, commands, modes } = api()
-  const value = await runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, {})
+  const value = await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app' }, {})
   assert.deepEqual(workspaces, [{ hostId: 'prod1', remotePath: '/srv/app', title: undefined }])
   assert.equal(value.remotePath, '/srv/app')
   assert.equal(value.created, true)
   // The placeholder path must never reach the model: it is the handle
   // working_directory would need to move this session onto the host.
   assert.equal('path' in value, false)
-  // Registering is a local action: no shell, no approval card.
   assert.deepEqual(commands, [])
+  assert.deepEqual(modes, [])
+})
+
+test('ssh_workspace does not return the placeholder; the stored path is the realpath', async () => {
+  const { api: hostApi } = api()
+  const calling: ToolHost = {
+    ...hostApi,
+    createWorkspace: async (_target, _remotePath, title) => ({
+      path: '/tmp/placeholder',
+      remotePath: '/private/tmp/app',
+      title: title ?? 'app',
+      created: true,
+    }),
+  }
+  const value = await runSshWorkspace(
+    calling,
+    host({ opsPolicy: 'trust' }),
+    { directory: '/tmp/app' },
+    { agent: { session: { id: 'sess-a' } } },
+  )
+  assert.equal(value.remotePath, '/private/tmp/app')
+  assert.equal('path' in value, false)
+})
+
+test('ssh_workspace on an ask host requires danger-full-access before it registers', async () => {
+  const { api: hostApi, workspaces, modes } = api()
+  await assert.rejects(
+    () => runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, {}),
+    /escalation available/,
+  )
+  assert.deepEqual(workspaces, [])
+  const value = await runSshWorkspace(hostApi, host(), {
+    directory: '/srv/app',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'open the app tree',
+  }, {})
+  assert.equal(value.remotePath, '/srv/app')
+  assert.equal(value.created, true)
+  assert.equal('path' in value, false)
+  assert.equal(modes.at(-1)?.[0], 'danger-full-access')
+  assert.equal(modes.at(-1)?.[1], 'open the app tree')
+  assert.match(modes.at(-1)?.[2]?.en ?? '', /open onto that machine/)
+  assert.match(modes.at(-1)?.[2]?.en ?? '', /does not enter/)
+  assert.match(modes.at(-1)?.[2]?.zh ?? '', /打开后的会话在那台机器上/)
+  assert.match(modes.at(-1)?.[2]?.zh ?? '', /不会进入/)
+})
+
+test('ssh_workspace refuses the filesystem root before prompting', async () => {
+  const { api: hostApi, workspaces, modes } = api()
+  await assert.rejects(
+    () => runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/' }, {}),
+    /filesystem root/,
+  )
+  await assert.rejects(
+    () => runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app/../..' }, {}),
+    /filesystem root/,
+  )
+  assert.deepEqual(workspaces, [])
+  assert.deepEqual(modes, [])
+})
+
+test('ssh_workspace refuses a home directory that is the filesystem root', async () => {
+  const { api: hostApi, workspaces, modes } = api({
+    exec: () => result({ stdout: '__DSH_OPS_HOME_BEGIN__\n/\n__DSH_OPS_HOME_END__\n' }),
+  })
+  await assert.rejects(
+    () => runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '~' }, {}),
+    /filesystem root/,
+  )
+  assert.deepEqual(workspaces, [])
   assert.deepEqual(modes, [])
 })
 
 test('ssh_workspace expands a leading ~/ against the remote home', async () => {
   const { api: hostApi, workspaces } = api()
-  await runSshWorkspace(hostApi, host(), { directory: '~/code/app', title: 'app' }, {})
+  await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '~/code/app', title: 'app' }, {})
   // The one remote command is the `$HOME` probe; the registry sees the absolute path.
   assert.equal(workspaces[0]!.remotePath, '/home/ops/code/app')
 })
 
 test('ssh_workspace passes the title through', async () => {
   const { api: hostApi, workspaces } = api()
-  await runSshWorkspace(hostApi, host(), { directory: '/srv/app', title: 'my app' }, {})
+  await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app', title: 'my app' }, {})
   assert.equal(workspaces[0]!.title, 'my app')
 })
 
@@ -447,11 +516,11 @@ test('ssh_workspace surfaces a registration failure instead of reporting success
       throw new Error(`remote path is not a directory: ${remotePath}`)
     },
   })
-  await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: '/srv/app/index.ts' }, {}), /not a directory/)
+  await assert.rejects(() => runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app/index.ts' }, { agent: { session: { id: 'sess-a' } } }), /not a directory/)
   assert.deepEqual(workspaces, [])
 })
 
-test('ssh_workspace follows the read gate: deny and untrusted refuse it', async () => {
+test('ssh_workspace follows the command gate: deny and untrusted refuse it', async () => {
   const { api: hostApi, workspaces, commands } = api()
   await assert.rejects(() => runSshWorkspace(hostApi, host({ opsPolicy: 'deny' }), { directory: '/srv/app' }, {}), /disabled/)
   await assert.rejects(() => runSshWorkspace(hostApi, host({ fingerprint: '' }), { directory: '/srv/app' }, {}), /trust its fingerprint/)
@@ -478,7 +547,10 @@ test('rendered workspace output names the host and directory, and points at the 
     created: true,
   })
   assert.match(added, /workspace added: "prod · app" for \/srv\/app on prod/)
-  assert.match(added, /open it from the workspace list/)
+  assert.match(added, /This session stays here/)
+  assert.match(added, /Open the workspace from the list/)
+  assert.match(added, /on that machine/)
+  assert.doesNotMatch(added, /may enter/)
   // The placeholder path must not leak into the model-facing text.
   assert.doesNotMatch(added, /\.dsh\/remote/)
 

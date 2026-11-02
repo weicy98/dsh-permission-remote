@@ -14,10 +14,10 @@ function settings() {
   }
 }
 
-function agentFor(cwd: string, register: (definition: { name: string }) => () => void) {
+function agentFor(cwd: string, register: (definition: { name: string }) => () => void, sessionId?: string) {
   const cleanups: Array<() => void> = []
   const agent = {
-    session: { header: { cwd } },
+    session: { id: sessionId, header: { cwd } },
     ctx: {
       tools: {
         get: (_name?: string): { execute: () => Promise<unknown> } | undefined => ({ execute: async () => 'official' }),
@@ -128,10 +128,11 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
   assert.deepEqual(hosts?.parameters.properties, {})
-  // Registering a workspace is a local action backed by one remote stat, so it
-  // advertises no escalation argument: there is no card to open.
+  // Opening the new workspace starts a session on that host, so registration
+  // uses the same escalation argument as ssh_exec and ssh_write.
   assert.deepEqual(workspace?.parameters.required, ['host', 'directory'])
-  assert.deepEqual(Object.keys(workspace?.parameters.properties ?? {}).sort(), ['directory', 'host', 'title'])
+  assert.deepEqual(Object.keys(workspace?.parameters.properties ?? {}).sort(), ['directory', 'host', 'justification', 'sandbox_permissions', 'title'])
+  assert.deepEqual(workspace?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   // Only danger-full-access opens the ops approval card; narrower modes would
   // send the model into a retry that can never succeed.
   assert.deepEqual(exec?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
@@ -153,11 +154,11 @@ test('a session that walks into a placeholder no workspace owns is refused', asy
   const bash = tools.find(tool => tool.name === 'bash')
   await assert.rejects(
     () => bash!.execute({ command: 'id' }, { agent }),
-    /no registered workspace owns/,
+    /not opened on that host/,
   )
 })
 
-test('a registered workspace lets the session run there', async () => {
+test('a local session standing in a registered placeholder is refused', async () => {
   const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
   apply(ctx, { hosts: [], maxConnections: 4 })
   const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
@@ -167,9 +168,21 @@ test('a registered workspace lets the session run there', async () => {
   })
   await created(ctx, agent)
   const bash = tools.find(tool => tool.name === 'bash')
-  // Past the ownership guard, so the next failure is the (deliberately) missing
-  // host configuration rather than the refusal.
-  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /not configured/)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  const refused = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    assert.match(message, /not opened on that host/)
+    assert.doesNotMatch(message, /ssh_workspace/)
+    assert.doesNotMatch(message, /not configured/)
+    assert.equal(message.includes(remoteCwd), false)
+    return true
+  }
+  // The header is local. A registered placeholder is not enough, for the
+  // current directory or for a cd out of it.
+  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), refused)
+  for (const cd of ['/etc', 'src']) {
+    await assert.rejects(() => workingDirectory!.execute({ cd }, { agent }), refused)
+  }
 })
 
 test('a session already on the host may walk outside its workspace', async () => {
@@ -206,9 +219,129 @@ test('working_directory refuses to commit an unregistered placeholder', async ()
   const workingDirectory = tools.find(tool => tool.name === 'working_directory')
   await assert.rejects(
     () => workingDirectory!.execute({ cd: remoteCwd }, { agent }),
-    /no registered workspace owns/,
+    /not opened on that host/,
   )
   // The directory is never committed, so the session is not stranded inside it.
+  assert.equal(officialCalls, 0)
+})
+
+test('a session opened on the host may cd outside its workspace', async () => {
+  const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const { agent } = agentFor(remoteCwd, definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  await assert.rejects(() => workingDirectory!.execute({ cd: '/etc' }, { agent }), /not configured/)
+})
+
+test('working_directory refuses a local cd when the filesystem service is missing', async () => {
+  const ctx = pluginWithWorkspaces([])
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let officialCalls = 0
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  // The official tool would commit the placeholder. The missing service must
+  // stop the call before that commit.
+  agent.ctx.tools.get = (name?: string) => name === 'working_directory' || name === 'bash'
+    ? { execute: async () => { officialCalls += 1; return { cwd: remoteCwd } } }
+    : undefined
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  await assert.rejects(
+    () => workingDirectory!.execute({ cd: 'jump' }, { agent }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      assert.match(message, /filesystem service is unavailable/)
+      assert.equal(message.includes(remoteCwd), false)
+      return true
+    },
+  )
+  assert.equal(officialCalls, 0)
+})
+
+test('working_directory still reaches the official tool for a placeholder the header already opened', async () => {
+  const ctx = pluginWithWorkspaces([], '/tmp/local-project')
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let officialCalls = 0
+  const { agent } = agentFor(remoteCwd, definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  agent.ctx.tools.get = (name?: string) => name === 'working_directory' || name === 'bash'
+    ? { execute: async () => { officialCalls += 1; return { cwd: remoteCwd } } }
+    : undefined
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  const committed = await workingDirectory!.execute({ cd: remoteCwd }, { agent })
+  assert.deepEqual(committed, { cwd: remoteCwd })
+  assert.equal(officialCalls, 1)
+})
+
+test('working_directory follows a symlink before accepting a local cd', async () => {
+  const ctx = pluginWithWorkspaces([])
+  ctx.provide('fs', {
+    resolve: async () => ({ kind: 'followed' }),
+    processPath: () => remoteCwd,
+  })
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let officialCalls = 0
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  agent.ctx.tools.get = (name?: string) => name === 'working_directory' || name === 'bash'
+    ? { execute: async () => { officialCalls += 1; return { cwd: '/tmp/local-project' } } }
+    : undefined
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  await assert.rejects(
+    () => workingDirectory!.execute({ cd: 'jump' }, { agent }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      assert.match(message, /not opened on that host/)
+      assert.equal(message.includes(remoteCwd), false)
+      return true
+    },
+  )
+  assert.equal(officialCalls, 0)
+})
+
+test('working_directory refuses a symlink into a registered placeholder', async () => {
+  const ctx = pluginWithWorkspaces([remoteCwd])
+  ctx.provide('fs', {
+    resolve: async () => ({ kind: 'followed' }),
+    processPath: () => remoteCwd,
+  })
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let officialCalls = 0
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  agent.ctx.tools.get = (name?: string) => name === 'working_directory' || name === 'bash'
+    ? { execute: async () => { officialCalls += 1; return { cwd: remoteCwd } } }
+    : undefined
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  await assert.rejects(
+    () => workingDirectory!.execute({ cd: 'jump' }, { agent }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      assert.match(message, /not opened on that host/)
+      assert.equal(message.includes(remoteCwd), false)
+      return true
+    },
+  )
   assert.equal(officialCalls, 0)
 })
 

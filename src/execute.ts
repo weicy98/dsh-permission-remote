@@ -44,7 +44,7 @@ import {
   type ProbeOutcome,
 } from './probe.ts'
 import { rgPlatformOf } from './rg-fetch.ts'
-import { mapRemoteToLocal, resolveRemotePath, toModelPath, type RemoteRoute } from './router.ts'
+import { mapRemoteToLocal, resolveRemotePath, toModelPath, workspaceBinding, type RemoteRoute } from './router.ts'
 import { loginEnvApply } from './login-env.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
@@ -319,6 +319,22 @@ async function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, 
   return { workspaceRoot, tmp: status.roots.tmp, userTmp: status.roots.userTmp }
 }
 
+/**
+ * Writable root for workspace-write.
+ *
+ * Header on that host: the workspace encoded in the header, so `cd /` does not
+ * bind `/`. Header not on that host: the live directory. There is no grant to pin.
+ */
+export function sandboxWorkspaceRoot(route: RemoteRoute, exec: ToolExec): string {
+  const opened = workspaceBinding(exec.agent?.session?.header?.cwd)
+  if (opened !== null && opened.hostId === route.hostId) return opened.remotePath
+  return route.remoteCwd
+}
+
+function sandboxRoots(hostApi: ToolHost, route: RemoteRoute, exec: ToolExec, status: RunnerStatus, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
+  return rootsFor(status, sandboxWorkspaceRoot(route, exec), hostApi.pool, host, secret)
+}
+
 const NOT_FOUND = /no such file|cannot find|not found|does not exist/i
 
 /**
@@ -362,7 +378,7 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
   throwIfAborted(exec.signal)
-  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
   const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
   const result = await hostApi.pool.exec(host, secret, argv, timeoutMs, exec.signal)
   const denied = mode !== 'danger-full-access' && sandboxDenied(result.code, result.stderr)
@@ -451,7 +467,7 @@ async function startBackground(
   if (mode !== 'danger-full-access' && !status.sandbox.available) {
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
-  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
   const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
   const reaped = status.sandbox.available && status.sandboxTool === 'bwrap' && mode !== 'danger-full-access'
   const note = reaped ? '' : '\n[dsh-permission-remote] stopping this job closes its SSH channel; descendant processes may survive when no sandbox runner is wrapping the command'
@@ -514,7 +530,7 @@ export async function runWrite(hostApi: ToolHost, route: RemoteRoute, args: Reco
   const status = await hostApi.statusOf(host)
   const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'write', 'operation')
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
   const target = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
   if (!fileWriteAllowed(mode, target, roots)) {
     throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
@@ -542,7 +558,7 @@ export async function runEdit(hostApi: ToolHost, route: RemoteRoute, args: Recor
   const status = await hostApi.statusOf(host)
   const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'edit', 'operation')
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const roots = await rootsFor(status, route.remoteCwd, hostApi.pool, host, secret)
+  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
   const real = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
   if (!fileWriteAllowed(mode, real, roots)) {
     throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
@@ -633,6 +649,9 @@ export async function runWorkingDirectory(
   args: Record<string, unknown>,
   exec: ToolExec,
   setDirectory: (directory: string) => Promise<string>,
+  // `sftpRealpath` follows links, so the confirmed directory can sit outside the
+  // tree the caller already allowed. Reject that before creating a placeholder.
+  allow?: (remote: string, local: string) => void,
 ): Promise<{ cwd: string, remote: string }> {
   if (args.cd === undefined || args.cd === '') return { cwd: route.placeholderCwd, remote: route.remoteCwd }
   const requested = resolveRemotePath(String(args.cd), route.remoteCwd, route.placeholderCwd)
@@ -646,6 +665,7 @@ export async function runWorkingDirectory(
   }
   const local = mapRemoteToLocal(route.hostId, remote)
   if (local === null) throw new Error('remote directory cannot be mapped to a workspace path')
+  allow?.(remote, local)
   await mkdir(local, { recursive: true })
   if (exec.agent === undefined) throw new Error('working_directory requires an agent Session')
   const cwd = await setDirectory(local)

@@ -77,6 +77,29 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
 }
 
 /**
+ * The workspace a placeholder was opened on, ignoring later subdirectory segments.
+ *
+ * `routeByCwd` folds those segments into the live remote directory. The sandbox
+ * root is the encoded workspace, the directory the session was opened on, and
+ * must not follow a `cd` into `/etc` or `/`.
+ */
+export function workspaceBinding(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): { hostId: string, remotePath: string } | null {
+  if (!cwd) return null
+  const root = remoteRoot(env)
+  const rel = path.relative(root, cwd)
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null
+  const segments = rel.split(path.sep).filter(segment => segment.length > 0)
+  if (segments.length < 2) return null
+  const hostId = segments[0]!
+  if (!isValidHostId(hostId)) return null
+  const remotePath = decodeRemotePath(segments[1]!)
+  if (remotePath === null || !remotePath.startsWith('/')) return null
+  const normalized = normalizeRemoteDirectory(remotePath)
+  if (normalized === null) return null
+  return { hostId, remotePath: normalized }
+}
+
+/**
  * Resolve a model-supplied path against a remote workspace.
  * Relative paths and paths inside the placeholder root re-anchor to the remote
  * directory. Other absolute paths are remote absolute paths, lexically normalized.

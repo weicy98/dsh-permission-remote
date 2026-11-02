@@ -12,6 +12,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { atomicWriteScript } from './profile.ts'
+import { normalizeRemoteDirectory } from './router.ts'
 import { shJoin } from './shell-quote.ts'
 import type { SecretMaterial } from './ssh-pool.ts'
 
@@ -199,28 +200,40 @@ export function renderOpsRead(value: Record<string, unknown>): string {
 /**
  * Register a remote directory as a DSH workspace.
  *
- * The remote side only reads (`stat`) and the registration is local, so this
- * follows the read gate rather than the command gate: a `deny` host refuses it
- * and an untrusted host key is refused, but no approval card is raised.
+ * This only adds the sidebar workspace. It does not let this session enter
+ * and does not return the local placeholder. Opening that workspace starts a
+ * session on that machine, so an `ask` host still treats the registration
+ * like a command: `danger-full-access`, or one approval. The filesystem root
+ * is refused, because that one workspace would cover every path.
  *
- * The local placeholder path is deliberately not returned. A local session that
- * knew it could hand it to `working_directory` and turn one registration into a
- * remote shell; keeping it out of the result keeps this tool to what it says —
- * an entry the user opens from the workspace list.
+ * The current session does not move. The user opens the new workspace from the list.
  */
 export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
-  if (host.opsPolicy === 'deny') throw new Error(`remote ops are disabled for SSH host ${hostLabel(host)}`)
-  requireTrusted(host)
   throwIfAborted(exec?.signal)
   const requested = String(args.directory ?? '').trim()
   if (requested.length === 0) throw new Error('directory is required')
   if (!posix.isAbsolute(requested) && requested !== '~' && !requested.startsWith('~/')) {
     throw new Error(`directory must be an absolute remote path or start with "~/": ${requested}`)
   }
+  if (posix.isAbsolute(requested)) refuseFilesystemRoot(requested, host)
   const create = hostApi.createWorkspace
   if (create === undefined) throw new Error('this build cannot register a workspace for an SSH host')
+  await requireOps(
+    hostApi,
+    host,
+    exec ?? {},
+    args as OpsApprovalArgs,
+    'ssh_workspace',
+    hostSubject(host, 'remote workspace registration'),
+    {
+      en: `register workspace ${clip(requested)} on ${hostLabel(host)}. This adds a sidebar workspace the user can open onto that machine. This session does not enter it`,
+      zh: `在 ${hostLabel(host)} 上注册工作区 ${clip(requested)}。侧栏会多出一个可打开的远端工作区，打开后的会话在那台机器上。这个会话不会进入`,
+    },
+  )
+  throwIfAborted(exec?.signal)
   const secret = await hostApi.secretOf(host)
   const remotePath = await resolveOpsPath(hostApi, host, secret, requested, 'directory')
+  refuseFilesystemRoot(remotePath, host)
   const title = typeof args.title === 'string' ? args.title : undefined
   const created = await create(host, remotePath, title, exec?.signal)
   return {
@@ -241,7 +254,7 @@ export function renderSshWorkspace(value: Record<string, unknown>): string {
   if (value.created === false) {
     return `workspace already registered: "${title}" for ${path} on ${label}; nothing changed, and the existing title was kept`
   }
-  return `workspace added: "${title}" for ${path} on ${label}; open it from the workspace list to use it (this session stays here)`
+  return `workspace added: "${title}" for ${path} on ${label}. This session stays here. Open the workspace from the list to start a session on that machine`
 }
 
 export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
@@ -297,6 +310,12 @@ export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Rec
  */
 export function isRemoteMissing(error: unknown): boolean {
   return error instanceof Error && NOT_FOUND.test(error.message)
+}
+
+/** `/` covers every remote path, and a workspace-write bind of it replaces the read-only root. */
+function refuseFilesystemRoot(remotePath: string, host: HostConfig): void {
+  if (normalizeRemoteDirectory(remotePath) !== '/') return
+  throw new Error(`refusing to register "/": a workspace rooted at the remote filesystem root covers every path on ${hostLabel(host)}`)
 }
 
 /** Absolute remote paths only. A leading `~/` expands against the remote home. */

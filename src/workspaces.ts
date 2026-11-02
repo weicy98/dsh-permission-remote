@@ -127,22 +127,14 @@ export function workspaceRoute(workspacePath: string, env: NodeJS.ProcessEnv = p
 }
 
 /**
- * Whether a session cwd is covered by a registered workspace.
+ * Whether `remoteCwd` is `root` or a directory inside it.
  *
- * Routing a cwd to the remote host only proves that the placeholder directory
- * exists, and the placeholder outlives its registration: DSH's registry keeps a
- * deleted workspace's directory. Since the placeholder is what
- * `working_directory` needs to hand the model a remote shell, "the directory is
- * there" must not be the authorization — a row under the same host, at or above
- * the remote directory, is.
+ * `..cache` and `...` are real directory names. Only a `..` segment leaves the tree.
  */
-export function coversRemoteCwd(workspaces: readonly WorkspaceLike[], route: { hostId: string, remoteCwd: string }, env: NodeJS.ProcessEnv = process.env): boolean {
-  return workspaces.some(workspace => {
-    const owned = workspaceRoute(workspace.path, env)
-    if (owned === null || owned.hostId !== route.hostId) return false
-    const rel = posix.relative(owned.remotePath, route.remoteCwd)
-    return rel === '' || (!rel.startsWith('..') && !posix.isAbsolute(rel))
-  })
+export function remotePathInside(root: string, remoteCwd: string): boolean {
+  const rel = posix.relative(root, remoteCwd)
+  const leaves = rel === '..' || rel.startsWith('../') || posix.isAbsolute(rel)
+  return rel === '' || !leaves
 }
 
 export function remoteWorkspaces(workspaces: readonly WorkspaceLike[], env: NodeJS.ProcessEnv = process.env): RemoteWorkspaceView[] {

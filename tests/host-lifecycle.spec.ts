@@ -266,11 +266,12 @@ test('registering a remote directory creates a titled workspace and a placeholde
     const registry = new FakeRegistry()
     const core = build(registry)
     const stats: string[] = []
-    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
     fakePool.sftpStat = async (_host: unknown, _secret: unknown, path: string) => {
       stats.push(path)
       return { isDirectory: true, size: 0, mode: 0o040755 }
     }
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => path
     const created = await core.registerWorkspace(host(), '/srv/app')
     assert.deepEqual(stats, ['/srv/app'])
     assert.equal(created.remotePath, '/srv/app')
@@ -288,8 +289,9 @@ test('registering the same directory twice keeps one row and its title', async (
   await withRemoteRoot(async () => {
     const registry = new FakeRegistry()
     const core = build(registry)
-    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
     fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => path
     const first = await core.registerWorkspace(host(), '/srv/app', 'notes')
     const second = await core.registerWorkspace(host(), '/srv/app/', 'another')
     assert.equal(first.created, true)
@@ -305,8 +307,9 @@ test('registering without title tagging keeps the plain directory name', async (
   await withRemoteRoot(async () => {
     const registry = new FakeRegistry()
     const core = build(registry, [], [host()], { tagWorkspaceTitles: false })
-    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
     fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => path
     const created = await core.registerWorkspace(host(), '/srv/app/')
     assert.equal(created.title, 'app')
     assert.equal(created.remotePath, '/srv/app')
@@ -367,19 +370,60 @@ test('a cancelled registration never stats the host or registers a row', async (
   })
 })
 
-test('a session may only route into a workspace the registry owns', async () => {
+test('registering the filesystem root is refused before the host is contacted', async () => {
+  const registry = new FakeRegistry()
+  const core = build(registry)
+  const stats: string[] = []
+  const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+  fakePool.sftpStat = async (_host: unknown, _secret: unknown, path: string) => {
+    stats.push(path)
+    return { isDirectory: true, size: 0, mode: 0o040755 }
+  }
+  await assert.rejects(() => core.registerWorkspace(host(), '/'), /filesystem root/)
+  await assert.rejects(() => core.registerWorkspace(host(), '/srv/app/../..'), /filesystem root/)
+  assert.deepEqual(stats, [])
+  assert.deepEqual(registry.rows, [])
+})
+
+test('registration stores the remote real path and refuses one that is /', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => {
+      if (path === '/tmp/app' || path === '/private/tmp/app') return '/private/tmp/app'
+      return '/'
+    }
+    const created = await core.registerWorkspace(host(), '/tmp/app')
+    assert.equal(created.remotePath, '/private/tmp/app')
+    assert.equal(created.created, true)
+    // The symlink and the real directory are one row.
+    const again = await core.registerWorkspace(host(), '/private/tmp/app')
+    assert.equal(again.created, false)
+    assert.equal(again.path, created.path)
+    assert.equal(registry.rows.length, 1)
+    // A directory whose real path is the filesystem root never becomes a row.
+    // Registering one does not put the calling session on the host.
+    await assert.rejects(() => core.registerWorkspace(host(), '/var/rootlink'), /filesystem root/)
+    assert.equal(registry.rows.length, 1)
+    assert.equal(core.allowsRemoteCwd({ kind: 'remote', hostId: 'host1', remoteCwd: '/private/tmp/app', placeholderCwd: '' }, '/tmp/local'), false)
+  })
+})
+
+test('a session may route on a host only when its header was opened there', async () => {
   const registry = new FakeRegistry()
   const core = build(registry, [], [host(), host({ id: 'host2', host: '10.0.0.9' })])
   remoteWorkspace(registry, 'host1', '/srv/app', 'dev · app')
   const route = (hostId: string, remoteCwd: string) => ({ kind: 'remote' as const, hostId, remoteCwd, placeholderCwd: '' })
 
-  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app'), undefined), true)
-  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app/src'), undefined), true)
-  // The placeholder directory can outlive its registration, and a directory
-  // that merely shares the prefix must not count as the same workspace.
-  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/lib'), undefined), false)
-  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/application'), undefined), false)
-  assert.equal(core.allowsRemoteCwd(route('host2', '/srv/app'), undefined), false)
+  // A row in the list is not enough. A local header and a missing header stay
+  // outside, including a child path, `/etc`, and another host.
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app'), undefined), false)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app'), '/tmp/local-project'), false)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app/src'), '/tmp/local-project'), false)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/etc'), '/tmp/local-project'), false)
+  assert.equal(core.allowsRemoteCwd(route('host2', '/srv/app'), '/tmp/local-project'), false)
 
   // A session opened in the workspace keeps working after the row is removed,
   // and it may walk anywhere on that host: `working_directory` is navigation,
@@ -397,8 +441,9 @@ test('the ops tool host exposes the same registration as the settings page', asy
   await withRemoteRoot(async () => {
     const registry = new FakeRegistry()
     const core = build(registry)
-    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
     fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => path
     const toolHost = core.toolHost(undefined)
     const created = await toolHost.createWorkspace!(host(), '/srv/lib', 'lib')
     assert.equal(created.title, 'dev · lib')

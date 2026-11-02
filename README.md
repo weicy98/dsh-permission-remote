@@ -44,7 +44,7 @@ dsh plugin --profile web add dsh-permission-remote
 7. **侧栏认主机。** DSH 的侧栏工作区行只显示标题、没有可挂标记的 slot，所以插件把主机名写进标题：`服务器 · 目录名`。加载时只标注标题仍是目录名的那些；你改过的名字不会被自动改写，可以随时用该主机下的「标注侧栏标题」手动重标——它会给该主机的全部工作区标注，并把旧服务器的前缀换成当前的。设置页的开关（`tagWorkspaceTitles`）可以整体关掉标注，重新打开时会立即标注一遍。
 8. **删除与恢复主机。** 删除主机只是把它从列表移走，工作区仍然注册在 DSH 里，标题保留原前缀。设置页的「已删除的主机」分组里可以「恢复主机」（配置和指纹都还在），也可以逐个「注销工作区」。
 
-打开这个工作区的会话后，对话和 Permissions 与本地会话相同。相对路径按远端工作目录解析。工具结果里的路径写成占位目录，模型下一轮仍用这条路径。`working_directory` 也留在这条占位路径上：切换目录会确认远端目录存在，再把会话目录改成对应的占位路径，不会改到你这台电脑上的真实目录。从**本地**会话切进远端路径时，那条路径必须属于一个**已注册**的工作区：占位目录会随着工作区注销留下来，而进了占位目录就等于拿到那台机器的远端 shell，所以插件不会只凭「目录还在」放行，会拒绝并提示先用 `ssh_workspace` 加进来或从列表打开。已经在某台主机上的会话不受影响——在这台机器上 `cd /etc` 这类导航照常，跨主机本来也跳不过去。这样一来，`deny` 主机也无法靠残留的占位目录绕开「拒绝所有远端读取」。每轮的运行时上下文还会写明这条占位路径对应的远端真实目录（`Remote directory: "..."`），`working_directory` 的结果也会在占位路径下面多给一行 `(remote: /home/...)`，命令里可以直接用这条绝对路径，不必先跑 pwd。
+打开这个工作区的会话后，对话和 Permissions 与本地会话相同。相对路径按远端工作目录解析。工具结果里的路径写成占位目录，模型下一轮仍用这条路径。`working_directory` 也留在这条占位路径上：切换目录会确认远端目录存在，再把会话目录改成对应的占位路径，不会改到你这台电脑上的真实目录。从**本地**会话切进远端路径时，占位目录会随着工作区注销留下来，而进了占位目录就等于拿到那台机器的远端 shell，所以插件不会只凭「目录还在」或「列表里已经有这个工作区」放行。`ssh_workspace` 和设置页都只注册工作区，不让当前会话进入；要在那台机器上工作，从侧栏打开。拒绝发生在目录写进会话之前，错误里也不写出占位路径，并说明这个会话不是从那台主机打开的。本地会话即使当前目录已经是某个已注册的占位目录，工具同样拒绝。从这台主机的工作区打开的会话不受影响——在这台机器上 `cd /etc` 照常，跨主机本来也跳不过去。`workspace-write` 的可写根钉在会话头里记下的工作区目录上，不跟着当前目录走，所以打开的会话即使 `cd /` 也不会把整台机器绑成可写。这样一来，`deny` 主机也无法靠残留的占位目录绕开「拒绝所有远端读取」。每轮的运行时上下文还会写明这条占位路径对应的远端真实目录（`Remote directory: "..."`），`working_directory` 的结果也会在占位路径下面多给一行 `(remote: /home/...)`，命令里可以直接用这条绝对路径，不必先跑 pwd。
 
 ## 主机设置：远程调用审批与环境变量来源
 
@@ -85,7 +85,7 @@ dsh plugin --profile web add dsh-permission-remote
 | 档位 | 文件写入 | bash |
 |---|---|---|
 | `read-only` | 拒绝 | 有可用 runner 时在约束下执行；没有则 `SANDBOX_UNAVAILABLE`，命令不跑 |
-| `workspace-write` | 只允许远端工作区和远端临时目录 | 同上。bubblewrap 的 `/tmp` 是私有 tmpfs；文件工具写的是真实临时目录 |
+| `workspace-write` | 只允许打开时的工作区根和远端临时目录 | 同上。可写根不跟着 `cd` 变。bubblewrap 的 `/tmp` 是私有 tmpfs；文件工具写的是真实临时目录 |
 | `danger-full-access` | 按远端登录用户执行 | 不包壳。没有 runner 时，停掉任务可能收不齐子孙进程 |
 
 模型带 `sandbox_permissions` 和一句话理由重试时，仍走现有审批。批准只放宽这一次调用。
@@ -100,19 +100,19 @@ dsh plugin --profile web add dsh-permission-remote
 | `ssh_exec` | 在那台机器上执行 `bash -lc`，可选绝对路径 `workdir` 和 `timeoutMs` |
 | `ssh_read` | 读取远端文件，1 MiB 上限，按行分页；支持 `~/` |
 | `ssh_write` | 用临时文件加 `mv -f` 原子替换远端文件。已有文件保留权限位，新文件按远端 umask 创建，目录路径会被拒绝 |
-| `ssh_workspace` | 给某台已有主机、以某个远端目录创建一个工作区。目录必须已经存在且是目录；标题默认取目录名，开了标题标注时会带上服务器前缀。重复添加同一目录不会产生第二行，保留原标题，结果里会说明 |
+| `ssh_workspace` | 给某台已有主机、以某个远端目录创建一个工作区。目录必须已经存在且是目录，不能是文件系统根 `/`。标题默认取目录名，开了标题标注时会带上服务器前缀。重复添加同一目录不会产生第二行，保留原标题，结果里会说明 |
 
 每台主机在设置里有一个**远程运维**策略：
 
-| 策略 | 读取 `ssh_read` / 添加工作区 `ssh_workspace` | 命令 `ssh_exec` / 写入 `ssh_write` |
+| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` / 添加工作区 `ssh_workspace` |
 |---|---|---|
 | 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，模型必须带 `sandbox_permissions: "danger-full-access"` 和理由重试后弹审批卡。卡片上有主机和截断后的命令或路径，批准只放宽这一次。其它档位不会弹卡 |
 | 信任 | 允许 | 直接执行，不弹审批 |
 | 禁止 | 拒绝 | 拒绝 |
 
-`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取和添加工作区只受「禁止」限制。
+`ssh_exec`、`ssh_write` 和 `ssh_workspace` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
 
-`ssh_workspace` 只做一次远端 `stat`，然后在本机注册工作区，不改远端文件，因此不弹审批卡。它只负责在侧栏加一条工作区，让用户自己点开——当前会话不动，所以要用它请在侧栏打开这个新工作区（会新开一个会话）。结果里不给出占位目录：占位目录一旦交给模型，模型就能用 `working_directory` 把本会话挪进那台主机，等于绕过这台主机的远程调用审批。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
+`ssh_workspace` 做一次远端 `stat`，再按远端真实路径注册（符号链接记成它指向的目录，标题默认取这个真实路径的目录名）。`realpath` 失败则这次注册失败。它不改远端文件。它只在侧栏加一条工作区。打开这条工作区会在那台机器上开始一个会话，所以询问策略下仍和命令一样要审批。这次调用不让当前会话进入，结果里也不给出占位目录。要在那台机器上工作，从侧栏打开。文件系统根 `/` 不能注册，真实路径解析成 `/` 时同样拒绝：那一棵会盖住整台机器。对同一个远端真实路径重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
 
 运维工具的前提：
 
@@ -186,7 +186,7 @@ Each host lists the workspaces created from it, with the remote directory and se
 
 Deleting a host only removes it from the list: its workspaces stay registered with their old title prefix. The “Deleted hosts” group in Settings can restore the host (configuration and fingerprint are kept) or unregister its workspaces one by one.
 
-`working_directory` stays on the placeholder path for that remote directory. From a **local** session, entering a remote path requires that path to belong to a **registered** workspace: the placeholder directory outlives its registration, and stepping into one is what hands the model a remote shell, so the plugin refuses a bare leftover directory and points at `ssh_workspace` or the workspace list instead. A session already on that host keeps working — `cd /etc` is ordinary navigation there, and routing cannot cross hosts — so a leftover placeholder can no longer be used to read a `deny` host. Every turn's runtime context also names the real remote directory that placeholder maps to (`Remote directory: "..."`), and the `working_directory` result adds a second line `(remote: /home/...)` under the placeholder, so a command can use the absolute path without running `pwd` first. Under `workspace-write`, the confined command writes a temp file in the same directory and `mv -f` replaces the target, so a dropped connection does not truncate the original. `danger-full-access` uses the same replace without confinement.
+`working_directory` stays on the placeholder path for that remote directory. From a **local** session, entering a remote path is not authorized by a leftover placeholder, by a workspace that merely exists in the list, or by `ssh_workspace`. Registration only adds the sidebar row; start a session there by opening that workspace. The plugin refuses before the session directory changes. The error does not include the placeholder path, and it says this session was not opened on that host. A local session whose current directory is already a registered placeholder is refused the same way. A session **opened** on that host keeps working — `cd /etc` is ordinary navigation there, and routing cannot cross hosts — so a leftover placeholder can no longer be used to read a `deny` host. Under `workspace-write`, the writable root stays the workspace encoded in the header. It does not follow the live directory, so `cd /` does not bind the whole machine. Every turn's runtime context also names the real remote directory that placeholder maps to (`Remote directory: "..."`), and the `working_directory` result adds a second line `(remote: /home/...)` under the placeholder, so a command can use the absolute path without running `pwd` first. Under `workspace-write`, the confined command writes a temp file in the same directory and `mv -f` replaces the target, so a dropped connection does not truncate the original. `danger-full-access` uses the same replace without confinement.
 
 Linux bash confinement needs bubblewrap. The settings page can install it with `sudo -n`, and also shows the manual command for Debian, Fedora, Arch, and Alpine. macOS uses the system `sandbox-exec`.
 
@@ -247,19 +247,19 @@ A workspace whose directory is on your own computer can also act on a configured
 | `ssh_exec` | Run `bash -lc` on that host, with optional absolute `workdir` and `timeoutMs` |
 | `ssh_read` | Read a remote file, capped at 1 MiB, paginated by line; `~/` is expanded |
 | `ssh_write` | Replace a remote file atomically with a temp file and `mv -f`. An existing file keeps its permission bits, a new file uses the remote umask, and a directory path is rejected |
-| `ssh_workspace` | Add a workspace for an existing host from one remote directory. The directory must already exist and be a directory; the title defaults to its name, carrying the server prefix when title tagging is on. Registering the same directory again keeps the existing row and its title, and the result says so |
+| `ssh_workspace` | Add a workspace for an existing host from one remote directory. The directory must already exist and be a directory, and it cannot be the filesystem root `/`. The title defaults to its name, carrying the server prefix when title tagging is on. Registering the same directory again keeps the existing row and its title, and the result says so |
 
 Each host has a **Remote ops** policy in Settings:
 
-| Policy | `ssh_read` / `ssh_workspace` | `ssh_exec` / `ssh_write` |
+| Policy | `ssh_read` | `ssh_exec` / `ssh_write` / `ssh_workspace` |
 |---|---|---|
 | Ask (default) | allowed | runs only when the session is `danger-full-access`; otherwise the first call is denied and a retry must pass `sandbox_permissions: "danger-full-access"` plus a justification. The approval card names the host and the truncated command or path, and grants this one call. Any other mode does not open a card |
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads and workspace registration are only limited by Deny.
+Ops commands, writes, and workspace registration are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
 
-`ssh_workspace` does one remote `stat` and then registers the workspace locally, so it raises no approval card and never modifies remote files. It only adds a workspace for the user to open; the current session does not move, so use the new workspace from the sidebar (it opens in a new session). The placeholder path is not returned: once the model has it, it could hand it to `working_directory` and move this session onto that host, which would bypass the host's remote-call approval. Registering the same remote directory again keeps the existing row and its title, and the result says so.
+`ssh_workspace` does one remote `stat`, then registers the remote real path (a symlink is stored as its target, and the default title is that real path's directory name). A `realpath` failure fails the registration. It does not modify remote files. It only adds a sidebar workspace. Opening that workspace starts a session on that machine, which is why an ask host still requires the same approval as a command. This call does not let the current session enter, and the placeholder path is not returned. Start a session there by opening the workspace from the sidebar. The filesystem root `/` is refused, including when the real path is `/`, because that one workspace would cover the whole machine. Registering the same real path again keeps the existing row and its title, and the result says so.
 
 Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 

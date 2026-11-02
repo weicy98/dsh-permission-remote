@@ -5,9 +5,9 @@ import type { HostConfig } from '../src/config.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import {
   autoTaggedTitle,
-  coversRemoteCwd,
   createdWorkspaceTitle,
   hostTag,
+  remotePathInside,
   remoteWorkspaces,
   retaggedTitle,
   stripKnownPrefix,
@@ -163,16 +163,16 @@ test('tagging one host prefixes every workspace once and replaces a stale prefix
   assert.equal(await tagRemoteWorkspaces([host()], rows, { hostId: 'host1', knownHosts: known }, env), 0)
 })
 
-test('only a registered workspace covers a remote cwd', () => {
-  const rows = [workspace('a', '/srv/app', 'dev · app')]
-  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/app' }, env), true)
-  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/app/src/lib' }, env), true)
-  // A sibling directory is not covered, and neither is another host.
-  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/lib' }, env), false)
-  assert.equal(coversRemoteCwd(rows, { hostId: 'host2', remoteCwd: '/srv/app' }, env), false)
-  // A prefix that is not a path boundary must not count as covered.
-  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/application' }, env), false)
-  assert.equal(coversRemoteCwd([], { hostId: 'host1', remoteCwd: '/srv/app' }, env), false)
+test('remotePathInside keeps dot-directories and rejects a prefix or a parent', () => {
+  assert.equal(remotePathInside('/srv/app', '/srv/app'), true)
+  assert.equal(remotePathInside('/srv/app', '/srv/app/src/lib'), true)
+  assert.equal(remotePathInside('/srv/app', '/srv/lib'), false)
+  // A prefix that is not a path boundary must not count as inside.
+  assert.equal(remotePathInside('/srv/app', '/srv/application'), false)
+  // A directory whose name starts with dots is still inside the workspace.
+  assert.equal(remotePathInside('/srv/app', '/srv/app/..cache'), true)
+  assert.equal(remotePathInside('/srv/app', '/srv/app/...'), true)
+  assert.equal(remotePathInside('/srv/app', '/srv'), false)
 })
 
 test('load-time tagging does not replace another server prefix', async () => {

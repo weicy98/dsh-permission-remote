@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath, workspaceBinding } from '../src/router.ts'
 
 const env = { DSH_HOME: '/tmp/dsh-home' }
 
@@ -25,6 +25,14 @@ test('relative and placeholder paths re-anchor to the remote directory', () => {
   assert.equal(resolveRemotePath('/etc/passwd', route.remoteCwd, route.placeholderCwd), '/etc/passwd')
   const nested = path.join(local, 'src', 'main.ts')
   assert.equal(resolveRemotePath(nested, route.remoteCwd, route.placeholderCwd), '/srv/app/src/main.ts')
+})
+
+test('workspace binding keeps the encoded root and drops subdirectory segments', () => {
+  const local = mapRemoteToLocal('host1', '/srv/app', env)!
+  assert.deepEqual(workspaceBinding(local, env), { hostId: 'host1', remotePath: '/srv/app' })
+  assert.deepEqual(workspaceBinding(path.join(local, 'src'), env), { hostId: 'host1', remotePath: '/srv/app' })
+  assert.equal(workspaceBinding('/tmp/local-project', env), null)
+  assert.equal(workspaceBinding(undefined, env), null)
 })
 
 test('a subdirectory of the placeholder still routes to the remote workspace', () => {

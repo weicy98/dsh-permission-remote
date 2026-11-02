@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { finishBackground, runBash, runGlob, runWorkingDirectory, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
-import type { RemoteRoute } from '../src/router.ts'
+import { finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
 const host: HostConfig = {
@@ -405,6 +405,135 @@ test('working_directory reports the remote directory alongside the placeholder',
     else process.env.DSH_SSH_REMOTE_ROOT = previous
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('working_directory does not commit a directory the caller rejects after realpath', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-wd-'))
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    const api = {
+      pool: {
+        sftpRealpath: async () => '/etc',
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+    } as unknown as ToolHost
+    const setCalls: string[] = []
+    let seen: string | undefined
+    await assert.rejects(
+      () => runWorkingDirectory(api, route, { cd: '.' }, { agent: {} }, async directory => {
+        setCalls.push(directory)
+        return directory
+      }, remote => {
+        seen = remote
+        throw new Error('no registered workspace owns this directory')
+      }),
+      /no registered workspace owns/,
+    )
+    assert.equal(seen, '/etc')
+    assert.deepEqual(setCalls, [])
+    assert.deepEqual(await readdir(root), [])
+  } finally {
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+const bwrapStatus: RunnerStatus = {
+  ...status,
+  sandbox: { available: true, reason: 'ok' },
+  sandboxTool: 'bwrap',
+}
+
+test('workspace-write binds the opened workspace, not the live directory', async () => {
+  const opened = mapRemoteToLocal('host1', '/srv/app')!
+  const atRoot: RemoteRoute = { ...route, remoteCwd: '/' }
+  const pinned = capturingBash({ mode: 'workspace-write', status: bwrapStatus })
+  await runBash(pinned.api, atRoot, { command: 'true' }, {
+    agent: { session: { header: { cwd: opened } } },
+  })
+  assert.match(pinned.command(), /'--bind' '\/srv\/app' '\/srv\/app'/)
+  assert.doesNotMatch(pinned.command(), /'--bind' '\/' '\/'/)
+  assert.match(pinned.command(), /'--chdir' '\/'/)
+
+  // A header that already sits in a subdirectory still pins the encoded workspace.
+  const fromChild = capturingBash({ mode: 'workspace-write', status: bwrapStatus })
+  await runBash(fromChild.api, atRoot, { command: 'true', workdir: '/etc' }, {
+    agent: { session: { header: { cwd: join(opened, 'src') } } },
+  })
+  assert.match(fromChild.command(), /'--bind' '\/srv\/app' '\/srv\/app'/)
+  assert.match(fromChild.command(), /'--chdir' '\/etc'/)
+
+  const background = capturingBash({ mode: 'workspace-write', status: bwrapStatus })
+  await runBash(background.api, atRoot, { command: 'true', run_in_background: true }, {
+    agent: { session: { header: { cwd: opened } } },
+  })
+  assert.match(background.command(), /'--bind' '\/srv\/app' '\/srv\/app'/)
+  assert.doesNotMatch(background.command(), /'--bind' '\/' '\/'/)
+
+  // danger-full-access does not wrap, and it may still chdir to the live directory.
+  const open = capturingBash()
+  await runBash(open.api, atRoot, { command: 'true' }, {
+    agent: { session: { header: { cwd: opened } } },
+  })
+  assert.equal(open.command(), "cd '/' && 'bash' '-c' 'true'")
+})
+
+test('workspace-write binds the live directory when the header is not on this host', async () => {
+  const local = capturingBash({
+    mode: 'workspace-write',
+    status: bwrapStatus,
+  })
+  const api = local.api as ToolHost & {
+    pool: { sftpRealpath: (host: HostConfig, secret: unknown, path: string) => Promise<string> }
+  }
+  api.pool.sftpRealpath = async (_host, _secret, path) => path === '/srv/app/src' ? '/private/srv/app/src' : path
+  const nested: RemoteRoute = { ...route, remoteCwd: '/srv/app/src' }
+  await runBash(api, nested, { command: 'true' }, {
+    agent: { session: { header: { cwd: '/tmp/local-project' } } },
+  })
+  assert.match(local.command(), /'--bind' '\/private\/srv\/app\/src' '\/private\/srv\/app\/src'/)
+  assert.doesNotMatch(local.command(), /'--bind' '\/srv\/app' '\/srv\/app'/)
+  assert.doesNotMatch(local.command(), /'--bind' '\/srv' '\/srv'/)
+})
+
+test('workspace-write file tools keep the pin when the session has cd to /etc', async () => {
+  const opened = mapRemoteToLocal('host1', '/srv/app')!
+  let command = ''
+  let writes = 0
+  const api = {
+    pool: {
+      sftpRealpath: async (_host: HostConfig, _secret: unknown, path: string) => path,
+      sftpRead: async () => Buffer.from('before'),
+      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
+        writes += 1
+        command = argv
+        return { ...killed(), code: 0, signal: null }
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => bwrapStatus,
+    resolveMode: async () => 'workspace-write' as const,
+  } satisfies ToolHost
+  const atEtc: RemoteRoute = { ...route, remoteCwd: '/etc', placeholderCwd: mapRemoteToLocal('host1', '/etc')! }
+  const exec = { agent: { session: { header: { cwd: opened } } } }
+  await assert.rejects(
+    () => runWrite(api, atEtc, { file_path: '/etc/passwd', content: 'x' }, exec),
+    /file access denied under workspace-write/,
+  )
+  await assert.rejects(
+    () => runEdit(api, atEtc, { file_path: '/etc/passwd', old_string: 'a', new_string: 'b' }, exec),
+    /file access denied under workspace-write/,
+  )
+  assert.equal(writes, 0)
+  const written = await runWrite(api, atEtc, { file_path: '/srv/app/note.txt', content: 'next' }, exec)
+  assert.equal(written.operation, 'update')
+  assert.match(command, /'--bind' '\/srv\/app' '\/srv\/app'/)
+  assert.match(command, /'--chdir' '\/srv\/app'/)
+  assert.doesNotMatch(command, /'--bind' '\/etc'/)
 })
 
 test('working_directory rejects a remote directory that does not exist', async () => {
