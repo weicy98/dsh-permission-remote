@@ -135,6 +135,22 @@ export function normalizeRemoteDirectory(remotePath: string): string | null {
 }
 
 /**
+ * The path a listing request should realpath.
+ *
+ * The picker also takes a typed path, so a request may be `~` or `~/src`, which
+ * SFTP will not expand by itself: `home` is the login home the session starts
+ * in, resolved by the caller. An empty request means the filesystem root, so a
+ * picker that lost its path still has somewhere to list.
+ */
+export function listingPath(requested: string, home: string): string {
+  const text = requested.trim()
+  if (text.length === 0) return '/'
+  if (text === '~') return home
+  if (text.startsWith('~/')) return posix.join(home, text.slice(2)).replace(/\/+$/, '') || '/'
+  return text
+}
+
+/**
  * A directory the picker may create inside `parent`, or `null` with the reason.
  *
  * The name is one path segment: a separator would build a tree the operator

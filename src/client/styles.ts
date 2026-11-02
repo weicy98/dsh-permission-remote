@@ -598,7 +598,9 @@ const CSS = `
   height: 28px;
   font-size: 12px;
 }
-/* The count only appears while filtering, so it must not shift the box width. */
+/* The count and the hint share the end of the row: the count answers "how many
+   match" while typing, the hint says where Tab and "/" go while the box is
+   empty. One slot, sized by its content, so the box never jumps. */
 .dsh-ssh-filter-count {
   flex: none;
   color: var(--dsw-alias-label-tertiary);
@@ -606,6 +608,73 @@ const CSS = `
   font-size: 11px;
   line-height: 18px;
   white-space: nowrap;
+}
+/* Where Tab and "/" go, said while the box is empty. It is also the box's
+   aria-describedby target, so the same sentence reaches a screen reader. */
+.dsh-ssh-filter-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 18px;
+}
+/* A typed path offered as a row. It is not a child of the listing, so it keeps
+   its own border and never joins the arrow-key rows or their indices. */
+.dsh-ssh-goto {
+  display: flex;
+}
+.dsh-ssh-goto-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+.dsh-ssh-goto-button:hover:not(:disabled) {
+  border-color: var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.dsh-ssh-goto-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.dsh-ssh-goto-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  font-size: 12px;
+}
+.dsh-ssh-goto-action {
+  flex: none;
+  margin-left: auto;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+/* A failed listing belongs under the box that asked for it, not at page top. */
+.dsh-ssh-browser-error {
+  margin: 0;
+  color: var(--dsw-alias-state-warn-label);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
 }
 /* Inline create row: it sits between the filter and the listing so the names
    already on screen stay visible while the operator picks one that is free. */

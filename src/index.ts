@@ -31,7 +31,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, type RemoteRoute, type Route } from './router.ts'
+import { childDirectoryPath, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, type RemoteRoute, type Route } from './router.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -168,10 +168,28 @@ class SshApi extends TypertRemoteService {
     return { ok: true, ...result }
   }
 
+  /**
+   * List a directory for the picker.
+   *
+   * The picker also accepts a typed path, so a request may arrive as `~`,
+   * `~/src`, or with `..` and doubled separators in it. Resolve it first: the
+   * SFTP session starts in the login home, which is what `~` means, and
+   * realpath yields the one spelling the breadcrumb, the workspace registry,
+   * and a later listing all agree on.
+   */
   async listDir(input: { hostId: string, path: string }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
     const host = this.core.requireHost(input.hostId)
-    const entries = await this.core.pool.sftpList(host, await this.core.secret(host), input.path || '/')
-    return { path: input.path || '/', entries }
+    const secret = await this.core.secret(host)
+    const requested = input.path.trim()
+    // `~` is the login home: the SFTP session starts there, but SFTP does not
+    // expand the tilde itself.
+    const home = requested === '~' || requested.startsWith('~/')
+      ? await this.core.pool.sftpRealpath(host, secret, '.')
+      : ''
+    const expanded = listingPath(requested, home)
+    const resolved = normalizeRemoteDirectory(await this.core.pool.sftpRealpath(host, secret, expanded)) ?? expanded
+    const entries = await this.core.pool.sftpList(host, secret, resolved)
+    return { path: resolved, entries }
   }
 
   /**

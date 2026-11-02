@@ -100,6 +100,78 @@ export function filterEntries<T extends { name: string }>(entries: readonly T[],
 }
 
 /**
+ * Whether a typed query names a path instead of filtering names.
+ *
+ * A directory name cannot contain `/`, so a query that does can never match one
+ * and is unambiguously a path. `~` is the one path without a separator: it is
+ * the remote home, and typing it as a filter would be meaningless anyway.
+ */
+export function isPathQuery(query: string): boolean {
+  const text = query.trim()
+  return text === '~' || text.startsWith('~/') || text.includes('/')
+}
+
+/**
+ * The directory a typed query names, or `null` when it is a plain name filter.
+ *
+ * The listing box doubles as a path field: `/home/me`, `~/src`, `../shared`,
+ * and `me/projects` all resolve here, so walking into a deep directory does not
+ * mean clicking one level at a time. Relative queries resolve against `cwd`,
+ * which is always an absolute listing path.
+ *
+ * `..`, `.`, and repeated separators are resolved lexically; symlinked parents
+ * cannot be known here, and the remote realpath settles those when the listing
+ * is requested. A leading `~` stays in the result: the remote home is the
+ * remote's answer, not something this side can assume.
+ */
+export function pathQuery(query: string, cwd: string): string | null {
+  const text = query.trim()
+  if (!isPathQuery(text)) return null
+  if (text === '~' || text.startsWith('~/')) {
+    const parts = normalizeSegments(text.slice(1), false)
+    return parts.length === 0 ? '~' : `~/${parts.join('/')}`
+  }
+  if (text.startsWith('/')) return absolutePath(text)
+  // `cwd` is absolute, so appending the query keeps absolute semantics: `..`
+  // above the root stays at the root instead of producing a relative path.
+  const base = cwd.replace(/\/+$/, '')
+  return absolutePath(`${base}/${text}`)
+}
+
+/**
+ * The last segment of a typed path, used to keep child names that match the
+ * part being typed in the listing (`/home/we` shows `weichongyong`).
+ */
+export function pathTail(query: string, cwd: string): string {
+  const resolved = pathQuery(query, cwd)
+  if (resolved === null) return ''
+  // `~` is not a name in the listing, so it must not narrow anything; `~/src`
+  // narrows by the part after it.
+  const parts = resolved.split('/').filter(part => part.length > 0 && part !== '~')
+  return parts.length === 0 ? '' : parts[parts.length - 1] ?? ''
+}
+
+/** `/a//b/./c/../d` -> `/a/b/d`; `..` never escapes an absolute path. */
+function absolutePath(text: string): string {
+  const parts = normalizeSegments(text, true)
+  return parts.length === 0 ? '/' : `/${parts.join('/')}`
+}
+
+function normalizeSegments(text: string, absolute: boolean): string[] {
+  const out: string[] = []
+  for (const part of text.split('/')) {
+    if (part.length === 0 || part === '.') continue
+    if (part === '..') {
+      if (out.length > 0 && out[out.length - 1] !== '..') out.pop()
+      else if (!absolute) out.push('..')
+      continue
+    }
+    out.push(part)
+  }
+  return out
+}
+
+/**
  * Keep a highlighted row valid after the list changed under it. The filter can
  * shrink the listing while a row is highlighted, and an index past the end
  * would silently drop the highlight; clamping to the last row keeps the

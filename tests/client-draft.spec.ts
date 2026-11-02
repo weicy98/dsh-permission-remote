@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostView } from '../src/client/api.ts'
-import { blankDraft, clampActive, createTarget, draftPort, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft } from '../src/client/draft.ts'
+import { blankDraft, clampActive, createTarget, draftPort, draftPortValid, filterEntries, isPathQuery, mergeEditedHost, parentDir, pathQuery, pathTail, stepActive, toDraft } from '../src/client/draft.ts'
 
 function host(overrides: Partial<HostView> = {}): HostView {
   return {
@@ -108,6 +108,44 @@ test('the directory filter never matches on the encoded path', () => {
   // would make any query that is a substring of that directory match all rows.
   const entries = [{ name: 'src', path: '/home/me/code/src' }, { name: 'lib', path: '/home/me/code/lib' }]
   assert.deepEqual(filterEntries(entries, 'code'), [])
+})
+
+test('only a query with a separator or a leading ~ is a path', () => {
+  // A name filter cannot contain `/`, so the two meanings never collide.
+  assert.equal(isPathQuery('src'), false)
+  assert.equal(isPathQuery('  src  '), false)
+  assert.equal(isPathQuery('~/'), true)
+  assert.equal(isPathQuery('~'), true)
+  assert.equal(isPathQuery('/home'), true)
+  assert.equal(isPathQuery('src/lib'), true)
+})
+
+test('a typed path resolves against the listed directory', () => {
+  assert.equal(pathQuery('/home/me', '/'), '/home/me')
+  assert.equal(pathQuery('/home/me/', '/'), '/home/me')
+  assert.equal(pathQuery('//home///me', '/'), '/home/me')
+  assert.equal(pathQuery('me/projects', '/home/me'), '/home/me/me/projects')
+  assert.equal(pathQuery('../shared', '/home/me'), '/home/shared')
+  assert.equal(pathQuery('./src', '/srv/app'), '/srv/app/src')
+  // Above the root there is nothing, and a relative escape must not be invented.
+  assert.equal(pathQuery('../../..', '/'), '/')
+  assert.equal(pathQuery('/../etc', '/'), '/etc')
+})
+
+test('a typed ~ stays for the remote to expand', () => {
+  // The remote home is the remote's answer, so it is not guessed here.
+  assert.equal(pathQuery('~', '/srv'), '~')
+  assert.equal(pathQuery('~/src', '/srv'), '~/src')
+  assert.equal(pathQuery('~/src/../lib', '/srv'), '~/lib')
+  assert.equal(pathQuery('~', '/'), '~')
+})
+
+test('the tail of a typed path narrows the listing it is walked from', () => {
+  assert.equal(pathTail('/home/weich', '/'), 'weich')
+  assert.equal(pathTail('/home/weichongyong/', '/'), 'weichongyong')
+  assert.equal(pathTail('~', '/home'), '')
+  // A plain name filter has no tail: the whole query stays the needle.
+  assert.equal(pathTail('src', '/home'), '')
 })
 
 test('arrow keys start at an end and clamp instead of wrapping', () => {

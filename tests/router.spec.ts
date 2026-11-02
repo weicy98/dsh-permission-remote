@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath, workspaceBinding } from '../src/router.ts'
+import { childDirectoryPath, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath, workspaceBinding } from '../src/router.ts'
 
 const env = { DSH_HOME: '/tmp/dsh-home' }
 
@@ -93,4 +93,16 @@ test('a remote directory has one spelling, whatever the trailing slashes', () =>
   assert.equal(normalizeRemoteDirectory('/'), '/')
   assert.equal(normalizeRemoteDirectory('   '), null)
   assert.equal(normalizeRemoteDirectory('srv/app'), null)
+})
+
+test('a listing request expands ~ against the login home and defaults to the root', () => {
+  // The picker accepts typed paths, and SFTP itself does not expand a tilde.
+  assert.equal(listingPath('~', '/home/me'), '/home/me')
+  assert.equal(listingPath('~/src', '/home/me'), '/home/me/src')
+  assert.equal(listingPath('~/src/', '/home/me'), '/home/me/src')
+  // Everything else is passed through for the remote realpath to settle.
+  assert.equal(listingPath('/srv/../srv/app', '/home/me'), '/srv/../srv/app')
+  assert.equal(listingPath('/srv/app', ''), '/srv/app')
+  // A request that lost its path still lists something.
+  assert.equal(listingPath('   ', '/home/me'), '/')
 })
