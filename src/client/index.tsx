@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, isPathQuery, joinPath, matchRange, mergeEditedHost, parentDir, pickCompletion, resolveUnder, splitPath, stepActive, toDraft, type Draft } from './draft.ts'
+import { importNeedsConfirm } from './import-risk.ts'
+import { rootPromptFor, type RootPrompt } from './root-prompt.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -250,6 +252,16 @@ function Section(props: SectionProps): JSX.Element {
   const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
   const [tagTitles, setTagTitles] = useState(true)
   const [rgRegistry, setRgRegistry] = useState('')
+  const [rootInfo, setRootInfo] = useState<RemoteRootInfo | null>(null)
+  const [rootDraft, setRootDraft] = useState('')
+  const [rootPrompt, setRootPrompt] = useState<RootPrompt | null>(null)
+  /** Set once the operator accepts the "sessions are open" prompt. */
+  const rootForceRef = useRef(false)
+  const [importConfirm, setImportConfirm] = useState(false)
+  /** Parsed file held until the operator accepts an address change or a looser ops policy. */
+  const [importRisk, setImportRisk] = useState<{ payload: unknown, mode: 'merge' | 'replace' } | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
+  const importModeRef = useRef<'merge' | 'replace'>('merge')
   const [revision, setRevision] = useState(0)
   /** Which tab is showing. The page holds four unrelated groups of controls. */
   const [tab, setTab] = useState<TabId>('hosts')
@@ -261,8 +273,18 @@ function Section(props: SectionProps): JSX.Element {
     setHosts(loaded.hosts)
     setTagTitles(loaded.tagWorkspaceTitles)
     setRgRegistry(loaded.rgRegistry)
+    setRootDraft(loaded.remoteRoot)
     setRevision(loaded.revision)
     return loaded.hosts
+  }
+
+  /** The effective placeholder root and its default, for the field's hint. */
+  async function reloadRoot(): Promise<void> {
+    try {
+      setRootInfo(await readRemoteRootInfo(ctx))
+    } catch {
+      setRootInfo(null)
+    }
   }
 
   async function toggleTagTitles(enabled: boolean): Promise<void> {
@@ -307,6 +329,7 @@ function Section(props: SectionProps): JSX.Element {
   useEffect(() => {
     // A host without the newer workspace RPC still has to list and save hosts.
     void reload().catch(error => fail(error))
+    void reloadRoot()
     void reloadWorkspaces().catch(() => setWorkspaces([]))
   }, [])
 
@@ -443,6 +466,165 @@ function Section(props: SectionProps): JSX.Element {
       note(t('registrySaved'))
     } catch (error) {
       await reload().catch(() => undefined)
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Change the placeholder root; the server may first ask about conflicts or live sessions. */
+  async function saveRemoteRoot(): Promise<void> {
+    setBusy(true)
+    setRootPrompt(null)
+    rootForceRef.current = false
+    try {
+      await applyRootResult(await changeRemoteRoot(ctx, rootDraft))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function applyRootResult(result: RemoteRootChange): Promise<void> {
+    if (result.status === 'unchanged') {
+      note(t('remoteRootUnchanged'))
+      setRootDraft(result.root)
+      await reloadRoot()
+      return
+    }
+    const next = rootPromptFor(result, rootForceRef.current)
+    rootForceRef.current = next.force
+    if (next.prompt !== null) {
+      setRootPrompt(next.prompt)
+      return
+    }
+    const migration = result.migration
+    const counts = [
+      `${t('remoteRootCopied')} ${migration?.copied ?? 0}`,
+      `${t('remoteRootSkipped')} ${migration?.skipped ?? 0}`,
+      `${t('remoteRootOverwritten')} ${migration?.overwritten ?? 0}`,
+      `${t('remoteRootRemapped')} ${result.workspacesRemapped ?? 0}`,
+    ].join(' · ')
+    const left = migration?.conflicts.length ?? 0
+    note(`${t('remoteRootChanged')} ${result.oldRoot} → ${result.root} · ${counts}${left > 0 ? ` · ${t('remoteRootConflictsLeft')} ${left}` : ''}`)
+    setRootDraft(result.root)
+    await reloadRoot()
+    await reloadWorkspaces().catch(() => undefined)
+  }
+
+  /**
+   * Re-run the pending change with the operator's chosen strategy.
+   *
+   * `rootForceRef` carries the "migrate anyway" answer across the two prompts:
+   * a target with both live sessions and conflicting files asks twice, and the
+   * second call must keep the first answer or the pair could never finish.
+   */
+  async function resolveRootPrompt(strategy?: 'auto' | 'overwrite'): Promise<void> {
+    if (rootPrompt === null) return
+    const target = rootPrompt.root
+    setBusy(true)
+    try {
+      const result = await changeRemoteRoot(ctx, target, {
+        strategy,
+        force: rootForceRef.current,
+        conflicts: rootPrompt.kind === 'conflicts' ? rootPrompt.conflicts : undefined,
+      })
+      setRootPrompt(null)
+      await applyRootResult(result)
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Download the host list as JSON. Secrets are never part of the config. */
+  async function doExport(): Promise<void> {
+    setBusy(true)
+    try {
+      const payload = await exportHosts(ctx)
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `dsh-ssh-hosts-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      note(t('exportedHosts'))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * How many rows of an import file would run commands without asking.
+   *
+   * A backup carries `opsPolicy`, so a file from elsewhere can turn approval
+   * off for its hosts. Turning that back into a prompt would be wrong, but the
+   * operator should at least see the count in the result.
+   */
+  function trustCountOf(payload: unknown): number {
+    const rows = Array.isArray(payload)
+      ? payload
+      : (typeof payload === 'object' && payload !== null && Array.isArray((payload as { hosts?: unknown }).hosts)
+        ? (payload as { hosts: unknown[] }).hosts
+        : [])
+    return rows.filter(row => typeof row === 'object' && row !== null && (row as { opsPolicy?: unknown }).opsPolicy === 'trust').length
+  }
+
+  /** First few conflicting paths, so the choice is not made from a count alone. */
+  function conflictPreview(paths: readonly string[]): string {
+    const shown = paths.slice(0, 8)
+    return `${shown.join('  ·  ')}${paths.length > shown.length ? `  … +${paths.length - shown.length}` : ''}`
+  }
+
+  function pickImport(mode: 'merge' | 'replace'): void {
+    importModeRef.current = mode
+    importInputRef.current?.click()
+  }
+
+  async function finishImport(payload: unknown, mode: 'merge' | 'replace'): Promise<void> {
+    const result = await importHosts(ctx, payload, mode)
+    await reload()
+    await reloadWorkspaces().catch(() => undefined)
+    const trusted = trustCountOf(payload)
+    note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}${trusted > 0 ? ` · ${t('importTrusted')} ${trusted}` : ''}`)
+  }
+
+  async function doImport(file: File): Promise<void> {
+    setBusy(true)
+    try {
+      const text = await file.text()
+      const payload: unknown = JSON.parse(text)
+      const mode = importModeRef.current
+      // Hold the file: applying it now would move a host or relax its policy
+      // before the operator has seen that.
+      if (importNeedsConfirm(payload, hosts)) {
+        setImportRisk({ payload, mode })
+        return
+      }
+      setImportRisk(null)
+      await finishImport(payload, mode)
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirmImportRisk(): Promise<void> {
+    if (importRisk === null) return
+    const pending = importRisk
+    setImportRisk(null)
+    setBusy(true)
+    try {
+      await finishImport(pending.payload, pending.mode)
+    } catch (error) {
       fail(error)
     } finally {
       setBusy(false)
@@ -1434,6 +1616,91 @@ function Section(props: SectionProps): JSX.Element {
         </label>
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRegistry()}>{t('save')}</button>
         <span className="dsh-ssh-note">{t('rgRegistryHint')}</span>
+      </div>
+      {/* Where the local mirror of every remote workspace lives. */}
+      <div className="dsh-ssh-registry">
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-root">
+          <span className="dsh-ssh-label">{t('remoteRoot')}</span>
+          <input
+            id="dsh-ssh-root"
+            className="dsh-ssh-input"
+            type="text"
+            value={rootDraft}
+            placeholder={rootInfo?.defaultRoot ?? '~/.dsh/remote'}
+            disabled={busy}
+            onChange={event => setRootDraft(event.target.value)}
+          />
+        </label>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRemoteRoot()}>{t('remoteRootSave')}</button>
+        <span className="dsh-ssh-note">{t('remoteRootHint')}{rootInfo !== null ? ` ${t('remoteRootCurrent')} ${rootInfo.current}` : ''}</span>
+        {rootPrompt !== null ? (
+          <div className="dsh-ssh-note dsh-ssh-danger-note">
+            {rootPrompt.kind === 'sessions'
+              ? `${t('remoteRootHasSessions')} ${rootPrompt.sessions}. ${t('remoteRootForceHint')}`
+              : `${t('remoteRootConflicts')} ${rootPrompt.conflicts?.length ?? 0}. ${t('remoteRootConflictHint')}`}
+            {rootPrompt.kind === 'conflicts' && (rootPrompt.conflicts?.length ?? 0) > 0
+              ? <div className="dsh-ssh-conflict-list">{conflictPreview(rootPrompt.conflicts ?? [])}</div>
+              : null}
+            <span className="dsh-ssh-inline">
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setRootPrompt(null)}>{t('cancel')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button"
+                disabled={busy}
+                onClick={() => {
+                  // Remember the answer: the conflict prompt that may follow must
+                  // be able to finish the same migration.
+                  if (rootPrompt.kind === 'sessions') rootForceRef.current = true
+                  void resolveRootPrompt(rootPrompt.kind === 'conflicts' ? 'auto' : undefined)
+                }}
+              >{rootPrompt.kind === 'sessions' ? t('remoteRootForce') : t('remoteRootKeepTarget')}</button>
+              {rootPrompt.kind === 'conflicts'
+                ? <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void resolveRootPrompt('overwrite')}>{t('remoteRootOverwrite')}</button>
+                : null}
+            </span>
+          </div>
+        ) : null}
+      </div>
+      {/* Host list backup and restore. */}
+      <div className="dsh-ssh-registry">
+        <span className="dsh-ssh-label">{t('hostBackup')}</span>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void doExport()}>{t('exportHosts')}</button>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => pickImport('merge')}>{t('importMerge')}</button>
+        {/* Replace drops every host the file does not list; ask before the file dialog. */}
+        {importConfirm
+          ? <>
+              <span className="dsh-ssh-note dsh-ssh-danger-note">{t('importReplaceConfirm')}</span>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportConfirm(false)}>{t('cancel')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button dsh-ssh-danger"
+                disabled={busy}
+                onClick={() => {
+                  setImportConfirm(false)
+                  pickImport('replace')
+                }}
+              >{t('importReplace')}</button>
+            </>
+          : <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportConfirm(true)}>{t('importReplace')}</button>}
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: 'none' }}
+          onChange={event => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (file !== undefined) void doImport(file)
+          }}
+        />
+        {importRisk !== null
+          ? <>
+              <span className="dsh-ssh-note dsh-ssh-danger-note">{t('importRiskConfirm')}</span>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportRisk(null)}>{t('cancel')}</button>
+              <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void confirmImportRisk()}>{t('importRiskContinue')}</button>
+            </>
+          : null}
+        <span className="dsh-ssh-note">{t('hostBackupHint')}</span>
       </div>
         </>
       ) : null}

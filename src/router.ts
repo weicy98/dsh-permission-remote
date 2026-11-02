@@ -8,10 +8,98 @@ import os from 'node:os'
 import path from 'node:path'
 import { posix } from 'node:path'
 
-export function remoteRoot(env: NodeJS.ProcessEnv = process.env): string {
+/**
+ * The placeholder root when nothing has overridden it: `DSH_SSH_REMOTE_ROOT`,
+ * else `<DSH_HOME>/remote` (`~/.dsh/remote`). Kept separate from
+ * {@link remoteRoot} so the Settings page can show what the default would be.
+ */
+export function defaultRemoteRoot(env: NodeJS.ProcessEnv = process.env): string {
   if (env.DSH_SSH_REMOTE_ROOT) return path.resolve(String(env.DSH_SSH_REMOTE_ROOT))
   const home = env.DSH_HOME ? String(env.DSH_HOME) : path.join(os.homedir(), '.dsh')
   return path.join(home, 'remote')
+}
+
+/**
+ * Runtime override for the placeholder root, set by the plugin from its
+ * `remoteRoot` setting. Every routing helper already funnels through
+ * {@link remoteRoot}, so a single setter beats threading the value through
+ * every call. `null` restores the environment/default resolution, which keeps
+ * a config-less install and the unit tests on their old behaviour.
+ */
+let remoteRootOverride: string | null = null
+
+/**
+ * Roots this process used before the operator moved it.
+ *
+ * The migration copies the placeholders instead of moving them, so a directory
+ * from an earlier root still exists. A session opened on one must keep routing
+ * to its server: treating it as a local path would run the model's commands on
+ * this machine while the conversation still says it is remote. Keeping the old
+ * roots routable turns that into a refusal instead — a placeholder no
+ * registered workspace covers is rejected by the entry guard.
+ */
+const supersededRoots: string[] = []
+
+export function setRemoteRootOverride(root: string | null): void {
+  const text = root === null ? '' : String(root).trim()
+  remoteRootOverride = text.length === 0 ? null : path.resolve(text)
+}
+
+/**
+ * Remember a root the operator migrated away from.
+ *
+ * Only the running process needs this: after a restart the old placeholders no
+ * longer belong to a registered workspace, and reopening the workspace is what
+ * the settings page already asks for.
+ */
+export function addSupersededRoot(root: string): void {
+  const text = String(root ?? '').trim()
+  if (text.length === 0) return
+  const resolved = path.resolve(text)
+  if (resolved === remoteRoot()) return
+  if (!supersededRoots.includes(resolved)) supersededRoots.push(resolved)
+}
+
+/** Drop every remembered root. Tests and a fresh plugin load only. */
+export function clearSupersededRoots(): void {
+  supersededRoots.length = 0
+}
+
+/**
+ * Every root a cwd may be a placeholder under, current one first.
+ *
+ * A previous root stays in the list so stale sessions keep their remote host;
+ * see {@link addSupersededRoot}.
+ */
+export function routingRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = [remoteRoot(env)]
+  for (const root of supersededRoots) {
+    if (!roots.includes(root)) roots.push(root)
+  }
+  return roots
+}
+
+export function remoteRoot(env: NodeJS.ProcessEnv = process.env): string {
+  if (remoteRootOverride !== null) return remoteRootOverride
+  return defaultRemoteRoot(env)
+}
+
+/**
+ * Expand a user-typed root into an absolute local path.
+ *
+ * `~` and `~/…` use this machine's home; every other relative spelling is
+ * refused, because the placeholder tree must live at a stable absolute path.
+ * @returns the resolved path, or `null` when the input is blank or relative.
+ */
+export function expandRemoteRoot(input: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const text = String(input ?? '').trim()
+  if (text.length === 0) return null
+  const home = env.HOME && String(env.HOME).length > 0 ? String(env.HOME) : os.homedir()
+  let expanded = text
+  if (text === '~') expanded = home
+  else if (text.startsWith('~/')) expanded = path.join(home, text.slice(2))
+  if (!path.isAbsolute(expanded)) return null
+  return path.resolve(expanded)
 }
 
 /** Same grammar as `credentialKey()` segments: lowercase, digits, and hyphens. */
@@ -59,9 +147,15 @@ export type Route = RemoteRoute | LocalRoute
  * The first two segments are host id and the encoded workspace root; further
  * segments are a remote subdirectory. Local separators stay on this machine.
  */
-export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): Route {
+/**
+ * The route of a cwd read as a path under one placeholder root.
+ *
+ * Split from {@link routeByCwd} so a caller that holds a root of its own (the
+ * workspace registry may store `fs.realpath`) does not have to pass it back
+ * through the environment.
+ */
+export function routeUnderRoot(root: string, cwd: string | undefined): Route {
   if (!cwd) return { kind: 'local' }
-  const root = remoteRoot(env)
   const rel = path.relative(root, cwd)
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return { kind: 'local' }
   const segments = rel.split(path.sep).filter(segment => segment.length > 0)
@@ -76,6 +170,14 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
   return { kind: 'remote', hostId, remoteCwd, placeholderCwd: cwd }
 }
 
+export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): Route {
+  for (const root of routingRoots(env)) {
+    const route = routeUnderRoot(root, cwd)
+    if (route.kind === 'remote') return route
+  }
+  return { kind: 'local' }
+}
+
 /**
  * The workspace a placeholder was opened on, ignoring later subdirectory segments.
  *
@@ -85,18 +187,22 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
  */
 export function workspaceBinding(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): { hostId: string, remotePath: string } | null {
   if (!cwd) return null
-  const root = remoteRoot(env)
-  const rel = path.relative(root, cwd)
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null
-  const segments = rel.split(path.sep).filter(segment => segment.length > 0)
-  if (segments.length < 2) return null
-  const hostId = segments[0]!
-  if (!isValidHostId(hostId)) return null
-  const remotePath = decodeRemotePath(segments[1]!)
-  if (remotePath === null || !remotePath.startsWith('/')) return null
-  const normalized = normalizeRemoteDirectory(remotePath)
-  if (normalized === null) return null
-  return { hostId, remotePath: normalized }
+  // A session left on a superseded root still belongs to its workspace; without
+  // this it would lose the sandbox pin and could follow a `cd` out of it.
+  for (const root of routingRoots(env)) {
+    const rel = path.relative(root, cwd)
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue
+    const segments = rel.split(path.sep).filter(segment => segment.length > 0)
+    if (segments.length < 2) continue
+    const hostId = segments[0]!
+    if (!isValidHostId(hostId)) continue
+    const remotePath = decodeRemotePath(segments[1]!)
+    if (remotePath === null || !remotePath.startsWith('/')) continue
+    const normalized = normalizeRemoteDirectory(remotePath)
+    if (normalized === null) continue
+    return { hostId, remotePath: normalized }
+  }
+  return null
 }
 
 /**

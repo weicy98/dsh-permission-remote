@@ -1,5 +1,6 @@
+import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { posix, resolve as resolveLocalPath } from 'node:path'
+import { join as joinPath, posix, resolve as resolveLocalPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
@@ -7,7 +8,7 @@ import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type Para
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { fetchRgBinary, rgPlatformOf } from './rg-fetch.ts'
-import { Config, connectionKeyChanged, normalizeLoginEnv, normalizeOpsPolicy, readConfig, type HostConfig, type PluginConfig } from './config.ts'
+import { Config, connectionKeyChanged, exportHostConfig, mergeImportedHosts, normalizeLoginEnv, normalizeOpsPolicy, parseHostImport, readConfig, type DeletedHost, type HostConfig, type HostConfigExport, type HostImportResult, type PluginConfig } from './config.ts'
 import { LoginEnvCache, LOGIN_ENV_CAPTURE_MS, loginEnvCaptureCommand, type LoginEnvRead } from './login-env.ts'
 import {
   buildResolveMode,
@@ -31,7 +32,8 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { childDirectoryPath, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
+import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -53,9 +55,11 @@ import {
   hostTag,
   remoteWorkspaces,
   tagRemoteWorkspaces,
+  workspaceRoute,
   textOrUndefined,
   type DeletedHostView,
   type RemoteWorkspaceView,
+  type WorkspaceLike,
   type WorkspaceRegistryLike,
 } from './workspaces.ts'
 
@@ -79,10 +83,14 @@ interface HostContext {
   credentials: {
     readRecord(key: ReturnType<typeof credentialKey>): Promise<CredentialRecord | undefined>
     modifyRecord(key: ReturnType<typeof credentialKey>, mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>): Promise<CredentialRecord | undefined>
+    /** Absent only in tests that never import a host. Returning undefined from modifyRecord would keep the old secret. */
+    deleteRecord?(key: ReturnType<typeof credentialKey>): Promise<void>
   }
   workspaceRegistry: WorkspaceRegistryLike
   get(service: string): unknown
   on(event: 'agent/created', listener: (payload: { agent: AgentLike }) => void): () => void
+  /** Fired after any surface writes a settings section (`ns` is its id). */
+  on(event: 'settings/document-updated', listener: (ns: unknown, revision: number) => void): () => void
   effect(dispose: () => void): void
   logger?: { info(message: string): void, warn(message: string): void }
 }
@@ -120,6 +128,28 @@ interface AgentLike {
 interface GrantPayload {
   password?: string
   passphrase?: string
+}
+
+/** Where remote-workspace placeholders live right now, and the built-in default. */
+export interface RemoteRootInfo {
+  current: string
+  defaultRoot: string
+}
+
+/**
+ * Outcome of a remote-root change.
+ *
+ * `needs-strategy` and `has-sessions` are non-destructive refusals: the page
+ * asks the operator how to proceed, then calls again with `strategy`/`force`.
+ */
+export interface RemoteRootChange {
+  status: 'changed' | 'unchanged' | 'needs-strategy' | 'has-sessions'
+  oldRoot: string
+  root: string
+  sessions?: number
+  conflicts?: string[]
+  migration?: MigrationReport
+  workspacesRemapped?: number
 }
 
 class SshApi extends TypertRemoteService {
@@ -279,6 +309,33 @@ class SshApi extends TypertRemoteService {
     await this.core.saveSecret(input.hostId, { password: input.password, passphrase: input.passphrase })
     return { ok: true }
   }
+
+  /** The effective placeholder root plus the built-in default, for the Settings field. */
+  async remoteRootInfo(): Promise<RemoteRootInfo> {
+    return this.core.remoteRootInfo()
+  }
+
+  /**
+   * Change the placeholder root and move the old tree there.
+   *
+   * Without `strategy`, this only plans: an empty/absent target is copied and
+   * switched at once, a non-empty target with conflicting files is reported
+   * back so the page can ask before touching anything.
+   */
+  async changeRemoteRoot(input: { root: string, strategy?: MigrationStrategy, force?: boolean, conflicts?: string[] }): Promise<RemoteRootChange> {
+    const accepted = Array.isArray(input.conflicts) ? input.conflicts.filter(item => typeof item === 'string') : undefined
+    return this.core.changeRemoteRoot(input.root, { strategy: input.strategy, force: input.force === true, acceptedConflicts: accepted })
+  }
+
+  /** Export the host list as JSON. No secrets are ever included. */
+  async exportHosts(): Promise<HostConfigExport> {
+    return this.core.exportHostConfig()
+  }
+
+  /** Merge or replace the host list from a JSON export. */
+  async importHosts(input: { payload: unknown, mode?: 'merge' | 'replace' }): Promise<HostImportResult & { ok: true }> {
+    return this.core.importHostConfig(input.payload, input.mode === 'replace' ? 'replace' : 'merge')
+  }
 }
 
 export class Core {
@@ -287,6 +344,8 @@ export class Core {
   private readonly status = new Map<string, Promise<RunnerStatus>>()
   private readonly shellLists = new Map<string, Promise<SidebarShell[]>>()
   private readonly loginEnvs = new LoginEnvCache((hostId, signal) => this.readLoginEnv(hostId, signal))
+  /** The first apply installs the configured root; only a later change keeps the previous one routable. */
+  private remoteRootApplied = false
 
   constructor(
     private readonly ctx: HostContext,
@@ -534,19 +593,10 @@ export class Core {
     const removed = this.config.hosts.find(item => item.id === hostId)
     if (removed !== undefined) {
       // Keep the row so the settings page can restore it; its workspaces stay.
-      // Hosts that still have workspaces are not dropped to make room for the
-      // newest 20 deletes that have none.
-      const rows = [
+      this.commitTombstones([
         { host: removed, deletedAt: new Date().toISOString() },
         ...this.config.deletedHosts.filter(item => item.host.id !== hostId),
-      ]
-      const withWorkspaces = new Set(this.listWorkspaces().map(item => item.hostId))
-      let spare = 0
-      this.config.deletedHosts = rows.filter(row => {
-        if (withWorkspaces.has(row.host.id)) return true
-        spare += 1
-        return spare <= 20
-      })
+      ])
     }
     this.config.hosts = this.config.hosts.filter(item => item.id !== hostId)
     this.pool.invalidate(hostId)
@@ -554,6 +604,25 @@ export class Core {
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
     await this.persistHosts()
+  }
+
+  /**
+   * Replace the tombstone list.
+   *
+   * Hosts that still own a workspace always keep their row, so those workspaces
+   * stay reachable; the newest 20 that own none are kept as the delete history.
+   * Shared by `deleteHost` and the JSON import, which drops hosts the same way.
+   */
+  private commitTombstones(rows: readonly DeletedHost[]): void {
+    const withWorkspaces = new Set(this.listWorkspaces().map(item => item.hostId))
+    let spare = 0
+    this.config.deletedHosts = rows
+      .filter(row => {
+        if (withWorkspaces.has(row.host.id)) return true
+        spare += 1
+        return spare <= 20
+      })
+      .map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))
   }
 
   private async persistHosts(): Promise<void> {
@@ -566,6 +635,292 @@ export class Core {
       hosts: this.config.hosts,
       deletedHosts: this.config.deletedHosts,
     })
+  }
+
+  /** Persist only the placeholder root, leaving the host rows untouched. */
+  private async persistRemoteRoot(root: string): Promise<void> {
+    const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
+    if (row === undefined) {
+      // Nothing was written, so this must not look like a successful switch: the
+      // next load would resolve an older root and leave every workspace
+      // registered under a placeholder that no longer routes anywhere.
+      throw new Error('the settings row "permission-remote" is missing; the remote root was not saved')
+    }
+    await this.ctx.settings.update(String(row.ns), { remoteRoot: root })
+  }
+
+  /**
+   * Save the root and point routing at it, in that order.
+   *
+   * The write goes first: a failure leaves the setting and the routing on the
+   * old root, which still owns every placeholder. The reverse order would
+   * report a switch the next load does not agree with.
+   */
+  private async commitRemoteRoot(root: string): Promise<void> {
+    await this.persistRemoteRoot(root)
+    setRemoteRootOverride(root)
+    try {
+      this.config.remoteRoot = root
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] could not store the remote root in memory: ${errorText(error)}`)
+    }
+  }
+
+  /**
+   * Apply the configured root to the routing helpers.
+   *
+   * Called at load and again whenever the settings section is written by any
+   * surface, so editing the value in the generic settings editor takes effect
+   * without a restart. A root already superseded by a migration stays routable:
+   * dropping it here would strand a session that is still on it.
+   */
+  applyRemoteRootOverride(): void {
+    const previous = remoteRoot()
+    const configured = this.config.remoteRoot.trim()
+    let override: string | null = null
+    if (configured.length === 0) {
+      override = null
+    } else {
+      const expanded = expandRemoteRoot(configured)
+      if (expanded === null) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] the configured remote root ${JSON.stringify(configured)} is not an absolute path; falling back to ${defaultRemoteRoot()}`)
+        override = null
+      } else {
+        override = expanded
+        if (!existsSync(expanded)) {
+          this.ctx.logger?.warn(`[@dsh-permission-remote] the configured remote root ${expanded} does not exist; placeholders will be created there on demand`)
+        }
+      }
+    }
+    setRemoteRootOverride(override)
+    // A generic settings edit does not copy the tree. Keep the root this process
+    // was using, or the next command on an open placeholder runs on this machine.
+    // The first apply is a load: the previous default was never this process's root.
+    if (this.remoteRootApplied && remoteRoot() !== previous) addSupersededRoot(previous)
+    this.remoteRootApplied = true
+  }
+
+  /** Re-read the root after a settings write from any surface. */
+  onSettingsUpdated(ns: unknown): void {
+    if (String(ns) !== 'permission-remote') return
+    this.applyRemoteRootOverride()
+    this.ctx.logger?.info(`[@dsh-permission-remote] remote root setting changed; routing now uses ${remoteRoot()}`)
+  }
+
+  /** The effective placeholder root and the built-in default. */
+  remoteRootInfo(): RemoteRootInfo {
+    return { current: remoteRoot(), defaultRoot: defaultRemoteRoot() }
+  }
+
+  exportHostConfig(): HostConfigExport {
+    return exportHostConfig(this.config.hosts, this.config.deletedHosts)
+  }
+
+  async importHostConfig(payload: unknown, mode: 'merge' | 'replace'): Promise<HostImportResult & { ok: true }> {
+    const incoming = parseHostImport(payload)
+    const previous = new Map(this.config.hosts.map(host => [host.id, host]))
+    // A host renamed by a backup must retag its sidebar rows exactly like
+    // `saveHost` does; load-time tagging only touches an untagged title. A
+    // revived host counts too, which is why the tombstones are read as well.
+    const previousTags = new Map<string, string>()
+    for (const host of [...this.config.hosts, ...this.config.deletedHosts.map(row => row.host)]) {
+      previousTags.set(host.id, hostTag(host))
+    }
+    const merged = mergeImportedHosts(this.config.hosts, this.config.deletedHosts, incoming, mode)
+    let deletedHosts = merged.deletedHosts
+    if (mode === 'replace') {
+      // A host deleted earlier, whose workspaces are still registered, is not in
+      // the live list, so `replace` would otherwise drop the only copy of its
+      // address and key path. Keep that tombstone when the file does not mention it.
+      const live = new Set(merged.hosts.map(host => host.id))
+      const already = new Set(deletedHosts.map(row => row.host.id))
+      const owned = new Set(this.listWorkspaces().map(item => item.hostId))
+      const retained = this.config.deletedHosts.filter(row => owned.has(row.host.id) && !live.has(row.host.id) && !already.has(row.host.id))
+      deletedHosts = [...deletedHosts, ...retained.map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))]
+    }
+    // The password is stored by host id. A new address must not keep using it,
+    // including a tombstone the file revives onto a different machine.
+    for (const host of merged.hosts) {
+      const before = previous.get(host.id) ?? this.config.deletedHosts.find(row => row.host.id === host.id)?.host
+      if (before !== undefined && before.host !== host.host) await this.dropSecret(host.id)
+    }
+    this.config.hosts = merged.hosts
+    // Keeping a dropped host as a tombstone is what `replace` shares with
+    // `deleteHost`: its workspaces are still registered and must stay reachable.
+    this.commitTombstones(deletedHosts)
+    // Drop cached connections/probes/shells for a host that is new, whose
+    // handshake changed, or whose login-env switch flipped; a plain restore of
+    // unchanged rows leaves running sessions alone.
+    const nextIds = new Set(merged.hosts.map(host => host.id))
+    for (const before of previous.values()) {
+      if (!nextIds.has(before.id)) this.forgetStatus(before.id)
+    }
+    for (const host of merged.hosts) {
+      const before = previous.get(host.id)
+      if (before === undefined || connectionKeyChanged(before, host) || before.loginEnv !== host.loginEnv) {
+        this.forgetStatus(host.id)
+      }
+    }
+    await this.persistHosts()
+    if (this.config.tagWorkspaceTitles) {
+      for (const host of merged.hosts) {
+        const previousTag = previousTags.get(host.id)
+        if (previousTag === undefined || previousTag === hostTag(host)) continue
+        await this.tagWorkspaces(host.id, undefined, previousTag)
+      }
+    }
+    return { ok: true, ...merged, deletedHosts }
+  }
+
+  /** Forget the password stored for one host id. `modifyRecord` returning undefined would keep it. */
+  private async dropSecret(hostId: string): Promise<void> {
+    const drop = this.ctx.credentials.deleteRecord
+    if (drop === undefined) return
+    await drop(credentialKey('dsh-permission-remote', hostId))
+  }
+
+  /**
+   * Move the placeholder tree to `inputRoot` and point routing at it.
+   *
+   * The old tree's workspace rows are re-created at the new placeholder paths,
+   * keeping their titles. A change is refused (without touching anything) while
+   * workspaces have live sessions, and a non-empty target whose files conflict
+   * is reported before it is merged, so the operator can choose the strategy.
+   *
+   * Nothing is committed until the plan has been accepted and the copy has
+   * finished: the old tree is only ever read, so a failure leaves it as the
+   * authoritative root.
+   */
+  async changeRemoteRoot(inputRoot: string, opts: { strategy?: MigrationStrategy, force: boolean, acceptedConflicts?: readonly string[] }): Promise<RemoteRootChange> {
+    const oldRoot = remoteRoot()
+    const trimmed = inputRoot.trim()
+    // A blank field means "go back to the built-in default", so the operator can
+    // undo a custom root from the page instead of typing the default by hand.
+    const newRoot = trimmed.length === 0 ? resolveLocalPath(defaultRemoteRoot()) : expandRemoteRoot(inputRoot)
+    if (newRoot === null) throw new Error('remote root must be an absolute path or start with ~/')
+    if (newRoot === oldRoot) {
+      // Pin an explicit spelling, but a blank field that already resolves to the
+      // default must not persist the default path (it would stop tracking it).
+      if (trimmed.length > 0 && this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
+      return { status: 'unchanged', oldRoot, root: newRoot }
+    }
+    const opened = this.remoteWorkspaceRows()
+    // Plan before anything is asked or written: a target that is inside the old
+    // root, or that is not a directory, must be an error rather than a
+    // confirmation prompt the operator can only answer into a failure.
+    const strategy = opts.strategy ?? 'auto'
+    // The page calls again with the chosen strategy, which plans afresh. When it
+    // also sends the conflict list it showed, a path that was not on that list
+    // is asked again instead of being overwritten.
+    const plan = await planRemoteRoot(oldRoot, newRoot, strategy)
+    const sessions = opened.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
+    if (sessions > 0 && !opts.force) return { status: 'has-sessions', oldRoot, root: newRoot, sessions }
+    if (!plan.targetWasEmpty && opts.strategy === undefined && plan.conflicts.length > 0) {
+      return { status: 'needs-strategy', oldRoot, root: newRoot, conflicts: plan.conflicts }
+    }
+    if (opts.strategy !== undefined && opts.acceptedConflicts !== undefined) {
+      const accepted = new Set(opts.acceptedConflicts)
+      if (plan.conflicts.some(conflict => !accepted.has(conflict))) {
+        return { status: 'needs-strategy', oldRoot, root: newRoot, conflicts: plan.conflicts }
+      }
+    }
+    for (const item of opened) {
+      const rel = `${item.hostId}/${encodeRemotePath(item.remotePath)}`
+      const blocked = plan.conflicts.some(conflict => conflict === rel || rel.startsWith(`${conflict}/`))
+      if (blocked) {
+        throw new Error(`cannot move the remote root to ${newRoot}: ${rel} conflicts with an existing file or directory and was left unchanged`)
+      }
+    }
+    let migration: MigrationReport
+    try {
+      migration = await runMigration(plan)
+    } catch (error) {
+      // The old root was only read from, so it is still the authoritative one.
+      // The target may hold a partial copy, which nothing points at yet.
+      throw new Error(`copying the remote root to ${newRoot} failed: ${errorText(error)}`)
+    }
+    // Register at the new paths before the setting changes. A failure here still
+    // leaves the old root in charge; switching first would report success while
+    // a workspace stayed on a path that stops routing after restart.
+    const relocating = this.remoteWorkspaceRows()
+    const created: WorkspaceLike[] = []
+    // Rows this attempt added. A path the registry already had is not ours to delete.
+    const existedIds = new Set(this.workspaces.list().map(row => String(row.id)))
+    let workspacesRemapped = 0
+    try {
+      for (const item of relocating) {
+        const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
+        if (local === null) throw new Error(`workspace ${String(item.ws.id)} cannot be mapped under ${newRoot}`)
+        if (resolveLocalPath(item.ws.path) === resolveLocalPath(local)) {
+          workspacesRemapped += 1
+          continue
+        }
+        await mkdir(local, { recursive: true })
+        const row = await this.workspaces.create(local, item.ws.title)
+        const rowId = String(row.id)
+        if (!existedIds.has(rowId)) {
+          existedIds.add(rowId)
+          created.push(row)
+        }
+      }
+    } catch (error) {
+      for (const row of created.reverse()) {
+        try {
+          await this.workspaces.delete(row.id)
+        } catch (cleanup) {
+          this.ctx.logger?.warn(`[@dsh-permission-remote] could not roll back workspace ${String(row.id)}: ${errorText(cleanup)}`)
+        }
+      }
+      throw new Error(`registering workspaces at ${newRoot} failed: ${errorText(error)}; the old root is still in use`)
+    }
+    try {
+      await this.commitRemoteRoot(newRoot)
+    } catch (error) {
+      for (const row of created.reverse()) {
+        try {
+          await this.workspaces.delete(row.id)
+        } catch (cleanup) {
+          this.ctx.logger?.warn(`[@dsh-permission-remote] could not roll back workspace ${String(row.id)}: ${errorText(cleanup)}`)
+        }
+      }
+      throw new Error(`the placeholders were copied to ${newRoot}, but the new root could not be saved (${errorText(error)}); the old root is still in use`)
+    }
+    // Sessions still sitting on the old placeholders must keep routing to their
+    // server: an old placeholder that no registered workspace covers is then
+    // refused by the entry guard instead of quietly becoming a local directory.
+    addSupersededRoot(oldRoot)
+    const stuck: string[] = []
+    for (const item of relocating) {
+      const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
+      if (local === null || resolveLocalPath(item.ws.path) === resolveLocalPath(local)) continue
+      try {
+        await this.workspaces.delete(item.ws.id)
+        workspacesRemapped += 1
+      } catch (error) {
+        stuck.push(String(item.ws.id))
+        this.ctx.logger?.warn(`[@dsh-permission-remote] could not remove workspace ${String(item.ws.id)} from the old remote root: ${errorText(error)}`)
+      }
+    }
+    if (stuck.length > 0) {
+      throw new Error(`the remote root is now ${newRoot}, but ${stuck.length} workspace registration(s) could not be removed from the old root (${stuck.join(', ')})`)
+    }
+    return { status: 'changed', oldRoot, root: newRoot, migration, workspacesRemapped }
+  }
+
+  /** Workspaces whose placeholder still routes, including ones registered during a copy. */
+  private remoteWorkspaceRows(): Array<{ ws: WorkspaceLike, hostId: string, remotePath: string }> {
+    const mapped: Array<{ ws: WorkspaceLike, hostId: string, remotePath: string }> = []
+    for (const ws of this.workspaces.list()) {
+      const route = workspaceRoute(ws.path)
+      if (route !== null) mapped.push({ ws, hostId: route.hostId, remotePath: route.remotePath })
+    }
+    return mapped
+  }
+
+  /** The placeholder path under an explicit root, before routing has switched to it. */
+  private placeholderAt(root: string, hostId: string, remotePath: string): string | null {
+    if (!isValidHostId(hostId)) return null
+    return joinPath(root, hostId, encodeRemotePath(remotePath))
   }
 
   /** Fetch and cache the ripgrep binary for this host's remote platform. */
@@ -653,16 +1008,42 @@ export class Core {
     const local = mapRemoteToLocal(host.id, resolved)
     if (local === null) throw new Error(`remote path must be absolute: ${resolved}`)
     throwIfAborted(signal)
-    // The registry matches by canonical path, so a row created earlier may sit
-    // under the realpath of the same directory. Ask the current listing rather
-    // than comparing the placeholder spelling.
-    const existed = this.listWorkspaces().some(row => row.hostId === host.id && row.remotePath === resolved)
+    // Rows saved before realpath registration still encode the symlink spelling.
+    // Comparing that string with this realpath would add a second workspace.
+    const existing = await this.findRegisteredWorkspace(host, secret, resolved, signal)
+    if (existing !== undefined) {
+      return { path: existing.placeholderPath, remotePath: existing.remotePath, title: existing.title, created: false }
+    }
     await mkdir(local, { recursive: true })
     const requested = title?.trim() || posix.basename(resolved) || resolved
     const nextTitle = createdWorkspaceTitle(host, requested, this.taggingEnabled)
     const workspace = await this.workspaces.create(local, nextTitle)
     // `create` keeps an existing record's title; only a new row carries ours.
-    return { path: workspace.path, remotePath: resolved, title: workspace.title, created: !existed }
+    return { path: workspace.path, remotePath: resolved, title: workspace.title, created: true }
+  }
+
+  /**
+   * A workspace this host already has for `resolved`.
+   *
+   * The stored remote path is whatever was encoded at registration. A later
+   * realpath of that spelling is the same directory, including a trailing-slash
+   * variant that `normalizeRemoteDirectory` already collapsed.
+   */
+  private async findRegisteredWorkspace(host: HostConfig, secret: SecretMaterial, resolved: string, signal?: AbortSignal): Promise<RemoteWorkspaceView | undefined> {
+    const rows = this.listWorkspaces().filter(row => row.hostId === host.id)
+    const direct = rows.find(row => normalizeRemoteDirectory(row.remotePath) === resolved)
+    if (direct !== undefined) return direct
+    for (const row of rows) {
+      const spelled = normalizeRemoteDirectory(row.remotePath)
+      if (spelled === null || spelled === resolved) continue
+      try {
+        const real = normalizeRemoteDirectory(await withSignal(this.pool.sftpRealpath(host, secret, spelled), signal))
+        if (real === resolved) return row
+      } catch {
+        // The stored spelling is gone. It is not this directory.
+      }
+    }
+    return undefined
   }
 
   /**
@@ -729,7 +1110,7 @@ function grantPayload(material: SecretMaterial, previous: GrantPayload): GrantPa
 }
 
 function markRemote(service: SshApi): void {
-  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'refreshLoginEnv', 'deleteHost']
+  const methods = ['testConnection', 'trustFingerprint', 'probe', 'installDeps', 'installRipgrep', 'listDir', 'createDir', 'createWorkspace', 'listWorkspaces', 'tagWorkspaces', 'removeWorkspace', 'restoreHost', 'purgeHost', 'saveSecret', 'saveHost', 'refreshLoginEnv', 'deleteHost', 'remoteRootInfo', 'changeRemoteRoot', 'exportHosts', 'importHosts']
   Object.defineProperty(Object.getPrototypeOf(service), REMOTE_METHODS, {
     configurable: true,
     value: Object.freeze({
@@ -767,6 +1148,11 @@ const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory'>, (host: ToolH
 export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const ctx = rawCtx as unknown as HostContext
   const core = new Core(ctx, readConfig(rawConfig), ctx.workspaceRegistry)
+  // A fresh load starts with no superseded roots: a leftover from a previous
+  // plugin instance would make an unrelated directory look like a placeholder.
+  clearSupersededRoots()
+  core.applyRemoteRootOverride()
+  ctx.effect(() => ctx.on('settings/document-updated', ns => core.onSettingsUpdated(ns)))
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   ctx.effect(() => ctx.settings.configure({ auto: false }))

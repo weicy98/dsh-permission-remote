@@ -192,6 +192,16 @@ const CSS = `
 .dsh-ssh-danger-note {
   color: var(--dsw-alias-state-warn-label);
 }
+/* The paths a merge would leave alone: monospace and wrappable so a long name
+   stays readable beside the strategy buttons. */
+.dsh-ssh-conflict-list {
+  margin: 2px 0;
+  color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-all;
+}
 /* Title and its action read as one group on the left rather than the button
    floating at the far edge of a wide settings page. */
 /* The add button only exists on the hosts tab, and it is taller than the title

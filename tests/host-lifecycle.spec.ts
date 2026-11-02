@@ -411,6 +411,26 @@ test('registration stores the remote real path and refuses one that is /', async
   })
 })
 
+test('a stored symlink spelling is the same workspace as its later real path', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const legacy = remoteWorkspace(registry, 'host1', '/srv/app', 'dev · app')
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown, sftpRealpath: unknown } }).pool
+    fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
+    fakePool.sftpRealpath = async (_host: unknown, _secret: unknown, path: string) => {
+      if (path === '/srv/app' || path === '/data/app') return '/data/app'
+      return path
+    }
+    const again = await core.registerWorkspace(host(), '/data/app')
+    assert.equal(again.created, false)
+    assert.equal(again.path, legacy.path)
+    assert.equal(again.remotePath, '/srv/app')
+    assert.equal(again.title, 'dev · app')
+    assert.equal(registry.rows.length, 1)
+  })
+})
+
 test('a session may route on a host only when its header was opened there', async () => {
   const registry = new FakeRegistry()
   const core = build(registry, [], [host(), host({ id: 'host2', host: '10.0.0.9' })])

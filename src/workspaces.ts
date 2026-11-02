@@ -2,7 +2,7 @@
  * Which registered workspaces belong to which SSH host.
  *
  * A remote workspace is a real local directory under `remoteRoot()/<hostId>/<encoded>`,
- * so the workspace registry only knows the placeholder path. `routeByCwd` turns
+ * so the workspace registry only knows the placeholder path. `routeUnderRoot` turns
  * that back into a host id and a remote absolute directory.
  *
  * DSH's sidebar renders a workspace row from its stored title alone and offers no
@@ -12,7 +12,7 @@
 import { realpathSync } from 'node:fs'
 import { posix } from 'node:path'
 import type { HostConfig } from './config.ts'
-import { remoteRoot, routeByCwd } from './router.ts'
+import { routeUnderRoot, routingRoots } from './router.ts'
 
 export interface WorkspaceLike {
   readonly id: unknown
@@ -104,23 +104,26 @@ export function autoTaggedTitle(host: HostConfig, remotePath: string, title: str
 
 /**
  * The remote root can itself be a symlink (`~/.dsh` is one on some installs) and
- * the registry stores `fs.realpath`, so accept either spelling.
+ * the registry stores `fs.realpath`, so accept either spelling. A root the
+ * operator migrated away from stays in the list for the rest of the process.
  */
 function candidateRoots(env: NodeJS.ProcessEnv): string[] {
-  const root = remoteRoot(env)
-  const roots = [root]
-  try {
-    const real = realpathSync(root)
-    if (real !== root) roots.push(real)
-  } catch {
-    // The remote root does not exist yet; the lexical spelling is all there is.
+  const roots: string[] = []
+  for (const root of routingRoots(env)) {
+    if (!roots.includes(root)) roots.push(root)
+    try {
+      const real = realpathSync(root)
+      if (!roots.includes(real)) roots.push(real)
+    } catch {
+      // The remote root does not exist yet; the lexical spelling is all there is.
+    }
   }
   return roots
 }
 
 export function workspaceRoute(workspacePath: string, env: NodeJS.ProcessEnv = process.env): { hostId: string, remotePath: string } | null {
   for (const root of candidateRoots(env)) {
-    const route = routeByCwd(workspacePath, { ...env, DSH_SSH_REMOTE_ROOT: root })
+    const route = routeUnderRoot(root, workspacePath)
     if (route.kind === 'remote') return { hostId: route.hostId, remotePath: route.remoteCwd }
   }
   return null

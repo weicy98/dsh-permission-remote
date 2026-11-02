@@ -58,7 +58,7 @@ export interface RpcResult<T> {
 
 export interface SettingsNamespace {
   ns: string
-  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean, rgRegistry?: string }
+  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean, rgRegistry?: string, remoteRoot?: string }
   revision: number
 }
 
@@ -76,6 +76,7 @@ export interface HostSettings {
   hosts: HostView[]
   tagWorkspaceTitles: boolean
   rgRegistry: string
+  remoteRoot: string
   revision: number
 }
 
@@ -90,7 +91,8 @@ export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   // Older host builds have no such field; tagging is their default.
   const tagWorkspaceTitles = row?.value?.tagWorkspaceTitles !== false
   const rgRegistry = typeof row?.value?.rgRegistry === 'string' ? row.value.rgRegistry : ''
-  return { hosts, tagWorkspaceTitles, rgRegistry, revision: row?.revision ?? 0 }
+  const remoteRoot = typeof row?.value?.remoteRoot === 'string' ? row.value.remoteRoot : ''
+  return { hosts, tagWorkspaceTitles, rgRegistry, remoteRoot, revision: row?.revision ?? 0 }
 }
 
 export async function writeTagWorkspaceTitles(ctx: ClientFace, enabled: boolean, revision: number): Promise<void> {
@@ -138,4 +140,73 @@ export async function readWorkspaces(ctx: ClientFace): Promise<WorkspaceListing>
     items: Array.isArray(listed.items) ? listed.items : [],
     deleted: Array.isArray(listed.deleted) ? listed.deleted : [],
   }
+}
+
+
+/** Where remote-workspace placeholders live now, and the built-in default. */
+export interface RemoteRootInfo {
+  current: string
+  defaultRoot: string
+}
+
+/** Result of a remote-root change; `needs-strategy`/`has-sessions` touched nothing. */
+export interface RemoteRootChange {
+  status: 'changed' | 'unchanged' | 'needs-strategy' | 'has-sessions'
+  oldRoot: string
+  root: string
+  sessions?: number
+  conflicts?: string[]
+  workspacesRemapped?: number
+  migration?: {
+    copied: number
+    skipped: number
+    overwritten: number
+    /** Paths left untouched: different content kept, or a file/directory clash. */
+    conflicts: string[]
+  }
+}
+
+export async function readRemoteRootInfo(ctx: ClientFace): Promise<RemoteRootInfo> {
+  return callHost<RemoteRootInfo>(ctx, 'remoteRootInfo')
+}
+
+export async function changeRemoteRoot(
+  ctx: ClientFace,
+  root: string,
+  options?: { strategy?: 'auto' | 'overwrite', force?: boolean, conflicts?: readonly string[] },
+): Promise<RemoteRootChange> {
+  return callHost<RemoteRootChange>(ctx, 'changeRemoteRoot', {
+    root,
+    strategy: options?.strategy,
+    force: options?.force === true,
+    // The list the page showed. A conflict that was not on it is asked again.
+    conflicts: options?.conflicts,
+  })
+}
+
+/** A JSON export of the host list. Passwords and key passphrases never ride. */
+export interface HostConfigExport {
+  version: number
+  exportedAt: string
+  hosts: HostView[]
+  deletedHosts: Array<{ host: HostView, deletedAt: string }>
+}
+
+export async function exportHosts(ctx: ClientFace): Promise<HostConfigExport> {
+  return callHost<HostConfigExport>(ctx, 'exportHosts')
+}
+
+export interface HostImportResult {
+  ok: true
+  added: number
+  updated: number
+  removed: number
+}
+
+export async function importHosts(
+  ctx: ClientFace,
+  payload: unknown,
+  mode: 'merge' | 'replace',
+): Promise<HostImportResult> {
+  return callHost<HostImportResult>(ctx, 'importHosts', { payload, mode })
 }
