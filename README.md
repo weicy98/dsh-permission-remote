@@ -85,13 +85,13 @@ dsh plugin --profile web add dsh-permission-remote
 设置页的「远端根目录」是本地存放所有远端工作区占位目录的位置，默认 `~/.dsh/remote`（可用 `DSH_SSH_REMOTE_ROOT` 覆盖）。把这一栏清空再保存，会回到内置默认目录。改到新目录并点「保存并迁移」时：
 
 - 新目录不存在或是空的：把旧的 `remote` 目录整棵复制过去。
-- 新目录已有内容：自动合并——缺失的补上、完全相同的跳过、同名但内容不同的文件先不覆盖，页面上会问你要「保留目标（自动合并）」还是「用旧目录覆盖」。同名但一侧是目录、另一侧是文件的情况一律不动，会列在冲突里，由你手工处理。
+- 新目录已有内容：自动合并——缺失的补上、完全相同的跳过、同名但内容不同的文件先不覆盖，页面上会问你要「保留目标（自动合并）」还是「用旧目录覆盖」。同名但一侧是目录、另一侧是文件的情况一律不动，会列在冲突里，由你手工处理。符号链接按链接原样复制、不跟随；目标里已有的符号链接保持不动并列为冲突，避免写穿链接。
 - 新目录不能放在旧目录里面（反过来也不行），否则直接报错，不会开始复制。
 - 工作区里有打开着的会话时，会先提示；迁移会按远端路径把这些工作区重新注册到新占位目录下，正在进行的会话需要重新打开。
 
 旧目录不会被删除，确认无误后可自行清理；迁移只搬本机的占位目录，不动远端服务器上的文件。若在通用设置编辑器里直接改这个值，会立即生效但**不会**迁移旧目录——要搬目录仍请用「保存并迁移」。本次运行期间，旧目录里的路径仍按「远端占位目录」解析——挂在旧占位目录上的会话还能继续连到那台服务器；但旧目录里没有已注册工作区覆盖时，会明确报错拒绝，而不是悄悄变成本地目录。重启后旧目录不再被识别。
 
-设置页还有「主机配置备份」：**导出配置**把主机列表存成 JSON（不含口令和私钥口令，它们只在凭据存储里）；**导入并合并**按主机 id 更新或新增，**导入并替换**用文件整体替换现有列表（会先确认一次；文件里没有的主机会移到「已删除主机」，可以恢复）。合并只并入主机行，不采用文件里的「已删除主机」记录。导入后请重新测试连接，并按需重填口令；文件里设为 `trust` 的主机会在结果里提示数量。
+设置页还有「主机配置备份」：**导出配置**把主机列表存成 JSON（不含口令和私钥口令，它们只在凭据存储里）；**导入并合并**按主机 id 更新或新增，且只更新文件里真正写了的字段——只改名字的行会保留指纹、私钥路径和审批策略；地址变了会丢掉已保存的口令，文件没给新指纹时会清掉旧主机密钥。**导入并替换**用文件整体替换现有列表（会先确认一次；文件里没有的主机会移到「已删除主机」，可以恢复）；之前已删除、但仍有工作区的主机，即使文件没提到也会保留在「已删除主机」里。合并只并入主机行，不采用文件里的「已删除主机」记录。导入后请重新测试连接，并按需重填口令；文件里设为 `trust` 的主机会在结果里提示数量。若文件改动现有主机的地址、把主机设为 `trust`，或把 `deny` 放宽成 `ask`，页面会先询问再导入；文件新增的主机直接生效。
 
 ## 权限
 
@@ -245,12 +245,12 @@ When DSH itself is running on Windows, a remote workspace exposes only the remot
 The Settings page's **Remote root directory** is where every remote-workspace placeholder lives on this machine. It defaults to `~/.dsh/remote` (overridable with `DSH_SSH_REMOTE_ROOT`). Clearing the field and saving goes back to the default. Pressing **Save and migrate** with a new directory:
 
 - copies the whole old `remote` tree when the target is absent or empty;
-- merges when the target already has content: missing entries are added, identical files skipped, and a same-named file with different content is left alone until you choose **Keep target (auto-merge)** or **Overwrite from old root**. A name that is a directory on one side and a file on the other is never replaced; it is listed as a conflict for you to resolve by hand;
+- merges when the target already has content: missing entries are added, identical files skipped, and a same-named file with different content is left alone until you choose **Keep target (auto-merge)** or **Overwrite from old root**. A name that is a directory on one side and a file on the other is never replaced; it is listed as a conflict for you to resolve by hand. A symlink is copied as a symlink and is never followed; a symlink already in the target is left untouched and listed as a conflict, so the copy cannot write through it;
 - refuses a target inside the old root (or the old root inside the target) before copying anything.
 
 If a workspace has a live session the page asks first; the migration re-registers those workspaces under the new placeholder paths, so their sessions must be reopened. The old directory is kept, so you can delete it once you are happy; only the local placeholder tree moves, and files on the remote servers are untouched. Editing the value in the generic settings editor takes effect immediately but does **not** migrate the old tree; use **Save and migrate** for that. For the rest of this process the old paths still read as remote placeholders, so a session left on one keeps talking to its server — and a placeholder no registered workspace covers is refused instead of quietly becoming a local directory. After a restart the old directory is no longer recognised.
 
-**Host configuration backup** exports the host list as JSON with no passwords or key passphrases (those live only in the credential store). **Import and merge** updates or adds by host id; **Import and replace** makes the file the whole list, asks first, and moves hosts the file drops to **deleted hosts** so they can be restored. A merge takes host rows only and ignores the file's deleted-host records. After importing, test the connections again and re-enter secrets as needed; hosts set to `trust` in the file are reported by count.
+**Host configuration backup** exports the host list as JSON with no passwords or key passphrases (those live only in the credential store). **Import and merge** updates or adds by host id, and only the fields the file actually contains: a row that only renames a host keeps its fingerprint, private-key path, and ops policy. A changed address drops the saved password and, when the file does not include a new fingerprint, clears the old host key. **Import and replace** makes the file the whole list, asks first, and moves hosts the file drops to **deleted hosts** so they can be restored. A host that was already deleted and still has workspaces stays in that list even when the file does not mention it. A merge takes host rows only and ignores the file's deleted-host records. After importing, test the connections again and re-enter secrets as needed; hosts set to `trust` in the file are reported by count. If the file changes an existing host's address, sets that host to `trust`, or relaxes `deny` to `ask`, the page asks before importing. A host the file adds is applied immediately.
 
 ### Sidebar terminal
 

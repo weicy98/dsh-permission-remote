@@ -133,7 +133,9 @@
   "importMerge": "Import and merge",
   "importReplace": "Import and replace",
   "importReplaceConfirm": "Replacing drops every host the file does not list (they move to deleted hosts). Continue?",
-  "hostBackupHint": "The exported JSON holds only the host list, never passwords or key passphrases. Import merges by host id (same id updates) or replaces the whole list; after importing, test connections again and re-enter secrets as needed.",
+  "importRiskConfirm": "This file changes a host address or relaxes its approval policy. A changed address drops the saved password. Import anyway?",
+  "importRiskContinue": "Import anyway",
+  "hostBackupHint": "The exported JSON holds only the host list, never passwords or key passphrases. Merge updates only the fields the file contains; a changed address drops the saved password. Replace makes the file the whole list and keeps a deleted host that still has workspaces. After importing, test connections again and re-enter secrets as needed.",
   "exportedHosts": "Host configuration exported.",
   "importedHosts": "Host configuration imported (added/updated/removed):",
   "importTrusted": "hosts set to trust (commands run without asking):"

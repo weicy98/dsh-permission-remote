@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { apply } from '../src/index.ts'
-import { clearSupersededRoots, defaultRemoteRoot, remoteRoot, setRemoteRootOverride } from '../src/router.ts'
+import { clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 
 /**
  * Editing the remote root through any other surface (the generic settings
@@ -82,6 +83,42 @@ test('a relative root written by hand falls back to the default instead of break
     updateVolatile(root, createVolatile('relative/root'))
     emitSettingsUpdated(ctx, 'permission-remote')
     assert.equal(remoteRoot(), defaultRemoteRoot())
+  } finally {
+    cleanRouting()
+  }
+})
+
+test('a generic settings switch keeps a placeholder from the previous root remote', () => {
+  const root = createVolatile('/tmp/root-a')
+  const ctx = pluginContext()
+  try {
+    apply(ctx, { hosts: createVolatile([]), deletedHosts: createVolatile([]), remoteRoot: root })
+    assert.equal(remoteRoot(), '/tmp/root-a')
+    // The load itself is not a migration: the built-in default was never this process's root.
+    const builtinPlaceholder = join(defaultRemoteRoot(), 'host1', encodeRemotePath('/srv/app'))
+    assert.equal(routeByCwd(builtinPlaceholder).kind, 'local')
+    const captured = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(captured.startsWith('/tmp/root-a/'), true)
+
+    updateVolatile(root, createVolatile('/tmp/root-b'))
+    emitSettingsUpdated(ctx, 'permission-remote')
+    assert.equal(remoteRoot(), '/tmp/root-b')
+    assert.equal(routeByCwd(captured).kind, 'remote')
+
+    updateVolatile(root, createVolatile(''))
+    emitSettingsUpdated(ctx, 'permission-remote')
+    assert.equal(remoteRoot(), defaultRemoteRoot())
+    assert.equal(routeByCwd(captured).kind, 'remote')
+
+    updateVolatile(root, createVolatile('/tmp/root-c'))
+    emitSettingsUpdated(ctx, 'permission-remote')
+    updateVolatile(root, createVolatile('relative/root'))
+    emitSettingsUpdated(ctx, 'permission-remote')
+    assert.equal(remoteRoot(), defaultRemoteRoot())
+    const route = routeByCwd(captured)
+    assert.equal(route.kind, 'remote')
+    assert.equal(route.kind === 'remote' ? route.hostId : '', 'host1')
+    assert.equal(route.kind === 'remote' ? route.remoteCwd : '', '/srv/app')
   } finally {
     cleanRouting()
   }

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { migrateRemoteRoot, planRemoteRoot, plannedReport, runMigration } from '../src/migrate.ts'
+import { migrateRemoteRoot, planRemoteRoot, plannedReport, runMigration, type MigrationPlan } from '../src/migrate.ts'
 import { addSupersededRoot, clearSupersededRoots, defaultRemoteRoot, expandRemoteRoot, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride, workspaceBinding } from '../src/router.ts'
 import {
   exportHostConfig,
@@ -455,4 +455,121 @@ test('a whole-tree copy refuses a target that gained content after the plan', as
   } finally {
     await box.dispose()
   }
+})
+
+test('a new root under a symlink into the old root is refused before anything is created', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    await mkdir(from, { recursive: true })
+    await writeFile(join(from, 'keep.txt'), 'keep')
+    const link = join(box.dir, 'link')
+    await symlink(from, link)
+    const nested = join(link, 'copy')
+    await assert.rejects(() => planRemoteRoot(from, nested), /must not be inside/)
+    await assert.rejects(() => stat(join(from, 'copy')), /ENOENT/)
+    // A plan that skipped the check must still refuse before mkdir.
+    const stale: MigrationPlan = {
+      oldRoot: from,
+      newRoot: nested,
+      action: 'copied',
+      targetWasEmpty: true,
+      copyTree: true,
+      directories: [],
+      copies: [],
+      links: [],
+      overwrites: [],
+      conflicts: [],
+      skipped: 0,
+    }
+    await assert.rejects(() => runMigration(stale), /must not be inside/)
+    await assert.rejects(() => stat(join(from, 'copy')), /ENOENT/)
+    assert.equal(await readFile(join(from, 'keep.txt'), 'utf8'), 'keep')
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('a symlink directory in the target is a conflict and is not written through', async () => {
+  const box = await scratch()
+  try {
+    const outside = join(box.dir, 'outside')
+    await mkdir(outside, { recursive: true })
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    await mkdir(join(from, 'host1', 'enc'), { recursive: true })
+    await writeFile(join(from, 'host1', 'enc', 'notes.txt'), 'OLD')
+    await mkdir(to, { recursive: true })
+    await symlink(outside, join(to, 'host1'))
+    const report = await migrateRemoteRoot(from, to, 'overwrite')
+    assert.ok(report.conflicts.includes('host1'))
+    assert.equal((await lstat(join(to, 'host1'))).isSymbolicLink(), true)
+    assert.deepEqual(await readdir(outside), [])
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('overwrite does not truncate the file a symlink points at', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    const victim = join(box.dir, 'victim.txt')
+    await mkdir(from, { recursive: true })
+    await mkdir(to, { recursive: true })
+    await writeFile(join(from, 'clash.txt'), 'OLD')
+    await writeFile(victim, 'SAFE')
+    await symlink(victim, join(to, 'clash.txt'))
+    await writeFile(join(to, 'keep.txt'), 'stay')
+    const report = await migrateRemoteRoot(from, to, 'overwrite')
+    assert.ok(report.conflicts.includes('clash.txt'))
+    assert.equal(await readFile(victim, 'utf8'), 'SAFE')
+    assert.equal((await lstat(join(to, 'clash.txt'))).isSymbolicLink(), true)
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('a symlink in the old tree is copied as a symlink', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    await mkdir(from, { recursive: true })
+    await symlink('/no/such/target', join(from, 'alias'))
+    await writeFile(join(from, 'real.txt'), 'x')
+    await migrateRemoteRoot(from, to)
+    assert.equal(await readlink(join(to, 'alias')), '/no/such/target')
+    assert.equal((await lstat(join(to, 'alias'))).isSymbolicLink(), true)
+    assert.equal(await readFile(join(to, 'real.txt'), 'utf8'), 'x')
+
+    const merged = join(box.dir, 'merged')
+    await mkdir(merged, { recursive: true })
+    await writeFile(join(merged, 'keep.txt'), 'k')
+    const report = await migrateRemoteRoot(from, merged, 'auto')
+    assert.equal(await readlink(join(merged, 'alias')), '/no/such/target')
+    assert.equal(report.copied >= 1, true)
+    assert.equal(await readFile(join(merged, 'real.txt'), 'utf8'), 'x')
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('merge keeps fields the file omits, and a new address clears an omitted fingerprint', () => {
+  const current = [host('a', { host: '10.0.0.1', fingerprint: 'SHA256:abc', opsPolicy: 'deny', privateKeyPath: '/keys/a' })]
+  const renamed = mergeImportedHosts(current, [], parseHostImport([{ id: 'a', host: '10.0.0.1', username: 'u', name: 'renamed' }]), 'merge')
+  const row = renamed.hosts.find(item => item.id === 'a')
+  assert.ok(row)
+  assert.equal(row.name, 'renamed')
+  assert.equal(row.fingerprint, 'SHA256:abc')
+  assert.equal(row.opsPolicy, 'deny')
+  assert.equal(row.privateKeyPath, '/keys/a')
+
+  const moved = mergeImportedHosts(current, [], parseHostImport([{ id: 'a', host: '10.0.0.9', username: 'u' }]), 'merge')
+  const next = moved.hosts.find(item => item.id === 'a')
+  assert.ok(next)
+  assert.equal(next.host, '10.0.0.9')
+  assert.equal(next.fingerprint, '')
+  assert.equal(next.opsPolicy, 'deny')
 })

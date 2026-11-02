@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import test from 'node:test'
+import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
-import { clearSupersededRoots, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
+import { clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 import { workspaceRoute, type WorkspaceLike } from '../src/workspaces.ts'
 
 /**
@@ -75,14 +76,16 @@ interface Harness {
   registry: FakeRegistry
   core: Core
   updates: Array<Record<string, unknown>>
+  droppedSecrets: unknown[]
 }
 
-async function harness(options: { sessions?: number, failPersist?: boolean } = {}): Promise<Harness> {
+async function harness(options: { sessions?: number, failPersist?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
   const box = await mkdtemp(join(tmpdir(), 'dsh-root-core-'))
   const oldRoot = join(box, 'old-root')
   const newRoot = join(box, 'new-root')
   await mkdir(oldRoot, { recursive: true })
   const updates: Array<Record<string, unknown>> = []
+  const droppedSecrets: unknown[] = []
   const fail = options.failPersist === true
   const ctx = {
     logger: { info() {}, warn() {} },
@@ -94,7 +97,11 @@ async function harness(options: { sessions?: number, failPersist?: boolean } = {
         updates.push(patch)
       },
     },
-    credentials: { readRecord: async () => undefined, modifyRecord: async () => undefined },
+    credentials: {
+      readRecord: async () => undefined,
+      modifyRecord: async () => undefined,
+      deleteRecord: async (key: unknown) => { droppedSecrets.push(key) },
+    },
     sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
     tools: { get: () => undefined, register: () => () => undefined },
     get: () => undefined,
@@ -102,10 +109,10 @@ async function harness(options: { sessions?: number, failPersist?: boolean } = {
     effect: () => undefined,
   }
   const registry = new FakeRegistry()
-  const config = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: oldRoot })
+  const config = readConfig({ hosts: options.hosts ?? [host()], deletedHosts: [], remoteRoot: oldRoot })
   const core = new Core(ctx as never, config, registry)
   core.applyRemoteRootOverride()
-  return { box, oldRoot, newRoot, registry, core, updates }
+  return { box, oldRoot, newRoot, registry, core, updates, droppedSecrets }
 }
 
 async function dispose(box: Harness): Promise<void> {
@@ -218,6 +225,8 @@ test('a settings write that fails leaves the old root in charge and says so', as
     assert.equal(remoteRoot(), box.oldRoot)
     assert.equal(workspaceRoute(seeded.path)?.remotePath, '/srv/app')
     assert.equal(routeByCwd(seeded.path).kind, 'remote')
+    // The new registration is rolled back with the failed save.
+    assert.deepEqual(box.registry.rows.map(row => row.id), [seeded.id])
   } finally {
     await dispose(box)
   }
@@ -261,6 +270,10 @@ test('import merges by id and retags a renamed host, like saveHost', async () =>
     }, 'merge')
     assert.equal(result.updated, 1)
     assert.equal(box.core.listHosts()[0]?.name, 'prod')
+    // Fields the file did not mention stay. A rename is not a new machine.
+    assert.equal(box.core.listHosts()[0]?.fingerprint, 'SHA256:abc')
+    assert.equal(box.core.listHosts()[0]?.opsPolicy, 'ask')
+    assert.deepEqual(box.droppedSecrets, [])
     // The sidebar prefix follows the new name.
     assert.equal(box.registry.rows[0]?.title, 'prod · app')
     // The connection key did not change, so nothing was invalidated.
@@ -310,6 +323,140 @@ test('clearing the field resets the root to the built-in default and migrates th
   } finally {
     if (savedEnv === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
     else process.env.DSH_SSH_REMOTE_ROOT = savedEnv
+    await dispose(box)
+  }
+})
+
+test('a partial import keeps deny and an omitted fingerprint', async () => {
+  const box = await harness({ hosts: [host({ opsPolicy: 'deny' })] })
+  try {
+    const result = await box.core.importHostConfig({
+      hosts: [{ id: 'host1', host: '10.0.0.5', username: 'me', name: 'still' }],
+    }, 'merge')
+    assert.equal(result.updated, 1)
+    assert.equal(box.core.listHosts()[0]?.name, 'still')
+    assert.equal(box.core.listHosts()[0]?.opsPolicy, 'deny')
+    assert.equal(box.core.listHosts()[0]?.fingerprint, 'SHA256:abc')
+    assert.deepEqual(box.droppedSecrets, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a changed address drops the saved password and an omitted fingerprint', async () => {
+  const box = await harness()
+  try {
+    await box.core.importHostConfig({
+      hosts: [{ id: 'host1', host: '10.1.1.1', username: 'me' }],
+    }, 'merge')
+    const row = box.core.listHosts()[0]
+    assert.equal(row?.host, '10.1.1.1')
+    assert.equal(row?.fingerprint, '')
+    assert.equal(row?.opsPolicy, 'ask')
+    assert.deepEqual(box.droppedSecrets, [credentialKey('dsh-permission-remote', 'host1')])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('replace keeps a deleted host that still owns a workspace', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    await box.core.deleteHost('host1')
+    assert.deepEqual(box.core.listHosts().map(item => item.id), [])
+    const result = await box.core.importHostConfig({
+      hosts: [{ id: 'other', host: '10.0.0.7', username: 'me' }],
+    }, 'replace')
+    assert.equal(result.deletedHosts.some(row => row.host.id === 'host1'), true)
+    assert.equal(box.core.listDeletedHosts().some(item => item.id === 'host1'), true)
+    await box.core.restoreHost('host1')
+    const restored = box.core.listHosts().find(item => item.id === 'host1')
+    assert.equal(restored?.host, '10.0.0.5')
+    assert.equal(restored?.fingerprint, 'SHA256:abc')
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a placeholder that clashes with a file is refused before the root switches', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const rel = `host1/${encodeRemotePath('/srv/app')}`
+    await mkdir(join(box.newRoot, 'host1'), { recursive: true })
+    await writeFile(join(box.newRoot, rel), 'not a directory')
+    await assert.rejects(
+      () => box.core.changeRemoteRoot(box.newRoot, { force: true, strategy: 'auto' }),
+      /conflicts with an existing file/,
+    )
+    assert.equal(remoteRoot(), box.oldRoot)
+    assert.equal(box.updates.length, 0)
+    assert.equal(await readFile(join(box.newRoot, rel), 'utf8'), 'not a directory')
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a content conflict inside a placeholder does not block the move', async () => {
+  const box = await harness()
+  try {
+    const seeded = await seedWorkspace(box, '/srv/app')
+    const rel = relative(box.oldRoot, join(seeded.path, 'left-behind.txt')).split('\\').join('/')
+    await mkdir(dirname(join(box.newRoot, rel)), { recursive: true })
+    await writeFile(join(box.newRoot, rel), 'other')
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true, strategy: 'auto' })
+    assert.equal(moved.status, 'changed')
+    assert.equal(await readFile(join(box.newRoot, rel), 'utf8'), 'other')
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a conflict that was not in the shown list is asked again and not copied', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    await mkdir(join(box.newRoot, 'host1'), { recursive: true })
+    await writeFile(join(box.newRoot, 'host1', 'w0'), 'target version')
+    await writeFile(join(box.oldRoot, 'host1', 'w0'), 'old version')
+    const planned = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(planned.status, 'needs-strategy')
+    await writeFile(join(box.newRoot, 'extra.txt'), 'target extra')
+    await writeFile(join(box.oldRoot, 'extra.txt'), 'old extra')
+    const again = await box.core.changeRemoteRoot(box.newRoot, {
+      force: true,
+      strategy: 'overwrite',
+      acceptedConflicts: planned.conflicts,
+    })
+    assert.equal(again.status, 'needs-strategy')
+    assert.equal(again.conflicts?.includes('extra.txt'), true)
+    assert.equal(remoteRoot(), box.oldRoot)
+    assert.equal(box.updates.length, 0)
+    assert.equal(await readFile(join(box.newRoot, 'host1', 'w0'), 'utf8'), 'target version')
+    assert.equal(await readFile(join(box.newRoot, 'extra.txt'), 'utf8'), 'target extra')
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a workspace that cannot be removed is reported after the root has switched', async () => {
+  const box = await harness()
+  try {
+    const seeded = await seedWorkspace(box, '/srv/app')
+    const original = box.registry.delete.bind(box.registry)
+    box.registry.delete = (id: unknown) => {
+      if (id === seeded.id) return Promise.reject(new Error('registry busy'))
+      return original(id)
+    }
+    await assert.rejects(
+      () => box.core.changeRemoteRoot(box.newRoot, { force: true }),
+      /the remote root is now .*could not be removed.*w-seed/,
+    )
+    assert.equal(remoteRoot(), box.newRoot)
+    assert.equal(box.registry.rows.some(row => row.id === seeded.id), true)
+    assert.equal(box.registry.rows.some(row => row.path !== seeded.path), true)
+  } finally {
     await dispose(box)
   }
 })

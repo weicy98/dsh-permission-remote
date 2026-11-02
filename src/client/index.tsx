@@ -3,6 +3,7 @@ import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft, type Draft } from './draft.ts'
+import { importNeedsConfirm } from './import-risk.ts'
 import { rootPromptFor, type RootPrompt } from './root-prompt.ts'
 import { installStyles } from './styles.ts'
 
@@ -226,6 +227,8 @@ function Section(props: SectionProps): JSX.Element {
   /** Set once the operator accepts the "sessions are open" prompt. */
   const rootForceRef = useRef(false)
   const [importConfirm, setImportConfirm] = useState(false)
+  /** Parsed file held until the operator accepts an address change or a looser ops policy. */
+  const [importRisk, setImportRisk] = useState<{ payload: unknown, mode: 'merge' | 'replace' } | null>(null)
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const importModeRef = useRef<'merge' | 'replace'>('merge')
   const [revision, setRevision] = useState(0)
@@ -491,7 +494,11 @@ function Section(props: SectionProps): JSX.Element {
     const target = rootPrompt.root
     setBusy(true)
     try {
-      const result = await changeRemoteRoot(ctx, target, { strategy, force: rootForceRef.current })
+      const result = await changeRemoteRoot(ctx, target, {
+        strategy,
+        force: rootForceRef.current,
+        conflicts: rootPrompt.kind === 'conflicts' ? rootPrompt.conflicts : undefined,
+      })
       setRootPrompt(null)
       await applyRootResult(result)
     } catch (error) {
@@ -550,16 +557,42 @@ function Section(props: SectionProps): JSX.Element {
     importInputRef.current?.click()
   }
 
+  async function finishImport(payload: unknown, mode: 'merge' | 'replace'): Promise<void> {
+    const result = await importHosts(ctx, payload, mode)
+    await reload()
+    await reloadWorkspaces().catch(() => undefined)
+    const trusted = trustCountOf(payload)
+    note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}${trusted > 0 ? ` · ${t('importTrusted')} ${trusted}` : ''}`)
+  }
+
   async function doImport(file: File): Promise<void> {
     setBusy(true)
     try {
       const text = await file.text()
       const payload: unknown = JSON.parse(text)
-      const result = await importHosts(ctx, payload, importModeRef.current)
-      await reload()
-      await reloadWorkspaces().catch(() => undefined)
-      const trusted = trustCountOf(payload)
-      note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}${trusted > 0 ? ` · ${t('importTrusted')} ${trusted}` : ''}`)
+      const mode = importModeRef.current
+      // Hold the file: applying it now would move a host or relax its policy
+      // before the operator has seen that.
+      if (importNeedsConfirm(payload, hosts)) {
+        setImportRisk({ payload, mode })
+        return
+      }
+      setImportRisk(null)
+      await finishImport(payload, mode)
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirmImportRisk(): Promise<void> {
+    if (importRisk === null) return
+    const pending = importRisk
+    setImportRisk(null)
+    setBusy(true)
+    try {
+      await finishImport(pending.payload, pending.mode)
     } catch (error) {
       fail(error)
     } finally {
@@ -1367,6 +1400,13 @@ function Section(props: SectionProps): JSX.Element {
             if (file !== undefined) void doImport(file)
           }}
         />
+        {importRisk !== null
+          ? <>
+              <span className="dsh-ssh-note dsh-ssh-danger-note">{t('importRiskConfirm')}</span>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportRisk(null)}>{t('cancel')}</button>
+              <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void confirmImportRisk()}>{t('importRiskContinue')}</button>
+            </>
+          : null}
         <span className="dsh-ssh-note">{t('hostBackupHint')}</span>
       </div>
         </>

@@ -22,12 +22,16 @@
  * The settings action may plan twice for one change: once to report the
  * conflicts, and again with the operator's chosen strategy to execute. A file
  * that appears in the target between those two plans therefore is not part of
- * the previewed conflict list; `auto` still never loses target content, while
- * `overwrite` only replaces the files its own plan found differing.
+ * the previewed conflict list; the page sends the list it showed, and a new
+ * conflict is asked again instead of being overwritten.
+ *
+ * Symlinks are not followed. A link in the target is a conflict, and a link in
+ * the old tree is copied as a link. Writing through a link would change a file
+ * outside the new root, or truncate whatever the link points at.
  */
 import { constants } from 'node:fs'
-import { copyFile, cp, mkdir, open, readdir, realpath, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { copyFile, lstat, mkdir, open, readdir, readlink, realpath, rmdir, stat, symlink } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export type MigrationStrategy = 'auto' | 'overwrite'
 
@@ -65,6 +69,8 @@ export interface MigrationPlan {
   directories: string[]
   /** Files missing on the target. Created exclusively, never overwriting. */
   copies: CopyStep[]
+  /** Symlinks in the old tree, recreated as links and never followed. */
+  links: CopyStep[]
   /** Conflicting files to replace with the old copy (`overwrite` only). */
   overwrites: CopyStep[]
   /** Relative paths the plan leaves untouched. */
@@ -73,14 +79,19 @@ export interface MigrationPlan {
   skipped: number
 }
 
-type PathKind = 'missing' | 'dir' | 'file'
+type PathKind = 'missing' | 'dir' | 'file' | 'symlink' | 'other'
 
 const COMPARE_CHUNK = 64 * 1024
+const NOFOLLOW = (constants as { O_NOFOLLOW?: number }).O_NOFOLLOW
 
-async function pathKind(target: string): Promise<PathKind> {
+/** `follow` is only for the roots themselves. Entries inside the tree use lstat. */
+async function pathKind(target: string, follow = false): Promise<PathKind> {
   try {
-    const info = await stat(target)
-    return info.isDirectory() ? 'dir' : 'file'
+    const info = follow ? await stat(target) : await lstat(target)
+    if (info.isSymbolicLink()) return 'symlink'
+    if (info.isDirectory()) return 'dir'
+    if (info.isFile()) return 'file'
+    return 'other'
   } catch {
     return 'missing'
   }
@@ -105,17 +116,44 @@ function within(parent: string, child: string): boolean {
 }
 
 /**
- * The path with symlinks resolved, or the lexical path when it does not exist.
+ * The path with symlinks resolved.
  *
  * A root that is itself a symlink (`~/.dsh` is one on some installs) would
  * otherwise slip past the nesting check and let a copy walk into itself.
+ * When the path does not exist yet, the nearest existing ancestor is resolved
+ * and the missing tail is rejoined, so a parent link cannot disguise a child
+ * of the old root as a sibling of it.
  */
 async function physicalPath(target: string): Promise<string> {
+  const resolved = resolve(target)
   try {
-    return await realpath(target)
+    return await realpath(resolved)
   } catch {
-    return resolve(target)
+    const tail: string[] = []
+    let cursor = resolved
+    for (;;) {
+      const parent = dirname(cursor)
+      if (parent === cursor) return resolved
+      tail.push(basename(cursor))
+      cursor = parent
+      let ancestor: string
+      try {
+        ancestor = await realpath(cursor)
+      } catch {
+        // This ancestor does not exist yet either.
+        continue
+      }
+      // Pushed leaf-first. Reverse only after the ancestor resolved, so a
+      // failed realpath cannot leave the tail backwards for the next try.
+      tail.reverse()
+      return join(ancestor, ...tail)
+    }
   }
+}
+
+/** A write through a parent symlink lands outside `rootReal`. */
+async function resolvesInside(rootReal: string, target: string): Promise<boolean> {
+  return within(rootReal, await physicalPath(target))
 }
 
 /**
@@ -161,6 +199,13 @@ async function planMerge(
     const source = join(oldRoot, childRel)
     const target = join(newRoot, childRel)
     const kind = await pathKind(target)
+    // A symlink on either side is left untouched. Following it would write
+    // outside the new root, and replacing it would truncate the link target.
+    if (entry.isSymbolicLink() || kind === 'symlink' || kind === 'other') {
+      if (entry.isSymbolicLink() && kind === 'missing') plan.links.push({ source, target, rel: childRel })
+      else plan.conflicts.push(childRel)
+      continue
+    }
     if (entry.isDirectory()) {
       // A file in the target where the old root has a directory: leave both
       // sides alone instead of wiping the file, and let the report say why.
@@ -210,6 +255,7 @@ export async function planRemoteRoot(
     copyTree: false,
     directories: [],
     copies: [],
+    links: [],
     overwrites: [],
     conflicts: [],
     skipped: 0,
@@ -222,14 +268,14 @@ export async function planRemoteRoot(
   if (within(fromReal, toReal) || within(toReal, fromReal)) {
     throw new Error('the new remote root must not be inside the old one, or the old one inside it')
   }
-  const oldKind = await pathKind(from)
-  if (oldKind === 'file') throw new Error(`the current remote root ${from} is not a directory`)
-  if (await pathKind(to) === 'file') throw new Error(`the target ${to} exists and is not a directory`)
+  const oldKind = await pathKind(from, true)
+  if (oldKind !== 'dir' && oldKind !== 'missing') throw new Error(`the current remote root ${from} is not a directory`)
+  if ((await pathKind(to, true)) === 'file') throw new Error(`the target ${to} exists and is not a directory`)
 
   // Nothing to move yet: just make the new root and switch the setting.
   if (oldKind === 'missing') return { ...plan, action: 'copied', targetWasEmpty: true }
 
-  const targetWasEmpty = (await pathKind(to)) === 'missing' || (await isEmptyDir(to))
+  const targetWasEmpty = (await pathKind(to, true)) === 'missing' || (await isEmptyDir(to))
   if (targetWasEmpty) {
     return { ...plan, action: 'copied', targetWasEmpty: true, copyTree: true }
   }
@@ -246,7 +292,7 @@ export function plannedReport(plan: MigrationPlan): MigrationReport {
     action: plan.action,
     targetWasEmpty: plan.targetWasEmpty,
     // A whole-tree copy learns its count while copying; see the callers.
-    copied: plan.copyTree ? 0 : plan.copies.length,
+    copied: plan.copyTree ? 0 : plan.copies.length + plan.links.length,
     skipped: plan.skipped,
     overwritten: plan.overwrites.length,
     conflicts: [...plan.conflicts],
@@ -260,6 +306,94 @@ export function plannedReport(plan: MigrationPlan): MigrationReport {
  * plan and the run, it is reported as a conflict instead of being overwritten,
  * which keeps `auto`'s promise that nothing in the target is lost.
  */
+/** Replace a regular file without following a symlink that appears in its place. */
+async function overwriteRegularFile(source: string, target: string): Promise<void> {
+  const info = await lstat(target)
+  if (!info.isFile()) {
+    const error = new Error(`refusing to replace ${target}`) as NodeJS.ErrnoException
+    error.code = 'EEXIST'
+    throw error
+  }
+  if (typeof NOFOLLOW !== 'number') {
+    await copyFile(source, target)
+    return
+  }
+  const src = await open(source, constants.O_RDONLY)
+  try {
+    const dest = await open(target, constants.O_WRONLY | constants.O_TRUNC | NOFOLLOW)
+    try {
+      const bytes = Buffer.alloc(COMPARE_CHUNK)
+      for (;;) {
+        const read = await src.read(bytes, 0, COMPARE_CHUNK, null)
+        if (read.bytesRead === 0) break
+        let offset = 0
+        while (offset < read.bytesRead) {
+          const wrote = await dest.write(bytes, offset, read.bytesRead - offset)
+          if (wrote.bytesWritten === 0) throw new Error(`could not write ${target}`)
+          offset += wrote.bytesWritten
+        }
+      }
+    } finally {
+      await dest.close()
+    }
+  } finally {
+    await src.close()
+  }
+}
+
+/**
+ * Copy one old-tree entry without following symlinks.
+ *
+ * `cp` follows links by default, which would pull an outside directory into
+ * the new root or write through a link that landed there.
+ */
+async function copyEntry(source: string, target: string, rootReal: string): Promise<void> {
+  if (!(await resolvesInside(rootReal, target))) {
+    throw new Error(`refusing to write ${target}: it resolves outside the new remote root`)
+  }
+  const info = await lstat(source)
+  if (info.isSymbolicLink()) {
+    await symlink(await readlink(source), target)
+    return
+  }
+  if (info.isDirectory()) {
+    await mkdir(target)
+    for (const name of await readdir(source)) await copyEntry(join(source, name), join(target, name), rootReal)
+    return
+  }
+  if (info.isFile()) {
+    await copyFile(source, target, constants.COPYFILE_EXCL)
+  }
+}
+
+async function assertDistinctRoots(plan: MigrationPlan, rootReal: string): Promise<void> {
+  const oldReal = await physicalPath(plan.oldRoot)
+  if (within(oldReal, rootReal) || within(rootReal, oldReal)) {
+    throw new Error('the new remote root must not be inside the old one, or the old one inside it')
+  }
+}
+
+/**
+ * Create the new root only when its resolved path stays outside the old one.
+ *
+ * A parent symlink can make a missing path look like a sibling while its real
+ * location is inside the old tree. Checking after mkdir would leave that
+ * directory behind.
+ */
+async function openNewRoot(plan: MigrationPlan): Promise<string> {
+  await assertDistinctRoots(plan, await physicalPath(plan.newRoot))
+  const before = await pathKind(plan.newRoot)
+  await mkdir(plan.newRoot, { recursive: true })
+  const rootReal = await realpath(plan.newRoot)
+  try {
+    await assertDistinctRoots(plan, rootReal)
+  } catch (error) {
+    if (before === 'missing') await rmdir(plan.newRoot).catch(() => undefined)
+    throw error
+  }
+  return rootReal
+}
+
 export async function runMigration(plan: MigrationPlan): Promise<MigrationReport> {
   if (plan.action === 'unchanged') return plannedReport(plan)
   if (plan.copyTree) {
@@ -267,22 +401,37 @@ export async function runMigration(plan: MigrationPlan): Promise<MigrationReport
     // If it gained content since, a `force` copy would silently overwrite files
     // the operator never saw: refuse instead, so nothing in the target is lost.
     // The operator can re-run, which plans a merge and reports the conflicts.
-    const kind = await pathKind(plan.newRoot)
+    const kind = await pathKind(plan.newRoot, true)
     if (kind === 'file') throw new Error(`the target ${plan.newRoot} is no longer a directory`)
     if (kind === 'dir' && !(await isEmptyDir(plan.newRoot))) {
       throw new Error(`the target ${plan.newRoot} is no longer empty; nothing was copied and nothing was overwritten`)
     }
     const copied = await countTree(plan.oldRoot)
-    await mkdir(plan.newRoot, { recursive: true })
-    await cp(plan.oldRoot, plan.newRoot, { recursive: true, force: true })
+    const rootReal = await openNewRoot(plan)
+    for (const name of await readdir(plan.oldRoot)) {
+      await copyEntry(join(plan.oldRoot, name), join(plan.newRoot, name), rootReal)
+    }
     return { ...plannedReport(plan), copied }
   }
-  await mkdir(plan.newRoot, { recursive: true })
-  for (const dir of plan.directories) await mkdir(dir, { recursive: true })
+  const rootReal = await openNewRoot(plan)
   let copied = 0
   let overwritten = 0
   const conflicts = [...plan.conflicts]
+  for (const dir of plan.directories) {
+    if (!(await resolvesInside(rootReal, dir))) {
+      throw new Error(`refusing to create ${dir}: it resolves outside the new remote root`)
+    }
+    const kind = await pathKind(dir)
+    if (kind === 'symlink' || kind === 'file' || kind === 'other') {
+      conflicts.push(relative(plan.newRoot, dir).split('\\').join('/'))
+      continue
+    }
+    await mkdir(dir, { recursive: true })
+  }
   for (const step of plan.copies) {
+    if (!(await resolvesInside(rootReal, step.target))) {
+      throw new Error(`refusing to write ${step.target}: it resolves outside the new remote root`)
+    }
     try {
       await copyFile(step.source, step.target, constants.COPYFILE_EXCL)
       copied += 1
@@ -296,9 +445,36 @@ export async function runMigration(plan: MigrationPlan): Promise<MigrationReport
       throw error
     }
   }
+  for (const step of plan.links) {
+    if (!(await resolvesInside(rootReal, step.target))) {
+      throw new Error(`refusing to write ${step.target}: it resolves outside the new remote root`)
+    }
+    try {
+      await symlink(await readlink(step.source), step.target)
+      copied += 1
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        conflicts.push(step.rel)
+        continue
+      }
+      throw error
+    }
+  }
   for (const step of plan.overwrites) {
-    await copyFile(step.source, step.target)
-    overwritten += 1
+    if (!(await resolvesInside(rootReal, step.target))) {
+      throw new Error(`refusing to write ${step.target}: it resolves outside the new remote root`)
+    }
+    try {
+      await overwriteRegularFile(step.source, step.target)
+      overwritten += 1
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST' || code === 'ELOOP') {
+        conflicts.push(step.rel)
+        continue
+      }
+      throw error
+    }
   }
   return {
     ...plannedReport(plan),

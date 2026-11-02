@@ -173,12 +173,14 @@ export async function readRemoteRootInfo(ctx: ClientFace): Promise<RemoteRootInf
 export async function changeRemoteRoot(
   ctx: ClientFace,
   root: string,
-  options?: { strategy?: 'auto' | 'overwrite', force?: boolean },
+  options?: { strategy?: 'auto' | 'overwrite', force?: boolean, conflicts?: readonly string[] },
 ): Promise<RemoteRootChange> {
   return callHost<RemoteRootChange>(ctx, 'changeRemoteRoot', {
     root,
     strategy: options?.strategy,
     force: options?.force === true,
+    // The list the page showed. A conflict that was not on it is asked again.
+    conflicts: options?.conflicts,
   })
 }
 

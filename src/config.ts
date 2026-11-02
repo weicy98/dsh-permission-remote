@@ -329,6 +329,40 @@ export function exportHostConfig(hosts: readonly HostConfig[], deletedHosts: rea
 export interface HostConfigImport {
   hosts: HostConfig[]
   deletedHosts: DeletedHost[]
+  /**
+   * Keys each host object actually contained, in the same order as `hosts`.
+   * A missing key is not a request to reset that field to its default.
+   */
+  present: ReadonlyArray<ReadonlySet<string>>
+}
+
+const HOST_PATCH_FIELDS = ['name', 'host', 'port', 'username', 'auth', 'privateKeyPath', 'fingerprint', 'opsPolicy', 'loginEnv'] as const
+
+function presentHostFields(raw: unknown): ReadonlySet<string> {
+  if (!isRecord(raw)) return new Set()
+  return new Set(HOST_PATCH_FIELDS.filter(field => Object.prototype.hasOwnProperty.call(raw, field)))
+}
+
+/**
+ * Keep every field the file did not mention.
+ *
+ * A hand-edited row that only renames a host must not clear its fingerprint,
+ * drop `deny`, or forget the private-key path. A new address without a new
+ * fingerprint cannot keep the old machine's host key.
+ */
+function overlayHost(current: HostConfig, incoming: HostConfig, present: ReadonlySet<string>): HostConfig {
+  const next: HostConfig = { ...current }
+  if (present.has('name')) next.name = incoming.name
+  if (present.has('host')) next.host = incoming.host
+  if (present.has('port')) next.port = incoming.port
+  if (present.has('username')) next.username = incoming.username
+  if (present.has('auth')) next.auth = incoming.auth
+  if (present.has('privateKeyPath')) next.privateKeyPath = incoming.privateKeyPath
+  if (present.has('fingerprint')) next.fingerprint = incoming.fingerprint
+  if (present.has('opsPolicy')) next.opsPolicy = incoming.opsPolicy
+  if (present.has('loginEnv')) next.loginEnv = incoming.loginEnv
+  if (present.has('host') && incoming.host !== current.host && !present.has('fingerprint')) next.fingerprint = ''
+  return next
 }
 
 /** Read an export payload (`{hosts:[…]}`, or a bare array) into validated rows. */
@@ -343,7 +377,12 @@ export function parseHostImport(payload: unknown): HostConfigImport {
     throw new Error('imported file is not a host configuration export')
   }
   if (!Array.isArray(hostsRaw)) throw new Error('imported file has no "hosts" array')
-  const hosts = hostsRaw.map(normalizeHostRow)
+  const hosts: HostConfig[] = []
+  const present: Array<ReadonlySet<string>> = []
+  for (const raw of hostsRaw) {
+    hosts.push(normalizeHostRow(raw))
+    present.push(presentHostFields(raw))
+  }
   const seen = new Set<string>()
   for (const host of hosts) {
     if (seen.has(host.id)) throw new Error(`imported file lists host ${host.id} more than once`)
@@ -359,7 +398,7 @@ export function parseHostImport(payload: unknown): HostConfigImport {
       deletedHosts.push({ host, deletedAt: typeof row.deletedAt === 'string' ? row.deletedAt : '' })
     }
   }
-  return { hosts, deletedHosts }
+  return { hosts, deletedHosts, present }
 }
 
 export interface HostImportResult {
@@ -373,12 +412,14 @@ export interface HostImportResult {
 /**
  * Fold a parsed import into the current list.
  *
- * `merge` keeps every current host and lets the file override a matching id.
- * `replace` makes the file the whole list, but a host the file drops becomes a
- * tombstone instead of disappearing: its workspaces are still registered, and
- * `deleteHost` already keeps a row so the host can be restored. The tombstone
- * list from the file is used by `replace` only; `merge` treats the file as host
- * rows and leaves the operator's own deleted list alone.
+ * `merge` keeps every current host and lets the file override a matching id,
+ * but only the fields the file actually contains. `replace` makes the file the
+ * whole list; an id that already exists (live or deleted) keeps fields the file
+ * omits. A host the file drops becomes a tombstone instead of disappearing:
+ * its workspaces are still registered, and `deleteHost` already keeps a row so
+ * the host can be restored. The tombstone list from the file is used by
+ * `replace` only; `merge` treats the file as host rows and leaves the
+ * operator's own deleted list alone.
  *
  * Either way an imported host that was a tombstone is revived, so restoring from
  * a backup does not leave a ghost "deleted host" row beside the live one.
@@ -390,6 +431,14 @@ export function mergeImportedHosts(
   mode: 'merge' | 'replace',
 ): HostImportResult {
   const importedIds = new Set(incoming.hosts.map(host => host.id))
+  const known = new Map<string, HostConfig>()
+  for (const host of current) known.set(host.id, host)
+  for (const row of currentDeleted) if (!known.has(row.host.id)) known.set(row.host.id, row.host)
+  const placed = incoming.hosts.map((host, index) => {
+    const previous = known.get(host.id)
+    const fields = incoming.present[index] ?? new Set<string>()
+    return previous === undefined ? { ...host } : overlayHost(previous, host, fields)
+  })
   let hosts: HostConfig[]
   let added = 0
   let updated = 0
@@ -400,7 +449,7 @@ export function mergeImportedHosts(
     // a replace (updated), not a new row. Counting every incoming row as "added"
     // made a no-op replace look like it added the whole list.
     const currentIds = new Set(current.map(host => host.id))
-    hosts = incoming.hosts.map(host => ({ ...host }))
+    hosts = placed
     added = incoming.hosts.filter(host => !currentIds.has(host.id)).length
     updated = incoming.hosts.length - added
     const droppedHosts = current.filter(host => !importedIds.has(host.id))
@@ -410,13 +459,13 @@ export function mergeImportedHosts(
   } else {
     hosts = current.map(host => ({ ...host }))
     const byId = new Map(hosts.map(host => [host.id, host]))
-    for (const host of incoming.hosts) {
-      const next = { ...host }
-      if (byId.has(host.id)) {
-        byId.set(host.id, next)
+    for (let index = 0; index < placed.length; index += 1) {
+      const next = placed[index]!
+      if (byId.has(next.id)) {
+        byId.set(next.id, next)
         updated += 1
       } else {
-        byId.set(host.id, next)
+        byId.set(next.id, next)
         added += 1
       }
     }
