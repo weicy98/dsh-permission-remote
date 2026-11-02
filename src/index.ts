@@ -728,10 +728,15 @@ export class Core {
    */
   async changeRemoteRoot(inputRoot: string, opts: { strategy?: MigrationStrategy, force: boolean }): Promise<RemoteRootChange> {
     const oldRoot = remoteRoot()
-    const newRoot = expandRemoteRoot(inputRoot)
+    const trimmed = inputRoot.trim()
+    // A blank field means "go back to the built-in default", so the operator can
+    // undo a custom root from the page instead of typing the default by hand.
+    const newRoot = trimmed.length === 0 ? resolveLocalPath(defaultRemoteRoot()) : expandRemoteRoot(inputRoot)
     if (newRoot === null) throw new Error('remote root must be an absolute path or start with ~/')
     if (newRoot === oldRoot) {
-      if (this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
+      // Pin an explicit spelling, but a blank field that already resolves to the
+      // default must not persist the default path (it would stop tracking it).
+      if (trimmed.length > 0 && this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
       return { status: 'unchanged', oldRoot, root: newRoot }
     }
     const mapped: Array<{ ws: WorkspaceLike, hostId: string, remotePath: string }> = []
@@ -743,9 +748,10 @@ export class Core {
     // root, or that is not a directory, must be an error rather than a
     // confirmation prompt the operator can only answer into a failure.
     const strategy = opts.strategy ?? 'auto'
-    // One walk decides everything: the conflicts to ask about and the exact
-    // copy list that will run. The answer the operator gives then executes that
-    // list, so the plan and the outcome cannot disagree.
+    // The plan carries the exact copy list. When conflicts need a decision the
+    // page calls again with the chosen strategy, and a fresh plan is built then,
+    // so a file that changed in between is re-evaluated rather than overwritten
+    // blind; `auto` still never loses target content.
     const plan = await planRemoteRoot(oldRoot, newRoot, strategy)
     const sessions = mapped.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
     if (sessions > 0 && !opts.force) return { status: 'has-sessions', oldRoot, root: newRoot, sessions }

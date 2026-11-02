@@ -287,3 +287,29 @@ test('import replace turns a dropped host into a tombstone so its workspaces sta
     await dispose(box)
   }
 })
+
+test('clearing the field resets the root to the built-in default and migrates there', async () => {
+  const box = await harness()
+  const savedEnv = process.env.DSH_SSH_REMOTE_ROOT
+  const builtin = join(box.box, 'builtin-default')
+  // The built-in default reads this env var, so point it at a temp dir instead of
+  // the real home. The routing override stays on the configured old root.
+  process.env.DSH_SSH_REMOTE_ROOT = builtin
+  try {
+    const seeded = await seedWorkspace(box, '/srv/app')
+    assert.equal(remoteRoot(), box.oldRoot)
+    const reset = await box.core.changeRemoteRoot('', { force: false })
+    assert.equal(reset.status, 'changed')
+    assert.equal(remoteRoot(), builtin)
+    const moved = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(moved.startsWith(builtin), true)
+    assert.equal(await readFile(join(moved, 'left-behind.txt'), 'utf8'), 'from the remote command')
+    // The old registration is gone; a new one sits under the default root.
+    assert.equal(box.registry.rows.some(row => row.path === seeded.path), false)
+    assert.equal(box.registry.rows.some(row => row.path === moved), true)
+  } finally {
+    if (savedEnv === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = savedEnv
+    await dispose(box)
+  }
+})

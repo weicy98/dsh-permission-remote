@@ -112,7 +112,7 @@
   "backToSession": "返回会话",
   "remoteRoot": "远端根目录",
   "remoteRootSave": "保存并迁移",
-  "remoteRootHint": "本地存放所有远端工作区占位目录的位置，默认 ~/.dsh/remote。改到新目录时，旧目录会复制过去；新目录已有内容时自动合并（保留目标已有文件，只补缺失），同名且内容不同的文件会先问你。",
+  "remoteRootHint": "本地存放所有远端工作区占位目录的位置，默认 ~/.dsh/remote。改到新目录时，旧目录会复制过去；新目录已有内容时自动合并（保留目标已有文件，只补缺失），同名且内容不同的文件会先问你。留空表示回到默认目录。",
   "remoteRootCurrent": "当前：",
   "remoteRootUnchanged": "远端根目录没有变化。",
   "remoteRootChanged": "远端根目录已切换：",

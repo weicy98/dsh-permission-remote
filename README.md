@@ -82,7 +82,7 @@ dsh plugin --profile web add dsh-permission-remote
 
 ### 远端根目录与配置备份
 
-设置页的「远端根目录」是本地存放所有远端工作区占位目录的位置，默认 `~/.dsh/remote`（可用 `DSH_SSH_REMOTE_ROOT` 覆盖）。改到新目录并点「保存并迁移」时：
+设置页的「远端根目录」是本地存放所有远端工作区占位目录的位置，默认 `~/.dsh/remote`（可用 `DSH_SSH_REMOTE_ROOT` 覆盖）。把这一栏清空再保存，会回到内置默认目录。改到新目录并点「保存并迁移」时：
 
 - 新目录不存在或是空的：把旧的 `remote` 目录整棵复制过去。
 - 新目录已有内容：自动合并——缺失的补上、完全相同的跳过、同名但内容不同的文件先不覆盖，页面上会问你要「保留目标（自动合并）」还是「用旧目录覆盖」。同名但一侧是目录、另一侧是文件的情况一律不动，会列在冲突里，由你手工处理。
@@ -242,7 +242,7 @@ When DSH itself is running on Windows, a remote workspace exposes only the remot
 
 ### Remote root directory and config backup
 
-The Settings page's **Remote root directory** is where every remote-workspace placeholder lives on this machine. It defaults to `~/.dsh/remote` (overridable with `DSH_SSH_REMOTE_ROOT`). Pressing **Save and migrate** with a new directory:
+The Settings page's **Remote root directory** is where every remote-workspace placeholder lives on this machine. It defaults to `~/.dsh/remote` (overridable with `DSH_SSH_REMOTE_ROOT`). Clearing the field and saving goes back to the default. Pressing **Save and migrate** with a new directory:
 
 - copies the whole old `remote` tree when the target is absent or empty;
 - merges when the target already has content: missing entries are added, identical files skipped, and a same-named file with different content is left alone until you choose **Keep target (auto-merge)** or **Overwrite from old root**. A name that is a directory on one side and a file on the other is never replaced; it is listed as a conflict for you to resolve by hand;

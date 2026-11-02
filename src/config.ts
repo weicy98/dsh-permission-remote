@@ -396,8 +396,13 @@ export function mergeImportedHosts(
   let removed = 0
   let dropped: DeletedHost[] = []
   if (mode === 'replace') {
+    // The file becomes the whole list, so an incoming id that already existed is
+    // a replace (updated), not a new row. Counting every incoming row as "added"
+    // made a no-op replace look like it added the whole list.
+    const currentIds = new Set(current.map(host => host.id))
     hosts = incoming.hosts.map(host => ({ ...host }))
-    added = incoming.hosts.length
+    added = incoming.hosts.filter(host => !currentIds.has(host.id)).length
+    updated = incoming.hosts.length - added
     const droppedHosts = current.filter(host => !importedIds.has(host.id))
     removed = droppedHosts.length
     const now = new Date().toISOString()
@@ -418,9 +423,19 @@ export function mergeImportedHosts(
     hosts = [...byId.values()]
   }
   const baseDeleted = mode === 'replace' ? [...dropped, ...incoming.deletedHosts] : currentDeleted
-  // A host that is live again must not keep a tombstone beside it.
+  // A host that is live again must not keep a tombstone beside it, and one host
+  // must not get two tombstone rows: a `replace` both drops a host that the file
+  // no longer lists and may carry the file's own tombstone for it, which would
+  // otherwise list the same deleted host twice. First spelling wins (a freshly
+  // dropped row before the file's stale tombstone).
+  const seenDeleted = new Set<string>()
   const deletedHosts = baseDeleted
     .filter(row => !importedIds.has(row.host.id))
+    .filter(row => {
+      if (seenDeleted.has(row.host.id)) return false
+      seenDeleted.add(row.host.id)
+      return true
+    })
     .map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))
   return { hosts, deletedHosts, added, updated, removed }
 }

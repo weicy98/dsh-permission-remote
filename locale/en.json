@@ -112,7 +112,7 @@
   "backToSession": "Back to session",
   "remoteRoot": "Remote root directory",
   "remoteRootSave": "Save and migrate",
-  "remoteRootHint": "Local directory that holds the placeholder for every remote workspace. Defaults to ~/.dsh/remote. Changing it copies the old tree over; a non-empty target is merged automatically (keep existing files, add missing ones), and a same-named file with different content asks you first.",
+  "remoteRootHint": "Local directory that holds the placeholder for every remote workspace. Defaults to ~/.dsh/remote. Changing it copies the old tree over; a non-empty target is merged automatically (keep existing files, add missing ones), and a same-named file with different content asks you first. Clear the field to go back to the default.",
   "remoteRootCurrent": "Current:",
   "remoteRootUnchanged": "The remote root did not change.",
   "remoteRootChanged": "Remote root switched:",

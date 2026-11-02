@@ -408,3 +408,51 @@ test('a file that appears after the plan is reported, never silently overwritten
     await box.dispose()
   }
 })
+
+test('replace import never lists the same deleted host twice', () => {
+  // The current host 'a' is dropped by the replace, and the file also carries a
+  // tombstone for 'a'. Without de-duplication 'a' appears twice in deletedHosts.
+  const current = [host('a'), host('b')]
+  const incoming = parseHostImport({
+    hosts: [{ id: 'b', host: '10.0.0.2', username: 'u' }],
+    deletedHosts: [{ host: { id: 'a', host: '10.0.0.1', username: 'u' }, deletedAt: '2024-01-01' }],
+  })
+  const result = mergeImportedHosts(current, [], incoming, 'replace')
+  assert.deepEqual(result.deletedHosts.map(row => row.host.id), ['a'])
+  assert.deepEqual(result.hosts.map(item => item.id), ['b'])
+  assert.equal(result.removed, 1)
+})
+
+test('replace import counts an existing id as updated, not added', () => {
+  const current = [host('a'), host('b')]
+  const incoming = parseHostImport([
+    { id: 'a', host: '10.0.0.1', username: 'u' },
+    { id: 'b', host: '10.0.0.1', username: 'u' },
+  ])
+  const result = mergeImportedHosts(current, [], incoming, 'replace')
+  assert.equal(result.added, 0)
+  assert.equal(result.updated, 2)
+  assert.equal(result.removed, 0)
+  assert.equal(result.hosts.length, 2)
+})
+
+test('a whole-tree copy refuses a target that gained content after the plan', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    await mkdir(from, { recursive: true })
+    await writeFile(join(from, 'a.txt'), 'from')
+    const plan = await planRemoteRoot(from, to, 'auto')
+    assert.equal(plan.copyTree, true)
+    // The target gains content between the plan and the run.
+    await mkdir(to, { recursive: true })
+    await writeFile(join(to, 'keep.txt'), 'do not lose me')
+    await assert.rejects(() => runMigration(plan), /no longer empty/)
+    // Nothing was overwritten and nothing was copied into the target.
+    assert.equal(await readFile(join(to, 'keep.txt'), 'utf8'), 'do not lose me')
+    await assert.rejects(() => readFile(join(to, 'a.txt'), 'utf8'), /ENOENT/)
+  } finally {
+    await box.dispose()
+  }
+})

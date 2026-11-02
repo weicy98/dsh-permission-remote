@@ -1305,7 +1305,7 @@ function Section(props: SectionProps): JSX.Element {
             onChange={event => setRootDraft(event.target.value)}
           />
         </label>
-        <button type="button" className="dsh-ssh-button" disabled={busy || rootDraft.trim().length === 0} onClick={() => void saveRemoteRoot()}>{t('remoteRootSave')}</button>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRemoteRoot()}>{t('remoteRootSave')}</button>
         <span className="dsh-ssh-note">{t('remoteRootHint')}{rootInfo !== null ? ` ${t('remoteRootCurrent')} ${rootInfo.current}` : ''}</span>
         {rootPrompt !== null ? (
           <div className="dsh-ssh-note dsh-ssh-danger-note">

@@ -15,11 +15,15 @@
  *   the reverse) is not what "keep target" or "use the old copy" promises. It
  *   is reported so the operator can look at it.
  *
- * Planning and copying are separate calls. The settings page asks once with
- * {@link planRemoteRoot} (which reads the tree but writes nothing), shows the
- * conflicts it found, and then executes that same plan with {@link runMigration}.
- * The tree is walked and the files compared exactly once, and what the operator
- * approved is what runs.
+ * Planning and copying are separate calls. {@link planRemoteRoot} reads the
+ * tree and writes nothing; {@link runMigration} executes the copy list that plan
+ * produced, so a plan and the run built from it never disagree.
+ *
+ * The settings action may plan twice for one change: once to report the
+ * conflicts, and again with the operator's chosen strategy to execute. A file
+ * that appears in the target between those two plans therefore is not part of
+ * the previewed conflict list; `auto` still never loses target content, while
+ * `overwrite` only replaces the files its own plan found differing.
  */
 import { constants } from 'node:fs'
 import { copyFile, cp, mkdir, open, readdir, realpath, stat } from 'node:fs/promises'
@@ -258,12 +262,22 @@ export function plannedReport(plan: MigrationPlan): MigrationReport {
  */
 export async function runMigration(plan: MigrationPlan): Promise<MigrationReport> {
   if (plan.action === 'unchanged') return plannedReport(plan)
-  await mkdir(plan.newRoot, { recursive: true })
   if (plan.copyTree) {
+    // The plan wanted a whole-tree copy because the target was absent or empty.
+    // If it gained content since, a `force` copy would silently overwrite files
+    // the operator never saw: refuse instead, so nothing in the target is lost.
+    // The operator can re-run, which plans a merge and reports the conflicts.
+    const kind = await pathKind(plan.newRoot)
+    if (kind === 'file') throw new Error(`the target ${plan.newRoot} is no longer a directory`)
+    if (kind === 'dir' && !(await isEmptyDir(plan.newRoot))) {
+      throw new Error(`the target ${plan.newRoot} is no longer empty; nothing was copied and nothing was overwritten`)
+    }
     const copied = await countTree(plan.oldRoot)
+    await mkdir(plan.newRoot, { recursive: true })
     await cp(plan.oldRoot, plan.newRoot, { recursive: true, force: true })
     return { ...plannedReport(plan), copied }
   }
+  await mkdir(plan.newRoot, { recursive: true })
   for (const dir of plan.directories) await mkdir(dir, { recursive: true })
   let copied = 0
   let overwritten = 0
