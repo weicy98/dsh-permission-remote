@@ -140,7 +140,9 @@ export function normalizeRemoteDirectory(remotePath: string): string | null {
  * The picker also takes a typed path, so a request may be `~` or `~/src`, which
  * SFTP will not expand by itself: `home` is the login home the session starts
  * in, resolved by the caller. An empty request means the filesystem root, so a
- * picker that lost its path still has somewhere to list.
+ * picker that lost its path still has somewhere to list. `~user` is passed
+ * through untouched — only the remote can say whose home that is, and the
+ * caller never sends one it did not see typed.
  */
 export function listingPath(requested: string, home: string): string {
   const text = requested.trim()

@@ -102,6 +102,9 @@ test('a listing request expands ~ against the login home and defaults to the roo
   assert.equal(listingPath('~/src/', '/home/me'), '/home/me/src')
   // Everything else is passed through for the remote realpath to settle.
   assert.equal(listingPath('/srv/../srv/app', '/home/me'), '/srv/../srv/app')
+  // Another account's home is not ours to expand, so it is not rewritten into
+  // something under the listed directory either.
+  assert.equal(listingPath('~me/src', '/home/me'), '~me/src')
   assert.equal(listingPath('/srv/app', ''), '/srv/app')
   // A request that lost its path still lists something.
   assert.equal(listingPath('   ', '/home/me'), '/')

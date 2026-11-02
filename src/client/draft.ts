@@ -104,25 +104,29 @@ export function filterEntries<T extends { name: string }>(entries: readonly T[],
  *
  * A directory name cannot contain `/`, so a query that does can never match one
  * and is unambiguously a path. `~` is the one path without a separator: it is
- * the remote home, and typing it as a filter would be meaningless anyway.
+ * the remote home, and typing it as a filter would be meaningless anyway. `..`
+ * is the same deal on the other end: no directory is named that, and it is how
+ * a picker's box goes up one level.
  */
 export function isPathQuery(query: string): boolean {
   const text = query.trim()
-  return text === '~' || text.startsWith('~/') || text.includes('/')
+  return text === '..' || text.startsWith('~') || text.includes('/')
 }
 
 /**
  * The directory a typed query names, or `null` when it is a plain name filter.
  *
  * The listing box doubles as a path field: `/home/me`, `~/src`, `../shared`,
- * and `me/projects` all resolve here, so walking into a deep directory does not
- * mean clicking one level at a time. Relative queries resolve against `cwd`,
- * which is always an absolute listing path.
+ * `..`, and `me/projects` all resolve here, so walking into a deep directory
+ * does not mean clicking one level at a time. Relative queries resolve against
+ * `cwd`, which is always an absolute listing path.
  *
  * `..`, `.`, and repeated separators are resolved lexically; symlinked parents
  * cannot be known here, and the remote realpath settles those when the listing
  * is requested. A leading `~` stays in the result: the remote home is the
- * remote's answer, not something this side can assume.
+ * remote's answer, not something this side can assume. `~user` is left exactly
+ * as typed for the same reason — only the remote can say whose home that is,
+ * and reading it as a child of the listed directory would be a guess.
  */
 export function pathQuery(query: string, cwd: string): string | null {
   const text = query.trim()
@@ -131,6 +135,8 @@ export function pathQuery(query: string, cwd: string): string | null {
     const parts = normalizeSegments(text.slice(1), false)
     return parts.length === 0 ? '~' : `~/${parts.join('/')}`
   }
+  // Someone else's home is not ours to expand.
+  if (text.startsWith('~')) return text
   if (text.startsWith('/')) return absolutePath(text)
   // `cwd` is absolute, so appending the query keeps absolute semantics: `..`
   // above the root stays at the root instead of producing a relative path.
@@ -139,16 +145,38 @@ export function pathQuery(query: string, cwd: string): string | null {
 }
 
 /**
- * The last segment of a typed path, used to keep child names that match the
- * part being typed in the listing (`/home/we` shows `weichongyong`).
+ * The part of a typed path that names something in the listing, so typing
+ * `/home/we` keeps `weichongyong` visible while the walk is being typed.
+ *
+ * It is read from the text, not from the resolved path: `..` resolves to a
+ * directory whose name is not on screen, and narrowing by it would empty a
+ * listing the operator is only asking to leave. `~` and the relative steps name
+ * nothing here, so they contribute nothing.
  */
-export function pathTail(query: string, cwd: string): string {
-  const resolved = pathQuery(query, cwd)
-  if (resolved === null) return ''
-  // `~` is not a name in the listing, so it must not narrow anything; `~/src`
-  // narrows by the part after it.
-  const parts = resolved.split('/').filter(part => part.length > 0 && part !== '~')
+export function pathTail(query: string): string {
+  const text = query.trim()
+  if (!isPathQuery(text)) return ''
+  const parts = text.split('/')
+    .filter(part => part.length > 0 && part !== '.' && part !== '..' && part !== '~')
   return parts.length === 0 ? '' : parts[parts.length - 1] ?? ''
+}
+
+/**
+ * The directories a typed query may name, in the order they are tried.
+ *
+ * A relative query is read from the listed directory first, the way a picker
+ * resolves what is typed, and then — for a bare relative query such as
+ * `home/me` — from the root: typing a path without its leading `/` is the
+ * common slip. A query that starts with `/` or `~` means itself, and `..` is
+ * already relative to `cwd` in the only way it can be, so neither gets a retry.
+ */
+export function pathCandidates(query: string, cwd: string): string[] {
+  const first = pathQuery(query, cwd)
+  if (first === null) return []
+  const text = query.trim()
+  if (text === '..' || text.startsWith('/') || text.startsWith('~')) return [first]
+  const fromRoot = pathQuery(`/${text}`, '/')
+  return fromRoot === null || fromRoot === first ? [first] : [first, fromRoot]
 }
 
 /** `/a//b/./c/../d` -> `/a/b/d`; `..` never escapes an absolute path. */

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
-import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, pathQuery, pathTail, stepActive, toDraft, type Draft } from './draft.ts'
+import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, pathCandidates, pathQuery, pathTail, stepActive, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -522,13 +522,14 @@ function Section(props: SectionProps): JSX.Element {
   /**
    * List one directory and commit it.
    *
-   * Failures come back instead of being reported here: a path typed in the box
-   * may be retried from the root, and the message must name the path the
-   * operator typed, not the one the retry used.
+   * Failures come back instead of being reported here: a typed path may be
+   * tried twice, and the caller decides what the message names. `resolve` asks
+   * the remote to settle a typed path; a path built from a listing is already
+   * settled, so a row click stays one request.
    */
-  async function listPath(hostId: string, path: string): Promise<{ ok: true } | { ok: false, error: unknown }> {
+  async function listPath(hostId: string, path: string, options: { resolve?: boolean } = {}): Promise<{ ok: true } | { ok: false, error: unknown }> {
     try {
-      const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'listDir', { hostId, path })
+      const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'listDir', { hostId, path, resolve: options.resolve === true })
       // Only commit once the listing succeeded: a failure keeps the previous host.
       setBrowsing(hostId)
       setDir(listed.path)
@@ -563,28 +564,31 @@ function Section(props: SectionProps): JSX.Element {
   /**
    * Enter a directory named in the filter box.
    *
-   * `me/projects` is first read relative to the listed directory, the way a
-   * file picker resolves a typed path; a relative path that is not there is
-   * then tried from the root, because typing `home/me` for `/home/me` is the
-   * common slip. Only when both fail does the message stand, and the listing
-   * stays where it was so the query can be corrected.
+   * The candidates come from `pathCandidates`: `me/projects` is read relative to
+   * the listed directory first, the way a picker resolves a typed path, and then
+   * from the root, because typing `home/me` for `/home/me` is the common slip.
+   * Only when every candidate fails does the message stand, and it names what
+   * was typed rather than either resolved guess; the listing stays where it was
+   * so the query can be corrected.
    */
   async function openPath(hostId: string, query: string): Promise<void> {
-    const requested = pathQuery(query, dir)
-    if (requested === null) return
-    const fromRoot = query.trim().startsWith('/') || query.trim().startsWith('~')
-      ? null
-      : pathQuery(`/${query.trim()}`, '/')
+    const candidates = pathCandidates(query, dir)
+    if (candidates.length === 0) return
     setBusy(true)
     try {
-      const first = await listPath(hostId, requested)
-      if (first.ok) return
-      if (fromRoot !== null && fromRoot !== requested) {
-        if ((await listPath(hostId, fromRoot)).ok) return
+      let result: { ok: true } | { ok: false, error: unknown } | null = null
+      for (const candidate of candidates) {
+        result = await listPath(hostId, candidate, { resolve: true })
+        if (result.ok) {
+          // The text was a path, not a filter for the listing that is now on
+          // screen: it has done its job, and leaving it behind would keep a
+          // path row for a directory the operator is already in.
+          setFilter('')
+          setActive(-1)
+          return
+        }
       }
-      // The retry is how a typed path is understood, not something the operator
-      // asked to see, so the message names the path that was typed.
-      failBrowse(hostId, requested, first.error)
+      if (result !== null && !result.ok) failBrowse(hostId, query.trim(), result.error)
     } finally {
       setBusy(false)
     }
@@ -770,14 +774,14 @@ function Section(props: SectionProps): JSX.Element {
         return
       }
       // Nothing highlighted, so Enter is about what was typed: a path is opened,
-      // and a name filter narrowed to one row enters that row. Anything else is
-      // left alone rather than guessing at a directory.
+      // and a name filter narrowed to one row enters that row. An empty box is
+      // not a query, so it is left alone rather than guessing at a directory.
       if (goTo !== null) {
         void openPath(browsing, filter)
         return
       }
       const only = visible[0]
-      if (visible.length === 1 && only !== undefined) void browse(browsing, only.path)
+      if (filter.trim().length > 0 && visible.length === 1 && only !== undefined) void browse(browsing, only.path)
       return
     }
     if (event.key === 'Home' || event.key === 'End') {
@@ -796,7 +800,7 @@ function Section(props: SectionProps): JSX.Element {
   // the remote, so every keystroke is instant even on a slow link. A path query
   // narrows by its last segment, so `/home/we` still shows `weichongyong` next
   // to the path row instead of emptying the list.
-  const visible = filterEntries(entries, goTo === null ? filter : pathTail(filter, dir))
+  const visible = filterEntries(entries, goTo === null ? filter : pathTail(filter))
   // Derived, not stored: the filter can shrink `visible` between keystrokes, and
   // deriving keeps the highlight on a real row without another effect.
   const highlighted = clampActive(active, visible.length)

@@ -172,22 +172,32 @@ class SshApi extends TypertRemoteService {
    * List a directory for the picker.
    *
    * The picker also accepts a typed path, so a request may arrive as `~`,
-   * `~/src`, or with `..` and doubled separators in it. Resolve it first: the
-   * SFTP session starts in the login home, which is what `~` means, and
-   * realpath yields the one spelling the breadcrumb, the workspace registry,
-   * and a later listing all agree on.
+   * `~/src`, or with `..` and doubled separators in it. `resolve` is the
+   * caller saying so: a typed path is settled with realpath, which yields the
+   * one spelling the breadcrumb, the workspace registry, and a later listing
+   * agree on, while a path the picker built from a listing is already that
+   * spelling. Skipping the call for the second case keeps a row click at one
+   * request instead of two on a slow link.
    */
-  async listDir(input: { hostId: string, path: string }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
+  async listDir(input: { hostId: string, path: string, resolve?: boolean }): Promise<{ path: string, entries: Array<{ name: string, path: string }> }> {
     const host = this.core.requireHost(input.hostId)
     const secret = await this.core.secret(host)
-    const requested = input.path.trim()
+    // The RPC is a boundary: a request without a path still has to list
+    // something, and the root is what an empty path has always meant.
+    const requested = (input.path ?? '').trim()
     // `~` is the login home: the SFTP session starts there, but SFTP does not
     // expand the tilde itself.
-    const home = requested === '~' || requested.startsWith('~/')
-      ? await this.core.pool.sftpRealpath(host, secret, '.')
-      : ''
-    const expanded = listingPath(requested, home)
-    const resolved = normalizeRemoteDirectory(await this.core.pool.sftpRealpath(host, secret, expanded)) ?? expanded
+    const wantsHome = requested === '~' || requested.startsWith('~/')
+    const home = wantsHome
+      ? normalizeRemoteDirectory(await this.core.pool.sftpRealpath(host, secret, '.'))
+      : null
+    // Guessing at a home would list the wrong directory under a path the
+    // operator asked for, so say so instead.
+    if (wantsHome && home === null) throw new Error('the remote did not report a login home')
+    const expanded = listingPath(requested, home ?? '')
+    const resolved = input.resolve === true
+      ? normalizeRemoteDirectory(await this.core.pool.sftpRealpath(host, secret, expanded)) ?? expanded
+      : expanded
     const entries = await this.core.pool.sftpList(host, secret, resolved)
     return { path: resolved, entries }
   }
