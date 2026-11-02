@@ -207,9 +207,11 @@ export function pickCompletion(input: {
   needle: string
 }): number | 'none' | 'missing' {
   if (input.highlighted >= 0) return input.highlighted
+  // A path that already ends at a directory has nothing to complete: the rows
+  // are that directory's children, and a lone child is not a completion of it.
+  if (input.needle.trim().length === 0) return 'none'
   if (input.visibleCount === 1) return 0
   if (input.exact >= 0) return input.exact
-  if (input.needle.trim().length === 0) return 'none'
   return 'missing'
 }
 

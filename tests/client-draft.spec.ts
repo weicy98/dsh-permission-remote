@@ -197,8 +197,10 @@ test('Enter completes the best match and explains a miss', () => {
   assert.equal(pickCompletion({ ...base, visibleCount: 1 }), 0)
   // Otherwise a row named exactly like the typed segment.
   assert.equal(pickCompletion({ ...base, exact: 1 }), 1)
-  // Nothing to complete once the path already ends at a directory.
+  // Nothing to complete once the path already ends at a directory — not even
+  // its only child, which is not a completion of the path itself.
   assert.equal(pickCompletion({ ...base, visibleCount: 0, needle: '' }), 'none')
+  assert.equal(pickCompletion({ ...base, visibleCount: 1, needle: '' }), 'none')
   // A miss is reported without asking the remote for a directory that is not there.
   assert.equal(pickCompletion({ ...base, visibleCount: 0 }), 'missing')
 })

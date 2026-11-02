@@ -1116,8 +1116,10 @@ function Section(props: SectionProps): JSX.Element {
    */
   useEffect(() => {
     if (browsing.length === 0 || request === null) return
-    if (shown === request) {
-      // Already there; a completion accepted for this request needs no fetch.
+    // The same rule the rows use. While the listing on screen already belongs to
+    // the box's directory there is nothing to fetch — and its late commit would
+    // reset a highlight the operator has moved in the meantime.
+    if (settled) {
       known.current = null
       return
     }
@@ -1140,7 +1142,7 @@ function Section(props: SectionProps): JSX.Element {
       stale = true
       clearTimeout(timer)
     }
-  }, [browsing, request, shown])
+  }, [browsing, request, settled, dir, listed])
 
   /**
    * Where a relative path typed next starts from: the directory the box was
@@ -1246,6 +1248,7 @@ function Section(props: SectionProps): JSX.Element {
                 className="dsh-ssh-button"
                 aria-expanded={newFolder !== null}
                 disabled={busy || !listed || !settled}
+                title={settled ? undefined : t('pathIncomplete')}
                 onClick={() => {
                   // A folder is created inside the directory being listed, so
                   // the row needs a committed listing to attach to.
