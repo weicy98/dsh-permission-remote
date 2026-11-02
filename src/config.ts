@@ -62,6 +62,12 @@ export const Config = Schema.object({
    * A mirror is usually needed where npmjs.org is slow or blocked.
    */
   rgRegistry: Schema.string().default('').volatile(),
+  /**
+   * Local directory the remote-workspace placeholder tree lives under. Empty
+   * keeps the built-in default (`<DSH_HOME>/remote`, or `DSH_SSH_REMOTE_ROOT`).
+   * The Settings action changes it and migrates the old tree there.
+   */
+  remoteRoot: Schema.string().default('').volatile(),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -118,6 +124,8 @@ export interface PluginConfig {
   readonly maxConnections: number
   readonly tagWorkspaceTitles: boolean
   readonly rgRegistry: string
+  /** Operator-chosen placeholder root, or empty for the built-in default. */
+  remoteRoot: string
 }
 
 type HostRef = Volatile<unknown>
@@ -168,6 +176,8 @@ export function readConfig(raw: unknown): PluginConfig {
   const tagDefault = record.tagWorkspaceTitles !== false
   const registryRef = refOf(record.rgRegistry)
   const registryDefault = typeof record.rgRegistry === 'string' ? record.rgRegistry : ''
+  const rootRef = refOf(record.remoteRoot)
+  const rootDefault = typeof record.remoteRoot === 'string' ? record.remoteRoot : ''
   const parsed = Config({
     ...record,
     hosts: copyHostRows(hostRef !== undefined ? hostRef.get() : record.hosts),
@@ -175,17 +185,19 @@ export function readConfig(raw: unknown): PluginConfig {
     // A volatile reference cannot be validated; resolve it to a value first.
     tagWorkspaceTitles: tagRef !== undefined ? tagRef.get() !== false : tagDefault,
     rgRegistry: registryRef !== undefined ? String(registryRef.get() ?? '') : registryDefault,
+    remoteRoot: rootRef !== undefined ? String(rootRef.get() ?? '') : rootDefault,
   }) as unknown as { hosts?: unknown, deletedHosts?: unknown, maxConnections?: number }
   const maxConnections = parsed.maxConnections ?? 4
   const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
   const registry = (): string => String(registryRef === undefined ? registryDefault : registryRef.get() ?? '').trim()
+  const root = (): string => String(rootRef === undefined ? rootDefault : rootRef.get() ?? '').trim()
   const ref = hostRef ?? parsed.hosts
   // `Config()` returns volatile wrappers for volatile fields even when the
   // input was a plain array, so prefer the parsed reference when present.
   const deletedRowRef = deletedRef ?? refOf(parsed.deletedHosts)
   const deletedRows = copyDeletedRows(deletedRowRef !== undefined ? deletedRowRef.get() : record.deletedHosts) ?? []
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, deletedRowRef, deletedRows)
-  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry() }
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, root, rootRef, deletedRowRef, deletedRows)
+  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root() }
 }
 
 function refOf(value: unknown): HostRef | undefined {
@@ -197,6 +209,8 @@ function viewConfig(
   maxConnections: number,
   tagWorkspaceTitles: () => boolean,
   rgRegistry: () => string,
+  remoteRoot: () => string,
+  rootRef: HostRef | undefined,
   deletedRef: HostRef | undefined,
   deletedRows: DeletedHost[],
 ): PluginConfig {
@@ -225,5 +239,154 @@ function viewConfig(
     get rgRegistry() {
       return rgRegistry()
     },
+    get remoteRoot() {
+      return remoteRoot()
+    },
+    set remoteRoot(value: string) {
+      // A read-only config (no volatile ref) cannot persist a new root; the
+      // migration must fail loudly rather than reporting a switch that is lost.
+      if (rootRef === undefined) throw new Error('the remote root setting is not writable in this config')
+      updateVolatile(rootRef, createVolatile(String(value ?? '')))
+    },
   }
+}
+
+/**
+ * One host row after validation, with schema defaults applied.
+ *
+ * Used by the JSON import: a hand-edited or foreign file must not put a row
+ * into the config that the handshake then chokes on. A host id is required to
+ * match the routing grammar, because a placeholder path is keyed by it.
+ */
+export function normalizeHostRow(raw: unknown): HostConfig {
+  if (!isRecord(raw)) throw new Error('each imported host must be an object')
+  const text = (value: unknown): string => (typeof value === 'string' ? value : '')
+  const id = text(raw.id).trim()
+  if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`imported host has an invalid id: ${JSON.stringify(raw.id)}`)
+  const host = text(raw.host).trim()
+  if (host.length === 0) throw new Error(`imported host ${id} is missing its address`)
+  const username = text(raw.username).trim()
+  if (username.length === 0) throw new Error(`imported host ${id} is missing its username`)
+  const rawPort = raw.port
+  const port = typeof rawPort === 'number' && Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 22
+  const auth: 'key' | 'password' = raw.auth === 'password' ? 'password' : 'key'
+  return {
+    id,
+    name: text(raw.name),
+    host,
+    port,
+    username,
+    auth,
+    privateKeyPath: text(raw.privateKeyPath),
+    fingerprint: text(raw.fingerprint),
+    opsPolicy: normalizeOpsPolicy(raw.opsPolicy),
+    loginEnv: normalizeLoginEnv(raw.loginEnv),
+  }
+}
+
+/** A JSON export of the host list; no secret ever rides along. */
+export interface HostConfigExport {
+  version: number
+  exportedAt: string
+  hosts: HostConfig[]
+  deletedHosts: DeletedHost[]
+}
+
+export function exportHostConfig(hosts: readonly HostConfig[], deletedHosts: readonly DeletedHost[]): HostConfigExport {
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    hosts: hosts.map(host => ({ ...host })),
+    deletedHosts: deletedHosts.map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' })),
+  }
+}
+
+/** A parsed import file: the host rows to merge and any tombstones it carried. */
+export interface HostConfigImport {
+  hosts: HostConfig[]
+  deletedHosts: DeletedHost[]
+}
+
+/** Read an export payload (`{hosts:[…]}`, or a bare array) into validated rows. */
+export function parseHostImport(payload: unknown): HostConfigImport {
+  let hostsRaw: unknown
+  let deletedRaw: unknown
+  if (Array.isArray(payload)) hostsRaw = payload
+  else if (isRecord(payload)) {
+    hostsRaw = payload.hosts
+    deletedRaw = payload.deletedHosts
+  } else {
+    throw new Error('imported file is not a host configuration export')
+  }
+  if (!Array.isArray(hostsRaw)) throw new Error('imported file has no "hosts" array')
+  const hosts = hostsRaw.map(normalizeHostRow)
+  const seen = new Set<string>()
+  for (const host of hosts) {
+    if (seen.has(host.id)) throw new Error(`imported file lists host ${host.id} more than once`)
+    seen.add(host.id)
+  }
+  const deletedHosts: DeletedHost[] = []
+  if (Array.isArray(deletedRaw)) {
+    for (const row of deletedRaw) {
+      if (!isRecord(row)) continue
+      const host = normalizeHostRow(row.host)
+      if (seen.has(host.id)) continue
+      seen.add(host.id)
+      deletedHosts.push({ host, deletedAt: typeof row.deletedAt === 'string' ? row.deletedAt : '' })
+    }
+  }
+  return { hosts, deletedHosts }
+}
+
+export interface HostImportResult {
+  hosts: HostConfig[]
+  deletedHosts: DeletedHost[]
+  added: number
+  updated: number
+  removed: number
+}
+
+/**
+ * Fold a parsed import into the current list.
+ *
+ * `merge` keeps every current host and lets the file override a matching id.
+ * `replace` makes the file the whole list. Either way an imported host that was
+ * a tombstone is revived, so restoring from a backup does not leave a ghost
+ * "deleted host" row beside the live one.
+ */
+export function mergeImportedHosts(
+  current: readonly HostConfig[],
+  currentDeleted: readonly DeletedHost[],
+  incoming: HostConfigImport,
+  mode: 'merge' | 'replace',
+): HostImportResult {
+  const importedIds = new Set(incoming.hosts.map(host => host.id))
+  let hosts: HostConfig[]
+  let added = 0
+  let updated = 0
+  let removed = 0
+  if (mode === 'replace') {
+    hosts = incoming.hosts.map(host => ({ ...host }))
+    added = incoming.hosts.length
+    removed = current.filter(host => !importedIds.has(host.id)).length
+  } else {
+    hosts = current.map(host => ({ ...host }))
+    const byId = new Map(hosts.map(host => [host.id, host]))
+    for (const host of incoming.hosts) {
+      const next = { ...host }
+      if (byId.has(host.id)) {
+        byId.set(host.id, next)
+        updated += 1
+      } else {
+        byId.set(host.id, next)
+        added += 1
+      }
+    }
+    hosts = [...byId.values()]
+  }
+  const baseDeleted = mode === 'replace' ? incoming.deletedHosts : currentDeleted
+  const deletedHosts = baseDeleted
+    .filter(row => !importedIds.has(row.host.id))
+    .map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))
+  return { hosts, deletedHosts, added, updated, removed }
 }

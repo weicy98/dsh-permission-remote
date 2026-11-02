@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
@@ -59,6 +59,14 @@ interface LayoutApi {
 interface LocaleApi {
   register(ns: string, lang: string, dict: Record<string, string>): () => void
   bind(ns: string): (key: string) => string
+}
+
+/** A remote-root change waiting on the operator's decision. */
+interface RootPrompt {
+  kind: 'sessions' | 'conflicts'
+  root: string
+  sessions?: number
+  conflicts?: string[]
 }
 
 /** `tagWorkspaces` returns the refreshed rows together with how many changed. */
@@ -219,6 +227,11 @@ function Section(props: SectionProps): JSX.Element {
   const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
   const [tagTitles, setTagTitles] = useState(true)
   const [rgRegistry, setRgRegistry] = useState('')
+  const [rootInfo, setRootInfo] = useState<RemoteRootInfo | null>(null)
+  const [rootDraft, setRootDraft] = useState('')
+  const [rootPrompt, setRootPrompt] = useState<RootPrompt | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
+  const importModeRef = useRef<'merge' | 'replace'>('merge')
   const [revision, setRevision] = useState(0)
   /** Which tab is showing. The page holds four unrelated groups of controls. */
   const [tab, setTab] = useState<TabId>('hosts')
@@ -230,8 +243,18 @@ function Section(props: SectionProps): JSX.Element {
     setHosts(loaded.hosts)
     setTagTitles(loaded.tagWorkspaceTitles)
     setRgRegistry(loaded.rgRegistry)
+    setRootDraft(loaded.remoteRoot)
     setRevision(loaded.revision)
     return loaded.hosts
+  }
+
+  /** The effective placeholder root and its default; a host without the RPC keeps the field hidden. */
+  async function reloadRoot(): Promise<void> {
+    try {
+      setRootInfo(await readRemoteRootInfo(ctx))
+    } catch {
+      setRootInfo(null)
+    }
   }
 
   async function toggleTagTitles(enabled: boolean): Promise<void> {
@@ -276,6 +299,7 @@ function Section(props: SectionProps): JSX.Element {
   useEffect(() => {
     // A host without the newer workspace RPC still has to list and save hosts.
     void reload().catch(error => fail(error))
+    void reloadRoot()
     void reloadWorkspaces().catch(() => setWorkspaces([]))
   }, [])
 
@@ -412,6 +436,99 @@ function Section(props: SectionProps): JSX.Element {
       note(t('registrySaved'))
     } catch (error) {
       await reload().catch(() => undefined)
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Change the placeholder root; the server may first ask about conflicts or live sessions. */
+  async function saveRemoteRoot(): Promise<void> {
+    setBusy(true)
+    setRootPrompt(null)
+    try {
+      await applyRootResult(await changeRemoteRoot(ctx, rootDraft))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function applyRootResult(result: RemoteRootChange): Promise<void> {
+    if (result.status === 'unchanged') {
+      note(t('remoteRootUnchanged'))
+      setRootDraft(result.root)
+      await reloadRoot()
+      return
+    }
+    if (result.status === 'has-sessions') {
+      setRootPrompt({ kind: 'sessions', root: result.root, sessions: result.sessions ?? 0 })
+      return
+    }
+    if (result.status === 'needs-strategy') {
+      setRootPrompt({ kind: 'conflicts', root: result.root, conflicts: result.conflicts ?? [] })
+      return
+    }
+    note(`${t('remoteRootChanged')} ${result.migration?.copied ?? 0}`)
+    setRootDraft(result.root)
+    await reloadRoot()
+    await reloadWorkspaces().catch(() => undefined)
+  }
+
+  /** Re-run the pending change with the operator's chosen strategy or force flag. */
+  async function resolveRootPrompt(strategy?: 'auto' | 'overwrite', force = false): Promise<void> {
+    if (rootPrompt === null) return
+    const target = rootPrompt.root
+    setBusy(true)
+    try {
+      const result = await changeRemoteRoot(ctx, target, { strategy, force })
+      setRootPrompt(null)
+      await applyRootResult(result)
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Download the host list as JSON. Secrets are never part of the config. */
+  async function doExport(): Promise<void> {
+    setBusy(true)
+    try {
+      const payload = await exportHosts(ctx)
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `dsh-ssh-hosts-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      note(t('exportedHosts'))
+    } catch (error) {
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function pickImport(mode: 'merge' | 'replace'): void {
+    importModeRef.current = mode
+    importInputRef.current?.click()
+  }
+
+  async function doImport(file: File): Promise<void> {
+    setBusy(true)
+    try {
+      const text = await file.text()
+      const payload = JSON.parse(text)
+      const result = await importHosts(ctx, payload, importModeRef.current)
+      await reload()
+      await reloadWorkspaces().catch(() => undefined)
+      note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}`)
+    } catch (error) {
       fail(error)
     } finally {
       setBusy(false)
@@ -1141,6 +1258,61 @@ function Section(props: SectionProps): JSX.Element {
         </label>
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRegistry()}>{t('save')}</button>
         <span className="dsh-ssh-note">{t('rgRegistryHint')}</span>
+      </div>
+      {/* Where the local mirror of every remote workspace lives. */}
+      <div className="dsh-ssh-registry">
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-root">
+          <span className="dsh-ssh-label">{t('remoteRoot')}</span>
+          <input
+            id="dsh-ssh-root"
+            className="dsh-ssh-input"
+            type="text"
+            value={rootDraft}
+            placeholder={rootInfo?.defaultRoot ?? '~/.dsh/remote'}
+            disabled={busy}
+            onChange={event => setRootDraft(event.target.value)}
+          />
+        </label>
+        <button type="button" className="dsh-ssh-button" disabled={busy || rootDraft.trim().length === 0} onClick={() => void saveRemoteRoot()}>{t('remoteRootSave')}</button>
+        <span className="dsh-ssh-note">{t('remoteRootHint')}{rootInfo !== null ? ` ${t('remoteRootCurrent')} ${rootInfo.current}` : ''}</span>
+        {rootPrompt !== null ? (
+          <div className="dsh-ssh-note dsh-ssh-danger-note">
+            {rootPrompt.kind === 'sessions'
+              ? `${t('remoteRootHasSessions')} ${rootPrompt.sessions}. ${t('remoteRootForceHint')}`
+              : `${t('remoteRootConflicts')} ${rootPrompt.conflicts?.length ?? 0}. ${t('remoteRootConflictHint')}`}
+            <span className="dsh-ssh-inline">
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setRootPrompt(null)}>{t('cancel')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button"
+                disabled={busy}
+                onClick={() => void resolveRootPrompt(rootPrompt.kind === 'conflicts' ? 'auto' : undefined, rootPrompt.kind === 'sessions')}
+              >{rootPrompt.kind === 'sessions' ? t('remoteRootForce') : t('remoteRootKeepTarget')}</button>
+              {rootPrompt.kind === 'conflicts'
+                ? <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void resolveRootPrompt('overwrite', false)}>{t('remoteRootOverwrite')}</button>
+                : null}
+            </span>
+          </div>
+        ) : null}
+      </div>
+      {/* Host list backup and restore. */}
+      <div className="dsh-ssh-registry">
+        <span className="dsh-ssh-label">{t('hostBackup')}</span>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void doExport()}>{t('exportHosts')}</button>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => pickImport('merge')}>{t('importMerge')}</button>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => pickImport('replace')}>{t('importReplace')}</button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: 'none' }}
+          onChange={event => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (file !== undefined) void doImport(file)
+          }}
+        />
+        <span className="dsh-ssh-note">{t('hostBackupHint')}</span>
       </div>
         </>
       ) : null}

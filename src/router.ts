@@ -8,10 +8,52 @@ import os from 'node:os'
 import path from 'node:path'
 import { posix } from 'node:path'
 
-export function remoteRoot(env: NodeJS.ProcessEnv = process.env): string {
+/**
+ * The placeholder root when nothing has overridden it: `DSH_SSH_REMOTE_ROOT`,
+ * else `<DSH_HOME>/remote` (`~/.dsh/remote`). Kept separate from
+ * {@link remoteRoot} so the Settings page can show what the default would be.
+ */
+export function defaultRemoteRoot(env: NodeJS.ProcessEnv = process.env): string {
   if (env.DSH_SSH_REMOTE_ROOT) return path.resolve(String(env.DSH_SSH_REMOTE_ROOT))
   const home = env.DSH_HOME ? String(env.DSH_HOME) : path.join(os.homedir(), '.dsh')
   return path.join(home, 'remote')
+}
+
+/**
+ * Runtime override for the placeholder root, set by the plugin from its
+ * `remoteRoot` setting. Every routing helper already funnels through
+ * {@link remoteRoot}, so a single setter beats threading the value through
+ * every call. `null` restores the environment/default resolution, which keeps
+ * a config-less install and the unit tests on their old behaviour.
+ */
+let remoteRootOverride: string | null = null
+
+export function setRemoteRootOverride(root: string | null): void {
+  const text = root === null ? '' : String(root).trim()
+  remoteRootOverride = text.length === 0 ? null : path.resolve(text)
+}
+
+export function remoteRoot(env: NodeJS.ProcessEnv = process.env): string {
+  if (remoteRootOverride !== null) return remoteRootOverride
+  return defaultRemoteRoot(env)
+}
+
+/**
+ * Expand a user-typed root into an absolute local path.
+ *
+ * `~` and `~/…` use this machine's home; every other relative spelling is
+ * refused, because the placeholder tree must live at a stable absolute path.
+ * @returns the resolved path, or `null` when the input is blank or relative.
+ */
+export function expandRemoteRoot(input: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const text = String(input ?? '').trim()
+  if (text.length === 0) return null
+  const home = env.HOME && String(env.HOME).length > 0 ? String(env.HOME) : os.homedir()
+  let expanded = text
+  if (text === '~') expanded = home
+  else if (text.startsWith('~/')) expanded = path.join(home, text.slice(2))
+  if (!path.isAbsolute(expanded)) return null
+  return path.resolve(expanded)
 }
 
 /** Same grammar as `credentialKey()` segments: lowercase, digits, and hyphens. */

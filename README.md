@@ -80,6 +80,18 @@ dsh plugin --profile web add dsh-permission-remote
 
 `workspace-write` 的文件写入在远端沙箱进程里完成：内容先进入同目录的临时文件，再 `mv -f` 换成目标文件。中途断开留下的是临时文件，原来的内容还在。`danger-full-access` 用同一步替换，但不包沙箱。
 
+### 远端根目录与配置备份
+
+设置页的「远端根目录」是本地存放所有远端工作区占位目录的位置，默认 `~/.dsh/remote`（可用 `DSH_SSH_REMOTE_ROOT` 覆盖）。改到新目录并点「保存并迁移」时：
+
+- 新目录不存在或是空的：把旧的 `remote` 目录整棵复制过去。
+- 新目录已有内容：自动合并——缺失的补上、完全相同的跳过、同名但内容不同的文件先不覆盖，页面上会问你要「保留目标（自动合并）」还是「用旧目录覆盖」。
+- 工作区里有打开着的会话时，会先提示；迁移会按远端路径把这些工作区重新注册到新占位目录下，正在进行的会话需要重新打开。
+
+旧目录不会被删除，确认无误后可自行清理。迁移只搬本机的占位目录，不动远端服务器上的文件。
+
+设置页还有「主机配置备份」：**导出配置**把主机列表存成 JSON（不含口令和私钥口令，它们只在凭据存储里）；**导入并合并**按主机 id 更新或新增，**导入并替换**用文件整体替换现有列表。导入后请重新测试连接，并按需重填口令。
+
 ## 权限
 
 | 档位 | 文件写入 | bash |
@@ -226,6 +238,17 @@ The variables are reused until the connection drops, the switch goes back to SSH
 In the conversation, reading, editing, searching, and shell commands run on the remote machine. The file list on the left is still the local placeholder directory.
 
 When DSH itself is running on Windows, a remote workspace exposes only the remote `bash` tool. `pwsh`, `powershell`, and `cmd` stay off the native tool list, and the static `tool:pwsh` note about Windows process termination is covered while the session remains on that workspace. Returning to a local directory restores those Windows tools and the original note. A `complete: true` persona such as `minimal` is not rewritten; the tool-list filter and an execution guard keep the Windows shells from running. A built-in preset's `pwsh` sits on an ancestor scope, so entering a remote workspace removes it from the native tool list and from the `ptc` SDK text. A `pwsh` registered on the agent scope itself cannot be removed that way: the SDK text may still name it, the native list is filtered, and the call is denied. File-tool arguments keep the placeholder paths the tools already return.
+
+### Remote root directory and config backup
+
+The Settings page's **Remote root directory** is where every remote-workspace placeholder lives on this machine. It defaults to `~/.dsh/remote` (overridable with `DSH_SSH_REMOTE_ROOT`). Pressing **Save and migrate** with a new directory:
+
+- copies the whole old `remote` tree when the target is absent or empty;
+- merges when the target already has content: missing entries are added, identical files skipped, and a same-named file with different content is left alone until you choose **Keep target (auto-merge)** or **Overwrite from old root**.
+
+If a workspace has a live session the page asks first; the migration re-registers those workspaces under the new placeholder paths, so their sessions must be reopened. The old directory is kept, so you can delete it once you are happy. Only the local placeholder tree moves; files on the remote servers are untouched.
+
+**Host configuration backup** exports the host list as JSON with no passwords or key passphrases (those live only in the credential store). **Import and merge** updates or adds by host id; **Import and replace** makes the file the whole list. After importing, test the connections again and re-enter secrets as needed.
 
 ### Sidebar terminal
 
