@@ -407,35 +407,60 @@ test('rendered reads say when more lines follow', () => {
   assert.match(text, /lines 1-1 of 4; more lines follow/)
 })
 
-test('ssh_workspace hands an absolute directory to the registry without a prompt', async () => {
+test('ssh_workspace takes the command gate: an ask host denies the first call', async () => {
+  const { api: hostApi, workspaces, modes } = api()
+  await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, {}), /escalation available/)
+  // Nothing is registered before the session mode is settled.
+  assert.deepEqual(workspaces, [])
+  // The resolver was asked once, without an escalation argument.
+  assert.equal(modes.length, 1)
+  assert.equal(modes[0]![0], undefined)
+  assert.equal(modes[0]![1], undefined)
+})
+
+test('ssh_workspace registers once the call is escalated, and names the directory on the card', async () => {
   const { api: hostApi, workspaces, commands, modes } = api()
-  const value = await runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, {})
+  const value = await runSshWorkspace(hostApi, host(), {
+    directory: '/srv/app',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'add my project',
+  }, {})
   assert.deepEqual(workspaces, [{ hostId: 'prod1', remotePath: '/srv/app', title: undefined }])
   assert.equal(value.remotePath, '/srv/app')
   assert.equal(value.created, true)
-  assert.equal(value.currentSessionChanged, false)
-  // Registering is a local action: no shell, no approval card.
+  // The card names what is being granted, not just the tool.
+  const detail = modes[0]![2]
+  assert.match(detail!.en, /add workspace for \/srv\/app on prod \(10\.0\.0\.1\)/)
+  assert.match(detail!.zh, /在 prod \(10\.0\.0\.1\) 上为 \/srv\/app 添加工作区/)
+  // Registration itself runs no shell.
   assert.deepEqual(commands, [])
+})
+
+test('ssh_workspace asks for no mode on a trust host', async () => {
+  const { api: hostApi, workspaces, modes } = api()
+  await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app' }, {})
+  assert.equal(workspaces.length, 1)
   assert.deepEqual(modes, [])
 })
 
 test('ssh_workspace expands a leading ~/ against the remote home', async () => {
   const { api: hostApi, workspaces } = api()
-  await runSshWorkspace(hostApi, host(), { directory: '~/code/app', title: 'app' }, {})
+  await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '~/code/app', title: 'app' }, {})
   // The one remote command is the `$HOME` probe; the registry sees the absolute path.
   assert.equal(workspaces[0]!.remotePath, '/home/ops/code/app')
 })
 
-test('ssh_workspace passes the title through and keeps the session put', async () => {
+test('ssh_workspace passes the title through', async () => {
   const { api: hostApi, workspaces } = api()
-  const value = await runSshWorkspace(hostApi, host(), { directory: '/srv/app', title: 'my app' }, {})
+  await runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app', title: 'my app' }, {})
   assert.equal(workspaces[0]!.title, 'my app')
-  assert.equal(value.currentSessionChanged, false)
 })
 
-test('ssh_workspace refuses a relative directory before connecting', async () => {
-  const { api: hostApi, workspaces, commands } = api()
+test('ssh_workspace rejects a malformed directory before asking for a mode', async () => {
+  const { api: hostApi, workspaces, commands, modes } = api()
   await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: 'srv/app' }, {}), /absolute/)
+  // A call that cannot succeed must not open an approval card.
+  assert.deepEqual(modes, [])
   assert.deepEqual(commands, [])
   assert.deepEqual(workspaces, [])
 })
@@ -446,26 +471,18 @@ test('ssh_workspace surfaces a registration failure instead of reporting success
       throw new Error(`remote path is not a directory: ${remotePath}`)
     },
   })
-  await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: '/srv/app/index.ts' }, {}), /not a directory/)
+  await assert.rejects(
+    () => runSshWorkspace(hostApi, host({ opsPolicy: 'trust' }), { directory: '/srv/app/index.ts' }, {}),
+    /not a directory/,
+  )
   assert.deepEqual(workspaces, [])
 })
 
-test('ssh_workspace follows the read gate: deny and untrusted refuse it', async () => {
+test('ssh_workspace refuses a deny host and an untrusted host key', async () => {
   const { api: hostApi, workspaces, commands } = api()
   await assert.rejects(() => runSshWorkspace(hostApi, host({ opsPolicy: 'deny' }), { directory: '/srv/app' }, {}), /disabled/)
   await assert.rejects(() => runSshWorkspace(hostApi, host({ fingerprint: '' }), { directory: '/srv/app' }, {}), /trust its fingerprint/)
   assert.deepEqual(commands, [])
-  assert.deepEqual(workspaces, [])
-})
-
-test('ssh_workspace is blocked by a cancelled call', async () => {
-  const controller = new AbortController()
-  controller.abort()
-  const { api: hostApi, workspaces } = api()
-  await assert.rejects(
-    () => runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, { signal: controller.signal }),
-    (error: unknown) => error instanceof Error && error.name === 'AbortError',
-  )
   assert.deepEqual(workspaces, [])
 })
 

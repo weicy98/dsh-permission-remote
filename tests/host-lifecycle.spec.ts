@@ -325,6 +325,48 @@ test('registering a directory that is a file or relative fails before creating a
   })
 })
 
+test('a mistyped remote directory is reported with the fix, not a bare SFTP code', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async () => {
+      throw new Error('No such file')
+    }
+    await assert.rejects(
+      () => core.registerWorkspace(host(), '/srv/nope'),
+      /remote directory not found on dev \(10\.0\.0\.5\): \/srv\/nope;.*ssh_exec/,
+    )
+    // Any other remote failure keeps its own wording.
+    fakePool.sftpStat = async () => {
+      throw new Error('Permission denied')
+    }
+    await assert.rejects(() => core.registerWorkspace(host(), '/root/app'), /Permission denied/)
+    assert.deepEqual(registry.rows, [])
+  })
+})
+
+test('a cancelled registration never stats the host or registers a row', async () => {
+  await withRemoteRoot(async () => {
+    const registry = new FakeRegistry()
+    const core = build(registry)
+    const stats: string[] = []
+    const fakePool = (core as unknown as { pool: { sftpStat: unknown } }).pool
+    fakePool.sftpStat = async (_host: unknown, _secret: unknown, path: string) => {
+      stats.push(path)
+      return { isDirectory: true, size: 0, mode: 0o040755 }
+    }
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(
+      () => core.registerWorkspace(host(), '/srv/app', undefined, controller.signal),
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+    )
+    assert.deepEqual(stats, [])
+    assert.deepEqual(registry.rows, [])
+  })
+})
+
 test('the ops tool host exposes the same registration as the settings page', async () => {
   await withRemoteRoot(async () => {
     const registry = new FakeRegistry()

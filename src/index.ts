@@ -30,7 +30,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { sniffImage } from './image.ts'
-import { opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
+import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, routeByCwd, type Route } from './router.ts'
 import {
   PWSH_SECTION,
@@ -590,7 +590,21 @@ export class Core {
     const normalized = normalizeRemoteDirectory(remotePath)
     if (normalized === null) throw new Error(`remote path must be absolute: ${remotePath}`)
     throwIfAborted(signal)
-    const info = await withSignal(this.pool.sftpStat(host, await this.secret(host), normalized), signal)
+    // Read the credential first: a credential-store failure must not be
+    // mistaken for a missing directory below.
+    const secret = await this.secret(host)
+    let info
+    try {
+      info = await withSignal(this.pool.sftpStat(host, secret, normalized), signal)
+    } catch (error) {
+      // A mistyped path is the common failure, and the bare SFTP code says
+      // nothing about the fix. Anything else (auth, network) is the remote's own
+      // news and is forwarded untouched.
+      if (isRemoteMissing(error)) {
+        throw new Error(`remote directory not found on ${hostLabel(host)}: ${normalized}; create it first with ssh_exec (mkdir -p) or pick an existing directory`)
+      }
+      throw error
+    }
     if (!info.isDirectory) throw new Error(`remote path is not a directory: ${normalized}`)
     const local = mapRemoteToLocal(host.id, normalized)
     if (local === null) throw new Error(`remote path must be absolute: ${normalized}`)
@@ -1199,11 +1213,12 @@ function opsTools(core: Core): object[] {
       },
     }), publishOpsTool({
       name: 'ssh_workspace',
-      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, whose file and command tools then run on that machine. The directory must already exist on the host and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. This only registers a workspace: the current session keeps its own directory, so use working_directory (or open the new workspace) to run commands there. Remote files are not modified. Allowed on any host whose ops policy is not "deny", but the host key must already be trusted in Settings → SSH hosts. The title defaults to the directory name.',
+      description: 'Add a workspace for an existing SSH host: register one remote directory as a DSH workspace, whose file and command tools then run on that machine. The directory must already exist on the host and be a directory; create it with ssh_exec first if it does not, and call ssh_hosts when you do not know the host id or name. The current session keeps its own directory; use working_directory to enter the new workspace, or the user can open it. Registering the workspace creates the local placeholder that working_directory needs, so this is a remote-access change, not just a list entry: on an "ask" host it runs only with danger-full-access, either from this session or a one-shot approval. Retry with sandbox_permissions "danger-full-access" and a one-sentence justification when it is denied. The title defaults to the directory name, and an existing workspace keeps its title (the result then reports created: false).',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         directory: { type: 'string', required: true, description: 'Absolute remote directory to register, or a path starting with "~/"' },
         title: { type: 'string', description: 'Sidebar title; defaults to the directory name, prefixed with the server when title tagging is on' },
+        ...OPS_ESCALATION,
       },
       output: textOutput(renderSshWorkspace),
       execute(args: unknown, exec: ToolExec) {

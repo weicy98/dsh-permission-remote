@@ -105,10 +105,11 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
   assert.deepEqual(hosts?.parameters.properties, {})
-  // Registering a workspace is a local action backed by one remote stat, so it
-  // advertises no escalation argument: there is no card to open.
+  // Registering a workspace creates the placeholder that working_directory needs,
+  // so it grants remote execution and advertises the same escalation as a write.
   assert.deepEqual(workspace?.parameters.required, ['host', 'directory'])
-  assert.deepEqual(Object.keys(workspace?.parameters.properties ?? {}).sort(), ['directory', 'host', 'title'])
+  assert.deepEqual(Object.keys(workspace?.parameters.properties ?? {}).sort(), ['directory', 'host', 'justification', 'sandbox_permissions', 'title'])
+  assert.deepEqual(workspace?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   // Only danger-full-access opens the ops approval card; narrower modes would
   // send the model into a retry that can never succeed.
   assert.deepEqual(exec?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])

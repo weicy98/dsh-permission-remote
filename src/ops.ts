@@ -199,23 +199,40 @@ export function renderOpsRead(value: Record<string, unknown>): string {
 /**
  * Register a remote directory as a DSH workspace.
  *
- * The remote side only reads (`stat`), and the registration is local, so this
- * follows the read gate rather than the command gate: a `deny` host refuses it
- * and an untrusted host key is refused, but no approval card is raised. The
- * remote files are never touched.
+ * This takes the command gate, not the read gate, even though the tool itself
+ * only reads (`stat`). Creating the workspace also creates the local placeholder
+ * directory, and `working_directory` accepts any existing directory, so the
+ * model can move this session into the placeholder afterwards and run `bash`,
+ * `read`, and `write` on that host. One registration therefore grants remote
+ * execution, and it must cost what a remote command costs: a `danger-full-access`
+ * session, a trusted host, or one approval naming the host and the directory.
  */
-export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
-  if (host.opsPolicy === 'deny') throw new Error(`remote ops are disabled for SSH host ${hostLabel(host)}`)
-  requireTrusted(host)
-  throwIfAborted(exec?.signal)
+export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
   const requested = String(args.directory ?? '').trim()
   if (requested.length === 0) throw new Error('directory is required')
+  // Shape check before the gate: a call that cannot succeed must not open an
+  // approval card. `~` is settled against the remote home after approval.
+  if (!posix.isAbsolute(requested) && requested !== '~' && !requested.startsWith('~/')) {
+    throw new Error(`directory must be an absolute remote path or start with "~/": ${requested}`)
+  }
+  await requireOps(
+    hostApi,
+    host,
+    exec,
+    args as OpsApprovalArgs,
+    'ssh_workspace',
+    hostSubject(host, 'remote workspace registration'),
+    {
+      en: `add workspace for ${clip(requested)} on ${hostLabel(host)}`,
+      zh: `在 ${hostLabel(host)} 上为 ${clip(requested)} 添加工作区`,
+    },
+  )
   const create = hostApi.createWorkspace
   if (create === undefined) throw new Error('this build cannot register a workspace for an SSH host')
   const secret = await hostApi.secretOf(host)
   const remotePath = await resolveOpsPath(hostApi, host, secret, requested, 'directory')
   const title = typeof args.title === 'string' ? args.title : undefined
-  const created = await create(host, remotePath, title, exec?.signal)
+  const created = await create(host, remotePath, title, exec.signal)
   return {
     host: opsHostView(host),
     path: created.path,
@@ -224,9 +241,6 @@ export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args:
     // The registry reuses an existing row and keeps its title, so a caller that
     // passed one cannot assume it was applied.
     created: created.created,
-    // The session stays where it is. Saying so stops the model from running
-    // `bash` and expecting it on the host it just registered.
-    currentSessionChanged: false,
   }
 }
 
@@ -238,7 +252,7 @@ export function renderSshWorkspace(value: Record<string, unknown>): string {
   if (value.created === false) {
     return `workspace already registered: "${title}" for ${path} on ${label}; nothing changed, and the existing title was kept`
   }
-  return `workspace added: "${title}" for ${path} on ${label}; the current session did not move`
+  return `workspace added: "${title}" for ${path} on ${label}; the current session did not move, and working_directory can enter it`
 }
 
 export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
@@ -287,7 +301,12 @@ export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Rec
   }
 }
 
-function isRemoteMissing(error: unknown): boolean {
+/**
+ * Whether a remote error says the path is not there. A bare SFTP code reads the
+ * same for a typo and for a moved directory, so workspace registration turns it
+ * into a hint instead of forwarding it.
+ */
+export function isRemoteMissing(error: unknown): boolean {
   return error instanceof Error && NOT_FOUND.test(error.message)
 }
 

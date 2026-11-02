@@ -100,17 +100,19 @@ dsh plugin --profile web add dsh-permission-remote
 | `ssh_exec` | 在那台机器上执行 `bash -lc`，可选绝对路径 `workdir` 和 `timeoutMs` |
 | `ssh_read` | 读取远端文件，1 MiB 上限，按行分页；支持 `~/` |
 | `ssh_write` | 用临时文件加 `mv -f` 原子替换远端文件。已有文件保留权限位，新文件按远端 umask 创建，目录路径会被拒绝 |
-| `ssh_workspace` | 给某台已有主机、以某个远端目录创建一个工作区。目录必须已经存在且是目录；标题默认取目录名，开了标题标注时会带上服务器前缀 |
+| `ssh_workspace` | 给某台已有主机、以某个远端目录创建一个工作区。目录必须已经存在且是目录；标题默认取目录名，开了标题标注时会带上服务器前缀。重复添加同一目录不会产生第二行，保留原标题，结果里会说明 |
 
 每台主机在设置里有一个**远程运维**策略：
 
-| 策略 | 读取 `ssh_read` / 添加工作区 `ssh_workspace` | 命令 `ssh_exec` / 写入 `ssh_write` |
+| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` / 添加工作区 `ssh_workspace` |
 |---|---|---|
 | 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，模型必须带 `sandbox_permissions: "danger-full-access"` 和理由重试后弹审批卡。卡片上有主机和截断后的命令或路径，批准只放宽这一次。其它档位不会弹卡 |
 | 信任 | 允许 | 直接执行，不弹审批 |
 | 禁止 | 拒绝 | 拒绝 |
 
-`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取和添加工作区只受「禁止」限制：`ssh_workspace` 只做一次远端 `stat`，然后在本机注册工作区，不改远端文件，因此不弹审批卡。新工作区不会把当前会话切过去——要在那里执行命令，用 `working_directory` 切目录，或者直接打开那个工作区。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
+`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
+
+`ssh_workspace` 虽然自己只做一次远端 `stat`、不改远端文件，但它和写操作同一档：注册工作区会顺手建好本机的占位目录，而 `working_directory` 接受任意已存在的目录，所以模型注册完就能用 `working_directory` 切进去，接着在那台机器上跑 `bash`、`read`、`write`。换句话说，一次注册等于把会话接到这台主机上，因此它要按命令的代价来换：本会话是 `danger-full-access`、主机被信任，或者一次写明主机和目录的审批。批准之后，新工作区里的命令仍按本会话的权限档位和远端沙箱执行。注册本身不会切换当前会话——要用 `working_directory` 切过去，或者直接打开那个工作区。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
 
 运维工具的前提：
 
@@ -245,17 +247,19 @@ A workspace whose directory is on your own computer can also act on a configured
 | `ssh_exec` | Run `bash -lc` on that host, with optional absolute `workdir` and `timeoutMs` |
 | `ssh_read` | Read a remote file, capped at 1 MiB, paginated by line; `~/` is expanded |
 | `ssh_write` | Replace a remote file atomically with a temp file and `mv -f`. An existing file keeps its permission bits, a new file uses the remote umask, and a directory path is rejected |
-| `ssh_workspace` | Add a workspace for an existing host from one remote directory. The directory must already exist and be a directory; the title defaults to its name, carrying the server prefix when title tagging is on |
+| `ssh_workspace` | Add a workspace for an existing host from one remote directory. The directory must already exist and be a directory; the title defaults to its name, carrying the server prefix when title tagging is on. Registering the same directory again keeps the existing row and its title, and the result says so |
 
 Each host has a **Remote ops** policy in Settings:
 
-| Policy | `ssh_read` / `ssh_workspace` | `ssh_exec` / `ssh_write` |
+| Policy | `ssh_read` | `ssh_exec` / `ssh_write` / `ssh_workspace` |
 |---|---|---|
 | Ask (default) | allowed | runs only when the session is `danger-full-access`; otherwise the first call is denied and a retry must pass `sandbox_permissions: "danger-full-access"` plus a justification. The approval card names the host and the truncated command or path, and grants this one call. Any other mode does not open a card |
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads and workspace registration are only limited by Deny: `ssh_workspace` does one remote `stat` and then registers the workspace locally, so it raises no approval card and never modifies remote files. It does not move the current session — use `working_directory` to run commands there, or open the new workspace. Registering the same remote directory again keeps the existing row and its title, and the result says so.
+Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
+
+`ssh_workspace` follows the same gate as a write, not as a read, although it only stats the directory and never modifies remote files: registering creates the local placeholder directory, and `working_directory` accepts any existing directory, so after one registration the model can move this session into the placeholder and run `bash`, `read`, and `write` on that host. One registration therefore hands over remote execution, and it costs what a remote command costs — the session's `danger-full-access`, a trusted host, or one approval naming the host and the directory. Once approved, commands in the new workspace still follow this session's permission mode and the remote sandbox. Registration itself does not move the current session — use `working_directory`, or open the new workspace. Registering the same remote directory again keeps the existing row and its title, and the result says so.
 
 Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 
