@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { posix, resolve as resolveLocalPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -32,7 +33,7 @@ import {
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, expandRemoteRoot, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
-import { migrateRemoteRoot, type MigrationReport, type MigrationStrategy } from './migrate.ts'
+import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -86,6 +87,8 @@ interface HostContext {
   workspaceRegistry: WorkspaceRegistryLike
   get(service: string): unknown
   on(event: 'agent/created', listener: (payload: { agent: AgentLike }) => void): () => void
+  /** Fired after any surface writes a settings section (`ns` is its id). */
+  on(event: 'settings/document-updated', listener: (ns: unknown, revision: number) => void): () => void
   effect(dispose: () => void): void
   logger?: { info(message: string): void, warn(message: string): void }
 }
@@ -630,12 +633,15 @@ export class Core {
     }
   }
 
-  /** Apply the configured root to the routing helpers. Called once at load. */
+  /**
+   * Apply the configured root to the routing helpers.
+   *
+   * Called at load and again whenever the settings section is written by any
+   * surface, so editing the value in the generic settings editor takes effect
+   * without a restart. A root already superseded by a migration stays routable:
+   * dropping it here would strand a session that is still on it.
+   */
   applyRemoteRootOverride(): void {
-    // A fresh load starts without the roots of the previous run; keeping a
-    // stale entry would make an unrelated local directory look like a remote
-    // placeholder for the lifetime of this process.
-    clearSupersededRoots()
     const configured = this.config.remoteRoot.trim()
     if (configured.length === 0) {
       setRemoteRootOverride(null)
@@ -648,6 +654,16 @@ export class Core {
       return
     }
     setRemoteRootOverride(expanded)
+    if (!existsSync(expanded)) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] the configured remote root ${expanded} does not exist; placeholders will be created there on demand`)
+    }
+  }
+
+  /** Re-read the root after a settings write from any surface. */
+  onSettingsUpdated(ns: unknown): void {
+    if (String(ns) !== 'permission-remote') return
+    this.applyRemoteRootOverride()
+    this.ctx.logger?.info(`[@dsh-permission-remote] remote root setting changed; routing now uses ${remoteRoot()}`)
   }
 
   /** The effective placeholder root and the built-in default. */
@@ -727,7 +743,10 @@ export class Core {
     // root, or that is not a directory, must be an error rather than a
     // confirmation prompt the operator can only answer into a failure.
     const strategy = opts.strategy ?? 'auto'
-    const plan = await migrateRemoteRoot(oldRoot, newRoot, strategy, true)
+    // One walk decides everything: the conflicts to ask about and the exact
+    // copy list that will run. The answer the operator gives then executes that
+    // list, so the plan and the outcome cannot disagree.
+    const plan = await planRemoteRoot(oldRoot, newRoot, strategy)
     const sessions = mapped.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
     if (sessions > 0 && !opts.force) return { status: 'has-sessions', oldRoot, root: newRoot, sessions }
     if (!plan.targetWasEmpty && opts.strategy === undefined && plan.conflicts.length > 0) {
@@ -735,7 +754,7 @@ export class Core {
     }
     let migration: MigrationReport
     try {
-      migration = await migrateRemoteRoot(oldRoot, newRoot, strategy)
+      migration = await runMigration(plan)
     } catch (error) {
       // The old root was only read from, so it is still the authoritative one.
       // The target may hold a partial copy, which nothing points at yet.
@@ -966,7 +985,11 @@ const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory'>, (host: ToolH
 export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const ctx = rawCtx as unknown as HostContext
   const core = new Core(ctx, readConfig(rawConfig), ctx.workspaceRegistry)
+  // A fresh load starts with no superseded roots: a leftover from a previous
+  // plugin instance would make an unrelated directory look like a placeholder.
+  clearSupersededRoots()
   core.applyRemoteRootOverride()
+  ctx.effect(() => ctx.on('settings/document-updated', ns => core.onSettingsUpdated(ns)))
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   ctx.effect(() => ctx.settings.configure({ auto: false }))

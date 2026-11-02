@@ -3,7 +3,7 @@ import test from 'node:test'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { migrateRemoteRoot } from '../src/migrate.ts'
+import { migrateRemoteRoot, planRemoteRoot, plannedReport, runMigration } from '../src/migrate.ts'
 import { addSupersededRoot, clearSupersededRoots, defaultRemoteRoot, expandRemoteRoot, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride, workspaceBinding } from '../src/router.ts'
 import {
   exportHostConfig,
@@ -354,5 +354,57 @@ test('a superseded root still yields the workspace binding used to pin the sandb
   } finally {
     clearSupersededRoots()
     setRemoteRootOverride(null)
+  }
+})
+
+test('the plan is what runs: the dry run and the real run report the same counts', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    await mkdir(from, { recursive: true })
+    await mkdir(to, { recursive: true })
+    await writeFile(join(from, 'same.txt'), 'same')
+    await writeFile(join(to, 'same.txt'), 'same')
+    await writeFile(join(from, 'add.txt'), 'add')
+    await writeFile(join(from, 'clash.txt'), 'from')
+    await writeFile(join(to, 'clash.txt'), 'target')
+
+    const plan = await planRemoteRoot(from, to, 'auto')
+    const planned = plannedReport(plan)
+    assert.equal(planned.action, 'merged')
+    assert.equal(planned.copied, 1)
+    assert.equal(planned.skipped, 1)
+    assert.equal(planned.overwritten, 0)
+    assert.deepEqual(planned.conflicts, ['clash.txt'])
+
+    const ran = await runMigration(plan)
+    assert.deepEqual(ran, planned)
+  } finally {
+    await box.dispose()
+  }
+})
+
+test('a file that appears after the plan is reported, never silently overwritten', async () => {
+  const box = await scratch()
+  try {
+    const from = join(box.dir, 'old')
+    const to = join(box.dir, 'new')
+    await mkdir(from, { recursive: true })
+    await mkdir(to, { recursive: true })
+    await writeFile(join(to, 'keep.txt'), 'target only') // makes the target non-empty
+    await writeFile(join(from, 'late.txt'), 'from')
+
+    const plan = await planRemoteRoot(from, to, 'auto')
+    assert.deepEqual(plan.copies.map(step => step.rel), ['late.txt'])
+    // The target gains that name between the plan and the copy.
+    await writeFile(join(to, 'late.txt'), 'appeared later')
+
+    const report = await runMigration(plan)
+    assert.equal(report.copied, 0)
+    assert.deepEqual(report.conflicts, ['late.txt'])
+    assert.equal(await readFile(join(to, 'late.txt'), 'utf8'), 'appeared later')
+  } finally {
+    await box.dispose()
   }
 })
