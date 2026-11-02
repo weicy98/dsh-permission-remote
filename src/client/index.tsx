@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, installRipgrep, purgeHost as purgeHostRequest, readHosts, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteWorkspaceView, type RunnerView } from './api.ts'
-import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, pathCandidates, pathQuery, pathTail, stepActive, toDraft, type Draft } from './draft.ts'
+import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, isPathQuery, joinPath, matchRange, mergeEditedHost, parentDir, pickCompletion, resolveUnder, splitPath, stepActive, toDraft, type Draft } from './draft.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -186,12 +186,31 @@ function Section(props: SectionProps): JSX.Element {
   const [dir, setDir] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string, path: string }>>([])
   /**
-   * Typed filter for the listing, applied while typing. It narrows the names
-   * already on screen, so it is local state, not a remote query: each keystroke
-   * costs no round trip. A new listing resets it, because the next directory is
-   * a different set of names and a stale query would hide all of them.
+   * The box's text. It is two things at once: a local name filter over the
+   * listing already on screen, and — once it contains a path — the path being
+   * completed, which does ask the remote for the directory it names. `pathMode`
+   * decides which, and is sticky: a typed path stays a path until the box is
+   * cleared, so deleting the last separator cannot silently become a name
+   * filter over a directory the operator did not choose.
    */
   const [filter, setFilter] = useState('')
+  /** Whether the box's text is a path (sticky until the box is cleared). */
+  const [pathMode, setPathMode] = useState(false)
+  /**
+   * The directory a relative path in the box resolves against: the one the box
+   * was empty in. It stays put while the box holds a path, because the panel
+   * walks with the path — resolving `a/b` against the `a` just entered would
+   * look for `a/a/b`.
+   */
+  const [origin, setOrigin] = useState('/')
+  /**
+   * The path-mode request whose listing is on screen. `null` means the listing
+   * came from an explicit navigation, not from the box; a mismatch means the box
+   * has moved on and the rows still on screen belong to another directory.
+   */
+  const [shown, setShown] = useState<string | null>(null)
+  /** Why the box's directory could not be listed; only shown for its request. */
+  const [baseError, setBaseError] = useState<{ request: string, text: string } | null>(null)
   /**
    * Failure of a listing request, shown inside the picker. A mistyped path has
    * to be explained where it was typed: the page message sits at the top, far
@@ -216,6 +235,12 @@ function Section(props: SectionProps): JSX.Element {
   const newFolderRef = useRef<HTMLInputElement | null>(null)
   const searchRef = useRef<HTMLInputElement | null>(null)
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
+  /**
+   * A completion the operator just accepted: the row already carries the
+   * directory's canonical path, so the listing can start from it instead of
+   * asking the remote to resolve the accepted text again.
+   */
+  const known = useRef<{ request: string, path: string } | null>(null)
   /** The open picker's card, scrolled into view when a host is opened. */
   const panelRef = useRef<HTMLDivElement | null>(null)
   const [busy, setBusy] = useState(false)
@@ -522,28 +547,38 @@ function Section(props: SectionProps): JSX.Element {
   /**
    * List one directory and commit it.
    *
-   * Failures come back instead of being reported here: a typed path may be
-   * tried twice, and the caller decides what the message names. `resolve` asks
-   * the remote to settle a typed path; a path built from a listing is already
-   * settled, so a row click stays one request.
+   * Failures come back instead of being reported here: the box's completion
+   * fetch and an explicit navigation word a failure differently, and only the
+   * caller knows which path the message should name. `resolve` asks the remote
+   * to settle a path the operator typed; a path taken from a listing is already
+   * settled, so a row click stays one request. `keepQuery` keeps the box's text:
+   * it is the path being completed, not a filter for this listing.
    */
-  async function listPath(hostId: string, path: string, options: { resolve?: boolean } = {}): Promise<{ ok: true } | { ok: false, error: unknown }> {
+  async function listPath(hostId: string, path: string, options: { resolve?: boolean, keepQuery?: boolean, request?: string, ifCurrent?: () => boolean } = {}): Promise<{ ok: true } | { ok: false, error: unknown }> {
     try {
       const listed = await callHost<{ path: string, entries: Array<{ name: string, path: string }> }>(ctx, 'listDir', { hostId, path, resolve: options.resolve === true })
+      // An SFTP call cannot be cancelled, so a late answer to a request the box
+      // has already left is dropped instead of committing its directory.
+      if (options.ifCurrent !== undefined && !options.ifCurrent()) return { ok: true }
       // Only commit once the listing succeeded: a failure keeps the previous host.
       setBrowsing(hostId)
       setDir(listed.path)
       setEntries(listed.entries)
       setListed(true)
+      setShown(options.request ?? null)
       setPathError('')
+      setBaseError(null)
       // A refresh keeps a query on the same directory useful; walking to another
       // directory — or to another host at the same path — does not, since none of
-      // those names are on screen under the query any more.
+      // those names are on screen under the query any more. A path being
+      // completed is not a query for this listing, so it survives the walk.
       if (listed.path !== dir || hostId !== browsing) {
-        setFilter('')
         setActive(-1)
-        // A name typed for the previous directory does not belong to this one.
-        setNewFolder(null)
+        if (options.keepQuery !== true) {
+          editFilter('')
+          // A name typed for the previous directory does not belong to this one.
+          setNewFolder(null)
+        }
       }
       return { ok: true }
     } catch (error) {
@@ -562,50 +597,61 @@ function Section(props: SectionProps): JSX.Element {
   }
 
   /**
-   * Enter a directory named in the filter box.
-   *
-   * The candidates come from `pathCandidates`: `me/projects` is read relative to
-   * the listed directory first, the way a picker resolves a typed path, and then
-   * from the root, because typing `home/me` for `/home/me` is the common slip.
-   * Only when every candidate fails does the message stand, and it names what
-   * was typed rather than either resolved guess; the listing stays where it was
-   * so the query can be corrected.
+   * The one place the box's text changes, so path mode and the error slots
+   * cannot drift apart. A cleared box leaves path mode, and the next relative
+   * path then starts from the directory that is on screen.
    */
-  async function openPath(hostId: string, query: string): Promise<void> {
-    const candidates = pathCandidates(query, dir)
-    if (candidates.length === 0) return
-    setBusy(true)
-    try {
-      let result: { ok: true } | { ok: false, error: unknown } | null = null
-      for (const candidate of candidates) {
-        result = await listPath(hostId, candidate, { resolve: true })
-        if (result.ok) {
-          // The text was a path, not a filter for the listing that is now on
-          // screen: it has done its job, and leaving it behind would keep a
-          // path row for a directory the operator is already in.
-          setFilter('')
-          setActive(-1)
-          return
-        }
-      }
-      if (result !== null && !result.ok) failBrowse(hostId, query.trim(), result.error)
-    } finally {
-      setBusy(false)
-    }
+  function editFilter(next: string): void {
+    setFilter(next)
+    // Sticky: once the box held a path it keeps being one until it is cleared,
+    // so deleting the last separator cannot flip into a name filter over a
+    // directory the operator never picked.
+    setPathMode(next.trim().length === 0 ? false : pathMode || isPathQuery(next))
+    setActive(-1)
+    setPathError('')
+    if (next.trim().length === 0) setBaseError(null)
   }
 
-  function failBrowse(hostId: string, path: string, error: unknown): void {
+  /** Accept a completion: the box keeps the whole path, now ending at the row. */
+  function acceptCompletion(base: string, entry: { name: string, path: string }): void {
+    const next = joinPath(base, entry.name)
+    editFilter(next)
+    searchRef.current?.focus()
+    known.current = { request: resolveUnder(next, origin), path: entry.path }
+    // The value commits before the caret can be placed at its end.
+    setTimeout(() => {
+      const node = searchRef.current
+      node?.setSelectionRange(next.length, next.length)
+    }, 0)
+  }
+
+  /** Turn a listing failure into the sentence shown beside the box. */
+  function describeListingError(path: string, error: unknown): string {
     const text = error instanceof Error ? error.message : String(error)
     // A bare SFTP code reads the same for a typo and for a directory the account
     // may not enter, so name both instead of forwarding "No such file".
     const reason = /no such file|not found|does not exist|permission denied/i.test(text) ? t('dirMissing') : text
-    const message = t('cannotOpen').replace('{path}', path).replace('{reason}', reason)
+    return t('cannotOpen').replace('{path}', path).replace('{reason}', reason)
+  }
+
+  function failBrowse(hostId: string, path: string, error: unknown): void {
+    const message = describeListingError(path, error)
     // The picker is open on this host: the message belongs beside the box.
     if (browsing === hostId) {
       setPathError(message)
       return
     }
     fail(message)
+  }
+
+  /**
+   * Navigate from a control instead of the box: the typed path has served its
+   * purpose, so the box is cleared and the panel moves where the click said. In
+   * name-filter mode a refresh of the same directory keeps the filter.
+   */
+  function navigate(hostId: string, path: string): void {
+    if (pathMode) editFilter('')
+    void browse(hostId, path)
   }
 
   /** Close the picker without touching the host or the remote. */
@@ -615,6 +661,11 @@ function Section(props: SectionProps): JSX.Element {
     setDir('/')
     setListed(false)
     setFilter('')
+    setPathMode(false)
+    setOrigin('/')
+    setShown(null)
+    setBaseError(null)
+    known.current = null
     setActive(-1)
     setPathError('')
     // The name belongs to one directory; reopening the picker elsewhere must
@@ -749,8 +800,7 @@ function Section(props: SectionProps): JSX.Element {
       // explicitly; only when there is nothing to clear does Esc give up focus.
       if (filter.length > 0) {
         event.preventDefault()
-        setFilter('')
-        setActive(-1)
+        editFilter('')
         return
       }
       event.preventDefault()
@@ -768,20 +818,37 @@ function Section(props: SectionProps): JSX.Element {
     if (event.key === 'Enter') {
       if (busy || browsing.length === 0) return
       event.preventDefault()
-      const entry = highlighted >= 0 ? visible[highlighted] : undefined
-      if (entry !== undefined) {
-        void browse(browsing, entry.path)
+      if (context !== null) {
+        // The rows below belong to the directory being typed; while it is still
+        // being listed there is nothing to accept yet.
+        if (!settled) return
+        // A path is completed, not opened: the row matching the segment being
+        // typed takes the box to the directory it names. Nothing matched is said
+        // here instead of sent to the remote, which would only repeat it.
+        const choice = pickCompletion({
+          highlighted,
+          visibleCount: count,
+          exact: visible.findIndex(entry => entry.name === context.needle),
+          needle: context.needle,
+        })
+        if (choice === 'none') return
+        if (choice === 'missing') {
+          setPathError(t('cannotOpen').replace('{path}', filter.trim()).replace('{reason}', t('dirMissing')))
+          return
+        }
+        const entry = visible[choice]
+        if (entry !== undefined) acceptCompletion(context.base, entry)
         return
       }
-      // Nothing highlighted, so Enter is about what was typed: a path is opened,
-      // and a name filter narrowed to one row enters that row. An empty box is
-      // not a query, so it is left alone rather than guessing at a directory.
-      if (goTo !== null) {
-        void openPath(browsing, filter)
+      const highlightedEntry = highlighted >= 0 ? visible[highlighted] : undefined
+      if (highlightedEntry !== undefined) {
+        void browse(browsing, highlightedEntry.path)
         return
       }
+      // Nothing highlighted and no path typed: a name filter narrowed to one row
+      // enters it. An empty box is not a query, so it is left alone.
       const only = visible[0]
-      if (filter.trim().length > 0 && visible.length === 1 && only !== undefined) void browse(browsing, only.path)
+      if (filter.trim().length > 0 && count === 1 && only !== undefined) void browse(browsing, only.path)
       return
     }
     if (event.key === 'Home' || event.key === 'End') {
@@ -791,19 +858,37 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
-  const target = createTarget(browsing, listed)
   const crumbs = dir.split('/').filter(Boolean)
-  // A path typed in the box names a directory instead of filtering names; this
-  // side can resolve it lexically, but only the remote can say it exists.
-  const goTo = pathQuery(filter, dir)
-  // The listing is filtered locally as the box is typed; `filter` never reaches
-  // the remote, so every keystroke is instant even on a slow link. A path query
-  // narrows by its last segment, so `/home/we` still shows `weichongyong` next
-  // to the path row instead of emptying the list.
-  const visible = filterEntries(entries, goTo === null ? filter : pathTail(filter))
+  /**
+   * The box read as a path: the directory its suggestions come from and the
+   * segment still being typed. `null` means the box is a name filter.
+   */
+  const context = pathMode ? splitPath(filter) : null
+  /** The request the suggestions need; `null` when the box filters names. */
+  const request = context === null ? null : resolveUnder(context.base, origin)
+  /**
+   * Whether the rows on screen belong to the box. While a directory is being
+   * listed the previous rows are hidden: showing one directory's names under
+   * another directory's path is how a picker lies about what Enter will do.
+   */
+  const settled = context === null || shown === request || (shown === null && listed && dir === request)
+  const rows = settled ? entries : []
+  /** The local needle: the whole filter, or the path's last segment. */
+  const needle = context === null ? filter : context.needle
+  const visible = filterEntries(rows, needle)
   // Derived, not stored: the filter can shrink `visible` between keystrokes, and
   // deriving keeps the highlight on a real row without another effect.
   const highlighted = clampActive(active, visible.length)
+  /** The directory the box names; `undefined` while its last segment is open. */
+  const namedPath = context === null || needle.length === 0 ? dir : undefined
+  const target = createTarget(browsing, listed && settled)
+  /** The one error slot under the box: a completion miss, or a failed listing. */
+  const failed = baseError !== null && baseError.request === request
+  const errorText = pathError.length > 0
+    ? pathError
+    : baseError !== null && baseError.request === request ? baseError.text : ''
+  /** No rows yet because the box's directory is still being listed. */
+  const pending = context !== null && !settled && !failed
 
   /**
    * `/` focuses the filter box, the convention every file picker uses. It is a
@@ -838,6 +923,52 @@ function Section(props: SectionProps): JSX.Element {
     if (highlighted < 0) return
     rowRefs.current[highlighted]?.scrollIntoView({ block: 'nearest' })
   }, [highlighted])
+
+  /**
+   * While the box holds a path, the listing follows the directory it points at:
+   * the rows are the children of everything before the last separator, filtered
+   * by the part still being typed. The request is debounced because a pasted
+   * path changes it once while typing changes it at every separator, and an
+   * answer that arrives after the box moved on is dropped — an SFTP call cannot
+   * be cancelled.
+   */
+  useEffect(() => {
+    if (browsing.length === 0 || request === null) return
+    if (shown === request) {
+      // Already there; a completion accepted for this request needs no fetch.
+      known.current = null
+      return
+    }
+    const hostId = browsing
+    const wanted = request
+    // Name what the operator typed when explaining a failure; a relative prefix
+    // is meaningless to the reader once it has been folded into `origin`.
+    const label = context !== null && context.base.length > 0 ? context.base : origin
+    const knownPath = known.current !== null && known.current.request === wanted ? known.current.path : null
+    if (knownPath !== null) known.current = null
+    let stale = false
+    const timer = setTimeout(() => {
+      void listPath(hostId, knownPath ?? wanted, { resolve: knownPath === null, keepQuery: true, request: wanted, ifCurrent: () => !stale })
+        .then(result => {
+          if (stale || result.ok) return
+          setBaseError({ request: wanted, text: describeListingError(label, result.error) })
+        })
+    }, knownPath === null ? 160 : 0)
+    return () => {
+      stale = true
+      clearTimeout(timer)
+    }
+  }, [browsing, request, shown])
+
+  /**
+   * Where a relative path typed next starts from: the directory the box was
+   * empty in. It keeps up while the box is empty, and freezes once a path is in
+   * it — which is what lets the panel walk without dragging the anchor along.
+   */
+  useEffect(() => {
+    if (pathMode) return
+    setOrigin(dir)
+  }, [pathMode, dir])
 
   /**
    * The picker opens inside the host row that was clicked, which may be far
@@ -926,13 +1057,13 @@ function Section(props: SectionProps): JSX.Element {
           </div>
           <div className="dsh-ssh-browser-tools">
             <div className="dsh-ssh-inline">
-              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => void browse(host.id, parentDir(dir))}>{t('up')}</button>
-              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void browse(host.id, dir)}>{t('refresh')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy || dir === '/'} onClick={() => navigate(host.id, parentDir(dir))}>{t('up')}</button>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => navigate(host.id, dir)}>{t('refresh')}</button>
               <button
                 type="button"
                 className="dsh-ssh-button"
                 aria-expanded={newFolder !== null}
-                disabled={busy || !listed}
+                disabled={busy || !listed || !settled}
                 onClick={() => {
                   // A folder is created inside the directory being listed, so
                   // the row needs a committed listing to attach to.
@@ -945,19 +1076,26 @@ function Section(props: SectionProps): JSX.Element {
                   setTimeout(() => newFolderRef.current?.focus(), 0)
                 }}
               >{t('newFolder')}</button>
-              <button type="button" className="dsh-ssh-button" data-primary="true" disabled={busy || target === null} onClick={() => { if (target !== null) void createWorkspace(target, dir) }}>{t('createWorkspace')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button"
+                data-primary="true"
+                disabled={busy || target === null || namedPath === undefined}
+                title={namedPath === undefined ? t('pathIncomplete') : undefined}
+                onClick={() => { if (target !== null && namedPath !== undefined) void createWorkspace(target, namedPath) }}
+              >{t('createWorkspace')}</button>
             </div>
             <button type="button" className="dsh-ssh-close" aria-label={t('closeBrowser')} title={t('closeBrowser')} disabled={busy} onClick={closeBrowser}>×</button>
           </div>
         </div>
         <div className="dsh-ssh-breadcrumb">
-          <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(host.id, '/')}>/</button>
+          <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => navigate(host.id, '/')}>/</button>
           {/* The root button already draws one separator: repeating it in the
               first part rendered `// home` for `/home`. */}
           {crumbs.map((name, index) => (
             <span key={`${name}-${index}`} className="dsh-ssh-crumb-part">
               {index > 0 ? <span className="dsh-ssh-crumb-sep">/</span> : null}
-              <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => void browse(host.id, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
+              <button type="button" className="dsh-ssh-crumb" disabled={busy} onClick={() => navigate(host.id, `/${crumbs.slice(0, index + 1).join('/')}`)}>{name}</button>
             </span>
           ))}
         </div>
@@ -968,9 +1106,10 @@ function Section(props: SectionProps): JSX.Element {
           the caret here, and `/` brings it back from anywhere on the page. The
           hint in the box says both, so this is not something to discover.
         */}
-        {/* Local filter over the entries already listed. It never disables and
-            never calls the remote, so typing stays responsive while a listing
-            is in flight; it filters whatever entries are committed. */}
+        {/* One box, two jobs. A plain name narrows the rows already on screen
+            with no round trip. A path is the directory to complete: everything
+            before its last separator decides which listing the rows come from,
+            and only that part asks the remote, once per separator. */}
         <div className="dsh-ssh-browser-filter">
           <input
             ref={searchRef}
@@ -983,48 +1122,32 @@ function Section(props: SectionProps): JSX.Element {
             aria-activedescendant={highlighted >= 0 ? `dsh-ssh-dir-${highlighted}` : undefined}
             value={filter}
             aria-label={t('filter')}
-            aria-describedby="dsh-ssh-filter-hint"
+            aria-describedby={context !== null && needle.length > 0 ? 'dsh-ssh-complete' : 'dsh-ssh-filter-hint'}
             placeholder={t('filterPlaceholder')}
             autoComplete="off"
             spellCheck={false}
-            onChange={event => {
-              setFilter(event.target.value)
-              // The old highlight belongs to the previous set of names, and the
-              // old failure belongs to the path that was typed before this edit.
-              setActive(-1)
-              setPathError('')
-            }}
+            onChange={event => editFilter(event.target.value)}
             onKeyDown={onSearchKeyDown}
           />
           {/* One slot for both: the count answers "how many match" while
               typing, and the hint says where Tab and `/` go while the box is
               empty. Sharing the slot keeps the row from growing. */}
-          {filter.trim().length > 0 && entries.length > 0
+          {settled && needle.trim().length > 0 && entries.length > 0
             ? <span className="dsh-ssh-filter-count">{visible.length} / {entries.length}</span>
             : filter.trim().length === 0
               ? <span className="dsh-ssh-filter-hint" id="dsh-ssh-filter-hint">{t('filterHint')}</span>
               : null}
         </div>
-        {/* A typed path turns into a row of its own. The box is also a path
-            field, and a row says so instead of leaving that behind Enter. It
-            stays outside the listbox so row indices for the arrow keys are
-            untouched. */}
-        {goTo !== null
-          ? <div className="dsh-ssh-goto">
-              <button
-                type="button"
-                className="dsh-ssh-goto-button"
-                disabled={busy}
-                title={t('openPathHint')}
-                onClick={() => void openPath(host.id, filter)}
-              >
-                <span className="dsh-ssh-dir-icon" aria-hidden="true">↳</span>
-                <span className="dsh-ssh-goto-path">{goTo}</span>
-                <span className="dsh-ssh-goto-action">{t('openPath')} ↵</span>
-              </button>
-            </div>
+        {/* The box holds a whole path, so the segment still being typed is
+            named here: it is what the rows below would add to it. */}
+        {context !== null && needle.length > 0
+          ? <p className="dsh-ssh-complete" id="dsh-ssh-complete">
+              <span className="dsh-ssh-complete-label">{t('pathComplete')}</span>
+              <code className="dsh-ssh-complete-base">{context.base.length === 0 ? './' : `${context.base}/`}</code>
+              <code className="dsh-ssh-complete-needle">{needle}</code>
+            </p>
           : null}
-        {pathError.length > 0 ? <p className="dsh-ssh-browser-error" role="status">{pathError}</p> : null}
+        {errorText.length > 0 ? <p className="dsh-ssh-browser-error" role="status">{errorText}</p> : null}
         {/* The name lives in the picker, not a dialog: the operator creates a
             folder inside the directory they are looking at, and a modal would
             hide the listing that says whether the name is already taken. */}
@@ -1070,36 +1193,47 @@ function Section(props: SectionProps): JSX.Element {
           className="dsh-ssh-dirs"
           role="listbox"
           aria-label={t('directory')}
+          aria-busy={pending}
           onKeyDown={event => {
             if (event.key !== 'Escape' && event.key !== 'Backspace') return
             event.preventDefault()
             searchRef.current?.focus()
           }}
         >
-          {visible.map((entry, index) => (
-            <li key={entry.path} role="none">
-              <button
-                ref={node => { rowRefs.current[index] = node }}
-                id={`dsh-ssh-dir-${index}`}
-                type="button"
-                role="option"
-                aria-selected={index === highlighted}
-                className="dsh-ssh-dir"
-                data-active={index === highlighted ? 'true' : undefined}
-                disabled={busy}
-                onClick={() => void browse(host.id, entry.path)}
-                onFocus={() => setActive(index)}
-                onMouseEnter={() => setActive(index)}
-              >
-                <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
-                <span className="dsh-ssh-dir-name">{entry.name}</span>
-              </button>
-            </li>
-          ))}
-          {entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
-          {/* A path query is not a name filter, so "nothing matches" would be
-              the wrong answer while the path row above offers the way in. */}
-          {entries.length > 0 && visible.length === 0 && goTo === null ? <li className="dsh-ssh-empty">{t('noMatch')}</li> : null}
+          {visible.map((entry, index) => {
+            const range = matchRange(entry.name, needle)
+            return (
+              <li key={entry.path} role="none">
+                <button
+                  ref={node => { rowRefs.current[index] = node }}
+                  id={`dsh-ssh-dir-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === highlighted}
+                  className="dsh-ssh-dir"
+                  data-active={index === highlighted ? 'true' : undefined}
+                  disabled={busy}
+                  onClick={() => { if (context === null) void browse(host.id, entry.path); else acceptCompletion(context.base, entry) }}
+                  onFocus={() => setActive(index)}
+                  onMouseEnter={() => setActive(index)}
+                >
+                  <span className="dsh-ssh-dir-icon" aria-hidden="true">▸</span>
+                  <span className="dsh-ssh-dir-name">
+                    {range === null
+                      ? entry.name
+                      : <>
+                          <span className="dsh-ssh-dir-rest">{entry.name.slice(0, range[0])}</span>
+                          <span className="dsh-ssh-dir-match">{entry.name.slice(range[0], range[1])}</span>
+                          <span className="dsh-ssh-dir-rest">{entry.name.slice(range[1])}</span>
+                        </>}
+                  </span>
+                </button>
+              </li>
+            )
+          })}
+          {pending ? <li className="dsh-ssh-empty">{t('pathLoading').replace('{path}', context !== null && context.base.length > 0 ? context.base : origin)}</li> : null}
+          {settled && entries.length === 0 ? <li className="dsh-ssh-empty">{t('emptyDir')}</li> : null}
+          {settled && entries.length > 0 && visible.length === 0 ? <li className="dsh-ssh-empty">{t('noMatch')}</li> : null}
         </ul>
       </div>
     )

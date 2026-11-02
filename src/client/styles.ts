@@ -621,38 +621,25 @@ const CSS = `
   font-size: 11px;
   line-height: 18px;
 }
-/* A typed path offered as a row. It is not a child of the listing, so it keeps
-   its own border and never joins the arrow-key rows or their indices. */
-.dsh-ssh-goto {
+/* The segment the rows below would add to. It says where the suggestions come
+   from in the operator's own spelling, which the breadcrumb cannot: the box may
+   read ~/src while the breadcrumb shows the resolved /home/me/src. */
+.dsh-ssh-complete {
   display: flex;
-}
-.dsh-ssh-goto-button {
-  display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
-  width: 100%;
-  min-height: 28px;
+  min-width: 0;
   margin: 0;
-  padding: 0 8px;
-  border: 0.5px solid var(--dsw-alias-border-l2);
-  border-radius: var(--dsw-radius-md);
-  background: transparent;
-  color: var(--dsw-alias-label-primary);
-  font: inherit;
-  font-size: 13px;
-  line-height: 20px;
-  text-align: left;
-  cursor: pointer;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 18px;
 }
-.dsh-ssh-goto-button:hover:not(:disabled) {
-  border-color: var(--dsw-alias-brand-primary);
-  background: var(--dsw-alias-interactive-bg-hover);
+.dsh-ssh-complete-label {
+  flex: none;
+  white-space: nowrap;
 }
-.dsh-ssh-goto-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-.dsh-ssh-goto-path {
+.dsh-ssh-complete-base,
+.dsh-ssh-complete-needle {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -660,13 +647,11 @@ const CSS = `
   font-family: var(--ds-font-family-code, ui-monospace, monospace);
   font-size: 12px;
 }
-.dsh-ssh-goto-action {
-  flex: none;
-  margin-left: auto;
-  color: var(--dsw-alias-label-tertiary);
-  font-size: 11px;
-  line-height: 18px;
-  white-space: nowrap;
+/* The part still being typed is the emphasised one: it is what the next row
+   adds to, and it matches the highlight inside the row names. */
+.dsh-ssh-complete-needle {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
 }
 /* A failed listing belongs under the box that asked for it, not at page top. */
 .dsh-ssh-browser-error {
@@ -772,6 +757,15 @@ const CSS = `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* While a query is typed, the match is what the row contributes to the box and
+   the rest is context, so only the match keeps the row's normal weight. */
+.dsh-ssh-dir-match {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+.dsh-ssh-dir-rest {
+  color: var(--dsw-alias-label-secondary);
 }
 .dsh-ssh-empty {
   padding: 8px;

@@ -63,13 +63,30 @@ test('opening the picker, or walking into another directory, focuses the box', (
   assert.match(body, /pointer: coarse/)
 })
 
+test('a typed path is completed in the listing, not turned into an "open" row', () => {
+  const picker = pickerOf()
+  // The path lives in the box: the rows below are the children of the directory
+  // before its last separator. The old "Open <path>" row is gone with that
+  // model, and the matched part of a name is marked so the row shows what it
+  // would add to the box.
+  assert.ok(!picker.includes('dsh-ssh-goto'), 'the open-path row is back')
+  assert.ok(picker.includes('className="dsh-ssh-complete"'), 'the completion line is missing')
+  assert.ok(picker.includes('matchRange(entry.name, needle)'), 'rows do not mark the matched segment')
+  // The line only appears while a segment is being typed; a finished path has
+  // nothing to complete, so it would just repeat the breadcrumb. It is also
+  // what the box describes itself with in that state.
+  assert.match(picker, /context !== null && needle\.length > 0/)
+  assert.match(picker, /aria-describedby=\{[^}]*'dsh-ssh-complete'/)
+})
+
 test('the empty box says where Tab and / go, and names itself to screen readers', () => {
   const picker = pickerOf()
   const hint = picker.indexOf('className="dsh-ssh-filter-hint"')
-  const described = picker.indexOf('aria-describedby="dsh-ssh-filter-hint"')
   assert.notEqual(hint, -1, 'the filter hint is missing')
-  assert.notEqual(described, -1, 'the box does not point at the hint')
-  assert.ok(described < hint, 'the box must describe itself with the hint it renders')
+  assert.ok(picker.includes('id="dsh-ssh-filter-hint"'), 'the hint has no id for the box to point at')
+  // The box describes itself with whichever of the two lines is on screen: the
+  // hint while it is empty, the segment being completed while it holds a path.
+  assert.match(picker, /aria-describedby=\{[^}]*'dsh-ssh-filter-hint'/, 'the box does not point at the hint')
   // One slot with the match count: the hint shows while the box is empty, the
   // count while it is not, so the row never grows.
   const before = picker.slice(Math.max(0, hint - 400), hint)

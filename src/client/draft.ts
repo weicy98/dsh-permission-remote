@@ -91,7 +91,8 @@ export function createTarget(browsing: string, listed: boolean): string | null {
  *
  * Only names are matched: every entry's `path` contains the current directory,
  * so matching paths would make any substring of that directory match
- * everything. Filtering stays local — a keystroke must not wait for the remote.
+ * everything. A plain name never reaches the remote, so a keystroke costs no
+ * round trip; only a path in the box asks for the directory it points at.
  */
 export function filterEntries<T extends { name: string }>(entries: readonly T[], query: string): readonly T[] {
   const needle = query.trim().toLowerCase()
@@ -113,24 +114,50 @@ export function isPathQuery(query: string): boolean {
   return text === '..' || text.startsWith('~') || text.includes('/')
 }
 
+/** The box's path split into the directory to list and the segment being typed. */
+export interface PathContext {
+  /** The directory the suggestions come from, as typed (`~/src`, `/home`, ``, `..`). */
+  base: string
+  /** The part still being typed, `''` once the path names a directory. */
+  needle: string
+}
+
 /**
- * The directory a typed query names, or `null` when it is a plain name filter.
+ * Split the box's path at its last separator.
  *
- * The listing box doubles as a path field: `/home/me`, `~/src`, `../shared`,
- * `..`, and `me/projects` all resolve here, so walking into a deep directory
- * does not mean clicking one level at a time. Relative queries resolve against
- * `cwd`, which is always an absolute listing path.
- *
- * `..`, `.`, and repeated separators are resolved lexically; symlinked parents
- * cannot be known here, and the remote realpath settles those when the listing
- * is requested. A leading `~` stays in the result: the remote home is the
- * remote's answer, not something this side can assume. `~user` is left exactly
- * as typed for the same reason — only the remote can say whose home that is,
- * and reading it as a child of the listed directory would be a guess.
+ * The box holds the whole path and only its last segment is incomplete:
+ * `/home/me/co` is the children of `/home/me` filtered by `co`. A trailing
+ * separator means the path already names a directory (`/home/me/`), and so does
+ * a last segment of `.` or `..`, which are steps rather than names — both leave
+ * nothing to complete, so the listing below is not filtered by them.
  */
-export function pathQuery(query: string, cwd: string): string | null {
-  const text = query.trim()
-  if (!isPathQuery(text)) return null
+export function splitPath(text: string): PathContext {
+  const raw = text.trim()
+  const trimmed = raw.replace(/\/+$/, '')
+  if (trimmed.length === 0) return { base: '/', needle: '' }
+  if (raw.endsWith('/')) return { base: trimmed, needle: '' }
+  // `~` and `~user` are whole paths, not a segment of one: the remote expands
+  // the login home (or refuses), and a listing cannot complete either of them.
+  if (trimmed.startsWith('~') && trimmed.indexOf('/') < 0) return { base: trimmed, needle: '' }
+  const slash = trimmed.lastIndexOf('/')
+  const last = slash < 0 ? trimmed : trimmed.slice(slash + 1)
+  if (last === '.' || last === '..') return { base: trimmed, needle: '' }
+  return { base: slash < 0 ? '' : trimmed.slice(0, slash), needle: last }
+}
+
+/**
+ * The remote path a typed prefix is asked as.
+ *
+ * A relative prefix resolves against `origin`, the directory the box was empty
+ * in. It stays put while the panel walks with the path, because resolving `a/b`
+ * against the directory `a` the panel just entered would look for `a/a/b`. `~`
+ * and `~user` stay as typed: the login home is the remote's answer. `.`, `..`,
+ * and doubled separators are folded lexically here, and the remote realpath
+ * settles symlinks when the listing is asked with `resolve`.
+ */
+export function resolveUnder(base: string, origin: string): string {
+  const text = base.trim()
+  if (text.length === 0 || text === '.') return origin
   if (text === '~' || text.startsWith('~/')) {
     const parts = normalizeSegments(text.slice(1), false)
     return parts.length === 0 ? '~' : `~/${parts.join('/')}`
@@ -138,45 +165,52 @@ export function pathQuery(query: string, cwd: string): string | null {
   // Someone else's home is not ours to expand.
   if (text.startsWith('~')) return text
   if (text.startsWith('/')) return absolutePath(text)
-  // `cwd` is absolute, so appending the query keeps absolute semantics: `..`
-  // above the root stays at the root instead of producing a relative path.
-  const base = cwd.replace(/\/+$/, '')
-  return absolutePath(`${base}/${text}`)
+  return absolutePath(`${origin.replace(/\/+$/, '')}/${text}`)
 }
 
 /**
- * The part of a typed path that names something in the listing, so typing
- * `/home/we` keeps `weichongyong` visible while the walk is being typed.
- *
- * It is read from the text, not from the resolved path: `..` resolves to a
- * directory whose name is not on screen, and narrowing by it would empty a
- * listing the operator is only asking to leave. `~` and the relative steps name
- * nothing here, so they contribute nothing.
+ * The box text after accepting a completion: the path names a directory now, so
+ * it ends with `/` and the next segment can be typed straight away.
  */
-export function pathTail(query: string): string {
-  const text = query.trim()
-  if (!isPathQuery(text)) return ''
-  const parts = text.split('/')
-    .filter(part => part.length > 0 && part !== '.' && part !== '..' && part !== '~')
-  return parts.length === 0 ? '' : parts[parts.length - 1] ?? ''
+export function joinPath(base: string, name: string): string {
+  const raw = base.trim()
+  const text = raw.replace(/\/+$/, '')
+  // A base that was only separators is the root, not an empty prefix.
+  if (text.length === 0) return raw.startsWith('/') ? `/${name}/` : `${name}/`
+  return `${text}/${name}/`
 }
 
 /**
- * The directories a typed query may name, in the order they are tried.
- *
- * A relative query is read from the listed directory first, the way a picker
- * resolves what is typed, and then — for a bare relative query such as
- * `home/me` — from the root: typing a path without its leading `/` is the
- * common slip. A query that starts with `/` or `~` means itself, and `..` is
- * already relative to `cwd` in the only way it can be, so neither gets a retry.
+ * The `[start, end)` a case-insensitive match covers in a name, or `null` when
+ * the name does not contain the typed segment. The listing uses it to show what
+ * a row would add to the box, so the match has to be found rather than assumed
+ * to be a prefix.
  */
-export function pathCandidates(query: string, cwd: string): string[] {
-  const first = pathQuery(query, cwd)
-  if (first === null) return []
-  const text = query.trim()
-  if (text === '..' || text.startsWith('/') || text.startsWith('~')) return [first]
-  const fromRoot = pathQuery(`/${text}`, '/')
-  return fromRoot === null || fromRoot === first ? [first] : [first, fromRoot]
+export function matchRange(name: string, needle: string): [number, number] | null {
+  const text = needle.trim().toLowerCase()
+  if (text.length === 0) return null
+  const at = name.toLowerCase().indexOf(text)
+  return at < 0 ? null : [at, at + text.length]
+}
+
+/**
+ * What Enter accepts, in the order a picker tries it: the highlighted row, the
+ * only matching row, then a row named exactly like the typed segment. `none`
+ * means there is nothing to complete (the path already ends at a directory) and
+ * `missing` means nothing matched — reported as a message instead of asking the
+ * remote for a directory that is not there.
+ */
+export function pickCompletion(input: {
+  highlighted: number
+  visibleCount: number
+  exact: number
+  needle: string
+}): number | 'none' | 'missing' {
+  if (input.highlighted >= 0) return input.highlighted
+  if (input.visibleCount === 1) return 0
+  if (input.exact >= 0) return input.exact
+  if (input.needle.trim().length === 0) return 'none'
+  return 'missing'
 }
 
 /** `/a//b/./c/../d` -> `/a/b/d`; `..` never escapes an absolute path. */

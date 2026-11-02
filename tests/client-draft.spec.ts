@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { HostView } from '../src/client/api.ts'
-import { blankDraft, clampActive, createTarget, draftPort, draftPortValid, filterEntries, isPathQuery, mergeEditedHost, parentDir, pathCandidates, pathQuery, pathTail, stepActive, toDraft } from '../src/client/draft.ts'
+import { blankDraft, clampActive, createTarget, draftPort, draftPortValid, filterEntries, isPathQuery, joinPath, matchRange, mergeEditedHost, parentDir, pickCompletion, resolveUnder, splitPath, stepActive, toDraft } from '../src/client/draft.ts'
 
 function host(overrides: Partial<HostView> = {}): HostView {
   return {
@@ -110,7 +110,7 @@ test('the directory filter never matches on the encoded path', () => {
   assert.deepEqual(filterEntries(entries, 'code'), [])
 })
 
-test('only a separator, a leading ~, or .. is a path', () => {
+test('only a separator, a leading ~, or .. opens path mode', () => {
   // A name filter cannot contain `/`, so the two meanings never collide; `~`
   // and `..` are not names a directory can have either.
   assert.equal(isPathQuery('src'), false)
@@ -125,64 +125,82 @@ test('only a separator, a leading ~, or .. is a path', () => {
   assert.equal(isPathQuery('src/lib'), true)
 })
 
-test('a typed path resolves against the listed directory', () => {
-  assert.equal(pathQuery('/home/me', '/'), '/home/me')
-  assert.equal(pathQuery('/home/me/', '/'), '/home/me')
-  assert.equal(pathQuery('//home///me', '/'), '/home/me')
-  assert.equal(pathQuery('me/projects', '/home/me'), '/home/me/me/projects')
-  assert.equal(pathQuery('../shared', '/home/me'), '/home/shared')
-  assert.equal(pathQuery('./src', '/srv/app'), '/srv/app/src')
-  // `..` on its own is the one relative step with no separator in it.
-  assert.equal(pathQuery('..', '/home/me'), '/home')
-  assert.equal(pathQuery('..', '/'), '/')
-  // Above the root there is nothing, and a relative escape must not be invented.
-  assert.equal(pathQuery('../../..', '/'), '/')
-  assert.equal(pathQuery('/../etc', '/'), '/etc')
+test('a typed path splits at its last separator', () => {
+  // The box holds the whole path; only its last segment is incomplete, and that
+  // segment is what the rows below complete.
+  assert.deepEqual(splitPath('/home/me/co'), { base: '/home/me', needle: 'co' })
+  assert.deepEqual(splitPath('/home/me'), { base: '/home', needle: 'me' })
+  // A trailing separator means the path already names a directory.
+  assert.deepEqual(splitPath('/home/me/'), { base: '/home/me', needle: '' })
+  assert.deepEqual(splitPath('/'), { base: '/', needle: '' })
+  assert.deepEqual(splitPath('/home/me//'), { base: '/home/me', needle: '' })
+  // `~` is the remote home; `~me` is somebody else's, and neither is a segment
+  // a listing could complete.
+  assert.deepEqual(splitPath('~'), { base: '~', needle: '' })
+  assert.deepEqual(splitPath('~/'), { base: '~', needle: '' })
+  assert.deepEqual(splitPath('~/src'), { base: '~', needle: 'src' })
+  assert.deepEqual(splitPath('~/src/'), { base: '~/src', needle: '' })
+  assert.deepEqual(splitPath('~me'), { base: '~me', needle: '' })
+  assert.deepEqual(splitPath('~me/src'), { base: '~me', needle: 'src' })
+  // `.` and `..` are steps, not names: the listing under them is unfiltered.
+  assert.deepEqual(splitPath('..'), { base: '..', needle: '' })
+  assert.deepEqual(splitPath('../shared'), { base: '..', needle: 'shared' })
+  assert.deepEqual(splitPath('/a/b/..'), { base: '/a/b/..', needle: '' })
+  // A relative path keeps its spelling; the panel resolves it against `origin`.
+  assert.deepEqual(splitPath('a/b'), { base: 'a', needle: 'b' })
+  assert.deepEqual(splitPath('co'), { base: '', needle: 'co' })
+  assert.deepEqual(splitPath('   '), { base: '/', needle: '' })
 })
 
-test('a typed ~ stays for the remote to expand', () => {
-  // The remote home is the remote's answer, so it is not guessed here.
-  assert.equal(pathQuery('~', '/srv'), '~')
-  assert.equal(pathQuery('~/src', '/srv'), '~/src')
-  assert.equal(pathQuery('~/src/../lib', '/srv'), '~/lib')
-  assert.equal(pathQuery('~', '/'), '~')
-  // Another account's home is the remote's business, so it is passed through as
-  // typed instead of being read as a child of the listed directory.
-  assert.equal(pathQuery('~me', '/srv'), '~me')
-  assert.equal(pathQuery('~me/src', '/srv'), '~me/src')
+test('a typed prefix resolves against the directory typing started in', () => {
+  assert.equal(resolveUnder('', '/home/me'), '/home/me')
+  assert.equal(resolveUnder('.', '/home/me'), '/home/me')
+  // The tilde is the remote's to expand, so it stays as typed.
+  assert.equal(resolveUnder('~', '/srv'), '~')
+  assert.equal(resolveUnder('~/src', '/srv'), '~/src')
+  assert.equal(resolveUnder('~/src/', '/srv'), '~/src')
+  assert.equal(resolveUnder('~/src/../lib', '/srv'), '~/lib')
+  // Another account's home is not ours to expand either.
+  assert.equal(resolveUnder('~me/src', '/srv'), '~me/src')
+  assert.equal(resolveUnder('/home/me', '/srv'), '/home/me')
+  assert.equal(resolveUnder('//home///me/', '/srv'), '/home/me')
+  assert.equal(resolveUnder('home/me', '/'), '/home/me')
+  assert.equal(resolveUnder('../shared', '/home/me'), '/home/shared')
+  // Above the root there is nothing, and an escape must not be invented.
+  assert.equal(resolveUnder('../../..', '/'), '/')
+  assert.equal(resolveUnder('/../etc', '/'), '/etc')
 })
 
-test('the tail of a typed path narrows the listing it is walked from', () => {
-  assert.equal(pathTail('/home/weich'), 'weich')
-  assert.equal(pathTail('/home/weichongyong/'), 'weichongyong')
-  assert.equal(pathTail('//home///we'), 'we')
-  assert.equal(pathTail('./src'), 'src')
-  assert.equal(pathTail('~/src'), 'src')
-  assert.equal(pathTail('~me/x'), 'x')
-  assert.equal(pathTail('~'), '')
-  // The relative steps name nothing on screen, so they narrow nothing: `..`
-  // leaves the current listing alone while offering a row for the parent.
-  assert.equal(pathTail('..'), '')
-  assert.equal(pathTail('~/..'), '')
-  // A plain name filter has no tail: the whole query stays the needle.
-  assert.equal(pathTail('src'), '')
+test('accepting a row leaves the box on a directory', () => {
+  assert.equal(joinPath('/home/me', 'code'), '/home/me/code/')
+  assert.equal(joinPath('/home/me/', 'code'), '/home/me/code/')
+  assert.equal(joinPath('/', 'home'), '/home/')
+  assert.equal(joinPath('~', 'src'), '~/src/')
+  assert.equal(joinPath('', 'code'), 'code/')
+  assert.equal(joinPath('..', 'shared'), '../shared/')
 })
 
-test('a typed path is tried against the listed directory, then the root', () => {
-  // The order is the contract: the literal reading of what was typed wins, and
-  // the root is only the second guess at a path typed without its leading `/`.
-  assert.deepEqual(pathCandidates('me/projects', '/home/me'), ['/home/me/me/projects', '/me/projects'])
-  assert.deepEqual(pathCandidates('../shared', '/home/me'), ['/home/shared', '/shared'])
-  // A path that means itself has nothing to retry.
-  assert.deepEqual(pathCandidates('/srv/app', '/home/me'), ['/srv/app'])
-  assert.deepEqual(pathCandidates('~/src', '/home/me'), ['~/src'])
-  assert.deepEqual(pathCandidates('~me/src', '/home/me'), ['~me/src'])
-  // `home/me` typed in the root is its own retry, so it is not tried twice.
-  assert.deepEqual(pathCandidates('home/me', '/'), ['/home/me'])
-  // `..` is already relative to the listed directory in the only way it can be.
-  assert.deepEqual(pathCandidates('..', '/home/me'), ['/home'])
-  // A plain name filter is not a path at all.
-  assert.deepEqual(pathCandidates('src', '/home/me'), [])
+test('the matched part of a name is what the row would add', () => {
+  assert.deepEqual(matchRange('code', 'co'), [0, 2])
+  // The match is found rather than assumed to be a prefix.
+  assert.deepEqual(matchRange('node_modules', 'mod'), [5, 8])
+  assert.deepEqual(matchRange('Code', 'co'), [0, 2])
+  assert.equal(matchRange('code', ''), null)
+  assert.equal(matchRange('code', 'zz'), null)
+})
+
+test('Enter completes the best match and explains a miss', () => {
+  const base = { highlighted: -1, visibleCount: 3, exact: -1, needle: 'co' }
+  // A highlighted row wins over everything else.
+  assert.equal(pickCompletion({ ...base, highlighted: 2 }), 2)
+  // A single candidate is unambiguous.
+  assert.equal(pickCompletion({ ...base, visibleCount: 1 }), 0)
+  // Otherwise a row named exactly like the typed segment.
+  assert.equal(pickCompletion({ ...base, exact: 1 }), 1)
+  // Nothing to complete once the path already ends at a directory.
+  assert.equal(pickCompletion({ ...base, visibleCount: 0, needle: '' }), 'none')
+  // A miss is reported without asking the remote for a directory that is not there.
+  assert.equal(pickCompletion({ ...base, visibleCount: 0 }), 'missing')
 })
 
 test('arrow keys start at an end and clamp instead of wrapping', () => {
