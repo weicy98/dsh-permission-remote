@@ -1,5 +1,5 @@
 import { mkdir } from 'node:fs/promises'
-import { posix } from 'node:path'
+import { posix, resolve as resolveLocalPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
@@ -31,7 +31,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, routeByCwd, type Route } from './router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, routeByCwd, type RemoteRoute, type Route } from './router.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -49,6 +49,7 @@ import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import {
+  coversRemoteCwd,
   createdWorkspaceTitle,
   hostTag,
   remoteWorkspaces,
@@ -621,6 +622,29 @@ export class Core {
     return { path: workspace.path, remotePath: normalized, title: workspace.title, created: !existed }
   }
 
+  /**
+   * Whether this session may route `route` to the host.
+   *
+   * Two things qualify. A registered workspace covering the directory: that is
+   * the directory the operator (or an approved `ssh_workspace` call) asked for.
+   * And a session that is already on that host: once the operator opened or
+   * entered a workspace there, walking to `/etc` with `working_directory` is
+   * ordinary navigation, not a new host. Routing cannot cross hosts, so this
+   * cannot be used to reach a second machine.
+   *
+   * What is left out is the reason for the check: a leftover placeholder (DSH
+   * keeps the directory when a workspace is deleted) must not let a *local*
+   * session step onto a host and read the filesystem.
+   */
+  allowsRemoteCwd(route: RemoteRoute, headerCwd: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+    const registry = this.workspaces as WorkspaceRegistryLike | undefined
+    // A host build without the registry cannot be checked; keep the old routing.
+    if (registry === undefined) return true
+    if (coversRemoteCwd(registry.list(), route, env)) return true
+    const opened = routeByCwd(headerCwd, env)
+    return opened.kind === 'remote' && opened.hostId === route.hostId
+  }
+
   toolHost(jobs: ToolHost['jobs']): ToolHost {
     return {
       pool: this.pool,
@@ -757,6 +781,34 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   ctx.logger?.info('[@dsh-permission-remote] loaded')
 }
 
+/**
+ * Refuse to put a session on a host for a placeholder no workspace owns.
+ *
+ * Routing a cwd to the remote only proves the placeholder directory exists, and
+ * DSH keeps that directory when a workspace registration is deleted. Since
+ * entering one hands the model a remote shell, "the directory is still there"
+ * is not an authorization: a registered workspace, or a session opened inside
+ * the same workspace, is.
+ */
+function assertEnterableRemoteCwd(core: Core, route: RemoteRoute, headerCwd: string | undefined): void {
+  if (core.allowsRemoteCwd(route, headerCwd)) return
+  throw new Error(`refusing to use ${route.remoteCwd} on SSH host ${route.hostId}: ${route.placeholderCwd} is a placeholder for a remote directory that no registered workspace owns. Add it with ssh_workspace (an "ask" host asks for approval first) or open the workspace from the list.`)
+}
+
+/**
+ * A local `working_directory` call must not step into a placeholder by accident.
+ *
+ * The directory outlives the workspace registration, so committing it would give
+ * this session a remote shell without any approval on the way. Refuse before the
+ * directory is committed, which also avoids stranding the session inside it.
+ */
+function assertLocalWorkingDirectory(core: Core, args: Record<string, unknown>, current: string | undefined, headerCwd: string | undefined): void {
+  const requested = typeof args.cd === 'string' ? args.cd.trim() : ''
+  if (requested.length === 0 || current === undefined) return
+  const route = routeByCwd(resolveLocalPath(current, requested))
+  if (route.kind === 'remote') assertEnterableRemoteCwd(core, route, headerCwd)
+}
+
 function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
@@ -780,19 +832,22 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
         ...base,
         name: plan.name,
         async execute(args: unknown, exec: ToolExec) {
-          const current = routeByCwd(effectiveCwd(ctx, exec, headerCwd))
+          const cwd = effectiveCwd(ctx, exec, headerCwd)
+          const current = routeByCwd(cwd)
           if (current.kind !== 'remote') {
+            if (plan.name === 'working_directory') assertLocalWorkingDirectory(core, args as Record<string, unknown>, cwd, headerCwd)
             return dispatchShadow(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, false, async () => {
               throw new Error('dsh-permission-remote: local call has no official tool')
             }, args, exec)
           }
+          assertEnterableRemoteCwd(core, current, headerCwd)
           return runner(host, current, args as Record<string, unknown>, exec, ctx)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
       disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
-    const surface = installRemoteShellSurface(ctx, agent, host, headerCwd, hasOfficialBash, disposers)
+    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers)
     disposeDynamic = surface.disposeDynamic
     surface.sync(opened)
   } catch (error) {
@@ -848,6 +903,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
  */
 function installRemoteShellSurface(
   ctx: HostContext,
+  core: Core,
   agent: AgentLike,
   host: ToolHost,
   headerCwd: string | undefined,
@@ -894,6 +950,7 @@ function installRemoteShellSurface(
           name: 'bash',
           async execute(args: unknown, exec: ToolExec) {
             const current = routeByCwd(effectiveCwd(ctx, exec, headerCwd))
+            if (current.kind === 'remote') assertEnterableRemoteCwd(core, current, headerCwd)
             if (current.kind !== 'remote') {
               return dispatchShadow(undefined, false, async () => {
                 throw new Error('dsh-permission-remote: local call has no official tool')

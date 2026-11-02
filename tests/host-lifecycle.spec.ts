@@ -367,6 +367,32 @@ test('a cancelled registration never stats the host or registers a row', async (
   })
 })
 
+test('a session may only route into a workspace the registry owns', async () => {
+  const registry = new FakeRegistry()
+  const core = build(registry, [], [host(), host({ id: 'host2', host: '10.0.0.9' })])
+  remoteWorkspace(registry, 'host1', '/srv/app', 'dev · app')
+  const route = (hostId: string, remoteCwd: string) => ({ kind: 'remote' as const, hostId, remoteCwd, placeholderCwd: '' })
+
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app'), undefined), true)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/app/src'), undefined), true)
+  // The placeholder directory can outlive its registration, and a directory
+  // that merely shares the prefix must not count as the same workspace.
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/lib'), undefined), false)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/application'), undefined), false)
+  assert.equal(core.allowsRemoteCwd(route('host2', '/srv/app'), undefined), false)
+
+  // A session opened in the workspace keeps working after the row is removed,
+  // and it may walk anywhere on that host: `working_directory` is navigation,
+  // not a new machine.
+  const opened = remoteWorkspace(registry, 'host1', '/srv/legacy', 'legacy')
+  await core.removeWorkspace('host1', opened.id)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/srv/legacy'), opened.path), true)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/etc'), opened.path), true)
+  // A session whose header is on another host (or local) gets no such pass.
+  assert.equal(core.allowsRemoteCwd(route('host1', '/etc'), remoteWorkspace(registry, 'host2', '/srv/other', 'other').path), false)
+  assert.equal(core.allowsRemoteCwd(route('host1', '/etc'), '/tmp/local-project'), false)
+})
+
 test('the ops tool host exposes the same registration as the settings page', async () => {
   await withRemoteRoot(async () => {
     const registry = new FakeRegistry()

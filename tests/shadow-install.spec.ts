@@ -14,13 +14,13 @@ function settings() {
   }
 }
 
-function agentFor(cwd: string, register: () => () => void) {
+function agentFor(cwd: string, register: (definition: { name: string }) => () => void) {
   const cleanups: Array<() => void> = []
   const agent = {
     session: { header: { cwd } },
     ctx: {
       tools: {
-        get: () => ({ execute: async () => 'official' }),
+        get: (_name?: string): { execute: () => Promise<unknown> } | undefined => ({ execute: async () => 'official' }),
         register,
         restrict: () => () => undefined,
         guard: () => () => undefined,
@@ -45,6 +45,29 @@ function agentFor(cwd: string, register: () => () => void) {
 function plugin(): Context {
   const ctx = new Context()
   ctx.provide('settings', settings())
+  return ctx
+}
+
+/**
+ * A plugin whose registry owns `paths`; the guard reads it, nothing else does.
+ * `liveCwd` seeds the working-directory service, which is what decides routing
+ * for a session that moved away from its header directory.
+ */
+function pluginWithWorkspaces(paths: string[], liveCwd?: string): Context {
+  const ctx = plugin()
+  if (liveCwd !== undefined) ctx.provide('workingDirectory', { get: () => liveCwd })
+  ctx.provide('workspaceRegistry', {
+    list: () => paths.map((path, index) => ({
+      id: `w${index}`,
+      path,
+      title: path,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      sessionIds: [],
+      setTitle: async () => undefined,
+    })),
+    create: async () => { throw new Error('not used') },
+    delete: async () => true,
+  })
   return ctx
 }
 
@@ -116,6 +139,78 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   assert.deepEqual(write?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
   await assert.rejects(async () => workspace!.execute({ host: 'lo' }, {}), /invalid arguments/)
+})
+
+test('a session that walks into a placeholder no workspace owns is refused', async () => {
+  const ctx = pluginWithWorkspaces([], remoteCwd)
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  // A local session that moved its live directory into the placeholder.
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  await created(ctx, agent)
+  const bash = tools.find(tool => tool.name === 'bash')
+  await assert.rejects(
+    () => bash!.execute({ command: 'id' }, { agent }),
+    /no registered workspace owns/,
+  )
+})
+
+test('a registered workspace lets the session run there', async () => {
+  const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  await created(ctx, agent)
+  const bash = tools.find(tool => tool.name === 'bash')
+  // Past the ownership guard, so the next failure is the (deliberately) missing
+  // host configuration rather than the refusal.
+  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /not configured/)
+})
+
+test('a session already on the host may walk outside its workspace', async () => {
+  const etc = mapRemoteToLocal('host1', '/etc')!
+  const ctx = pluginWithWorkspaces([remoteCwd], etc)
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  // Header is the workspace itself, so the session is already on host1.
+  const { agent } = agentFor(remoteCwd, definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  await created(ctx, agent)
+  const bash = tools.find(tool => tool.name === 'bash')
+  // Navigation on the same host is not the escalation the guard blocks; the
+  // next failure is the deliberately missing host configuration.
+  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /not configured/)
+})
+
+test('working_directory refuses to commit an unregistered placeholder', async () => {
+  const ctx = pluginWithWorkspaces([])
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let officialCalls = 0
+  const { agent } = agentFor('/tmp/local-project', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  // Capture the official tool before the shadows are installed.
+  agent.ctx.tools.get = (name?: string) => name === 'working_directory' || name === 'bash'
+    ? { execute: async () => { officialCalls += 1; return { cwd: '/tmp/local-project' } } }
+    : undefined
+  await created(ctx, agent)
+  const workingDirectory = tools.find(tool => tool.name === 'working_directory')
+  await assert.rejects(
+    () => workingDirectory!.execute({ cd: remoteCwd }, { agent }),
+    /no registered workspace owns/,
+  )
+  // The directory is never committed, so the session is not stranded inside it.
+  assert.equal(officialCalls, 0)
 })
 
 test('terminal_open refuses on a remote workspace and still calls the local tool', async () => {

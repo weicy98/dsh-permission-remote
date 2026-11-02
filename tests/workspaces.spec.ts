@@ -5,6 +5,7 @@ import type { HostConfig } from '../src/config.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import {
   autoTaggedTitle,
+  coversRemoteCwd,
   createdWorkspaceTitle,
   hostTag,
   remoteWorkspaces,
@@ -160,6 +161,18 @@ test('tagging one host prefixes every workspace once and replaces a stale prefix
   assert.equal(rows[1]!.title, 'dev · my notes')
   assert.equal(rows[2]!.title, 'dev · lib')
   assert.equal(await tagRemoteWorkspaces([host()], rows, { hostId: 'host1', knownHosts: known }, env), 0)
+})
+
+test('only a registered workspace covers a remote cwd', () => {
+  const rows = [workspace('a', '/srv/app', 'dev · app')]
+  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/app' }, env), true)
+  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/app/src/lib' }, env), true)
+  // A sibling directory is not covered, and neither is another host.
+  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/lib' }, env), false)
+  assert.equal(coversRemoteCwd(rows, { hostId: 'host2', remoteCwd: '/srv/app' }, env), false)
+  // A prefix that is not a path boundary must not count as covered.
+  assert.equal(coversRemoteCwd(rows, { hostId: 'host1', remoteCwd: '/srv/application' }, env), false)
+  assert.equal(coversRemoteCwd([], { hostId: 'host1', remoteCwd: '/srv/app' }, env), false)
 })
 
 test('load-time tagging does not replace another server prefix', async () => {
