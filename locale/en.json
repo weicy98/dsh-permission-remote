@@ -115,7 +115,12 @@
   "remoteRootHint": "Local directory that holds the placeholder for every remote workspace. Defaults to ~/.dsh/remote. Changing it copies the old tree over; a non-empty target is merged automatically (keep existing files, add missing ones), and a same-named file with different content asks you first.",
   "remoteRootCurrent": "Current:",
   "remoteRootUnchanged": "The remote root did not change.",
-  "remoteRootChanged": "Remote root switched; files copied:",
+  "remoteRootChanged": "Remote root switched:",
+  "remoteRootCopied": "copied",
+  "remoteRootSkipped": "skipped",
+  "remoteRootOverwritten": "overwritten",
+  "remoteRootRemapped": "workspaces re-registered",
+  "remoteRootConflictsLeft": "left untouched",
   "remoteRootHasSessions": "Workspaces have live sessions:",
   "remoteRootForceHint": "Migrating re-registers these workspaces; open sessions must be reopened. Continue anyway?",
   "remoteRootForce": "Migrate anyway",
@@ -127,7 +132,9 @@
   "exportHosts": "Export config",
   "importMerge": "Import and merge",
   "importReplace": "Import and replace",
+  "importReplaceConfirm": "Replacing drops every host the file does not list (they move to deleted hosts). Continue?",
   "hostBackupHint": "The exported JSON holds only the host list, never passwords or key passphrases. Import merges by host id (same id updates) or replaces the whole list; after importing, test connections again and re-enter secrets as needed.",
   "exportedHosts": "Host configuration exported.",
-  "importedHosts": "Host configuration imported (added/updated/removed):"
+  "importedHosts": "Host configuration imported (added/updated/removed):",
+  "importTrusted": "hosts set to trust (commands run without asking):"
 }

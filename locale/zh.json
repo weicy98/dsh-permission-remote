@@ -115,7 +115,12 @@
   "remoteRootHint": "本地存放所有远端工作区占位目录的位置，默认 ~/.dsh/remote。改到新目录时，旧目录会复制过去；新目录已有内容时自动合并（保留目标已有文件，只补缺失），同名且内容不同的文件会先问你。",
   "remoteRootCurrent": "当前：",
   "remoteRootUnchanged": "远端根目录没有变化。",
-  "remoteRootChanged": "远端根目录已切换，已复制文件数：",
+  "remoteRootChanged": "远端根目录已切换：",
+  "remoteRootCopied": "复制",
+  "remoteRootSkipped": "跳过",
+  "remoteRootOverwritten": "覆盖",
+  "remoteRootRemapped": "重注册工作区",
+  "remoteRootConflictsLeft": "保留未动",
   "remoteRootHasSessions": "有会话正打开在这些工作区里，数量：",
   "remoteRootForceHint": "迁移会重新注册这些工作区，正在进行的会话需要重新打开。仍要继续吗？",
   "remoteRootForce": "仍然迁移",
@@ -127,7 +132,9 @@
   "exportHosts": "导出配置",
   "importMerge": "导入并合并",
   "importReplace": "导入并替换",
+  "importReplaceConfirm": "替换会移除文件里没有的主机（移到“已删除主机”里）。继续吗？",
   "hostBackupHint": "导出的 JSON 只含主机列表，不含口令和私钥口令。导入时按主机 id 合并（同名更新）或整体替换；导入后请重新测试连接并按需重填口令。",
   "exportedHosts": "主机配置已导出。",
-  "importedHosts": "主机配置已导入（新增/更新/移除）："
+  "importedHosts": "主机配置已导入（新增/更新/移除）：",
+  "importTrusted": "设为 trust 的主机（命令不再询问）："
 }

@@ -146,7 +146,6 @@ export async function readWorkspaces(ctx: ClientFace): Promise<WorkspaceListing>
 /** Where remote-workspace placeholders live now, and the built-in default. */
 export interface RemoteRootInfo {
   current: string
-  configured: string
   defaultRoot: string
 }
 
@@ -159,11 +158,10 @@ export interface RemoteRootChange {
   conflicts?: string[]
   workspacesRemapped?: number
   migration?: {
-    action: 'copied' | 'merged' | 'unchanged'
-    targetWasEmpty: boolean
     copied: number
     skipped: number
     overwritten: number
+    /** Paths left untouched: different content kept, or a file/directory clash. */
     conflicts: string[]
   }
 }

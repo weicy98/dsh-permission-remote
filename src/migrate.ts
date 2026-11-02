@@ -9,9 +9,16 @@
  * - a non-empty target is merged: missing entries are copied, identical files
  *   are skipped, and a file that differs is a conflict. `auto` keeps the
  *   target's copy (nothing is lost) and reports it; `overwrite` replaces it
- *   with the old root's copy.
+ *   with the old root's copy;
+ * - a name that is a directory on one side and a file on the other is always a
+ *   conflict, never resolved automatically: replacing a file with a tree (or
+ *   the reverse) is not what "keep target" or "use the old copy" promises. It
+ *   is reported so the operator can look at it.
+ *
+ * A dry run walks the same tree with the same decisions, so the plan the
+ * settings page shows is the plan that will run.
  */
-import { copyFile, cp, mkdir, readdir, readFile, stat } from 'node:fs/promises'
+import { copyFile, cp, mkdir, open, readdir, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
 export type MigrationStrategy = 'auto' | 'overwrite'
@@ -25,11 +32,16 @@ export interface MigrationReport {
   copied: number
   skipped: number
   overwritten: number
-  /** Relative paths present on both sides with different content. */
+  /**
+   * Relative paths left untouched: different content kept by `auto`, or a name
+   * that is a directory on one side and a file on the other.
+   */
   conflicts: string[]
 }
 
 type PathKind = 'missing' | 'dir' | 'file'
+
+const COMPARE_CHUNK = 64 * 1024
 
 async function pathKind(target: string): Promise<PathKind> {
   try {
@@ -58,12 +70,48 @@ function within(parent: string, child: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }
 
+/**
+ * The path with symlinks resolved, or the lexical path when it does not exist.
+ *
+ * A root that is itself a symlink (`~/.dsh` is one on some installs) would
+ * otherwise slip past the nesting check and let a copy walk into itself.
+ */
+async function physicalPath(target: string): Promise<string> {
+  try {
+    return await realpath(target)
+  } catch {
+    return resolve(target)
+  }
+}
+
+/**
+ * Compare two files without holding either in memory.
+ *
+ * Placeholder trees are mostly empty, but one leftover artifact must not turn a
+ * directory listing into two full reads of the same file.
+ */
 async function sameContent(a: string, b: string): Promise<boolean> {
   const [left, right] = await Promise.all([stat(a), stat(b)])
   if (!left.isFile() || !right.isFile()) return false
   if (left.size !== right.size) return false
-  const [leftBytes, rightBytes] = await Promise.all([readFile(a), readFile(b)])
-  return leftBytes.equals(rightBytes)
+  const [leftHandle, rightHandle] = await Promise.all([open(a, 'r'), open(b, 'r')])
+  try {
+    const leftBytes = Buffer.alloc(COMPARE_CHUNK)
+    const rightBytes = Buffer.alloc(COMPARE_CHUNK)
+    for (;;) {
+      const [leftRead, rightRead] = await Promise.all([
+        leftHandle.read(leftBytes, 0, COMPARE_CHUNK, null),
+        rightHandle.read(rightBytes, 0, COMPARE_CHUNK, null),
+      ])
+      if (leftRead.bytesRead !== rightRead.bytesRead) return false
+      if (leftRead.bytesRead === 0) return true
+      const leftChunk = leftBytes.subarray(0, leftRead.bytesRead)
+      const rightChunk = rightBytes.subarray(0, rightRead.bytesRead)
+      if (!leftChunk.equals(rightChunk)) return false
+    }
+  } finally {
+    await Promise.all([leftHandle.close(), rightHandle.close()])
+  }
 }
 
 async function mergeInto(
@@ -79,12 +127,18 @@ async function mergeInto(
     const childRel = rel.length === 0 ? entry.name : `${rel}/${entry.name}`
     const source = join(oldRoot, childRel)
     const target = join(newRoot, childRel)
+    const kind = await pathKind(target)
     if (entry.isDirectory()) {
+      // A file in the target where the old root has a directory: leave both
+      // sides alone instead of wiping the file, and let the report say why.
+      if (kind === 'file') {
+        report.conflicts.push(childRel)
+        continue
+      }
       if (!dryRun) await mkdir(target, { recursive: true })
       await mergeInto(oldRoot, newRoot, strategy, report, dryRun, childRel)
       continue
     }
-    const kind = await pathKind(target)
     if (kind === 'missing') {
       report.copied += 1
       if (!dryRun) await copyFile(source, target)
@@ -126,6 +180,10 @@ export async function migrateRemoteRoot(
   }
   if (from === to) return empty
   if (within(from, to) || within(to, from)) {
+    throw new Error('the new remote root must not be inside the old one, or the old one inside it')
+  }
+  const [fromReal, toReal] = await Promise.all([physicalPath(from), physicalPath(to)])
+  if (within(fromReal, toReal) || within(toReal, fromReal)) {
     throw new Error('the new remote root must not be inside the old one, or the old one inside it')
   }
   const oldKind = await pathKind(from)

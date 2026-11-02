@@ -3,6 +3,7 @@ import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
 import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, mergeEditedHost, parentDir, stepActive, toDraft, type Draft } from './draft.ts'
+import { rootPromptFor, type RootPrompt } from './root-prompt.ts'
 import { installStyles } from './styles.ts'
 
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
@@ -59,14 +60,6 @@ interface LayoutApi {
 interface LocaleApi {
   register(ns: string, lang: string, dict: Record<string, string>): () => void
   bind(ns: string): (key: string) => string
-}
-
-/** A remote-root change waiting on the operator's decision. */
-interface RootPrompt {
-  kind: 'sessions' | 'conflicts'
-  root: string
-  sessions?: number
-  conflicts?: string[]
 }
 
 /** `tagWorkspaces` returns the refreshed rows together with how many changed. */
@@ -230,6 +223,9 @@ function Section(props: SectionProps): JSX.Element {
   const [rootInfo, setRootInfo] = useState<RemoteRootInfo | null>(null)
   const [rootDraft, setRootDraft] = useState('')
   const [rootPrompt, setRootPrompt] = useState<RootPrompt | null>(null)
+  /** Set once the operator accepts the "sessions are open" prompt. */
+  const rootForceRef = useRef(false)
+  const [importConfirm, setImportConfirm] = useState(false)
   const importInputRef = useRef<HTMLInputElement | null>(null)
   const importModeRef = useRef<'merge' | 'replace'>('merge')
   const [revision, setRevision] = useState(0)
@@ -248,7 +244,7 @@ function Section(props: SectionProps): JSX.Element {
     return loaded.hosts
   }
 
-  /** The effective placeholder root and its default; a host without the RPC keeps the field hidden. */
+  /** The effective placeholder root and its default, for the field's hint. */
   async function reloadRoot(): Promise<void> {
     try {
       setRootInfo(await readRemoteRootInfo(ctx))
@@ -446,6 +442,7 @@ function Section(props: SectionProps): JSX.Element {
   async function saveRemoteRoot(): Promise<void> {
     setBusy(true)
     setRootPrompt(null)
+    rootForceRef.current = false
     try {
       await applyRootResult(await changeRemoteRoot(ctx, rootDraft))
     } catch (error) {
@@ -462,27 +459,39 @@ function Section(props: SectionProps): JSX.Element {
       await reloadRoot()
       return
     }
-    if (result.status === 'has-sessions') {
-      setRootPrompt({ kind: 'sessions', root: result.root, sessions: result.sessions ?? 0 })
+    const next = rootPromptFor(result, rootForceRef.current)
+    rootForceRef.current = next.force
+    if (next.prompt !== null) {
+      setRootPrompt(next.prompt)
       return
     }
-    if (result.status === 'needs-strategy') {
-      setRootPrompt({ kind: 'conflicts', root: result.root, conflicts: result.conflicts ?? [] })
-      return
-    }
-    note(`${t('remoteRootChanged')} ${result.migration?.copied ?? 0}`)
+    const migration = result.migration
+    const counts = [
+      `${t('remoteRootCopied')} ${migration?.copied ?? 0}`,
+      `${t('remoteRootSkipped')} ${migration?.skipped ?? 0}`,
+      `${t('remoteRootOverwritten')} ${migration?.overwritten ?? 0}`,
+      `${t('remoteRootRemapped')} ${result.workspacesRemapped ?? 0}`,
+    ].join(' · ')
+    const left = migration?.conflicts.length ?? 0
+    note(`${t('remoteRootChanged')} ${result.oldRoot} → ${result.root} · ${counts}${left > 0 ? ` · ${t('remoteRootConflictsLeft')} ${left}` : ''}`)
     setRootDraft(result.root)
     await reloadRoot()
     await reloadWorkspaces().catch(() => undefined)
   }
 
-  /** Re-run the pending change with the operator's chosen strategy or force flag. */
-  async function resolveRootPrompt(strategy?: 'auto' | 'overwrite', force = false): Promise<void> {
+  /**
+   * Re-run the pending change with the operator's chosen strategy.
+   *
+   * `rootForceRef` carries the "migrate anyway" answer across the two prompts:
+   * a target with both live sessions and conflicting files asks twice, and the
+   * second call must keep the first answer or the pair could never finish.
+   */
+  async function resolveRootPrompt(strategy?: 'auto' | 'overwrite'): Promise<void> {
     if (rootPrompt === null) return
     const target = rootPrompt.root
     setBusy(true)
     try {
-      const result = await changeRemoteRoot(ctx, target, { strategy, force })
+      const result = await changeRemoteRoot(ctx, target, { strategy, force: rootForceRef.current })
       setRootPrompt(null)
       await applyRootResult(result)
     } catch (error) {
@@ -514,6 +523,28 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  /**
+   * How many rows of an import file would run commands without asking.
+   *
+   * A backup carries `opsPolicy`, so a file from elsewhere can turn approval
+   * off for its hosts. Turning that back into a prompt would be wrong, but the
+   * operator should at least see the count in the result.
+   */
+  function trustCountOf(payload: unknown): number {
+    const rows = Array.isArray(payload)
+      ? payload
+      : (typeof payload === 'object' && payload !== null && Array.isArray((payload as { hosts?: unknown }).hosts)
+        ? (payload as { hosts: unknown[] }).hosts
+        : [])
+    return rows.filter(row => typeof row === 'object' && row !== null && (row as { opsPolicy?: unknown }).opsPolicy === 'trust').length
+  }
+
+  /** First few conflicting paths, so the choice is not made from a count alone. */
+  function conflictPreview(paths: readonly string[]): string {
+    const shown = paths.slice(0, 8)
+    return `${shown.join('  ·  ')}${paths.length > shown.length ? `  … +${paths.length - shown.length}` : ''}`
+  }
+
   function pickImport(mode: 'merge' | 'replace'): void {
     importModeRef.current = mode
     importInputRef.current?.click()
@@ -523,11 +554,12 @@ function Section(props: SectionProps): JSX.Element {
     setBusy(true)
     try {
       const text = await file.text()
-      const payload = JSON.parse(text)
+      const payload: unknown = JSON.parse(text)
       const result = await importHosts(ctx, payload, importModeRef.current)
       await reload()
       await reloadWorkspaces().catch(() => undefined)
-      note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}`)
+      const trusted = trustCountOf(payload)
+      note(`${t('importedHosts')} +${result.added} ~${result.updated} -${result.removed}${trusted > 0 ? ` · ${t('importTrusted')} ${trusted}` : ''}`)
     } catch (error) {
       fail(error)
     } finally {
@@ -1280,16 +1312,24 @@ function Section(props: SectionProps): JSX.Element {
             {rootPrompt.kind === 'sessions'
               ? `${t('remoteRootHasSessions')} ${rootPrompt.sessions}. ${t('remoteRootForceHint')}`
               : `${t('remoteRootConflicts')} ${rootPrompt.conflicts?.length ?? 0}. ${t('remoteRootConflictHint')}`}
+            {rootPrompt.kind === 'conflicts' && (rootPrompt.conflicts?.length ?? 0) > 0
+              ? <div className="dsh-ssh-conflict-list">{conflictPreview(rootPrompt.conflicts ?? [])}</div>
+              : null}
             <span className="dsh-ssh-inline">
               <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setRootPrompt(null)}>{t('cancel')}</button>
               <button
                 type="button"
                 className="dsh-ssh-button"
                 disabled={busy}
-                onClick={() => void resolveRootPrompt(rootPrompt.kind === 'conflicts' ? 'auto' : undefined, rootPrompt.kind === 'sessions')}
+                onClick={() => {
+                  // Remember the answer: the conflict prompt that may follow must
+                  // be able to finish the same migration.
+                  if (rootPrompt.kind === 'sessions') rootForceRef.current = true
+                  void resolveRootPrompt(rootPrompt.kind === 'conflicts' ? 'auto' : undefined)
+                }}
               >{rootPrompt.kind === 'sessions' ? t('remoteRootForce') : t('remoteRootKeepTarget')}</button>
               {rootPrompt.kind === 'conflicts'
-                ? <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void resolveRootPrompt('overwrite', false)}>{t('remoteRootOverwrite')}</button>
+                ? <button type="button" className="dsh-ssh-button dsh-ssh-danger" disabled={busy} onClick={() => void resolveRootPrompt('overwrite')}>{t('remoteRootOverwrite')}</button>
                 : null}
             </span>
           </div>
@@ -1300,7 +1340,22 @@ function Section(props: SectionProps): JSX.Element {
         <span className="dsh-ssh-label">{t('hostBackup')}</span>
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void doExport()}>{t('exportHosts')}</button>
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => pickImport('merge')}>{t('importMerge')}</button>
-        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => pickImport('replace')}>{t('importReplace')}</button>
+        {/* Replace drops every host the file does not list; ask before the file dialog. */}
+        {importConfirm
+          ? <>
+              <span className="dsh-ssh-note dsh-ssh-danger-note">{t('importReplaceConfirm')}</span>
+              <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportConfirm(false)}>{t('cancel')}</button>
+              <button
+                type="button"
+                className="dsh-ssh-button dsh-ssh-danger"
+                disabled={busy}
+                onClick={() => {
+                  setImportConfirm(false)
+                  pickImport('replace')
+                }}
+              >{t('importReplace')}</button>
+            </>
+          : <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => setImportConfirm(true)}>{t('importReplace')}</button>}
         <input
           ref={importInputRef}
           type="file"

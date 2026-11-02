@@ -1,5 +1,6 @@
 import Schema from '@deepseek-ai/schemastery'
 import { createVolatile, isVolatile, updateVolatile, type Volatile } from '@deepseek-ai/cosmokit'
+import { isValidHostId } from './router.ts'
 
 /**
  * `ask` gates commands and writes behind the session permission mode and an
@@ -262,25 +263,48 @@ export function normalizeHostRow(raw: unknown): HostConfig {
   if (!isRecord(raw)) throw new Error('each imported host must be an object')
   const text = (value: unknown): string => (typeof value === 'string' ? value : '')
   const id = text(raw.id).trim()
-  if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`imported host has an invalid id: ${JSON.stringify(raw.id)}`)
+  if (!isValidHostId(id)) throw new Error(`imported host has an invalid id: ${JSON.stringify(raw.id)}`)
   const host = text(raw.host).trim()
   if (host.length === 0) throw new Error(`imported host ${id} is missing its address`)
   const username = text(raw.username).trim()
   if (username.length === 0) throw new Error(`imported host ${id} is missing its username`)
-  const rawPort = raw.port
-  const port = typeof rawPort === 'number' && Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 22
-  const auth: 'key' | 'password' = raw.auth === 'password' ? 'password' : 'key'
-  return {
+  // A wrong port must fail the import instead of falling back to 22: a file
+  // that says "2222" as a string would otherwise dial the wrong sshd, and with
+  // key auth that can succeed without anything looking broken.
+  const port = raw.port === undefined ? 22 : raw.port
+  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`imported host ${id} has an invalid port: ${JSON.stringify(raw.port)}`)
+  }
+  if (raw.auth !== undefined && raw.auth !== 'key' && raw.auth !== 'password') {
+    throw new Error(`imported host ${id} has an unknown auth mode: ${JSON.stringify(raw.auth)}`)
+  }
+  if (raw.opsPolicy !== undefined && raw.opsPolicy !== 'ask' && raw.opsPolicy !== 'trust' && raw.opsPolicy !== 'deny') {
+    throw new Error(`imported host ${id} has an unknown ops policy: ${JSON.stringify(raw.opsPolicy)}`)
+  }
+  // The schema owns every remaining default. Schemastery keeps keys it does not
+  // declare, so the row is rebuilt from the declared fields only: a foreign file
+  // must not smuggle extra keys into the config. The compiler checks this list
+  // against `HostConfig`, which is what keeps it complete.
+  const parsed = Host({
+    ...raw,
     id,
-    name: text(raw.name),
     host,
-    port,
     username,
-    auth,
-    privateKeyPath: text(raw.privateKeyPath),
-    fingerprint: text(raw.fingerprint),
-    opsPolicy: normalizeOpsPolicy(raw.opsPolicy),
-    loginEnv: normalizeLoginEnv(raw.loginEnv),
+    port,
+    privateKeyPath: text(raw.privateKeyPath).trim(),
+    fingerprint: text(raw.fingerprint).trim(),
+  }) as HostConfig
+  return {
+    id: parsed.id,
+    name: text(parsed.name).trim(),
+    host: parsed.host,
+    port: parsed.port,
+    username: parsed.username,
+    auth: parsed.auth,
+    privateKeyPath: parsed.privateKeyPath,
+    fingerprint: parsed.fingerprint,
+    opsPolicy: parsed.opsPolicy,
+    loginEnv: parsed.loginEnv,
   }
 }
 
@@ -350,9 +374,14 @@ export interface HostImportResult {
  * Fold a parsed import into the current list.
  *
  * `merge` keeps every current host and lets the file override a matching id.
- * `replace` makes the file the whole list. Either way an imported host that was
- * a tombstone is revived, so restoring from a backup does not leave a ghost
- * "deleted host" row beside the live one.
+ * `replace` makes the file the whole list, but a host the file drops becomes a
+ * tombstone instead of disappearing: its workspaces are still registered, and
+ * `deleteHost` already keeps a row so the host can be restored. The tombstone
+ * list from the file is used by `replace` only; `merge` treats the file as host
+ * rows and leaves the operator's own deleted list alone.
+ *
+ * Either way an imported host that was a tombstone is revived, so restoring from
+ * a backup does not leave a ghost "deleted host" row beside the live one.
  */
 export function mergeImportedHosts(
   current: readonly HostConfig[],
@@ -365,10 +394,14 @@ export function mergeImportedHosts(
   let added = 0
   let updated = 0
   let removed = 0
+  let dropped: DeletedHost[] = []
   if (mode === 'replace') {
     hosts = incoming.hosts.map(host => ({ ...host }))
     added = incoming.hosts.length
-    removed = current.filter(host => !importedIds.has(host.id)).length
+    const droppedHosts = current.filter(host => !importedIds.has(host.id))
+    removed = droppedHosts.length
+    const now = new Date().toISOString()
+    dropped = droppedHosts.map(host => ({ host: { ...host }, deletedAt: now }))
   } else {
     hosts = current.map(host => ({ ...host }))
     const byId = new Map(hosts.map(host => [host.id, host]))
@@ -384,7 +417,8 @@ export function mergeImportedHosts(
     }
     hosts = [...byId.values()]
   }
-  const baseDeleted = mode === 'replace' ? incoming.deletedHosts : currentDeleted
+  const baseDeleted = mode === 'replace' ? [...dropped, ...incoming.deletedHosts] : currentDeleted
+  // A host that is live again must not keep a tombstone beside it.
   const deletedHosts = baseDeleted
     .filter(row => !importedIds.has(row.host.id))
     .map(row => ({ host: { ...row.host }, deletedAt: row.deletedAt ?? '' }))
