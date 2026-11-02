@@ -97,6 +97,21 @@ export function resolveRemotePath(requestedPath: string, remoteCwd: string, plac
 }
 
 /**
+ * A remote directory path in the one spelling a workspace is keyed by.
+ *
+ * `posix.normalize` keeps a trailing slash, and the placeholder path encodes the
+ * remote path verbatim, so `/srv/app/` would register a second workspace beside
+ * `/srv/app`. This drops the slashes; the filesystem root stays `/`.
+ *
+ * @returns the normalized path, or `null` when the input is not absolute.
+ */
+export function normalizeRemoteDirectory(remotePath: string): string | null {
+  const text = remotePath.trim()
+  if (!posix.isAbsolute(text)) return null
+  return posix.normalize(text).replace(/\/+$/, '') || '/'
+}
+
+/**
  * A directory the picker may create inside `parent`, or `null` with the reason.
  *
  * The name is one path segment: a separator would build a tree the operator

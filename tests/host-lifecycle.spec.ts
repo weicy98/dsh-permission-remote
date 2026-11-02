@@ -275,6 +275,7 @@ test('registering a remote directory creates a titled workspace and a placeholde
     assert.deepEqual(stats, ['/srv/app'])
     assert.equal(created.remotePath, '/srv/app')
     assert.equal(created.title, 'dev · app')
+    assert.equal(created.created, true)
     assert.ok(created.path.startsWith(root), `placeholder ${created.path} is outside ${root}`)
     assert.equal((await stat(created.path)).isDirectory(), true)
     assert.equal(registry.rows.length, 1)
@@ -291,6 +292,8 @@ test('registering the same directory twice keeps one row and its title', async (
     fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
     const first = await core.registerWorkspace(host(), '/srv/app', 'notes')
     const second = await core.registerWorkspace(host(), '/srv/app/', 'another')
+    assert.equal(first.created, true)
+    assert.equal(second.created, false)
     assert.equal(second.path, first.path)
     // The registry keeps the existing record's title; only a new row takes ours.
     assert.equal(second.title, 'dev · notes')
@@ -306,6 +309,7 @@ test('registering without title tagging keeps the plain directory name', async (
     fakePool.sftpStat = async () => ({ isDirectory: true, size: 0, mode: 0o040755 })
     const created = await core.registerWorkspace(host(), '/srv/app/')
     assert.equal(created.title, 'app')
+    assert.equal(created.remotePath, '/srv/app')
   })
 })
 
@@ -330,6 +334,7 @@ test('the ops tool host exposes the same registration as the settings page', asy
     const toolHost = core.toolHost(undefined)
     const created = await toolHost.createWorkspace!(host(), '/srv/lib', 'lib')
     assert.equal(created.title, 'dev · lib')
+    assert.equal(created.created, true)
     const listed = core.listWorkspaces()
     assert.equal(listed.length, 1)
     assert.equal(listed[0]!.remotePath, '/srv/lib')

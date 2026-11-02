@@ -31,7 +31,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, routeByCwd, type Route } from './router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, routeByCwd, type Route } from './router.ts'
 import {
   PWSH_SECTION,
   REMOTE_POSIX_SECTION,
@@ -583,26 +583,28 @@ export class Core {
    * Shared by the settings page and the `ssh_workspace` tool, so both entries
    * point at the same directory and cannot disagree about the title.
    */
-  async registerWorkspace(host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal): Promise<{ path: string, remotePath: string, title: string }> {
-    const requestedPath = remotePath.trim()
-    if (requestedPath.length === 0) throw new Error('remote path is required')
-    if (!posix.isAbsolute(requestedPath)) throw new Error(`remote path must be absolute: ${remotePath}`)
-    // `normalize` keeps a trailing slash on a directory, and the placeholder
-    // encodes the path verbatim: `/srv/app/` would create a second workspace
-    // beside `/srv/app`. Drop the slashes; `/` itself stays `/`.
-    const normalized = posix.normalize(requestedPath).replace(/\/+$/, '') || '/'
+  async registerWorkspace(host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal): Promise<{ path: string, remotePath: string, title: string, created: boolean }> {
+    if (remotePath.trim().length === 0) throw new Error('remote path is required')
+    // One spelling per directory: a trailing slash would otherwise encode a
+    // placeholder of its own and register a second workspace for the same path.
+    const normalized = normalizeRemoteDirectory(remotePath)
+    if (normalized === null) throw new Error(`remote path must be absolute: ${remotePath}`)
     throwIfAborted(signal)
     const info = await withSignal(this.pool.sftpStat(host, await this.secret(host), normalized), signal)
     if (!info.isDirectory) throw new Error(`remote path is not a directory: ${normalized}`)
     const local = mapRemoteToLocal(host.id, normalized)
     if (local === null) throw new Error(`remote path must be absolute: ${normalized}`)
     throwIfAborted(signal)
+    // The registry matches by canonical path, so a row created earlier may sit
+    // under the realpath of the same directory. Ask the current listing rather
+    // than comparing the placeholder spelling.
+    const existed = this.listWorkspaces().some(row => row.hostId === host.id && row.remotePath === normalized)
     await mkdir(local, { recursive: true })
     const requested = title?.trim() || posix.basename(normalized) || normalized
     const nextTitle = createdWorkspaceTitle(host, requested, this.taggingEnabled)
     const workspace = await this.workspaces.create(local, nextTitle)
     // `create` keeps an existing record's title; only a new row carries ours.
-    return { path: local, remotePath: normalized, title: workspace.title }
+    return { path: workspace.path, remotePath: normalized, title: workspace.title, created: !existed }
   }
 
   toolHost(jobs: ToolHost['jobs']): ToolHost {

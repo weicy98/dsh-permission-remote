@@ -110,7 +110,7 @@ dsh plugin --profile web add dsh-permission-remote
 | 信任 | 允许 | 直接执行，不弹审批 |
 | 禁止 | 拒绝 | 拒绝 |
 
-`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取和添加工作区只受「禁止」限制：`ssh_workspace` 只做一次远端 `stat`，然后在本机注册工作区，不改远端文件，因此不弹审批卡。新工作区不会把当前会话切过去——要在那里执行命令，用 `working_directory` 切目录，或者直接打开那个工作区。
+`ssh_exec` 和 `ssh_write` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取和添加工作区只受「禁止」限制：`ssh_workspace` 只做一次远端 `stat`，然后在本机注册工作区，不改远端文件，因此不弹审批卡。新工作区不会把当前会话切过去——要在那里执行命令，用 `working_directory` 切目录，或者直接打开那个工作区。对同一个远端目录重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
 
 运维工具的前提：
 
@@ -255,7 +255,7 @@ Each host has a **Remote ops** policy in Settings:
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads and workspace registration are only limited by Deny: `ssh_workspace` does one remote `stat` and then registers the workspace locally, so it raises no approval card and never modifies remote files. It does not move the current session — use `working_directory` to run commands there, or open the new workspace.
+Ops commands and writes are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads and workspace registration are only limited by Deny: `ssh_workspace` does one remote `stat` and then registers the workspace locally, so it raises no approval card and never modifies remote files. It does not move the current session — use `working_directory` to run commands there, or open the new workspace. Registering the same remote directory again keeps the existing row and its title, and the result says so.
 
 Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 

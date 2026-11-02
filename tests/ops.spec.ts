@@ -59,6 +59,8 @@ function api(options: {
   exec?: (command: string) => ExecResult
   read?: (path: string) => Buffer
   stat?: (path: string) => { isDirectory: boolean, size: number, mode: number }
+  /** Fail the registration the way Core.registerWorkspace would. */
+  register?: (remotePath: string) => void
 } = {}): OpsApi {
   forgetOpsHost('prod1')
   const commands: string[] = []
@@ -90,12 +92,14 @@ function api(options: {
       hostOf: id => id === 'prod1' ? host() : undefined,
       secretOf: async () => ({}),
       statusOf: async () => status,
+      // A recorder, not a second implementation: `runSshWorkspace` is what is
+      // under test here, and Core.registerWorkspace owns the stat/title logic
+      // (covered in tests/host-lifecycle.spec.ts).
       createWorkspace: async (target, remotePath, title) => {
-        // Mirrors Core.registerWorkspace: one stat decides, then registration.
-        const info = await pool.sftpStat(target, {}, remotePath)
-        if (!info.isDirectory) throw new Error(`remote path is not a directory: ${remotePath}`)
+        options.register?.(remotePath)
+        const exists = workspaces.some(row => row.hostId === target.id && row.remotePath === remotePath)
         workspaces.push({ hostId: target.id, remotePath, title })
-        return { path: `/tmp/dsh-home/remote/${target.id}/placeholder`, remotePath, title: title?.trim() || 'app' }
+        return { path: `/tmp/dsh-home/remote/${target.id}/placeholder`, remotePath, title: title?.trim() || 'app', created: !exists }
       },
       resolveMode: async (_exec, requested, justification, _tool, _subject, detail) => {
         modes.push([requested, justification, detail])
@@ -403,97 +407,87 @@ test('rendered reads say when more lines follow', () => {
   assert.match(text, /lines 1-1 of 4; more lines follow/)
 })
 
-test('ssh_workspace registers an existing remote directory without a prompt', async () => {
-  const { api: hostApi, stats, workspaces, commands, modes } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+test('ssh_workspace hands an absolute directory to the registry without a prompt', async () => {
+  const { api: hostApi, workspaces, commands, modes } = api()
   const value = await runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, {})
-  assert.deepEqual(stats, ['/srv/app'])
   assert.deepEqual(workspaces, [{ hostId: 'prod1', remotePath: '/srv/app', title: undefined }])
   assert.equal(value.remotePath, '/srv/app')
+  assert.equal(value.created, true)
   assert.equal(value.currentSessionChanged, false)
-  // Registering is a local action backed by one stat: no shell, no approval.
+  // Registering is a local action: no shell, no approval card.
   assert.deepEqual(commands, [])
   assert.deepEqual(modes, [])
 })
 
 test('ssh_workspace expands a leading ~/ against the remote home', async () => {
-  const { api: hostApi, stats, workspaces } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+  const { api: hostApi, workspaces } = api()
   await runSshWorkspace(hostApi, host(), { directory: '~/code/app', title: 'app' }, {})
-  assert.deepEqual(stats, ['/home/ops/code/app'])
+  // The one remote command is the `$HOME` probe; the registry sees the absolute path.
   assert.equal(workspaces[0]!.remotePath, '/home/ops/code/app')
 })
 
 test('ssh_workspace passes the title through and keeps the session put', async () => {
-  const { api: hostApi, workspaces } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+  const { api: hostApi, workspaces } = api()
   const value = await runSshWorkspace(hostApi, host(), { directory: '/srv/app', title: 'my app' }, {})
   assert.equal(workspaces[0]!.title, 'my app')
   assert.equal(value.currentSessionChanged, false)
 })
 
 test('ssh_workspace refuses a relative directory before connecting', async () => {
-  const { api: hostApi, stats, workspaces } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+  const { api: hostApi, workspaces, commands } = api()
   await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: 'srv/app' }, {}), /absolute/)
-  assert.deepEqual(stats, [])
+  assert.deepEqual(commands, [])
   assert.deepEqual(workspaces, [])
 })
 
-test('ssh_workspace refuses a missing directory instead of registering it', async () => {
+test('ssh_workspace surfaces a registration failure instead of reporting success', async () => {
   const { api: hostApi, workspaces } = api({
-    stat: () => {
-      throw new Error('No such file')
+    register: remotePath => {
+      throw new Error(`remote path is not a directory: ${remotePath}`)
     },
-  })
-  await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: '/srv/nope' }, {}), /No such file/)
-  assert.deepEqual(workspaces, [])
-})
-
-test('ssh_workspace refuses a file', async () => {
-  const { api: hostApi, workspaces } = api({
-    stat: () => ({ isDirectory: false, size: 24, mode: 0o100644 }),
   })
   await assert.rejects(() => runSshWorkspace(hostApi, host(), { directory: '/srv/app/index.ts' }, {}), /not a directory/)
   assert.deepEqual(workspaces, [])
 })
 
 test('ssh_workspace follows the read gate: deny and untrusted refuse it', async () => {
-  const { api: hostApi, stats, workspaces } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+  const { api: hostApi, workspaces, commands } = api()
   await assert.rejects(() => runSshWorkspace(hostApi, host({ opsPolicy: 'deny' }), { directory: '/srv/app' }, {}), /disabled/)
   await assert.rejects(() => runSshWorkspace(hostApi, host({ fingerprint: '' }), { directory: '/srv/app' }, {}), /trust its fingerprint/)
-  assert.deepEqual(stats, [])
+  assert.deepEqual(commands, [])
   assert.deepEqual(workspaces, [])
 })
 
 test('ssh_workspace is blocked by a cancelled call', async () => {
   const controller = new AbortController()
   controller.abort()
-  const { api: hostApi, stats, workspaces } = api({
-    stat: () => ({ isDirectory: true, size: 0, mode: 0o040755 }),
-  })
+  const { api: hostApi, workspaces } = api()
   await assert.rejects(
     () => runSshWorkspace(hostApi, host(), { directory: '/srv/app' }, { signal: controller.signal }),
     (error: unknown) => error instanceof Error && error.name === 'AbortError',
   )
-  assert.deepEqual(stats, [])
   assert.deepEqual(workspaces, [])
 })
 
-test('rendered workspace output names the host, directory, and placeholder', () => {
-  const text = renderSshWorkspace({
+test('rendered workspace output names the host and directory, and says the session did not move', () => {
+  const added = renderSshWorkspace({
     host: { name: 'prod', address: '10.0.0.1' },
     path: '/home/me/.dsh/remote/prod1/abc',
     remotePath: '/srv/app',
     title: 'prod · app',
+    created: true,
   })
-  assert.match(text, /workspace added: prod · app · \/srv\/app on prod/)
-  assert.match(text, /placeholder \/home\/me\/\.dsh\/remote\/prod1\/abc/)
-  assert.match(text, /did not move/)
+  assert.match(added, /workspace added: "prod · app" for \/srv\/app on prod/)
+  assert.match(added, /did not move/)
+
+  // A directory that was already registered must not read as a fresh add.
+  const existing = renderSshWorkspace({
+    host: { name: 'prod', address: '10.0.0.1' },
+    path: '/home/me/.dsh/remote/prod1/abc',
+    remotePath: '/srv/app',
+    title: 'prod · app',
+    created: false,
+  })
+  assert.match(existing, /workspace already registered/)
+  assert.match(existing, /existing title was kept/)
 })

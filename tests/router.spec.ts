@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
-import { childDirectoryPath, isValidHostId, mapRemoteToLocal, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
+import { childDirectoryPath, isValidHostId, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath } from '../src/router.ts'
 
 const env = { DSH_HOME: '/tmp/dsh-home' }
 
@@ -75,4 +75,14 @@ test('a new folder name that would leave the listed directory is refused', () =>
   // A dot inside a longer name is a normal name.
   assert.deepEqual(childDirectoryPath('/home/u', '.config'), { path: '/home/u/.config' })
   assert.deepEqual(childDirectoryPath('/home/u', 'a..b'), { path: '/home/u/a..b' })
+})
+
+test('a remote directory has one spelling, whatever the trailing slashes', () => {
+  assert.equal(normalizeRemoteDirectory('/srv/app'), '/srv/app')
+  assert.equal(normalizeRemoteDirectory('/srv/app/'), '/srv/app')
+  assert.equal(normalizeRemoteDirectory('//srv//app//'), '/srv/app')
+  // The filesystem root must not collapse to an empty string.
+  assert.equal(normalizeRemoteDirectory('/'), '/')
+  assert.equal(normalizeRemoteDirectory('   '), null)
+  assert.equal(normalizeRemoteDirectory('srv/app'), null)
 })

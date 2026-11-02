@@ -221,6 +221,9 @@ export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args:
     path: created.path,
     remotePath: created.remotePath,
     title: created.title,
+    // The registry reuses an existing row and keeps its title, so a caller that
+    // passed one cannot assume it was applied.
+    created: created.created,
     // The session stays where it is. Saying so stops the model from running
     // `bash` and expecting it on the host it just registered.
     currentSessionChanged: false,
@@ -230,7 +233,12 @@ export async function runSshWorkspace(hostApi: ToolHost, host: HostConfig, args:
 export function renderSshWorkspace(value: Record<string, unknown>): string {
   const host = value.host as OpsHostView | undefined
   const label = host === undefined ? 'remote host' : host.name || host.address
-  return `workspace added: ${String(value.title ?? '')} · ${String(value.remotePath ?? '')} on ${label} (placeholder ${String(value.path ?? '')}); the current session did not move`
+  const title = String(value.title ?? '')
+  const path = String(value.remotePath ?? '')
+  if (value.created === false) {
+    return `workspace already registered: "${title}" for ${path} on ${label}; nothing changed, and the existing title was kept`
+  }
+  return `workspace added: "${title}" for ${path} on ${label}; the current session did not move`
 }
 
 export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {

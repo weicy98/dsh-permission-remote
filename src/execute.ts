@@ -89,7 +89,7 @@ export interface ToolHost {
    * path and the title it ended up with. The ops tools expose it; the workspace
    * runners do not need it.
    */
-  readonly createWorkspace?: (host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal) => Promise<{ path: string, remotePath: string, title: string }>
+  readonly createWorkspace?: (host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal) => Promise<{ path: string, remotePath: string, title: string, created: boolean }>
   readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: ApprovalDetail) => Promise<SandboxMode>
   /** Captured Bash startup exports for this host. Empty when the capture failed or timed out. */
   readonly loginEnvOf?: (host: HostConfig, signal?: AbortSignal) => Promise<string>
