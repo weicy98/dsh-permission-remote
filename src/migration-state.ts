@@ -4,7 +4,7 @@ import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 
 /**
- * Migration bookkeeping kept beside the settings, not inside them.
+ * Migration bookkeeping kept in the plugin's own data directory, not in settings.
  *
  * Two pieces of state describe work in progress rather than anything the
  * operator chose: the placeholder roots this profile migrated away from, and
@@ -14,7 +14,7 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
  * mistaken edit silently drops the record of a session that still needs
  * re-homing.
  *
- * They live in their own JSON document under the DSH home instead, written
+ * They live in their own JSON document under `~/.dsh/data/dsh-permission-remote/`, written
  * through `writeFileAtomic` (readers see the old or the new document, never a
  * partial one) with `0600` because it names local paths. Every read is
  * defensive: a corrupt or missing file degrades to empty bookkeeping, which the

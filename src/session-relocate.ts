@@ -618,7 +618,7 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
  * silently overwrites a log.
  */
 async function reconcileExistingDestination(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
-  const { destDir, dir, id, from, to, options: _options, summary } = context
+  const { destDir, dir, id, from, to, summary } = context
   const fail = (reason: string): false => {
     summary.failed.push({ id, reason })
     return false

@@ -35,7 +35,7 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, supersededRootsSnapshot, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
@@ -992,10 +992,18 @@ export class Core {
    * save again" advice keeps working across restarts too.
    */
   private catchupRoots(current: string): string[] {
+    // Only the persisted sidecar drives the sweep. The in-memory router list is
+    // kept solely so a stale placeholder keeps routing to its server; it is not
+    // a work queue. Reading it here made every later save re-scan an already
+    // drained root (it is never removed from memory), while the sidecar is
+    // pruned once empty.
     const roots: string[] = []
-    for (const root of [...this.migrationState.supersededRemoteRoots, ...supersededRootsSnapshot()]) {
-      if (resolveLocalPath(root) === resolveLocalPath(current)) continue
-      if (!roots.includes(root)) roots.push(root)
+    const seen = new Set<string>([resolveLocalPath(current)])
+    for (const root of this.migrationState.supersededRemoteRoots) {
+      const canonical = resolveLocalPath(root)
+      if (seen.has(canonical)) continue
+      seen.add(canonical)
+      roots.push(root)
     }
     return roots
   }
@@ -1056,12 +1064,12 @@ export class Core {
     const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
     const list = agents?.list?.() ?? []
     if (list.length === 0) return 0
-    const roots = rows.map(row => resolveLocalPath(row.ws.path))
+    const roots = rows.map(row => canonicalPath(row.ws.path))
     let count = 0
     for (const agent of list) {
       const cwd = agent.session?.header?.cwd
       if (typeof cwd !== 'string' || cwd.length === 0) continue
-      const resolved = resolveLocalPath(cwd)
+      const resolved = canonicalPath(cwd)
       if (roots.some(root => resolved === root || resolved.startsWith(`${root}${sep}`))) count += 1
     }
     return count
@@ -2102,6 +2110,15 @@ function summaryCounts(summary: SessionRelocationSummary): {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** The realpath of `path` when it resolves, else its lexical resolve. */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    return resolveLocalPath(path)
+  }
 }
 
 /** Whether two paths name the same directory, canonicalizing symlinks when possible. */
