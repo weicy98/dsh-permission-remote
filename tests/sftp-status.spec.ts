@@ -16,6 +16,14 @@ function statusError(code: number, message: string): Error {
   return error
 }
 
+test('a raw ssh2 STATUS is missing when the numeric code says so', () => {
+  // attrsOf classifies this error before failureOf copies the code onto
+  // SshFailure. A German sshd still has to resolve as "no entry".
+  const error = statusError(SFTP_STATUS.NO_SUCH_FILE, 'Datei nicht gefunden')
+  assert.equal(isSftpMissing(error), true)
+  assert.equal(isSftpPermissionDenied(statusError(SFTP_STATUS.PERMISSION_DENIED, 'Zugriff verweigert')), true)
+})
+
 test('a NO_SUCH_FILE status reads as missing even when the message is localised', () => {
   // A German sshd says "Datei nicht gefunden". The English regex misses it, so
   // only the numeric status can classify the failure.

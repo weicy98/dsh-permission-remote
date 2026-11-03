@@ -179,23 +179,31 @@ function failureOf(error: Error, stage: string): SshFailure {
   return new SshFailure(error.message, stage, sftpStatusOf(error))
 }
 
+/**
+ * Numeric SFTP status, from `SshFailure.status` or from the `code` ssh2 sets
+ * on the raw STATUS error. `attrsOf` classifies the raw error before it is
+ * wrapped, so the code has to be visible there too.
+ */
+function sftpFailureStatus(error: unknown): number | undefined {
+  if (error instanceof SshFailure && typeof error.status === 'number') return error.status
+  return sftpStatusOf(error)
+}
+
 /** The path is not there. The code is authoritative; the message is the fallback. */
 export function isSftpMissing(error: unknown): boolean {
-  if (error instanceof SshFailure) {
-    if (error.status === SFTP_STATUS.NO_SUCH_FILE) return true
-    // A status of FAILURE is what a server without a specific code sends; the
-    // message still distinguishes "no such file" for those.
-    if (error.status !== undefined && error.status !== SFTP_STATUS.FAILURE) return false
-  }
+  const status = sftpFailureStatus(error)
+  if (status === SFTP_STATUS.NO_SUCH_FILE) return true
+  // A status of FAILURE is what a server without a specific code sends; the
+  // message still distinguishes "no such file" for those.
+  if (status !== undefined && status !== SFTP_STATUS.FAILURE) return false
   return error instanceof Error && /no such file|cannot find|not found|does not exist/i.test(error.message)
 }
 
 /** The server refused the operation on permissions. Code first, message second. */
 export function isSftpPermissionDenied(error: unknown): boolean {
-  if (error instanceof SshFailure) {
-    if (error.status === SFTP_STATUS.PERMISSION_DENIED) return true
-    if (error.status !== undefined && error.status !== SFTP_STATUS.FAILURE) return false
-  }
+  const status = sftpFailureStatus(error)
+  if (status === SFTP_STATUS.PERMISSION_DENIED) return true
+  if (status !== undefined && status !== SFTP_STATUS.FAILURE) return false
   return error instanceof Error && /permission denied/i.test(error.message)
 }
 

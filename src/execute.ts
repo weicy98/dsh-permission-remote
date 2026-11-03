@@ -624,14 +624,10 @@ const PRESENT_CAP = 32 * 1024 * 1024
  * that happens to share the spelling is left alone.
  */
 const stagedPlaceholders = new Set<string>()
+/** Bumped when unloading starts, so a copy that lands afterwards is removed too. */
+let stagedEpoch = 0
 
-/**
- * Delete the delivery copies this process staged. Best-effort per path: one
- * failure must not stop the rest, because this runs during teardown.
- */
-export async function clearStagedPresentFiles(): Promise<void> {
-  const paths = [...stagedPlaceholders]
-  stagedPlaceholders.clear()
+async function removeStagedCopies(paths: readonly string[]): Promise<void> {
   await Promise.all(paths.map(async target => {
     try {
       await rm(target, { force: true })
@@ -639,6 +635,28 @@ export async function clearStagedPresentFiles(): Promise<void> {
       // A copy the user already removed, or a directory that was never ours.
     }
   }))
+}
+
+/**
+ * Delete delivery copies this process staged. Best-effort per path: one
+ * failure must not stop the rest, because this runs during teardown.
+ *
+ * With no list, every staged path is removed and a write that is still in
+ * flight deletes its file instead of publishing it. A list removes only those
+ * paths, so one caller cannot wipe copies another caller still has on screen.
+ */
+export async function clearStagedPresentFiles(only?: readonly string[]): Promise<void> {
+  if (only !== undefined) {
+    const paths = only.filter(target => stagedPlaceholders.delete(target))
+    await removeStagedCopies(paths)
+    return
+  }
+  stagedEpoch += 1
+  while (stagedPlaceholders.size > 0) {
+    const paths = [...stagedPlaceholders]
+    for (const target of paths) stagedPlaceholders.delete(target)
+    await removeStagedCopies(paths)
+  }
 }
 
 /**
@@ -666,6 +684,7 @@ export async function stagePresentFiles(
     const requested = String(file.path ?? '').trim()
     if (requested.length === 0) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
     const remotePath = resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
+    const ticket = stagedEpoch
     let info: { isDirectory: boolean, size: number }
     try {
       info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
@@ -687,6 +706,13 @@ export async function stagePresentFiles(
     // sees one path for one file whichever tool produced it.
     const placeholder = toModelPath(remotePath, route)
     await withSignal(writeFileAtomic(placeholder, data, { mode: 0o600, dirMode: 0o700 }), exec?.signal)
+    // Unload may have started while this file was being fetched or written.
+    // Its snapshot does not include this path, so leaving the bytes here would
+    // outlive the plugin. A path that was not written is not removed.
+    if (ticket !== stagedEpoch) {
+      await rm(placeholder, { force: true })
+      throw new Error(`Cannot present ${requested}: the plugin is unloading`)
+    }
     stagedPlaceholders.add(placeholder)
     staged.push({ path: placeholder, bytes: data.length })
   }

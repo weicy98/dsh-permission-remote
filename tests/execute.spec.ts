@@ -676,7 +676,7 @@ test('unloading removes the delivery copies it staged', async () => {
     const staged = await stagePresentFiles(api, sessionRoute, [{ path: 'out/report.txt' }], { signal: new AbortController().signal })
     const target = staged[0]!.path
     assert.equal(await readFile(target, 'utf8'), 'hello')
-    await clearStagedPresentFiles()
+    await clearStagedPresentFiles([target])
     assert.equal(existsSync(target), false)
   } finally {
     delete process.env.DSH_SSH_REMOTE_ROOT
@@ -695,7 +695,7 @@ test('clearing delivery copies leaves files this process did not stage alone', a
     const foreign = join(mapping, 'out', 'foreign.txt')
     await mkdir(join(mapping, 'out'), { recursive: true })
     await writeFile(foreign, 'mine')
-    await clearStagedPresentFiles()
+    await clearStagedPresentFiles([foreign])
     assert.equal(await readFile(foreign, 'utf8'), 'mine')
   } finally {
     delete process.env.DSH_SSH_REMOTE_ROOT

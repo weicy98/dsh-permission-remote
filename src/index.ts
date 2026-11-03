@@ -367,6 +367,15 @@ export class Core {
   private migrationStateLoaded: Promise<void> | null = null
   /** False when the sidecar exists but could not be read; never overwrite then. */
   private migrationStateWritable = true
+  /**
+   * Tail of the session-relocation queue.
+   *
+   * `apply` starts `resumeSessionMigrationState` without awaiting it, and saving
+   * the current root again also calls `relocateFromRoots`. Both rename the same
+   * session directory; the loser used to record ENOENT as a failed move. A
+   * rejection still settles the tail, so one failed sweep cannot wedge the next.
+   */
+  private relocationTail: Promise<void> = Promise.resolve()
 
   readonly pool: SshPool
   private config: PluginConfig
@@ -1009,8 +1018,28 @@ export class Core {
     return roots
   }
 
-  /** Move stored sessions from each of `roots` onto `newRoot`. */
-  private async relocateFromRoots(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
+  /**
+   * Queue `work` behind any relocation already running on this core.
+   * Callers outside the queue use this; the queued body must not call it again.
+   */
+  private enqueueRelocation<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.relocationTail.then(work, work)
+    this.relocationTail = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /**
+   * Move stored sessions from each of `roots` onto `newRoot`.
+   *
+   * One pass at a time: the load-time sweep and a save of the same root both
+   * enter here, and running them together renames one directory twice.
+   */
+  private relocateFromRoots(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
+    return this.enqueueRelocation(() => this.relocateFromRootsNow(roots, newRoot))
+  }
+
+  /** The body of {@link relocateFromRoots}. Must not enqueue relocation again. */
+  private async relocateFromRootsNow(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
     const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
     const survivors = new Set<string>()
     let pruned = false
@@ -1026,6 +1055,12 @@ export class Core {
         survivors.add(resolveLocalPath(root))
       } else {
         pruned = true
+        // Once, for a directory that is still there: the prune below drops the
+        // root, so the next startup does not say this again. A missing directory
+        // is the normal end of a migration and stays quiet.
+        if (existsSync(root)) {
+          this.ctx.logger?.info(`[@dsh-permission-remote] old remote root ${root} is still on disk; the sweep moved, skipped, and failed nothing`)
+        }
       }
     }
     if (pruned && this.migrationState.supersededRemoteRoots.length > 0) {
@@ -1546,7 +1581,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   ctx.effect(() => ctx.settings.configure({ auto: false }))
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     // One agent disposer must not skip the remaining agents or the pool.
     const failure = settleDisposers([...unregisters])
     unregisters.clear()
@@ -1554,9 +1589,10 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       ctx.logger?.warn(`[@dsh-permission-remote] plugin cleanup failed: ${errorText(failure)}`)
     }
     // Delivery copies live in the placeholder tree and a card may still name
-    // them, so this is the only safe moment to remove them.
-    void clearStagedPresentFiles()
-    void core.pool.dispose()
+    // them, so this is the only safe moment to remove them. The disposer is
+    // async so Cordis waits for the files to disappear before the pool closes.
+    await clearStagedPresentFiles()
+    await core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
     const remove = installSidebarBridge(bridged, core)

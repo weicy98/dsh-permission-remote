@@ -86,9 +86,14 @@ function makeCtx(options: {
   droppedSecrets: unknown[]
   liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }>
   failPersist?: boolean
+  infos?: string[]
+  warns?: string[]
 }) {
   return {
-    logger: { info() {}, warn() {} },
+    logger: {
+      info(message?: unknown) { options.infos?.push(String(message)) },
+      warn(message?: unknown) { options.warns?.push(String(message)) },
+    },
     settings: {
       configure: () => () => undefined,
       describe: () => [{ ns: 'permission-remote' }],
@@ -1179,6 +1184,81 @@ test('sessionLogExists finds a log recorded under the other root spelling', asyn
     assert.equal(await sessionLogExists(box.box, lexical, 'session-x'), true)
     assert.equal(await sessionLogExists(box.box, canonical, 'session-x'), true)
     assert.equal(await sessionLogExists(box.box, canonical, 'session-absent'), false)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('an empty sweep names an old root that is still on disk, then drops it', async () => {
+  const box = await harness()
+  try {
+    const infos: string[] = []
+    await writeMigrationState({ supersededRemoteRoots: [box.oldRoot], pendingSessionGrouping: [] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloaded = new Core(
+      makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [], infos }) as never,
+      readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }),
+      box.registry,
+    )
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    const named = infos.filter(line => line.includes(box.oldRoot) && line.includes('moved, skipped, and failed nothing'))
+    assert.deepEqual(named, [`[@dsh-permission-remote] old remote root ${box.oldRoot} is still on disk; the sweep moved, skipped, and failed nothing`])
+    assert.deepEqual((await sidecar(box)).supersededRemoteRoots, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('an empty sweep of a root that is already gone stays quiet and still drops it', async () => {
+  const box = await harness()
+  try {
+    const gone = join(box.box, 'gone-root')
+    const infos: string[] = []
+    await writeMigrationState({ supersededRemoteRoots: [gone], pendingSessionGrouping: [] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloaded = new Core(
+      makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [], infos }) as never,
+      readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }),
+      box.registry,
+    )
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.equal(infos.some(line => line.includes('moved, skipped, and failed nothing')), false)
+    assert.deepEqual((await sidecar(box)).supersededRemoteRoots, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a startup sweep and a save do not both rename one session', async () => {
+  const box = await harness()
+  try {
+    // Captured while routing still points at the old root. The reloaded core
+    // below switches the process-wide root before either pass runs.
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-race', oldLocal, [{ type: 'session/append', seq: 1 }])
+    await writeMigrationState({ supersededRemoteRoots: [box.oldRoot], pendingSessionGrouping: [] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const warns: string[] = []
+    const reloaded = new Core(
+      makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [], warns }) as never,
+      readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }),
+      box.registry,
+    )
+    reloaded.applyRemoteRootOverride()
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    // Same root, so the save takes the catch-up path and both call relocateFromRoots.
+    const sweep = reloaded.resumeSessionMigrationState()
+    const save = reloaded.changeRemoteRoot(box.newRoot, { force: false })
+    const [, saved] = await Promise.all([sweep, save])
+    assert.equal(saved.status, 'unchanged')
+    assert.equal(saved.sessionsFailed, 0)
+    assert.equal(saved.sessionsSkippedLive, 0)
+    const bytes = await readFile(join(storedSessionDir(box, newLocal, 'session-race'), 'session.v4.jsonl.zstd'))
+    assert.equal(headerOf(bytes).cwd, newLocal)
+    await assert.rejects(() => readFile(join(storedSessionDir(box, oldLocal, 'session-race'), 'session.v4.jsonl.zstd')), /ENOENT/)
+    // Overlap used to record the loser's ENOENT and leave the root queued.
+    assert.equal(warns.some(line => line.includes('could not follow the remote root')), false)
+    assert.deepEqual((await sidecar(box)).supersededRemoteRoots, [])
+    assert.equal((await sidecar(box)).pendingSessionGrouping.some(entry => entry.id === 'session-race'), true)
   } finally {
     await dispose(box)
   }
