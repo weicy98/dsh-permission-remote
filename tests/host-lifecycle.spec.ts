@@ -104,6 +104,22 @@ function watchInvalidate(core: Core): string[] {
   return invalidated
 }
 
+test('changing the address drops the remote file tree, a rename and a new fingerprint keep it', async () => {
+  const core = build(new FakeRegistry())
+  const dropped: string[] = []
+  const unbind = core.bindRemoteTree(hostId => { dropped.push(hostId) })
+  await core.trust('host1', 'SHA256:other')
+  await core.saveHost({ ...host(), name: 'renamed' })
+  assert.deepEqual(dropped, [])
+  await core.saveHost({ ...host(), name: 'renamed', host: '10.0.0.9' })
+  assert.deepEqual(dropped, ['host1'])
+  await core.deleteHost('host1')
+  assert.deepEqual(dropped, ['host1', 'host1'])
+  unbind()
+  await core.restoreHost('host1')
+  assert.deepEqual(dropped, ['host1', 'host1'])
+})
+
 test('changing the address drops the pooled session, renaming keeps it', async () => {
   const registry = new FakeRegistry()
   const core = build(registry)

@@ -65,6 +65,22 @@ export interface DirEntry {
   readonly path: string
 }
 
+/** One directory entry, including files. `sftpList` stays directories only. */
+export interface RemoteDirEntry {
+  readonly name: string
+  readonly type: 'file' | 'directory' | 'symlink' | 'other'
+  readonly size: number
+  readonly mtime: number
+}
+
+/** `stat` follows the last symlink. `lstat` does not. `undefined` means the path is absent. */
+export interface SftpAttrs {
+  readonly type: 'file' | 'directory' | 'symlink' | 'other'
+  readonly size: number
+  readonly mtime: number
+  readonly mode?: number
+}
+
 export interface SecretMaterial {
   readonly password?: string
   readonly passphrase?: string
@@ -366,6 +382,66 @@ export class SshPool {
     await this.exec(host, secret, `chmod 755 ${shJoin([remotePath])}`, 15_000)
   }
 
+  /**
+   * Place a data file. The parent directory is private. The file itself keeps
+   * the remote umask: `sftpUpload` marks a binary executable, and a document
+   * must not become one.
+   */
+  async sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string): Promise<void> {
+    const body = await readFile(localPath)
+    const dir = remotePath.slice(0, remotePath.lastIndexOf('/'))
+    if (dir.length > 0) {
+      await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000)
+    }
+    await this.sftpWrite(host, secret, remotePath, body)
+  }
+
+  async sftpAttrs(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
+    const session = await this.sftp(host, secret)
+    return attrsOf(session, remotePath, follow)
+  }
+
+  /** The symlink target. A non-link rejects; the caller decides which errors mean that. */
+  async sftpReadLink(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
+    const session = await this.sftp(host, secret)
+    return readLinkOf(session, remotePath)
+  }
+
+  /**
+   * Whether `remotePath` can be opened as a directory. The names are not read:
+   * a mode-less `stat` only needs the open to succeed.
+   */
+  async sftpProbeDir(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<void> {
+    const session = await this.sftp(host, secret)
+    await probeOpenDir(session, remotePath)
+  }
+
+  /** Files and directories. The settings picker uses {@link sftpList}, which drops files. */
+  async sftpReadDir(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<RemoteDirEntry[]> {
+    const session = await this.sftp(host, secret)
+    const rows = await readdir(session, remotePath)
+    const entries: RemoteDirEntry[] = []
+    for (const row of rows) {
+      if (row.filename === '.' || row.filename === '..' || row.filename.includes('/') || row.filename.includes('\\')) continue
+      const attrs = attrsFrom(row.attrs, row.longname)
+      entries.push({ name: row.filename, type: attrs.type, size: attrs.size, mtime: attrs.mtime })
+    }
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    return entries
+  }
+
+  /** One byte window. A short reply is read again until the window is full or a read returns nothing. */
+  async sftpReadAt(host: HostConfig, secret: SecretMaterial, remotePath: string, offset: number, length: number): Promise<Buffer> {
+    const session = await this.sftp(host, secret)
+    return readOpenRange(session, remotePath, offset, length)
+  }
+
+  /** Chunks from one open handle. Stopping the generator closes the handle. */
+  async *sftpReadChunks(host: HostConfig, secret: SecretMaterial, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
+    const session = await this.sftp(host, secret)
+    yield* readOpenChunks(session, remotePath, signal)
+  }
+
   private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
     return claimPending(this.live, host.id, async () => {
       await this.reserve()
@@ -645,12 +721,27 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
   return { done, close: () => stop('cancel') }
 }
 
+interface SftpStats {
+  size: number
+  mode?: number
+  mtime?: number
+  isDirectory(): boolean
+  isFile?: () => boolean
+  isSymbolicLink?: () => boolean
+}
+
 interface SftpLike {
   readFile(path: string, callback: (error: Error | undefined, data: Buffer) => void): void
   writeFile(path: string, data: Buffer | string, callback: (error: Error | undefined) => void): void
   realpath(path: string, callback: (error: Error | undefined, resolved: string) => void): void
-  readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>) => void): void
-  stat(path: string, callback: (error: Error | undefined, stats: { size: number, mode?: number, isDirectory(): boolean }) => void): void
+  readdir(path: string, callback: (error: Error | undefined, list: ReadonlyArray<{ filename: string, longname?: string, attrs: SftpStats }>) => void): void
+  stat(path: string, callback: (error: Error | undefined, stats: SftpStats) => void): void
+  lstat(path: string, callback: (error: Error | undefined, stats: SftpStats) => void): void
+  readlink(path: string, callback: (error: Error | undefined, target?: string) => void): void
+  opendir(path: string, callback: (error: Error | undefined, handle?: Buffer) => void): void
+  open(path: string, flags: string, callback: (error: Error | undefined, handle: Buffer) => void): void
+  read(handle: Buffer, buffer: Buffer, offset: number, length: number, position: number, callback: (error: Error | undefined, bytesRead: number, buffer: Buffer, position: number) => void): void
+  close(handle: Buffer, callback: (error: Error | undefined) => void): void
   /** `attrs` is optional in ssh2: `mkdir(path, callback)` sends an empty ATTRS. */
   mkdir(path: string, callback: (error: Error | undefined) => void): void
   end(callback?: () => void): void
@@ -757,11 +848,159 @@ function realpathOf(sftp: SftpLike, remotePath: string): Promise<string> {
   })
 }
 
-function readdir(sftp: SftpLike, remotePath: string): Promise<ReadonlyArray<{ filename: string, attrs: { isDirectory(): boolean } }>> {
+/** `OPENDIR` plus `CLOSE`. A later `READDIR` would pull every name in a large directory. */
+export async function probeOpenDir(sftp: SftpLike, remotePath: string): Promise<void> {
+  const handle = await new Promise<Buffer>((resolve, reject) => {
+    sftp.opendir(remotePath, (error, opened) => {
+      if (error || opened === undefined) reject(new SshFailure(error?.message ?? 'sftp opendir failed', 'sftp-list'))
+      else resolve(opened)
+    })
+  })
+  await new Promise<void>(resolve => {
+    sftp.close(handle, () => resolve())
+  })
+}
+
+function readdir(sftp: SftpLike, remotePath: string): Promise<ReadonlyArray<{ filename: string, longname?: string, attrs: SftpStats }>> {
   return new Promise((resolve, reject) => {
     sftp.readdir(remotePath, (error, list) => {
       if (error) reject(new SshFailure(error.message, 'sftp-list'))
       else resolve(list)
     })
   })
+}
+
+const SFTP_NOT_FOUND = /no such file|cannot find|not found|does not exist/i
+const READ_CHUNK = 64 * 1024
+
+/**
+ * `ls -l` style longname. The first character is the type only when the next
+ * letters look like permission bits. A longname that is just the filename
+ * must not turn `data.txt` into a directory.
+ */
+const LONGNAME_KIND = /^([dlbcps-])[r-][w-][xsStT-]/
+
+/** Entry type. A real mode wins. Without permissions, `longname` supplies d, -, or l. */
+export function listingType(
+  stats: { mode?: number, isDirectory(): boolean, isFile?: () => boolean, isSymbolicLink?: () => boolean },
+  longname?: string,
+): SftpAttrs['type'] {
+  const link = typeof stats.isSymbolicLink === 'function' && stats.isSymbolicLink()
+  const file = typeof stats.isFile === 'function' && stats.isFile()
+  const fromMode = link ? 'symlink' : stats.isDirectory() ? 'directory' : file ? 'file' : 'other'
+  if (typeof stats.mode === 'number') return fromMode
+  const mark = LONGNAME_KIND.exec(longname ?? '')?.[1]
+  if (mark === 'd') return 'directory'
+  if (mark === 'l') return 'symlink'
+  if (mark === '-') return 'file'
+  return fromMode
+}
+
+function attrsFrom(stats: SftpStats, longname?: string): SftpAttrs {
+  return {
+    type: listingType(stats, longname),
+    size: stats.size,
+    mtime: typeof stats.mtime === 'number' ? stats.mtime : 0,
+    ...typeof stats.mode === 'number' ? { mode: stats.mode } : {},
+  }
+}
+
+function readLinkOf(sftp: SftpLike, remotePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    sftp.readlink(remotePath, (error, target) => {
+      if (error) reject(new SshFailure(error.message, 'sftp-readlink'))
+      else if (target === undefined) reject(new SshFailure('Response missing link info', 'sftp-readlink'))
+      else resolve(target)
+    })
+  })
+}
+
+function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
+  return new Promise((resolve, reject) => {
+    const finish = (error: Error | undefined, stats?: SftpStats) => {
+      if (error) {
+        if (SFTP_NOT_FOUND.test(error.message)) resolve(undefined)
+        else reject(new SshFailure(error.message, follow ? 'sftp-stat' : 'sftp-lstat'))
+        return
+      }
+      if (stats === undefined) {
+        resolve(undefined)
+        return
+      }
+      resolve(attrsFrom(stats))
+    }
+    if (follow) sftp.stat(remotePath, finish)
+    else sftp.lstat(remotePath, finish)
+  })
+}
+
+function openRead(sftp: SftpLike, remotePath: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    sftp.open(remotePath, 'r', (error, handle) => {
+      if (error || handle === undefined) reject(new SshFailure(error?.message ?? 'sftp open failed', 'sftp-read'))
+      else resolve(handle)
+    })
+  })
+}
+
+function readAt(sftp: SftpLike, handle: Buffer, position: number, length: number): Promise<Buffer> {
+  const buf = Buffer.alloc(length)
+  return new Promise((resolve, reject) => {
+    sftp.read(handle, buf, 0, length, position, (error, bytesRead) => {
+      if (error) reject(new SshFailure(error.message, 'sftp-read'))
+      else resolve(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead))
+    })
+  })
+}
+
+function closeHandle(sftp: SftpLike, handle: Buffer): Promise<void> {
+  return new Promise(resolve => {
+    sftp.close(handle, () => resolve())
+  })
+}
+
+/**
+ * Read `[offset, offset + length)`. Length 0 does not open the file.
+ * SFTP may return fewer bytes than requested before EOF. Only a zero-length
+ * read ends the window; a short reply is continued from the next offset.
+ */
+export async function readOpenRange(sftp: SftpLike, remotePath: string, offset: number, length: number): Promise<Buffer> {
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+    throw new SshFailure('read range is not a non-negative safe integer', 'sftp-read')
+  }
+  if (length === 0) return Buffer.alloc(0)
+  const handle = await openRead(sftp, remotePath)
+  try {
+    const parts: Buffer[] = []
+    let got = 0
+    while (got < length) {
+      const chunk = await readAt(sftp, handle, offset + got, length - got)
+      if (chunk.length === 0) break
+      parts.push(chunk)
+      got += chunk.length
+    }
+    if (parts.length === 0) return Buffer.alloc(0)
+    const only = parts[0]
+    if (parts.length === 1 && only !== undefined) return only
+    return Buffer.concat(parts, got)
+  } finally {
+    await closeHandle(sftp, handle)
+  }
+}
+
+/** Sequential windows from one handle. A short read ends the file. */
+export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
+  const handle = await openRead(sftp, remotePath)
+  try {
+    let position = 0
+    while (true) {
+      if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
+      const chunk = await readAt(sftp, handle, position, READ_CHUNK)
+      if (chunk.length === 0) return
+      position += chunk.length
+      yield chunk
+    }
+  } finally {
+    await closeHandle(sftp, handle)
+  }
 }

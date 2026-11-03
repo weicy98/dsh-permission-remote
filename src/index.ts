@@ -53,6 +53,8 @@ import {
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
+import { installRemoteFs } from './remote-fs.ts'
+import { installRemoteUploads } from './uploads.ts'
 import {
   createdWorkspaceTitle,
   hostTag,
@@ -94,6 +96,14 @@ interface HostContext {
   on(event: 'agent/created', listener: (payload: { agent: AgentLike }) => void): () => void
   /** Fired after any surface writes a settings section (`ns` is its id). */
   on(event: 'settings/document-updated', listener: (ns: unknown, revision: number) => void): () => void
+  /**
+   * Model-stream waterfall. The listener returns the next iterable; it must not
+   * be async, because the bus does not await a promise.
+   */
+  on(event: 'llm/stream', listener: (
+    options: { sessionId?: string, messages?: unknown, signal?: AbortSignal },
+    next: () => AsyncIterable<unknown>,
+  ) => AsyncIterable<unknown>): () => void
   effect(dispose: () => void): void
   logger?: { info(message: string): void, warn(message: string): void }
 }
@@ -353,6 +363,8 @@ export class Core {
   private readonly status = new Map<string, Promise<RunnerStatus>>()
   private readonly shellLists = new Map<string, Promise<SidebarShell[]>>()
   private readonly loginEnvs = new LoginEnvCache((hostId, signal) => this.readLoginEnv(hostId, signal))
+  /** Drops realpath, stat, and containment records for one host. The file tree installs this. */
+  private readonly remoteTrees = new Set<(hostId: string) => void>()
   /** The first apply installs the configured root; only a later change keeps the previous one routable. */
   private remoteRootApplied = false
 
@@ -396,6 +408,7 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    this.dropRemoteTree(hostId)
     await this.persistHosts()
   }
 
@@ -427,6 +440,7 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    this.dropRemoteTree(hostId)
     return { workspaces: removed }
   }
 
@@ -486,9 +500,9 @@ export class Core {
 
   /**
    * Drop everything derived from a connection that no longer applies: the
-   * cached probe, the pooled session, the cached remote home, and the sidebar
-   * shell list. Connecting is interrupted, so an agent command running on that
-   * session is killed.
+   * cached probe, the pooled session, the cached remote home, the sidebar
+   * shell list, and the file tree's realpath and stat cache. Connecting is
+   * interrupted, so an agent command running on that session is killed.
    */
   forgetStatus(hostId: string): void {
     this.status.delete(hostId)
@@ -496,6 +510,23 @@ export class Core {
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
     this.loginEnvs.forget(hostId)
+    this.dropRemoteTree(hostId)
+  }
+
+  /** The installed file tree forgets one host when its connection is dropped. */
+  bindRemoteTree(invalidate: (hostId: string) => void): () => void {
+    this.remoteTrees.add(invalidate)
+    return () => { this.remoteTrees.delete(invalidate) }
+  }
+
+  private dropRemoteTree(hostId: string): void {
+    for (const invalidate of this.remoteTrees) {
+      try {
+        invalidate(hostId)
+      } catch (error) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] remote file tree reset failed for ${hostId}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
   }
 
   /**
@@ -612,6 +643,7 @@ export class Core {
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
+    this.dropRemoteTree(hostId)
     await this.persistHosts()
   }
 
@@ -1267,6 +1299,36 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     bridged.effect(() => () => {
       remove()
       unregisters.delete(remove)
+    })
+  })
+  // Sidebar listing, office preview, and markdown images all read ctx.fs at the
+  // placeholder path. Uploads are copied before that stream's first pull.
+  // `fs` is not in this plugin's inject list. A get() here runs before that
+  // service is active and returns nothing, and the install would not retry.
+  rawCtx.inject(['fs'], bridged => {
+    const ready = bridged as unknown as HostContext
+    const removeFs = installRemoteFs(ready, core)
+    const removeUploads = installRemoteUploads(ready, core)
+    const unbinds: Array<() => void> = []
+    if (removeFs !== undefined) {
+      unregisters.add(removeFs)
+      const unbind = core.bindRemoteTree(hostId => removeFs.invalidateHost(hostId))
+      unbinds.push(unbind)
+      unregisters.add(unbind)
+    }
+    if (removeUploads !== undefined) {
+      unregisters.add(removeUploads)
+      const unbind = core.bindRemoteTree(hostId => removeUploads.invalidateHost(hostId))
+      unbinds.push(unbind)
+      unregisters.add(unbind)
+    }
+    bridged.effect(() => () => {
+      removeFs?.()
+      removeUploads?.()
+      for (const unbind of unbinds) unbind()
+      if (removeFs !== undefined) unregisters.delete(removeFs)
+      if (removeUploads !== undefined) unregisters.delete(removeUploads)
+      for (const unbind of unbinds) unregisters.delete(unbind)
     })
   })
   void api
