@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
+import { FsError } from '@deepseek-ai/dsh-fs'
 import type { HostConfig } from '../src/config.ts'
 import { clearStagedPresentFiles, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import { apply } from '../src/index.ts'
@@ -121,6 +122,34 @@ test('plugin unload waits until the delivery copies it staged are gone', async (
     }
     assert.equal(sawPromise, true)
     assert.equal(existsSync(target), false)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('present refuses a non-regular remote file instead of blocking on it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-special-'))
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { kind: 'remote', hostId: 'host1', remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const api = {
+      pool: {
+        sftpStat: async () => ({ isDirectory: false, size: 0, type: 'other' }),
+        sftpRead: async () => Buffer.alloc(0),
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'pipe' }], { signal: new AbortController().signal }),
+      (error: unknown) => error instanceof FsError && error.code === 'FS_IO_ERROR',
+    )
   } finally {
     if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
     else process.env.DSH_SSH_REMOTE_ROOT = previous

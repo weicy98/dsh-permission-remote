@@ -276,17 +276,23 @@ async function readLogHeader(path: string, size: number): Promise<{ header: Reco
 }
 
 /**
- * Rewrite only the header of a log and leave every other byte untouched.
+ * Rewrite the header of a log to the new root, and retarget every
+ * `working-directory/change` event that still names an old placeholder.
  *
- * Complete event frames and a torn final frame are preserved byte for byte:
- * re-encoding them would change committed history, and the old placeholder
- * path inside messages must keep reading exactly as written. The result is
- * proven before it is returned — complete-frame count unchanged, header reads
- * back with the new cwd, every following complete frame byte-identical, torn
- * tail byte-identical.
+ * DSH's working-directory projection takes `header.cwd`, then lets a later
+ * `working-directory/change` override it — so a session that once `cd`'d would
+ * otherwise keep its old placeholder path in the body and, once the old root is
+ * pruned, run its commands in this machine's stale copy. Only those change
+ * events are re-encoded; every other frame is kept byte for byte (message text
+ * that mentions a placeholder path must keep reading exactly as written).
+ * A frame that cannot be decoded is kept and makes the caller retain the old
+ * root, so routing never silently falls back to local. The result is proven
+ * before it is returned: frame count unchanged, header reads back with the new
+ * cwd, unaffected frames byte-identical, changed frames decode to the new cwd,
+ * torn tail byte-identical.
  */
-function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compression: boolean): Buffer {
-  if (!compression) return rewritePlainHeader(buffer, expectedId, to)
+function rewriteHeader(buffer: Buffer, expectedId: string, to: string, oldRoots: readonly string[], newRoot: string, compression: boolean): { bytes: Buffer, retainedOldRoot: boolean } {
+  if (!compression) return rewritePlainHeader(buffer, expectedId, to, oldRoots, newRoot)
   const scan = scanLogFrames(buffer)
   if (scan.frames.length === 0) throw new Error('the log holds no complete header frame')
   const first = scan.frames[0]
@@ -298,7 +304,26 @@ function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compressi
   const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
   const plaintext = Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8')
   const head = zstdCompressSync(plaintext, CHECKSUM_OPTIONS)
-  const bytes = Buffer.concat([head, buffer.subarray(first.end)])
+  const parts: Buffer[] = [head]
+  const expected: Array<Record<string, unknown> | undefined> = [undefined]
+  let retainedOldRoot = false
+  for (let i = 1; i < scan.frames.length; i += 1) {
+    const frame = buffer.subarray(scan.frames[i].start, scan.frames[i].end)
+    const event = decodeEventFrame(frame)
+    const next = event === undefined ? undefined : retargetChangeEvent(event, oldRoots, newRoot)
+    if (next !== undefined) {
+      parts.push(zstdCompressSync(Buffer.from(`${JSON.stringify(next)}\n`, 'utf8'), CHECKSUM_OPTIONS))
+      expected.push(next)
+    } else {
+      // An opaque frame cannot be inspected; keep it and make the root survive
+      // the prune so a stale placeholder never starts routing locally.
+      if (event === undefined) retainedOldRoot = true
+      parts.push(frame)
+      expected.push(undefined)
+    }
+  }
+  if (scan.tornStart !== undefined) parts.push(buffer.subarray(scan.tornStart))
+  const bytes = Buffer.concat(parts)
   const check = scanLogFrames(bytes)
   if (check.frames.length !== scan.frames.length) {
     throw new Error(`complete frame count changed: ${scan.frames.length} → ${check.frames.length}`)
@@ -309,17 +334,49 @@ function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compressi
   for (let i = 1; i < check.frames.length; i += 1) {
     const before = buffer.subarray(scan.frames[i].start, scan.frames[i].end)
     const after = bytes.subarray(check.frames[i].start, check.frames[i].end)
-    if (before.length !== after.length || !before.equals(after)) throw new Error(`frame ${i} changed`)
+    const want = expected[i]
+    if (want === undefined) {
+      if (before.length !== after.length || !before.equals(after)) throw new Error(`frame ${i} changed`)
+    } else {
+      const got = decodeEventFrame(after)
+      if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(`frame ${i} did not rewrite as expected`)
+    }
   }
   if (scan.tornStart !== undefined) {
     if (check.tornStart === undefined) throw new Error('the rewritten log lost its torn tail')
     if (!bytes.subarray(check.tornStart).equals(buffer.subarray(scan.tornStart))) throw new Error('the torn tail changed')
   }
-  return bytes
+  return { bytes, retainedOldRoot }
 }
 
-/** Rewrite the first line of an uncompressed log, leaving the rest byte for byte. */
-function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buffer {
+/** Parse one frame as a JSON event, or undefined when it is not one. */
+function decodeEventFrame(frame: Buffer): Record<string, unknown> | undefined {
+  try {
+    const text = zstdDecompressSync(frame).toString('utf8')
+    const line = text.endsWith('\n') ? text.slice(0, -1) : text
+    const value = JSON.parse(line) as unknown
+    return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** A `working-directory/change` event whose `cwd` is a string. */
+function isWorkingDirectoryChange(event: Record<string, unknown> | undefined): event is { type: string, data: { cwd: string } } {
+  if (event === undefined || event.type !== 'working-directory/change') return false
+  const data = event.data
+  return typeof data === 'object' && data !== null && typeof (data as { cwd?: unknown }).cwd === 'string'
+}
+
+/** Move a change event's cwd onto the new root, or return undefined to keep it. */
+function retargetChangeEvent(event: Record<string, unknown>, oldRoots: readonly string[], newRoot: string): Record<string, unknown> | undefined {
+  if (!isWorkingDirectoryChange(event)) return undefined
+  if (!sitsUnder(event.data.cwd, oldRoots)) return undefined
+  return { ...event, data: { ...(event.data as Record<string, unknown>), cwd: mapPlaceholderCwd(event.data.cwd, oldRoots, newRoot) } }
+}
+
+/** Rewrite the first line of an uncompressed log, retargeting change events. */
+function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string, oldRoots: readonly string[], newRoot: string): { bytes: Buffer, retainedOldRoot: boolean } {
   const cut = buffer.indexOf(10)
   // A log whose header is the whole file (no trailing newline) is still a
   // header DSH reads; treat the missing newline as an empty body rather than
@@ -330,8 +387,36 @@ function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buf
   if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
   if (typeof header.cwd !== 'string' || header.cwd.length === 0) throw new Error('header carries no cwd')
   const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
-  const body = cut < 0 ? Buffer.alloc(0) : buffer.subarray(cut + 1)
-  return Buffer.concat([Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), body])
+  const headerBytes = Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8')
+  if (cut < 0) return { bytes: headerBytes, retainedOldRoot: false }
+  const body = buffer.subarray(cut + 1).toString('utf8')
+  if (body.length === 0) return { bytes: headerBytes, retainedOldRoot: false }
+  const trailingNewline = body.endsWith('\n')
+  const lines = body.split('\n')
+  if (trailingNewline) lines.pop()
+  let retainedOldRoot = false
+  const out: string[] = []
+  for (const line of lines) {
+    if (line.length === 0) {
+      out.push(line)
+      continue
+    }
+    let event: Record<string, unknown> | undefined
+    try {
+      event = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      event = undefined
+    }
+    if (event === undefined) {
+      retainedOldRoot = true
+      out.push(line)
+      continue
+    }
+    const next = retargetChangeEvent(event, oldRoots, newRoot)
+    out.push(next === undefined ? line : JSON.stringify(next))
+  }
+  const bodyText = out.join('\n') + (trailingNewline ? '\n' : '')
+  return { bytes: Buffer.concat([headerBytes, Buffer.from(bodyText, 'utf8')]), retainedOldRoot }
 }
 
 /** The generation version of a canonical log filename, or undefined. */
@@ -365,6 +450,12 @@ export interface SessionRelocationSummary {
   skippedLive: string[]
   /** Sessions that could not be moved, with the reason each failed. */
   failed: Array<{ id: string, reason: string }>
+  /**
+   * Old roots a moved session's body still references and could not be
+   * rewritten. Their sidecar entry must survive so the placeholder keeps
+   * routing to the server instead of falling back to a local directory.
+   */
+  retainedRoots?: string[]
 }
 
 export interface RelocateOptions {
@@ -374,8 +465,12 @@ export interface RelocateOptions {
   oldRoot: string
   /** Placeholder root the headers should name after the move. */
   newRoot: string
-  /** Session ids with a live writer; their files are never touched. */
-  liveSessionIds?: ReadonlySet<string>
+  /**
+   * Session ids with a live writer; their files are never touched. A function
+   * is re-evaluated before every move, so a session opened after the scan
+   * started is still caught.
+   */
+  liveSessionIds?: ReadonlySet<string> | (() => ReadonlySet<string>)
 }
 
 /**
@@ -408,7 +503,10 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return summary
     throw error
   }
-  const live = options.liveSessionIds ?? new Set<string>()
+  const supplied = options.liveSessionIds
+  const liveOf: () => ReadonlySet<string> = typeof supplied === 'function'
+    ? supplied
+    : () => supplied ?? new Set<string>()
   // A symlinked root is only `path.resolve`d in the config while DSH stores
   // canonical cwds, so match every spelling (see rootCandidateSpellings).
   const oldRoots = rootCandidateSpellings(options.oldRoot)
@@ -443,7 +541,7 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
       // backend ignores it too.
       if (log === undefined) continue
       const moved = await relocateSession(
-        { sessionsRoot, projectDir, dir, entry, logName: log.name, options, oldRoots, live, summary },
+        { sessionsRoot, projectDir, dir, entry, logName: log.name, options, oldRoots, liveOf, summary },
       )
       if (moved) touchedProjects.add(projectDir)
     }
@@ -467,13 +565,14 @@ interface RelocateContext {
   options: RelocateOptions
   /** Every accepted spelling of `options.oldRoot`. */
   oldRoots: readonly string[]
-  live: ReadonlySet<string>
+  /** Re-read the live session set before each move. */
+  liveOf: () => ReadonlySet<string>
   summary: SessionRelocationSummary
 }
 
 /** Relocate one session directory; every failure is recorded on the summary. */
 async function relocateSession(context: RelocateContext): Promise<boolean> {
-  const { sessionsRoot, projectDir, dir, entry, logName, options, oldRoots, live, summary } = context
+  const { sessionsRoot, projectDir, dir, entry, logName, options, oldRoots, liveOf, summary } = context
   const fail = (id: string, reason: string): false => {
     summary.failed.push({ id, reason })
     return false
@@ -510,13 +609,13 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   if (here !== expectedProject && here !== projectKey(to)) {
     return fail(id, `project directory ${here} matches neither projectKey(cwd) ${expectedProject} nor projectKey(newCwd): the layout encoder drifted`)
   }
-  if (live.has(id)) {
+  if (liveOf().has(id)) {
     summary.skippedLive.push(id)
     return false
   }
   if (resolvePath(dir) === resolvePath(destDir)) {
     // Renamed by an earlier run that died before the rewrite: finish it here.
-    if (!(await rewriteLogAt(destDir, logName, id, to, head.compression, summary))) return false
+    if (!(await rewriteLogAt(destDir, logName, id, to, oldRoots, options.newRoot, head.compression, summary))) return false
     summary.relocated.push({ id, from: cwd, to })
     return true
   }
@@ -545,7 +644,7 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
  * atomic rename. If that final rename fails the move is rolled back.
  */
 async function moveAndRewrite(context: RelocateContext & { destDir: string, id: string, from: string, to: string, compression: boolean }): Promise<boolean> {
-  const { destDir, dir, id, to, from, logName, summary, compression } = context
+  const { destDir, dir, id, to, from, logName, summary, compression, oldRoots, options, liveOf } = context
   const fail = (reason: string): false => {
     summary.failed.push({ id, reason })
     return false
@@ -556,12 +655,21 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
   // in-memory rewrite are the remaining fallible steps.
   let rewritten: Buffer
   let srcMode: number | undefined
+  let initialSize = 0
+  let initialMtime = 0
   try {
     const info = await stat(sourceLog)
     if (info.size > MAX_REWRITE_BYTES) throw new Error(`the log is ${info.size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
     srcMode = info.mode & 0o777
+    initialSize = info.size
+    initialMtime = info.mtimeMs
     const bytes = await readFile(sourceLog)
-    rewritten = rewriteHeader(bytes, id, to, compression)
+    const result = rewriteHeader(bytes, id, to, oldRoots, options.newRoot, compression)
+    rewritten = result.bytes
+    if (result.retainedOldRoot) {
+      summary.retainedRoots ??= []
+      if (!summary.retainedRoots.includes(options.oldRoot)) summary.retainedRoots.push(options.oldRoot)
+    }
   } catch (error) {
     return fail(`refusing to move the session: ${text(error)}`)
   }
@@ -578,6 +686,24 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
   } catch (error) {
     await rm(joinPath(dir, staged)).catch(() => undefined)
     return fail(`could not stage the rewritten log: ${text(error)}`)
+  }
+  // Re-check at the last moment: a session can be opened after the scan, and a
+  // writer can append after we read the bytes. Moving either would publish a
+  // log without bytes it already has, or steal a live session's files.
+  if (liveOf().has(id)) {
+    await rm(joinPath(dir, staged)).catch(() => undefined)
+    summary.skippedLive.push(id)
+    return false
+  }
+  try {
+    const now = await stat(sourceLog)
+    if (now.size !== initialSize || now.mtimeMs !== initialMtime) {
+      await rm(joinPath(dir, staged)).catch(() => undefined)
+      return fail('the log changed while it was being relocated; leaving it in place')
+    }
+  } catch (error) {
+    await rm(joinPath(dir, staged)).catch(() => undefined)
+    return fail(`could not re-check the log before moving it: ${text(error)}`)
   }
   // 3) Move the whole directory (older generations and the session lock ride
   // along), then 4) promote the staged bytes over the old-header newest log in
@@ -618,7 +744,7 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
  * silently overwrites a log.
  */
 async function reconcileExistingDestination(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
-  const { destDir, dir, id, from, to, summary } = context
+  const { destDir, dir, id, from, to, summary, oldRoots } = context
   const fail = (reason: string): false => {
     summary.failed.push({ id, reason })
     return false
@@ -666,7 +792,7 @@ async function reconcileExistingDestination(context: RelocateContext & { destDir
     // the stale source. A stuck source is reported but the session is already
     // correct, so the next run's reconcile branch removes it.
     const compression = destLog.name.endsWith('.zstd')
-    if (!(await rewriteLogAt(destDir, destLog.name, id, to, compression, summary))) return false
+    if (!(await rewriteLogAt(destDir, destLog.name, id, to, oldRoots, context.options.newRoot, compression, summary))) return false
     try {
       await rm(dir, { recursive: true, force: false })
     } catch (error) {
@@ -690,6 +816,8 @@ async function rewriteLogAt(
   logName: string,
   expectedId: string,
   to: string,
+  oldRoots: readonly string[],
+  newRoot: string,
   compression: boolean,
   summary: SessionRelocationSummary,
 ): Promise<boolean> {
@@ -698,7 +826,7 @@ async function rewriteLogAt(
     const size = (await stat(path)).size
     if (size > MAX_REWRITE_BYTES) throw new Error(`the log is ${size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
     const bytes = await readFile(path)
-    const rewritten = rewriteHeader(bytes, expectedId, to, compression)
+    const { bytes: rewritten } = rewriteHeader(bytes, expectedId, to, oldRoots, newRoot, compression)
     await publish(path, rewritten)
     // Read the published log back and prove it: header decodes with the moved
     // identity, complete-frame count and torn-tail state are unchanged.
@@ -712,11 +840,15 @@ async function rewriteLogAt(
       if (after.frames.length !== before.frames.length) throw new Error('the published log lost complete frames')
       if ((after.tornStart === undefined) !== (before.tornStart === undefined)) throw new Error('the published log changed the torn tail state')
     } else {
-      // Plaintext: the bytes past the first newline must be unchanged.
+      // Plaintext rewrite may retarget `working-directory/change` lines, so only
+      // require the same number of body lines; rewriteHeader already proved the
+      // content of every unaffected line and the new cwd of each changed one.
       const beforeCut = bytes.indexOf(10)
       const afterCut = published.indexOf(10)
-      if (beforeCut < 0 || afterCut < 0 || !published.subarray(afterCut + 1).equals(bytes.subarray(beforeCut + 1))) {
-        throw new Error('the published plaintext log changed its event body')
+      const beforeLines = beforeCut < 0 ? 0 : bytes.subarray(beforeCut + 1).toString('utf8').split('\n').length
+      const afterLines = afterCut < 0 ? 0 : published.subarray(afterCut + 1).toString('utf8').split('\n').length
+      if (beforeCut < 0 || afterCut < 0 || beforeLines !== afterLines) {
+        throw new Error('the published plaintext log changed its event count')
       }
     }
     return true

@@ -36,6 +36,16 @@ test('a timed out, truncated, or noisy capture is dropped', () => {
   assert.equal(loginEnvSnapshot({ stdout: '\n', timedOut: false, stdoutTruncated: false }), '')
 })
 
+test('a stray line after the declarations drops the whole capture', () => {
+  const read = (stdout: string): string => loginEnvSnapshot({ stdout, timedOut: false, stdoutTruncated: false })
+  // A bashrc EXIT trap prints after `export -p`; that line is not a variable and
+  // must never be eval'd on a later command.
+  assert.equal(read('declare -x A=1\nINJECTED_FROM_EXIT\n'), '')
+  assert.equal(read('declare -x A=1\ndeclare -x B=2\nrm -rf /tmp/x\n'), '')
+  // A trailing blank line is trimmed before the scan and stays harmless.
+  assert.equal(read('declare -x A=1\n\n'), 'declare -x A=1\n')
+})
+
 test('session state is removed and a quoted value that looks like it is kept', () => {
   const raw = [
     'declare -x FROM=kept',

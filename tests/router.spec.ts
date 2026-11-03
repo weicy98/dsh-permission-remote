@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { childDirectoryPath, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, toModelPath, workspaceBinding } from '../src/router.ts'
@@ -108,4 +110,26 @@ test('a listing request expands ~ against the login home and defaults to the roo
   assert.equal(listingPath('/srv/app', ''), '/srv/app')
   // A request that lost its path still lists something.
   assert.equal(listingPath('   ', '/home/me'), '/')
+})
+
+test('a placeholder root spelled through a symlink still routes and binds', () => {
+  const box = mkdtempSync(path.join(tmpdir(), 'dsh-route-link-'))
+  try {
+    const real = path.join(box, 'real')
+    mkdirSync(real)
+    const link = path.join(box, 'link')
+    symlinkSync(real, link)
+    // The operator configured the symlink spelling; DSH stores the realpath.
+    const linked = { DSH_HOME: box, DSH_SSH_REMOTE_ROOT: link }
+    const local = path.join(real, 'host1', Buffer.from('/srv/app').toString('base64url'), 'src')
+    const route = routeByCwd(local, linked)
+    assert.equal(route.kind, 'remote')
+    if (route.kind !== 'remote') return
+    assert.equal(route.hostId, 'host1')
+    assert.equal(route.remoteCwd, '/srv/app/src')
+    assert.deepEqual(workspaceBinding(local, linked), { hostId: 'host1', remotePath: '/srv/app' })
+    assert.equal(routeByCwd(path.join(box, 'elsewhere'), linked).kind, 'local')
+  } finally {
+    rmSync(box, { recursive: true, force: true })
+  }
 })

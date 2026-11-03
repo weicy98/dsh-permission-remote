@@ -41,6 +41,7 @@ function setup() {
   let stat = async (): Promise<{ isDirectory: boolean, size: number }> => {
     throw new SshFailure('no such file', 'sftp-stat')
   }
+  let attrs: () => Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number } | undefined> = async () => undefined
   let failPut = false
   let home = '/home/me'
   let putHook: () => void | Promise<void> = () => undefined
@@ -71,6 +72,7 @@ function setup() {
     pool: {
       async sftpRealpath(_host, _secret, remotePath) { return remotePath === '.' ? home : remotePath },
       sftpStat: () => stat(),
+      sftpAttrs: () => attrs(),
       async sftpPutFile(_host, _secret, local, remote) {
         sawNextDuringPut = nextCalled
         await putHook()
@@ -93,6 +95,7 @@ function setup() {
     get nextCalled() { return nextCalled },
     set nextCalled(value: boolean) { nextCalled = value },
     setStat(next: typeof stat) { stat = next },
+    setAttrs(next: typeof attrs) { attrs = next },
     setFailPut(value: boolean) { failPut = value },
     setHome(value: string) { home = value },
     setPut(hook: () => void | Promise<void>) { putHook = hook },
@@ -254,4 +257,13 @@ test('an aborted remote turn does not start the model stream or keep a failure',
   assert.equal(harness.puts.length, 0)
   harness.setInitiator(placeholder)
   assert.equal(harness.fs.processPathFromHostPath(HOST_PATH), HOST_PATH)
+})
+
+test('an existing symbolic link at the upload path is refused, not followed and truncated', async () => {
+  const harness = setup()
+  harness.setAttrs(async () => ({ type: 'symlink', size: 4 }))
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 0)
+  harness.setInitiator(placeholder)
+  assert.notEqual(harness.fs.processPathFromHostPath(HOST_PATH), UPLOADED)
 })

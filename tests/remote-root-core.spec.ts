@@ -1263,3 +1263,75 @@ test('a startup sweep and a save do not both rename one session', async () => {
     await dispose(box)
   }
 })
+
+test('a working-directory/change event is retargeted onto the new root', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    const oldSub = join(oldLocal, 'pkg')
+    const newSub = join(newLocal, 'pkg')
+    const oldLog = await seedStoredSession(box, 'session-cd', oldLocal, [
+      { type: 'session/append', seq: 1 },
+      { type: 'working-directory/change', seq: 2, data: { cwd: oldSub } },
+    ])
+    const original = await readFile(oldLog)
+    const originalFrames = scanLogFrames(original).frames
+
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+
+    const bytes = await readFile(join(storedSessionDir(box, newLocal, 'session-cd'), 'session.v4.jsonl.zstd'))
+    const frames = scanLogFrames(bytes).frames
+    assert.equal(frames.length, 3)
+    // Ordinary events are untouched byte for byte.
+    assert.equal(
+      bytes.subarray(frames[1]!.start, frames[1]!.end).equals(original.subarray(originalFrames[1]!.start, originalFrames[1]!.end)),
+      true,
+    )
+    const change = JSON.parse(zstdDecompressSync(bytes.subarray(frames[2]!.start, frames[2]!.end)).subarray(0, -1).toString('utf8')) as {
+      type?: string, data?: { cwd?: string }
+    }
+    assert.equal(change.type, 'working-directory/change')
+    assert.equal(change.data?.cwd, newSub)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a session opened after the scan started is still skipped as live', async () => {
+  const box = await harness()
+  try {
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const oldLog = await seedStoredSession(box, 'session-late', oldLocal, [{ type: 'session/append', seq: 1 }])
+    let calls = 0
+    const summary = await relocateSessions({
+      dshHome: box.box,
+      oldRoot: box.oldRoot,
+      newRoot: box.newRoot,
+      // Empty at the scan/entry check, live by the time the move re-checks.
+      liveSessionIds: () => (calls += 1) >= 2 ? new Set(['session-late']) : new Set<string>(),
+    })
+    assert.deepEqual(summary.skippedLive, ['session-late'])
+    assert.equal(summary.relocated.length, 0)
+    assert.equal((await stat(oldLog)).isFile(), true)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('saving a host at a new endpoint deletes its stored secret, a rename keeps it', async () => {
+  const box = await harness({ hosts: [host({ auth: 'password' })] })
+  try {
+    await box.core.saveHost({ ...host({ auth: 'password' }), host: '10.0.0.9' })
+    assert.equal(box.droppedSecrets.length, 1)
+    // Same endpoint, only the display name changes: keep the credential.
+    await box.core.saveHost({ ...host({ auth: 'password' }), host: '10.0.0.9', name: 'renamed' })
+    assert.equal(box.droppedSecrets.length, 1)
+  } finally {
+    await dispose(box)
+  }
+})

@@ -9,10 +9,9 @@
  * slot on that row, so the server is carried by the title: `hostTag · name`.
  * Tagging is idempotent and leaves a title that already starts with the tag alone.
  */
-import { realpathSync } from 'node:fs'
 import { posix } from 'node:path'
 import type { HostConfig } from './config.ts'
-import { routeUnderRoot, routingRoots } from './router.ts'
+import { canonicalRoutingRoots, routeUnderRoot } from './router.ts'
 
 export interface WorkspaceLike {
   readonly id: unknown
@@ -114,19 +113,12 @@ export function autoTaggedTitle(host: HostConfig, remotePath: string, title: str
  * The remote root can itself be a symlink (`~/.dsh` is one on some installs) and
  * the registry stores `fs.realpath`, so accept either spelling. A root the
  * operator migrated away from stays in the list for the rest of the process.
+ *
+ * Delegates to the router's canonical list so workspace lookup and tool
+ * routing agree on every spelling.
  */
 function candidateRoots(env: NodeJS.ProcessEnv): string[] {
-  const roots: string[] = []
-  for (const root of routingRoots(env)) {
-    if (!roots.includes(root)) roots.push(root)
-    try {
-      const real = realpathSync(root)
-      if (!roots.includes(real)) roots.push(real)
-    } catch {
-      // The remote root does not exist yet; the lexical spelling is all there is.
-    }
-  }
-  return roots
+  return canonicalRoutingRoots(env)
 }
 
 export function workspaceRoute(workspacePath: string, env: NodeJS.ProcessEnv = process.env): { hostId: string, remotePath: string } | null {

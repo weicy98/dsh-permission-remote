@@ -30,12 +30,14 @@ const TEXT_CAP = 32 * 1024 * 1024
 
 /**
  * `agent/pre-step` stats the working directory, `.git`, and every instruction
- * candidate on each step. A realpath stays put for half a minute. Attributes
- * are shorter: `write`, `edit`, and `bash` talk to SFTP directly and do not
- * tell this cache, so the sidebar must notice a new file within a few seconds.
- * A disconnected host can still answer from an older entry.
+ * candidate on each step. A realpath must not be trusted for long: replacing a
+ * directory with a symlink is the escape this cache could otherwise hide, so the
+ * window is only a few seconds. Attributes are shorter: `write`, `edit`, and
+ * `bash` talk to SFTP directly and do not tell this cache, so the sidebar must
+ * notice a new file within a few seconds. A disconnected host can still answer
+ * from an older entry.
  */
-const REALPATH_TTL_MS = 30_000
+const REALPATH_TTL_MS = 3_000
 const ATTR_TTL_MS = 5_000
 const META_CAP = 512
 
@@ -93,7 +95,7 @@ const REQUIRED: ReadonlyArray<keyof Originals> = [
 export interface RemoteFsOptions {
   /** Test clock. Production uses `Date.now`. */
   now?: () => number
-  /** How long a realpath is reused while the host still answers. Default 30s. */
+  /** How long a realpath is reused while the host still answers. Default 3s. */
   metaTtlMs?: number
   /** How long a stat result is reused. Default 5s. */
   attrTtlMs?: number
@@ -225,6 +227,12 @@ async function lstatRemote(runtime: Runtime, requested: string, opts: { cwd?: st
     // The path itself, not its target: a symlink must stay a symlink here.
     const info = await attrsFor(runtime, host, secret, route.remoteCwd, false, signal)
     throwIfFsAborted(signal)
+    // Seen as a link: drop any realpath cached for it, so the next resolve
+    // follows the current target instead of answering from a stale one.
+    if (info?.type === 'symlink') {
+      runtime.identity.delete(lexical)
+      runtime.meta.forgetRealpath(host.id, route.remoteCwd)
+    }
     runtime.meta.rememberAttrs(host.id, route.remoteCwd, false, info)
     return info === undefined ? undefined : pathInfo(info)
   } catch (error) {
@@ -268,6 +276,13 @@ async function listRemote(runtime: Runtime, target: FsTarget, signal?: AbortSign
       const childRemote = posix.join(place.remote, row.name)
       const child = await childEntry(runtime, place.host, secret, childRemote, row, signal)
       const childKey = path.join(parentKey, row.name)
+      // A child that is a symlink now must not keep a stale realpath identity,
+      // or containment would keep judging it by the old target while a listing
+      // follows the link. Drop it so the next resolve re-probes.
+      if (row.type === 'symlink') {
+        runtime.identity.delete(String(childKey))
+        runtime.meta.forgetRealpath(place.host.id, childRemote)
+      }
       // `placeOf` routes this placeholder key on its own. Recording the joined
       // path would answer `contains` from the link's own path. Only `resolve`
       // realpaths a symlink, and only that result belongs in `identity`.
@@ -411,7 +426,9 @@ async function readRemoteRange(
 /**
  * Containment uses only paths `resolve` already realpath'd. Falling back to
  * the placeholder spelling would keep a symlink whose target is `/etc` inside
- * the workspace, because that spelling still sits under the placeholder.
+ * the workspace, because that spelling still sits under the placeholder. When
+ * a remote placeholder has no realpath yet, fail closed; only paths that route
+ * locally may use the original lexical check.
  */
 function containsRemote(runtime: Runtime, parent: FsTarget, child: FsTarget): boolean {
   const left = runtime.identity.get(String(parent.targetKey))
@@ -421,6 +438,7 @@ function containsRemote(runtime: Runtime, parent: FsTarget, child: FsTarget): bo
     return remotePathInside(left.remoteReal, right.remoteReal)
   }
   if (left !== undefined || right !== undefined) return false
+  if (routeByCwd(String(parent.targetKey)).kind === 'remote' || routeByCwd(String(child.targetKey)).kind === 'remote') return false
   return runtime.originals.contains(parent, child)
 }
 
@@ -674,6 +692,11 @@ class MetaCache {
     this.write(this.realPaths, `${hostId}\0${remotePath}`, value)
   }
 
+  /** Drop one path's cached realpath after it was observed as a symlink. */
+  forgetRealpath(hostId: string, remotePath: string): void {
+    this.realPaths.delete(`${hostId}\0${remotePath}`)
+  }
+
   attrs(hostId: string, remotePath: string, follow: boolean, stale: boolean): MetaHit<SftpAttrs | undefined> | MetaMiss {
     return this.read(this.attrEntries, `${hostId}\0${follow ? 's' : 'l'}\0${remotePath}`, stale, this.attrTtl)
   }
@@ -713,6 +736,9 @@ class MetaCache {
  */
 function isSoftFailure(error: unknown): boolean {
   if (!(error instanceof SshFailure)) return false
+  // A server that cannot realpath must not silently degrade containment to a
+  // lexical comparison; surface it instead of keeping the placeholder spelling.
+  if (error.status === SFTP_STATUS.OP_UNSUPPORTED) return false
   if (isRemoteMissing(error)) return false
   return !isSftpPermissionDenied(error)
 }

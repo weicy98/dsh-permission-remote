@@ -28,6 +28,12 @@ test('ordinary permission denied is not a sandbox denial', () => {
 test('search argv disables ripgrep config before any path', () => {
   assert.equal(grepArgv('/opt/rg', 'foo', '/srv/app', '*.ts')[1], '--no-config')
   assert.equal(globArgv('/opt/rg', '**/*.ts')[1], '--no-config')
+  // The pattern is bound with -e and the path is behind --: a pattern starting
+  // with `-` must not become a ripgrep option.
+  const grep = grepArgv('/opt/rg', '--pre=/bin/sh', '/srv/app', '*.ts')
+  assert.equal(grep[grep.indexOf('-e') + 1], '--pre=/bin/sh')
+  assert.equal(grep.includes('--'), true)
+  assert.equal(grep.at(-1), '/srv/app')
 })
 
 test('image sniff rejects an unrecognized payload', () => {

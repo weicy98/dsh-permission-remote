@@ -685,7 +685,7 @@ export async function stagePresentFiles(
     if (requested.length === 0) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
     const remotePath = resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
     const ticket = stagedEpoch
-    let info: { isDirectory: boolean, size: number }
+    let info: { isDirectory: boolean, size: number, type?: string }
     try {
       info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
     } catch (error) {
@@ -697,9 +697,14 @@ export async function stagePresentFiles(
       if (isSftpMissing(error)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
       throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
     }
-    if (info.isDirectory) throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_FOUND')
+    if (info.isDirectory) throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_DIRECTORY')
+    // A FIFO, socket, or device would block or never end the read. Only a plain
+    // file is presentable; older stat fakes omit `type`, so leave them allowed.
+    if (info.type !== undefined && info.type !== 'file') {
+      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is not a regular file`, 'FS_IO_ERROR')
+    }
     if (info.size > PRESENT_CAP) {
-      throw new FsError(`Cannot present ${requested}: the remote file is ${info.size} bytes, over the ${PRESENT_CAP} byte delivery limit`, 'FS_NOT_FOUND')
+      throw new FsError(`Cannot present ${requested}: the remote file is ${info.size} bytes, over the ${PRESENT_CAP} byte delivery limit`, 'FS_TOO_LARGE')
     }
     const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP), exec?.signal)
     // The placeholder spelling every other remote tool returns, so the model

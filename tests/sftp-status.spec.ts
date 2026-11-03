@@ -3,6 +3,8 @@ import test from 'node:test'
 import {
   SFTP_STATUS,
   SshFailure,
+  fingerprintMatches,
+  formatFingerprint,
   isSftpMissing,
   isSftpPermissionDenied,
   sftpStatusOf,
@@ -66,4 +68,15 @@ test('sftpStatusOf reads only a numeric code', () => {
   assert.equal(sftpStatusOf(new Error('plain')), undefined)
   assert.equal(sftpStatusOf(undefined), undefined)
   assert.equal(sftpStatusOf({ code: '2' }), undefined)
+})
+
+test('fingerprints use OpenSSH base64 and still accept the legacy hex spelling', () => {
+  const hex = 'ab'.repeat(32)
+  const expected = `SHA256:${Buffer.from(hex, 'hex').toString('base64').replace(/=+$/, '')}`
+  assert.equal(formatFingerprint(hex), expected)
+  assert.equal(formatFingerprint(Buffer.from(hex, 'hex')), expected)
+  assert.equal(fingerprintMatches(expected, hex), true)
+  assert.equal(fingerprintMatches(`SHA256:${hex}`, hex), true)
+  assert.equal(fingerprintMatches('', hex), false)
+  assert.equal(fingerprintMatches('SHA256:deadbeef', hex), false)
 })

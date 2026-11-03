@@ -119,6 +119,12 @@ function declarationName(line: string): string | undefined {
  * to contain a line looking like one. `export -p` keeps a newline inside
  * quotes, and an unbalanced session-state value is kept: discarding the rest
  * of the text would throw away later variables such as `PATH`.
+ *
+ * Only complete `declare -x NAME...` / `export NAME...` assignments are
+ * trusted. `export -p` prints nothing else, so any other line is stray output
+ * (a bashrc `EXIT` trap, a banner) and must never be eval'd on a later command.
+ * A stray line makes the whole capture untrustworthy, so the entire block is
+ * dropped — the same outcome as a timeout or a truncated read.
  */
 function stripSessionState(text: string): string {
   const lines = text.split('\n')
@@ -127,18 +133,15 @@ function stripSessionState(text: string): string {
   while (index < lines.length) {
     const line = lines[index] ?? ''
     const name = declarationName(line)
-    if (name === undefined) {
-      kept.push(line)
-      index += 1
-      continue
-    }
+    if (name === undefined) return ''
     let end = index
     let block = line
     while (!quotesBalanced(block) && end + 1 < lines.length) {
       end += 1
       block += `\n${lines[end] ?? ''}`
     }
-    if (!SESSION_STATE.has(name) || !quotesBalanced(block)) kept.push(block)
+    if (!quotesBalanced(block)) return ''
+    if (!SESSION_STATE.has(name)) kept.push(block)
     index = end + 1
   }
   return kept.join('\n').replace(/^\n+/, '').replace(/\n+$/, '')

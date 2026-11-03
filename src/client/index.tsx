@@ -29,7 +29,9 @@ const TABS: ReadonlyArray<{ id: TabId, label: string }> = [
 ]
 
 const MANUAL = [
-  { title: 'Debian/Ubuntu', command: 'sudo apt-get update && sudo apt-get install -y bubblewrap' },
+  // Match the installer's `;` on purpose: a broken third-party apt source makes
+  // `apt-get update` fail forever, and `&&` would then skip the install.
+  { title: 'Debian/Ubuntu', command: 'sudo apt-get update; sudo apt-get install -y bubblewrap' },
   { title: 'Fedora/RHEL', command: 'sudo dnf install -y bubblewrap' },
   { title: 'Arch', command: 'sudo pacman -S bubblewrap' },
   { title: 'Alpine', command: 'sudo apk add bubblewrap' },

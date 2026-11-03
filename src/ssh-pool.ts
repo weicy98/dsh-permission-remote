@@ -1,4 +1,6 @@
 import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { Client, type ConnectConfig } from './ssh2-client.ts'
 import type { HostConfig } from './config.ts'
@@ -237,8 +239,38 @@ interface Live {
 
 const FINGERPRINT_PREFIX = 'SHA256:'
 
-export function formatFingerprint(hashedKey: Buffer): string {
-  return `${FINGERPRINT_PREFIX}${hashedKey.toString('base64')}`
+/**
+ * An OpenSSH-style fingerprint: `SHA256:` plus the standard base64 digest with
+ * padding removed. ssh2 hands us the digest as a hex string when `hostHash` is
+ * set, so decode it first; a Buffer is accepted too.
+ */
+export function formatFingerprint(hashedKey: Buffer | string): string {
+  const digest = typeof hashedKey === 'string' ? Buffer.from(hashedKey, 'hex') : hashedKey
+  return `${FINGERPRINT_PREFIX}${digest.toString('base64').replace(/=+$/, '')}`
+}
+
+/**
+ * The old hex spelling this plugin used to store. Kept only so a host trusted
+ * before the format change still verifies; a re-trust stores the new spelling.
+ */
+export function legacyFingerprint(hashedKey: Buffer | string): string {
+  const hex = typeof hashedKey === 'string' ? hashedKey : hashedKey.toString('hex')
+  return `${FINGERPRINT_PREFIX}${hex}`
+}
+
+/** Whether a stored fingerprint matches the offered key in either spelling. */
+export function fingerprintMatches(stored: string, hashedKey: Buffer | string): boolean {
+  const value = stored.trim()
+  if (value.length === 0) return false
+  return value === formatFingerprint(hashedKey) || value === legacyFingerprint(hashedKey)
+}
+
+/** Expand a leading `~` against this (the harness) user's home; other paths stay as typed. */
+function expandTildePath(input: string): string {
+  const text = input.trim()
+  if (text === '~') return homedir()
+  if (text.startsWith('~/') || text.startsWith('~\\')) return join(homedir(), text.slice(2))
+  return input
 }
 
 export class SshPool {
@@ -370,7 +402,7 @@ export class SshPool {
     try {
       live = await connect(host, secret, (key: Buffer) => {
         offered = formatFingerprint(key)
-        return stored.length > 0 && offered === stored
+        return fingerprintMatches(stored, key)
       })
       const banner = await openChannel(live, 'echo ok', 15_000).done
       return { fingerprint: stored, trusted: true, banner: banner.stdout.trim() }
@@ -391,6 +423,10 @@ export class SshPool {
     if (maxBytes !== undefined) {
       const size = await statSize(session, remotePath)
       if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read')
+      // Enforce the cap on the bytes actually read too: the size above is only
+      // the pre-read stat, and a file that grows afterwards must not be pulled
+      // whole into memory.
+      return readAllCapped(session, remotePath, maxBytes)
     }
     return readAll(session, remotePath)
   }
@@ -405,7 +441,7 @@ export class SshPool {
     return realpathOf(session, remotePath)
   }
 
-  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number }> {
+  async sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number, type?: SftpAttrs['type'] }> {
     const session = await this.sftp(host, secret)
     return statInfo(session, remotePath)
   }
@@ -414,7 +450,7 @@ export class SshPool {
     const session = await this.sftp(host, secret)
     const rows = await readdir(session, remotePath)
     return rows
-      .filter(row => row.attrs.isDirectory())
+      .filter(row => row.filename !== '.' && row.filename !== '..' && row.attrs.isDirectory())
       .map(row => ({
         name: row.filename,
         path: remotePath === '/' ? `/${row.filename}` : `${remotePath.replace(/\/$/, '')}/${row.filename}`,
@@ -434,10 +470,19 @@ export class SshPool {
 
   private async sftp(host: HostConfig, secret: SecretMaterial): Promise<SftpLike> {
     const live = await this.acquire(host, secret, true)
-    live.sftp ??= openSftp(live.client).catch(error => {
-      live.sftp = undefined
-      throw error
-    })
+    if (live.sftp === undefined) {
+      // A protocol fault destroys the SFTP channel but leaves the SSH connection
+      // up (`doFatalSFTPError`). Clearing the cached session on that error makes
+      // the next call open a fresh channel instead of reusing a destroyed one
+      // until something else drops the whole connection. The identity check
+      // keeps a late error from an older session clearing a newer one.
+      let opening!: Promise<SftpSession>
+      opening = openSftp(live.client, () => { if (live.sftp === opening) live.sftp = undefined }).catch(error => {
+        if (live.sftp === opening) live.sftp = undefined
+        throw error
+      })
+      live.sftp = opening
+    }
     const session = await live.sftp
     return session.api
   }
@@ -517,9 +562,8 @@ export class SshPool {
       await this.reserve()
       try {
         const client = await connect(host, secret, key => {
-          const fingerprint = formatFingerprint(key)
           if (!requireTrust) return true
-          return host.fingerprint.trim().length > 0 && host.fingerprint.trim() === fingerprint
+          return fingerprintMatches(host.fingerprint, key)
         })
         const live: Live = {
           client,
@@ -592,7 +636,7 @@ function connect(host: HostConfig, secret: SecretMaterial, accept: (key: Buffer)
       }
       options.password = secret.password
     } else if (host.privateKeyPath.trim().length > 0) {
-      void readFile(host.privateKeyPath).then(key => {
+      void readFile(expandTildePath(host.privateKeyPath)).then(key => {
         options.privateKey = key
         if (secret.passphrase) options.passphrase = secret.passphrase
         client.connect(options)
@@ -819,7 +863,7 @@ interface SftpLike {
   on(event: 'error', listener: (error: Error) => void): void
 }
 
-function openSftp(client: Client): Promise<SftpSession> {
+function openSftp(client: Client, onFatal?: () => void): Promise<SftpSession> {
   return new Promise((resolve, reject) => {
     client.sftp((error, sftp) => {
       if (error) {
@@ -834,7 +878,8 @@ function openSftp(client: Client): Promise<SftpSession> {
       // event, and dsh treats that as a fatal uncaught exception and exits.
       // Keeping one listener here does not swallow the fault: ssh2 fails every
       // in-flight request with it, so the call that triggered it still rejects.
-      api.on('error', () => undefined)
+      // It also reports the fatal error so the pool can drop the dead session.
+      api.on('error', () => { onFatal?.() })
       resolve({
         api,
         end: () => {
@@ -864,11 +909,16 @@ async function closeLive(live: Live): Promise<void> {
  * would be indistinguishable from a real `000` and would chmod the file to
  * nothing. A new file then keeps the remote umask.
  */
-function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number }> {
+function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number, type?: SftpAttrs['type'] }> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => {
       if (error) reject(failureOf(error, 'sftp-stat'))
-      else resolve({ isDirectory: stats.isDirectory(), size: stats.size, mode: typeof stats.mode === 'number' ? stats.mode : undefined })
+      else resolve({
+        isDirectory: stats.isDirectory(),
+        size: stats.size,
+        mode: typeof stats.mode === 'number' ? stats.mode : undefined,
+        type: listingType(stats),
+      })
     })
   })
 }
@@ -884,6 +934,18 @@ function readAll(sftp: SftpLike, remotePath: string): Promise<Buffer> {
       else resolve(data)
     })
   })
+}
+
+/** Read a file, aborting as soon as more than `maxBytes` have arrived. */
+async function readAllCapped(sftp: SftpLike, remotePath: string, maxBytes: number): Promise<Buffer> {
+  let total = 0
+  const parts: Buffer[] = []
+  for await (const chunk of readOpenChunks(sftp, remotePath)) {
+    total += chunk.length
+    if (total > maxBytes) throw new SshFailure(`file is over the ${maxBytes} byte limit`, 'sftp-read')
+    parts.push(chunk)
+  }
+  return parts.length === 0 ? Buffer.alloc(0) : Buffer.concat(parts, total)
 }
 
 function writeAll(sftp: SftpLike, remotePath: string, body: Buffer | string): Promise<void> {

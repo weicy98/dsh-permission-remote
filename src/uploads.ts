@@ -32,6 +32,8 @@ export interface UploadAccess {
   pool: {
     sftpRealpath(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string>
     sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number }>
+    /** `lstat` (follow=false) so an existing symbolic link can be refused. */
+    sftpAttrs?(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number } | undefined>
     sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string): Promise<void>
   }
 }
@@ -307,6 +309,23 @@ async function uploadOne(
   try {
     const secret = await access.secret(host)
     if (isAborted(signal)) throw abortError()
+    // Refuse a pre-existing symbolic link: `sftpPutFile` opens with `w`, so
+    // following the link would truncate a file outside the upload directory.
+    if (access.pool.sftpAttrs !== undefined) {
+      let attrs: { type: string } | undefined
+      try {
+        attrs = await access.pool.sftpAttrs(host, secret, remotePath, false)
+      } catch (error) {
+        if (!isRemoteMissing(error)) {
+          ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: ${errorText(error)}`)
+          return { kind: 'failed' }
+        }
+      }
+      if (attrs !== undefined && attrs.type !== 'file' && attrs.type !== 'directory') {
+        ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: the upload path is a ${attrs.type === 'symlink' ? 'symbolic link' : 'non-regular file'}`)
+        return { kind: 'failed' }
+      }
+    }
     let info: { isDirectory: boolean, size: number } | undefined
     try {
       info = await access.pool.sftpStat(host, secret, remotePath)

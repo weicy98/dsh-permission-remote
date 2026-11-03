@@ -127,9 +127,12 @@ export function sandboxDenied(exitCode: number | null, stderr: string): boolean 
 }
 
 export function grepArgv(rg: string, pattern: string, base: string, include?: string): string[] {
-  const argv = [rg, '--no-config', '--json', '-n', '--heading', pattern]
+  // `-e` binds the pattern, and `--` ends option parsing: a pattern that starts
+  // with `-` (e.g. `--pre=/bin/sh`) is searched for instead of becoming a
+  // ripgrep option that runs a program.
+  const argv = [rg, '--no-config', '--json', '-n', '--heading', '-e', pattern]
   if (include !== undefined && include.length > 0) argv.push('--glob', include)
-  argv.push(base)
+  argv.push('--', base)
   return argv
 }
 

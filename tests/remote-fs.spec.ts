@@ -616,3 +616,47 @@ test('readOpenRange reads one window and readOpenChunks closes when the consumer
   await chunks.return(undefined)
   assert.equal(closed, 3)
 })
+
+test('a server that cannot realpath fails closed instead of degrading containment', async () => {
+  const { backend, pool } = createHarness()
+  pool.realpath = async () => { throw new SshFailure('Operation unsupported', 'sftp-realpath', 8) }
+  await assert.rejects(
+    () => backend.resolve(placeholder('a.ts')),
+    (error: unknown) => error instanceof FsError && error.code === 'FS_IO_ERROR',
+  )
+  const workspace: FsTarget = { targetKey: FsTargetKey(placeholder()), displayPath: placeholder() }
+  const stray: FsTarget = { targetKey: FsTargetKey(placeholder('a.ts')), displayPath: placeholder('a.ts') }
+  assert.equal(backend.contains(workspace, stray), false)
+})
+
+test('a swapped symlink stops being contained after the realpath cache expires', async () => {
+  let clock = 0
+  let swapped = false
+  const { backend, pool } = createHarness([], { now: () => clock, metaTtlMs: 3000 })
+  pool.realpath = async remotePath => (swapped && remotePath.endsWith('/link') ? '/etc' : remotePath)
+  const workspace = await backend.resolve(placeholder())
+  const before = await backend.resolve(placeholder('link'))
+  assert.equal(backend.contains(workspace, before), true)
+  // Within the window the cached (old) realpath is still used.
+  swapped = true
+  clock = 1000
+  assert.equal(backend.contains(workspace, await backend.resolve(placeholder('link'))), true)
+  // Once it expires, the current target is probed and containment fails closed.
+  clock = 4000
+  const after = await backend.resolve(placeholder('link'))
+  assert.equal(backend.contains(workspace, after), false)
+})
+
+test('a symlink observed in a listing drops the child identity so the next resolve re-probes', async () => {
+  const { backend, pool } = createHarness()
+  pool.realpath = async remotePath => (remotePath.endsWith('/link') ? `${REMOTE}/link` : remotePath)
+  pool.attrs = async () => ({ type: 'directory', size: 0, mtime: 1 })
+  const workspace = await backend.resolve(placeholder())
+  const link = await backend.resolve(placeholder('link'))
+  assert.equal(backend.contains(workspace, link), true)
+
+  pool.realpath = async remotePath => (remotePath.endsWith('/link') ? '/etc' : remotePath)
+  pool.readDir = async () => [{ name: 'link', type: 'symlink', size: 1, mtime: 2 }]
+  await backend.listDir(workspace)
+  assert.equal(backend.contains(workspace, await backend.resolve(placeholder('link'))), false)
+})

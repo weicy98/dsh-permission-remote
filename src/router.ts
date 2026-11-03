@@ -4,6 +4,7 @@
  * A remote workspace is a real local directory so workspaceRegistry.create can
  * register it. The session cwd the model sees is that local path.
  */
+import { realpathSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { posix } from 'node:path'
@@ -75,6 +76,38 @@ export function routingRoots(env: NodeJS.ProcessEnv = process.env): string[] {
   const roots = [remoteRoot(env)]
   for (const root of supersededRoots) {
     if (!roots.includes(root)) roots.push(root)
+  }
+  return roots
+}
+
+/** The lexical spelling of a local path, followed by its canonical one when it resolves. */
+function pathSpellings(target: string): string[] {
+  const out = [target]
+  try {
+    const real = realpathSync(target)
+    if (real !== target) out.push(real)
+  } catch {
+    // The path does not exist yet; the lexical spelling is all there is.
+  }
+  return out
+}
+
+/**
+ * Every root a cwd may be a placeholder under, including each root's realpath.
+ *
+ * The workspace registry stores `fs.realpath`, so a session cwd is canonical
+ * even when the configured root (or the environment default) spells a symlink
+ * (`~/.dsh` is one on some installs). Routing must compare against both
+ * spellings, or it silently treats that session as local and runs its commands
+ * on this machine. This is the single authority `workspaces.ts` and the router
+ * both use, so the two cannot drift apart again.
+ */
+export function canonicalRoutingRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots: string[] = []
+  for (const root of routingRoots(env)) {
+    for (const spelling of pathSpellings(root)) {
+      if (!roots.includes(spelling)) roots.push(spelling)
+    }
   }
   return roots
 }
@@ -171,9 +204,18 @@ export function routeUnderRoot(root: string, cwd: string | undefined): Route {
 }
 
 export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): Route {
-  for (const root of routingRoots(env)) {
-    const route = routeUnderRoot(root, cwd)
-    if (route.kind === 'remote') return route
+  if (!cwd) return { kind: 'local' }
+  // Try the cwd as given first, then its realpath: DSH normally stores the
+  // canonical spelling already, but a row saved before realpath registration
+  // (or a caller holding a symlink spelling) must still route remote.
+  for (const spelling of pathSpellings(cwd)) {
+    for (const root of canonicalRoutingRoots(env)) {
+      const route = routeUnderRoot(root, spelling)
+      if (route.kind === 'remote') {
+        // Keep the spelling the caller (and the model) actually uses.
+        return spelling === cwd ? route : { ...route, placeholderCwd: cwd }
+      }
+    }
   }
   return { kind: 'local' }
 }
@@ -188,19 +230,22 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
 export function workspaceBinding(cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): { hostId: string, remotePath: string } | null {
   if (!cwd) return null
   // A session left on a superseded root still belongs to its workspace; without
-  // this it would lose the sandbox pin and could follow a `cd` out of it.
-  for (const root of routingRoots(env)) {
-    const rel = path.relative(root, cwd)
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue
-    const segments = rel.split(path.sep).filter(segment => segment.length > 0)
-    if (segments.length < 2) continue
-    const hostId = segments[0]!
-    if (!isValidHostId(hostId)) continue
-    const remotePath = decodeRemotePath(segments[1]!)
-    if (remotePath === null || !remotePath.startsWith('/')) continue
-    const normalized = normalizeRemoteDirectory(remotePath)
-    if (normalized === null) continue
-    return { hostId, remotePath: normalized }
+  // this it would lose the sandbox pin and could follow a `cd` out of it. Both
+  // the root and the cwd may be spelled through a symlink, so accept either.
+  for (const spelling of pathSpellings(cwd)) {
+    for (const root of canonicalRoutingRoots(env)) {
+      const rel = path.relative(root, spelling)
+      if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue
+      const segments = rel.split(path.sep).filter(segment => segment.length > 0)
+      if (segments.length < 2) continue
+      const hostId = segments[0]!
+      if (!isValidHostId(hostId)) continue
+      const remotePath = decodeRemotePath(segments[1]!)
+      if (remotePath === null || !remotePath.startsWith('/')) continue
+      const normalized = normalizeRemoteDirectory(remotePath)
+      if (normalized === null) continue
+      return { hostId, remotePath: normalized }
+    }
   }
   return null
 }

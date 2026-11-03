@@ -514,6 +514,11 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    // A rotated key may belong to a different machine; the cached login
+    // environment snapshot came from the previous one's bashrc and must not be
+    // eval'd against the new host. (The file tree is deliberately kept: the
+    // address did not change, only the key.)
+    this.loginEnvs.forget(hostId)
     await this.persistHosts()
   }
 
@@ -623,6 +628,12 @@ export class Core {
       ...host,
       opsPolicy: normalizeOpsPolicy((host as { opsPolicy?: unknown }).opsPolicy),
       loginEnv: normalizeLoginEnv((host as { loginEnv?: unknown }).loginEnv),
+    }
+    // A new endpoint must never inherit the old machine's password. Delete it
+    // before saving; `saveSecret` runs right after `saveHost` and writes the new
+    // one only if the operator typed one.
+    if (previous !== undefined && connectionKeyChanged(previous, normalized)) {
+      await this.dropSecret(host.id)
     }
     this.config.hosts = previous === undefined
       ? [...this.config.hosts, normalized]
@@ -802,7 +813,7 @@ export class Core {
     // including a tombstone the file revives onto a different machine.
     for (const host of merged.hosts) {
       const before = previous.get(host.id) ?? this.config.deletedHosts.find(row => row.host.id === host.id)?.host
-      if (before !== undefined && before.host !== host.host) await this.dropSecret(host.id)
+      if (before !== undefined && connectionKeyChanged(before, host)) await this.dropSecret(host.id)
     }
     this.config.hosts = merged.hosts
     // Keeping a dropped host as a tombstone is what `replace` shares with
@@ -965,6 +976,12 @@ export class Core {
     // server: an old placeholder that no registered workspace covers is then
     // refused by the entry guard instead of quietly becoming a local directory.
     addSupersededRoot(oldRoot)
+    // Persist the old root BEFORE any session directory is renamed. A crash
+    // between the directory rename and the header rewrite leaves a log under the
+    // new project key whose header still names the old root; DSH's `list()`
+    // rejects the whole store in that state. This record is what lets the next
+    // load's resume sweep find that session and finish the rewrite.
+    if (this.recordSupersededRoot(oldRoot)) await this.persistMigrationState()
     // Move the stored sessions onto the new root. Without this a session keeps
     // naming the old root: the workspace registry filters it out of membership
     // (it loses its sidebar group) and the entry guard refuses its cwd (it can
@@ -973,9 +990,8 @@ export class Core {
     // this process — the registry caches headers at startup — so the moved ids
     // are persisted and attached on the next plugin load.
     const relocation = await this.relocateStoredSessions(oldRoot, newRoot)
-    const rootRecorded = this.recordSupersededRoot(oldRoot)
     const pendingAdded = this.recordPendingGrouping(relocation)
-    if (rootRecorded || pendingAdded) await this.persistMigrationState()
+    if (pendingAdded) await this.persistMigrationState()
     const stuck: string[] = []
     for (const item of relocating) {
       const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
@@ -1048,10 +1064,14 @@ export class Core {
       summary.relocated.push(...part.relocated)
       summary.skippedLive.push(...part.skippedLive)
       summary.failed.push(...part.failed)
+      if (part.retainedRoots !== undefined && part.retainedRoots.length > 0) {
+        summary.retainedRoots = [...(summary.retainedRoots ?? []), ...part.retainedRoots]
+      }
       // A root with any remaining session (moved, skipped, or stuck) stays
       // routable and is scanned again next time; an empty one is dropped so a
-      // drained migration stops paying for a store scan on every startup.
-      if (part.relocated.length > 0 || part.skippedLive.length > 0 || part.failed.length > 0) {
+      // drained migration stops paying for a store scan on every startup. A
+      // root whose body still references it must also survive.
+      if (part.relocated.length > 0 || part.skippedLive.length > 0 || part.failed.length > 0 || (part.retainedRoots?.length ?? 0) > 0) {
         survivors.add(resolveLocalPath(root))
       } else {
         pruned = true
@@ -1085,9 +1105,8 @@ export class Core {
    * next load with headers rebuilt from disk.
    */
   private async relocateStoredSessions(oldRoot: string, newRoot: string): Promise<SessionRelocationSummary> {
-    const live = this.liveSessionIds()
     try {
-      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
+      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: () => this.liveSessionIds() })
     } catch (error) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
       // A scan failure is one error, not "every live session was skipped".
