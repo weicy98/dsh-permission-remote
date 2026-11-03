@@ -199,8 +199,8 @@ function decodeHeader(bytes: Buffer, compression: boolean): { header: Record<str
     return { header: JSON.parse(text.subarray(0, -1).toString('utf8')) as Record<string, unknown>, headerEnd: scan.frames[0].end }
   }
   const cut = bytes.indexOf(10)
-  if (cut < 0) throw new Error('the log has no newline after its header line')
-  return { header: JSON.parse(bytes.subarray(0, cut).toString('utf8')) as Record<string, unknown>, headerEnd: cut + 1 }
+  const text = cut < 0 ? bytes : bytes.subarray(0, cut)
+  return { header: JSON.parse(text.toString('utf8')) as Record<string, unknown>, headerEnd: cut < 0 ? bytes.length : cut + 1 }
 }
 
 /**
@@ -283,13 +283,17 @@ function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compressi
 /** Rewrite the first line of an uncompressed log, leaving the rest byte for byte. */
 function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buffer {
   const cut = buffer.indexOf(10)
-  if (cut < 0) throw new Error('the log has no newline after its header line')
-  const header = JSON.parse(buffer.subarray(0, cut).toString('utf8')) as Record<string, unknown>
+  // A log whose header is the whole file (no trailing newline) is still a
+  // header DSH reads; treat the missing newline as an empty body rather than
+  // failing forever on a session nobody can otherwise repair.
+  const headerText = cut < 0 ? buffer : buffer.subarray(0, cut)
+  const header = JSON.parse(headerText.toString('utf8')) as Record<string, unknown>
   if (header.type !== 'session') throw new Error(`first record is not a Session header (type ${String(header.type)})`)
   if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
   if (typeof header.cwd !== 'string' || header.cwd.length === 0) throw new Error('header carries no cwd')
   const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
-  return Buffer.concat([Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), buffer.subarray(cut + 1)])
+  const body = cut < 0 ? Buffer.alloc(0) : buffer.subarray(cut + 1)
+  return Buffer.concat([Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), body])
 }
 
 /** The generation version of a canonical log filename, or undefined. */
@@ -501,7 +505,9 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
     return false
   }
   const sourceLog = joinPath(dir, logName)
-  // 1) All fallible work, with the directory still in place.
+  // 1) All fallible work, with the directory still in place. The header probe
+  // already proved the log is structurally readable; the full read and the
+  // in-memory rewrite are the remaining fallible steps.
   let rewritten: Buffer
   let srcMode: number | undefined
   try {
@@ -519,7 +525,9 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
   // (session logs are 0600) and several users may share the machine.
   const staged = `${logName}.relocate-${process.pid}.tmp`
   try {
-    await writeFile(joinPath(dir, staged), rewritten)
+    // Create already restricted (0600) and widen to the source mode only after
+    // the bytes land, so the file is never world-readable mid-write.
+    await writeFile(joinPath(dir, staged), rewritten, { mode: 0o600 })
     if (srcMode !== undefined) await chmod(joinPath(dir, staged), srcMode)
   } catch (error) {
     await rm(joinPath(dir, staged)).catch(() => undefined)
@@ -541,6 +549,8 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
     let rolledBack = true
     try {
       await rename(destDir, dir)
+      // The staged file moved WITH the directory, so after the rollback it is
+      // under `dir` again (not `destDir`).
       await rm(joinPath(dir, staged)).catch(() => undefined)
     } catch {
       rolledBack = false
@@ -682,7 +692,7 @@ async function publish(path: string, bytes: Buffer): Promise<void> {
     mode = undefined
   }
   const temp = `${path}.relocate-${process.pid}.tmp`
-  await writeFile(temp, bytes)
+  await writeFile(temp, bytes, { mode: 0o600 })
   if (mode !== undefined) await chmod(temp, mode)
   await rename(temp, path)
 }

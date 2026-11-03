@@ -1051,3 +1051,57 @@ test('a rewritten session log keeps its 0600 mode', async () => {
     await dispose(box)
   }
 })
+
+test('a plaintext log whose header is the whole file is still relocated', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-oneline')
+    await mkdir(dir, { recursive: true })
+    // No trailing newline: the header is the entire file.
+    const oldLog = join(dir, 'session.jsonl')
+    await writeFile(oldLog, `{"type":"session","id":"session-oneline","cwd":${JSON.stringify(oldLocal)},"version":4}`)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const text = await readFile(join(storedSessionDir(box, newLocal, 'session-oneline'), 'session.jsonl'), 'utf8')
+    assert.equal(JSON.parse(text.trim()).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a moved session with no workspace yet stays queued and groups once one is registered', async () => {
+  const box = await harness()
+  try {
+    // /srv/app has a workspace; /srv/other does not.
+    await seedWorkspace(box, '/srv/app')
+    const otherOld = mapRemoteToLocal('host1', '/srv/other')!
+    await seedStoredSession(box, 'session-nogroup', otherOld, [{ type: 'session/append', seq: 1 }])
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    const pending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
+    // Kept even though nothing covers it yet: the path still routes to a host.
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0]!.id, 'session-nogroup')
+
+    // The operator registers the workspace later; the queued entry now attaches.
+    const newPath = mapRemoteToLocal('host1', '/srv/other')!
+    const row = new FakeWorkspace('w-late', newPath, 'dev · other')
+    row.attachSession = async (sessionId: unknown) => { row.attached.push(String(sessionId)) }
+    box.registry.rows.push(row)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({
+      hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot,
+      supersededRemoteRoots: [], pendingSessionGrouping: pending,
+    })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual(row.attached, ['session-nogroup'])
+  } finally {
+    await dispose(box)
+  }
+})

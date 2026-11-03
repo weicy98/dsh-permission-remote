@@ -1038,11 +1038,11 @@ export class Core {
       if (rows !== undefined) {
         // Record the workspace's OWN registered path (already canonical), not
         // the string we computed: with a symlinked root the two differ, and a
-        // later attach validates against the registered path. A session with no
-        // workspace stays ungrouped on purpose, so it is not queued.
+        // later attach validates against the registered path. When no workspace
+        // covers the destination yet the computed path is kept anyway, so a
+        // workspace registered later can still pick the session up.
         const target = rows.find(item => sameRealPath(item.path, row.to))
-        if (target === undefined) continue
-        path = target.path
+        path = target !== undefined ? target.path : row.to
       } else {
         path = row.to
       }
@@ -1161,8 +1161,12 @@ export class Core {
       }
       const target = rows.find(item => sameRealPath(item.path, entry.path))
       if (target === undefined) {
-        // No workspace covers this path any more (deleted, or never registered):
-        // stop retrying so the list does not grow forever.
+        // Distinguish "its workspace was deleted" from "nothing is registered
+        // there yet". A path that still belongs to a host placeholder stays
+        // queued, so registering a workspace later groups the session; one that
+        // resolves to no remote workspace at all can never be attached and is
+        // dropped, so the list cannot grow without limit.
+        if (routeByCwd(entry.path).kind === 'remote') remaining.push(entry)
         continue
       }
       const attach = target.attachSession
