@@ -491,13 +491,18 @@ function Section(props: SectionProps): JSX.Element {
     const moved = result.sessionsRelocated ?? 0
     const skipped = result.sessionsSkippedLive ?? 0
     const failed = result.sessionsFailed ?? 0
+    const reported = result.sessionsRelocated !== undefined || result.sessionsSkippedLive !== undefined || result.sessionsFailed !== undefined
+    // A sweep that found nothing must not turn every save into "moved 0".
+    if (!reported || (moved === 0 && skipped === 0 && failed === 0)) return ''
     const parts: string[] = []
-    if (result.sessionsRelocated !== undefined || result.sessionsSkippedLive !== undefined || result.sessionsFailed !== undefined) {
+    if (moved > 0) {
       parts.push(`${t('remoteRootSessionsMoved')} ${moved}`)
-      if (skipped > 0) parts.push(t('remoteRootSessionsOpen'))
-      if (failed > 0) parts.push(`${t('remoteRootSessionsFailed')} ${failed}`)
+      // Membership is restored on the next plugin load, not in this process.
+      parts.push(t('remoteRootSessionsRegroup'))
     }
-    return parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
+    if (skipped > 0) parts.push(t('remoteRootSessionsOpen'))
+    if (failed > 0) parts.push(`${t('remoteRootSessionsFailed')} ${failed}`)
+    return ` · ${parts.join(' · ')}`
   }
 
   async function applyRootResult(result: RemoteRootChange): Promise<void> {

@@ -119,6 +119,7 @@ export interface DeletedHost {
   deletedAt: string
 }
 
+
 export interface PluginConfig {
   hosts: HostConfig[]
   deletedHosts: DeletedHost[]

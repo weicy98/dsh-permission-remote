@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { randomBytes } from 'node:crypto'
 import { dirname, join, relative } from 'node:path'
 import test from 'node:test'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
@@ -8,7 +9,8 @@ import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
-import { encodeSegment, projectKey, scanLogFrames } from '../src/session-relocate.ts'
+import { encodeSegment, projectKey, relocateSessions, scanLogFrames, sessionLogExists } from '../src/session-relocate.ts'
+import { readMigrationState, writeMigrationState, migrationStatePath } from '../src/migration-state.ts'
 import { workspaceRoute, type WorkspaceLike } from '../src/workspaces.ts'
 
 /**
@@ -78,6 +80,36 @@ class FakeRegistry {
   }
 }
 
+/** The same host context for the first load and for simulated restarts. */
+function makeCtx(options: {
+  updates: Array<Record<string, unknown>>
+  droppedSecrets: unknown[]
+  liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }>
+  failPersist?: boolean
+}) {
+  return {
+    logger: { info() {}, warn() {} },
+    settings: {
+      configure: () => () => undefined,
+      describe: () => [{ ns: 'permission-remote' }],
+      update: async (_ns: string, patch: Record<string, unknown>) => {
+        if (options.failPersist === true) throw new Error('settings write refused')
+        options.updates.push(patch)
+      },
+    },
+    credentials: {
+      readRecord: async () => undefined,
+      modifyRecord: async () => undefined,
+      deleteRecord: async (key: unknown) => { options.droppedSecrets.push(key) },
+    },
+    sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
+    tools: { get: () => undefined, register: () => () => undefined },
+    get: (service: string) => service === 'agents' ? { list: () => options.liveAgents } : undefined,
+    on: () => () => undefined,
+    effect: () => undefined,
+  }
+}
+
 interface Harness {
   box: string
   oldRoot: string
@@ -87,41 +119,20 @@ interface Harness {
   updates: Array<Record<string, unknown>>
   droppedSecrets: unknown[]
   /** Agents the plugin sees through `ctx.get('agents')`; their session ids are "live". */
-  liveAgents: Array<{ session?: { id?: string } }>
+  liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }>
   /** `DSH_HOME` before the harness pinned it to the fixture box. */
   savedHome: string | undefined
 }
 
-async function harness(options: { sessions?: number, failPersist?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
+async function harness(options: { sessions?: number, failPersist?: boolean, readOnlyMigrationState?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
   const box = await mkdtemp(join(tmpdir(), 'dsh-root-core-'))
   const oldRoot = join(box, 'old-root')
   const newRoot = join(box, 'new-root')
   await mkdir(oldRoot, { recursive: true })
   const updates: Array<Record<string, unknown>> = []
   const droppedSecrets: unknown[] = []
-  const fail = options.failPersist === true
-  const liveAgents: Array<{ session?: { id?: string } }> = []
-  const ctx = {
-    logger: { info() {}, warn() {} },
-    settings: {
-      configure: () => () => undefined,
-      describe: () => [{ ns: 'permission-remote' }],
-      update: async (_ns: string, patch: Record<string, unknown>) => {
-        if (fail) throw new Error('settings write refused')
-        updates.push(patch)
-      },
-    },
-    credentials: {
-      readRecord: async () => undefined,
-      modifyRecord: async () => undefined,
-      deleteRecord: async (key: unknown) => { droppedSecrets.push(key) },
-    },
-    sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
-    tools: { get: () => undefined, register: () => () => undefined },
-    get: (service: string) => service === 'agents' ? { list: () => liveAgents } : undefined,
-    on: () => () => undefined,
-    effect: () => undefined,
-  }
+  const liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }> = []
+  const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true })
   const registry = new FakeRegistry()
   const config = readConfig({ hosts: options.hosts ?? [host()], deletedHosts: [], remoteRoot: oldRoot })
   const core = new Core(ctx as never, config, registry)
@@ -130,6 +141,11 @@ async function harness(options: { sessions?: number, failPersist?: boolean, host
   const savedHome = process.env.DSH_HOME
   process.env.DSH_HOME = box
   return { box, oldRoot, newRoot, registry, core, updates, droppedSecrets, liveAgents, savedHome }
+}
+
+/** The current sidecar bookkeeping for a harness box. */
+async function sidecar(box: Harness): Promise<{ supersededRemoteRoots: string[], pendingSessionGrouping: Array<{ path: string, id: string }> }> {
+  return (await readMigrationState({ DSH_HOME: box.box } as NodeJS.ProcessEnv)).state
 }
 
 async function dispose(box: Harness): Promise<void> {
@@ -168,8 +184,8 @@ test('a live session blocks the move until it is accepted, and then keeps routin
     assert.equal(moved.migration?.copied, 1)
     assert.equal(moved.workspacesRemapped, 1)
 
-    // The setting was written once, with only the new root.
-    assert.deepEqual(box.updates.at(-1), { remoteRoot: box.newRoot })
+    // The root is written once, then the migration bookkeeping follows.
+    assert.deepEqual(box.updates.at(0), { remoteRoot: box.newRoot })
     assert.equal(remoteRoot(), box.newRoot)
 
     // The row now points at the new placeholder and keeps its title.
@@ -481,29 +497,55 @@ test('a workspace that cannot be removed is reported after the root has switched
 })
 
 /** Build a stored session log the way the persistence backend does: checksummed header frame plus event frames. */
-async function seedStoredSession(box: Harness, id: string, cwd: string, events: Array<Record<string, unknown>> = []): Promise<string> {
+async function seedStoredLog(dir: string, id: string, cwd: string, options: {
+  events?: Array<Record<string, unknown>>
+  name?: string
+  tornTail?: Buffer
+} = {}): Promise<string> {
   const checksum = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
   const frames = [
     zstdCompressSync(Buffer.from(`${JSON.stringify({ type: 'session', id, cwd, version: 4 })}\n`, 'utf8'), checksum),
-    ...events.map(event => zstdCompressSync(Buffer.from(`${JSON.stringify(event)}\n`, 'utf8'), checksum)),
+    ...(options.events ?? []).map(event => zstdCompressSync(Buffer.from(`${JSON.stringify(event)}\n`, 'utf8'), checksum)),
   ]
-  const dir = join(box.box, 'sessions', projectKey(cwd), encodeSegment(id))
   await mkdir(dir, { recursive: true })
-  const log = join(dir, 'session.v4.jsonl.zstd')
-  await writeFile(log, Buffer.concat(frames))
+  const log = join(dir, options.name ?? 'session.v4.jsonl.zstd')
+  await writeFile(log, Buffer.concat([...frames, ...(options.tornTail === undefined ? [] : [options.tornTail])]))
   return log
 }
 
-/** Parse the header record out of a stored log. */
-function headerOf(bytes: Buffer): Record<string, unknown> {
-  const frames = scanLogFrames(bytes)
-  return JSON.parse(zstdDecompressSync(bytes.subarray(frames[0].start, frames[0].end)).subarray(0, -1).toString('utf8'))
+/** A stored session at the canonical location its cwd implies. */
+function storedSessionDir(box: Harness, cwd: string, id: string): string {
+  return join(box.box, 'sessions', projectKey(cwd), encodeSegment(id))
 }
 
-test('a migration moves stored sessions onto the new root and re-attaches them to their workspace', async () => {
+async function seedStoredSession(box: Harness, id: string, cwd: string, events: Array<Record<string, unknown>> = []): Promise<string> {
+  return seedStoredLog(storedSessionDir(box, cwd, id), id, cwd, { events })
+}
+
+/** Decode the header record of a stored log. */
+function headerOf(bytes: Buffer): Record<string, unknown> {
+  const scan = scanLogFrames(bytes)
+  if (scan.frames.length === 0) throw new Error('no complete header frame')
+  return JSON.parse(zstdDecompressSync(bytes.subarray(scan.frames[0].start, scan.frames[0].end)).subarray(0, -1).toString('utf8'))
+}
+
+async function logAt(path: string): Promise<Buffer> {
+  return readFile(path)
+}
+
+/** Write a session log with an explicit header record (for reconciliation fixtures). */
+async function seedRawLog(dir: string, name: string, header: Buffer): Promise<string> {
+  const checksum = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
+  await mkdir(dir, { recursive: true })
+  const log = join(dir, name)
+  await writeFile(log, Buffer.concat([zstdCompressSync(header, checksum), zstdCompressSync(Buffer.from('{"type":"session/append","seq":1}\n', 'utf8'), checksum)]))
+  return log
+}
+
+test('a migration moves stored sessions onto the new root and queues their group restoration', async () => {
   const box = await harness()
   try {
-    const seeded = await seedWorkspace(box, '/srv/app')
+    await seedWorkspace(box, '/srv/app')
     const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
     const original = await readFile(await seedStoredSession(box, 'session-move-1', oldLocal, [
       { type: 'session/append', seq: 1, data: { text: 'history must survive byte for byte' } },
@@ -515,31 +557,32 @@ test('a migration moves stored sessions onto the new root and re-attaches them t
     assert.equal(moved.sessionsSkippedLive, 0)
     assert.equal(moved.sessionsFailed, 0)
 
-    // The log now sits in the project directory the new placeholder implies,
-    // its header naming it and its event history byte for byte identical.
+    // The log now sits where the new placeholder implies, header naming it and
+    // the event history byte for byte identical.
     const newLocal = mapRemoteToLocal('host1', '/srv/app')!
     assert.equal(newLocal.startsWith(box.newRoot), true)
-    const movedLog = join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-move-1'), 'session.v4.jsonl.zstd')
-    const bytes = await readFile(movedLog)
-    const frames = scanLogFrames(bytes)
+    const movedLog = join(storedSessionDir(box, newLocal, 'session-move-1'), 'session.v4.jsonl.zstd')
+    const bytes = await logAt(movedLog)
+    const frames = scanLogFrames(bytes).frames
     assert.equal(frames.length, 2)
     const header = headerOf(bytes)
     assert.equal(header.cwd, newLocal)
     assert.equal(header.id, 'session-move-1')
-    assert.equal(
-      bytes.subarray(frames[1].start).equals(original.subarray(scanLogFrames(original)[1].start)),
-      true,
-      'the event frame must be byte-identical',
-    )
+    assert.equal(bytes.subarray(frames[1].start).equals(original.subarray(scanLogFrames(original).frames[1].start)), true)
 
     // The old session directory and the emptied old project directory are gone.
-    await assert.rejects(() => readFile(join(box.box, 'sessions', projectKey(oldLocal), encodeSegment('session-move-1'), 'session.v4.jsonl.zstd')), /ENOENT/)
+    await assert.rejects(() => readFile(join(storedSessionDir(box, oldLocal, 'session-move-1'), 'session.v4.jsonl.zstd')), /ENOENT/)
     await assert.rejects(() => stat(join(box.box, 'sessions', projectKey(oldLocal))), /ENOENT/)
 
-    // The recreated workspace row was asked to account the moved session.
-    const recreated = box.registry.rows.find(row => row.path !== seeded.path)
+    // Grouping cannot be restored in-process (the registry caches headers at
+    // startup), so the move is persisted for the next load instead of being
+    // reported as finished.
+    const recreated = box.registry.rows.find(row => row.path !== undefined && row.path !== oldLocal)
     assert.ok(recreated)
-    assert.deepEqual((recreated as FakeWorkspace).attached, ['session-move-1'])
+    const state = await sidecar(box)
+    assert.deepEqual(state.pendingSessionGrouping, [{ path: newLocal, id: 'session-move-1' }])
+    assert.equal(state.supersededRemoteRoots.includes(box.oldRoot), true)
+    assert.deepEqual((recreated as FakeWorkspace).attached, [])
   } finally {
     await dispose(box)
   }
@@ -561,7 +604,7 @@ test('open sessions are skipped by a migration and follow on a re-save', async (
     // The open session's file was never touched and still names the old root;
     // the superseded root keeps it routing to its server until it is closed.
     assert.equal(headerOf(await readFile(openLog)).cwd, oldLocal)
-    await assert.rejects(() => readFile(join(box.box, 'sessions', projectKey(oldLocal), encodeSegment('session-closed'), 'session.v4.jsonl.zstd')), /ENOENT/)
+    await assert.rejects(() => readFile(join(storedSessionDir(box, oldLocal, 'session-closed'), 'session.v4.jsonl.zstd')), /ENOENT/)
 
     // The operator closes the session and saves the same root again: the
     // catch-up sweep moves what the migration had to leave behind.
@@ -571,7 +614,7 @@ test('open sessions are skipped by a migration and follow on a re-save', async (
     assert.equal(again.sessionsRelocated, 1)
     assert.equal(again.sessionsSkippedLive, 0)
     const newLocal = mapRemoteToLocal('host1', '/srv/app')!
-    const sweptLog = join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-open'), 'session.v4.jsonl.zstd')
+    const sweptLog = join(storedSessionDir(box, newLocal, 'session-open'), 'session.v4.jsonl.zstd')
     assert.equal(headerOf(await readFile(sweptLog)).cwd, newLocal)
     await assert.rejects(() => readFile(openLog), /ENOENT/)
   } finally {
@@ -579,26 +622,563 @@ test('open sessions are skipped by a migration and follow on a re-save', async (
   }
 })
 
-test('a session whose target already holds a log is reported as failed, not overwritten', async () => {
+test('a plain save with no known old root does not scan the store', async () => {
+  const box = await harness()
+  try {
+    const same = await box.core.changeRemoteRoot(box.oldRoot, { force: false })
+    assert.equal(same.status, 'unchanged')
+    assert.equal(same.sessionsRelocated, undefined)
+    assert.equal(box.updates.length, 0)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('generation 0 logs are relocated too', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    // DSH writes generation 0 without a version tag; a v4-only matcher would
+    // silently skip these (real stores keep half their sessions this way).
+    const oldLog = await seedStoredLog(storedSessionDir(box, oldLocal, 'session-v0'), 'session-v0', oldLocal, {
+      name: 'session.jsonl.zstd',
+      events: [{ type: 'session/append', seq: 1 }],
+    })
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLog = join(storedSessionDir(box, newLocal, 'session-v0'), 'session.jsonl.zstd')
+    assert.equal(headerOf(await readFile(newLog)).cwd, newLocal)
+    await assert.rejects(() => readFile(oldLog), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a torn final frame is preserved and does not block the move', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const goodFrame = zstdCompressSync(Buffer.from('{"type":"session/append","seq":2}\n', 'utf8'), { params: { [zconst.ZSTD_c_checksumFlag]: 1 } })
+    // A crash mid-append leaves a truncated frame; DSH opens such logs as a
+    // committed prefix, so the migration must move them, not refuse them.
+    const torn = goodFrame.subarray(0, Math.max(4, goodFrame.length - 6))
+    const log = await seedStoredLog(storedSessionDir(box, oldLocal, 'session-torn'), 'session-torn', oldLocal, {
+      events: [{ type: 'session/append', seq: 1 }],
+      tornTail: torn,
+    })
+    const before = await readFile(log)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const after = await readFile(join(storedSessionDir(box, newLocal, 'session-torn'), 'session.v4.jsonl.zstd'))
+    // Complete frames moved, torn bytes kept exactly, header rewritten.
+    assert.equal(scanLogFrames(after).frames.length, 2)
+    assert.equal(scanLogFrames(after).tornStart !== undefined, true)
+    const beforeScan = scanLogFrames(before)
+    const afterScan = scanLogFrames(after)
+    assert.equal(after.subarray(afterScan.tornStart!).equals(before.subarray(beforeScan.tornStart!)), true)
+    assert.equal(headerOf(after).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a rename that died before the rewrite is finished in place on the next run', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    // The earlier run renamed the directory but died before rewriting the
+    // header: the session sits at the destination still naming the old root.
+    await seedRawLog(
+      join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-renamed')),
+      'session.v4.jsonl.zstd',
+      Buffer.from(`${JSON.stringify({ type: 'session', id: 'session-renamed', cwd: oldLocal, version: 4 })}\n`, 'utf8'),
+    )
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, newLocal, 'session-renamed'), 'session.v4.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a rewrite that died before the cleanup only removes the stale source', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    // Completed destination plus a leftover source copy: the next run finishes
+    // by deleting the source, never by writing a duplicate log.
+    await seedStoredLog(join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-done')), 'session-done', newLocal, {
+      events: [{ type: 'session/append', seq: 1 }],
+    })
+    const staleSource = await seedStoredSession(box, 'session-done', oldLocal, [{ type: 'session/append', seq: 1 }])
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    // Already relocated by the earlier run: cleaning up the stale copy must not
+    // count the same session as relocated a second time.
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 0)
+    await assert.rejects(() => readFile(staleSource), /ENOENT/)
+    const dest = join(storedSessionDir(box, newLocal, 'session-done'), 'session.v4.jsonl.zstd')
+    assert.equal(headerOf(await readFile(dest)).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a session whose target belongs to another session is reported, not overwritten', async () => {
   const box = await harness()
   try {
     await seedWorkspace(box, '/srv/app')
     const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
     await seedStoredSession(box, 'session-clash', oldLocal)
-    // A log already sits at the destination under the new root: a blind move
-    // must never overwrite whichever session it belongs to.
     const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
-    const destination = await seedStoredSession(box, 'session-clash', newLocal)
+    // A different session already occupies the destination id segment.
+    const destination = await seedStoredLog(join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-clash')), 'session-other', newLocal)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 1)
+    assert.equal(headerOf(await readFile(destination)).cwd, newLocal)
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, oldLocal, 'session-clash'), 'session.v4.jsonl.zstd'))).cwd, oldLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a directory whose name disagrees with projectKey(cwd) is refused loudly', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    // A drifted copy of the project-key algorithm would have placed this log
+    // under a wrong directory; the drift guard must report it, not move it.
+    const drifted = join(box.box, 'sessions', '--not-the-right-project--', encodeSegment('session-drift'))
+    await seedRawLog(drifted, 'session.v4.jsonl.zstd', Buffer.from(`${JSON.stringify({ type: 'session', id: 'session-drift', cwd: oldLocal, version: 4 })}\n`, 'utf8'))
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 1)
+    assert.equal(headerOf(await readFile(join(drifted, 'session.v4.jsonl.zstd'))).cwd, oldLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a moved session joins its workspace on the next load, when the cache is fresh', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-later', oldLocal, [{ type: 'session/append', seq: 1 }])
+    box.liveAgents.push({ session: { id: 'session-other-open' } })
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+
+    // The registry row now points at the new placeholder.
+    const row = box.registry.rows.find(item => item.path.startsWith(box.newRoot))
+    assert.ok(row)
+    // Real registries validate against the cwd from their header cache; a
+    // stale entry (the pre-move cwd) is exactly why an in-process attach had
+    // to be deferred. The next load's cache is rebuilt from disk instead.
+    ;(row as FakeWorkspace).attachSession = async (sessionId: unknown) => {
+      const bytes = await readFile(join(storedSessionDir(box, mapRemoteToLocal('host1', '/srv/app')!, String(sessionId)), 'session.v4.jsonl.zstd'))
+      if (headerOf(bytes).cwd !== row.path) throw new Error('stale header')
+      ;(row as FakeWorkspace).attached.push(String(sessionId))
+    }
+    const pendingBefore = (await sidecar(box)).pendingSessionGrouping
+    assert.equal(pendingBefore.length, 1)
+    // Simulated restart: a fresh Core over the same context, config and store.
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual((row as FakeWorkspace).attached, ['session-later'])
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('membership that cannot validate yet stays pending for the next load', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-stuck', oldLocal, [{ type: 'session/append', seq: 1 }])
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    const row = box.registry.rows.find(item => item.path.startsWith(box.newRoot))
+    assert.ok(row)
+    // The destination is still named by the old root in a stale cache: attach
+    // throws, and the entry must survive so the next load retries it.
+    ;(row as FakeWorkspace).attachSession = async () => { throw new Error("its cwd resolves to the old root") }
+    const pending = (await sidecar(box)).pendingSessionGrouping
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, pending)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a plaintext log is relocated with its body preserved', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-plain')
+    await mkdir(dir, { recursive: true })
+    const body = '{"type":"session/append","seq":1,"data":{"t":"kept"}}\n{"type":"session/append","seq":2}\n'
+    const oldLog = join(dir, 'session.jsonl')
+    await writeFile(oldLog, `{"type":"session","id":"session-plain","cwd":${JSON.stringify(oldLocal)},"version":4}\n${body}`)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const text = await readFile(join(storedSessionDir(box, newLocal, 'session-plain'), 'session.jsonl'), 'utf8')
+    const cut = text.indexOf('\n')
+    assert.equal(JSON.parse(text.slice(0, cut)).cwd, newLocal)
+    assert.equal(text.slice(cut + 1), body)
+    await assert.rejects(() => readFile(oldLog), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a session id that needs path encoding is not mistaken for a mismatch', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const id = 'weird id:with chars'
+    const dir = join(box.box, 'sessions', projectKey(oldLocal), encodeSegment(id))
+    await seedStoredLog(dir, id, oldLocal, { name: 'session.v4.jsonl.zstd', events: [{ type: 'session/append', seq: 1 }] })
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(headerOf(await readFile(join(box.box, 'sessions', projectKey(newLocal), encodeSegment(id), 'session.v4.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a bookkeeping write failure does not fail an otherwise successful move', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-keep', oldLocal, [{ type: 'session/append', seq: 1 }])
+    // Make the sidecar path unwritable (a directory sits where the file goes).
+    await mkdir(migrationStatePath({ DSH_HOME: box.box } as NodeJS.ProcessEnv), { recursive: true })
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, newLocal, 'session-keep'), 'session.v4.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a drained superseded root is pruned so startup stops rescanning it', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-drain', oldLocal, [{ type: 'session/append', seq: 1 }])
+    await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    // Simulated restart: the migration is done, old root holds nothing left.
+    await writeMigrationState({ supersededRemoteRoots: [box.oldRoot], pendingSessionGrouping: [] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).supersededRemoteRoots, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a fatal rewrite failure leaves the session exactly where it was, never half-moved', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-bad')
+    await mkdir(dir, { recursive: true })
+    const checksum = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
+    // A large, incompressible event frame so the whole log exceeds the 64 KiB
+    // header probe: the header then reads fine and the failure happens inside
+    // moveAndRewrite's pre-rename scan, which is the branch this test covers.
+    const bigEvent = zstdCompressSync(Buffer.concat([Buffer.from('{"type":"session/append","seq":1,"pad":"'), randomBytes(200_000), Buffer.from('"}\n')]), checksum)
+    const frames = [
+      zstdCompressSync(Buffer.from(`{"type":"session","id":"session-bad","cwd":${JSON.stringify(oldLocal)},"version":4}\n`, 'utf8'), checksum),
+      bigEvent,
+      Buffer.from('GARBAGE-THAT-IS-NOT-A-ZSTD-FRAME'),
+    ]
+    const oldLog = join(dir, 'session.v4.jsonl.zstd')
+    const original = Buffer.concat(frames)
+    assert.ok(original.length > 64 * 1024)
+    await writeFile(oldLog, original)
 
     const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
     assert.equal(moved.status, 'changed')
     assert.equal(moved.sessionsRelocated, 0)
     assert.equal(moved.sessionsFailed, 1)
-    // Both copies are untouched: the destination kept its log and the source
-    // stays where it was for the operator to decide.
-    assert.equal(headerOf(await readFile(destination)).cwd, newLocal)
-    const oldLog = join(box.box, 'sessions', projectKey(oldLocal), encodeSegment('session-clash'), 'session.v4.jsonl.zstd')
-    assert.equal(headerOf(await readFile(oldLog)).cwd, oldLocal)
+
+    // Untouched: the log bytes are exactly as before the attempted migration.
+    assert.equal((await readFile(oldLog)).equals(original), true)
+    // No staging temp left behind.
+    assert.equal((await readdir(dir)).some(name => /\.relocate-\d+\.tmp$/.test(name)), false)
+    // Never created at the destination, so DSH never sees a mismatched log.
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await assert.rejects(() => stat(storedSessionDir(box, newLocal, 'session-bad')), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a reconcile across different generations is refused rather than clobbering the newer one', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    // Source is v4, destination only holds a v3 generation.
+    await seedStoredSession(box, 'session-gen', oldLocal, [{ type: 'session/append', seq: 1 }])
+    const destDir = join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-gen'))
+    await seedRawLog(destDir, 'session.v3.jsonl.zstd', Buffer.from(`{"type":"session","id":"session-gen","cwd":${JSON.stringify(newLocal)},"version":3}\n`, 'utf8'))
+
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 1)
+    // Neither generation was rewritten or deleted.
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, oldLocal, 'session-gen'), 'session.v4.jsonl.zstd'))).cwd, oldLocal)
+    assert.equal(headerOf(await readFile(join(destDir, 'session.v3.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('the group restore waits for a registry that is still starting up', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    // Session already moved to the new root by an earlier run.
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-wait')), 'session-wait', newLocal, { events: [{ type: 'session/append', seq: 1 }] })
+    const row = box.registry.rows.find(item => item.path === newLocal) ?? null
+    // Register the workspace row at the new path with an attach that records.
+    const target = new FakeWorkspace('w-new', newLocal, 'dev · app')
+    target.attachSession = async (sessionId: unknown) => { target.attached.push(sessionId) }
+    box.registry.rows.push(target)
+    // Make the registry "not ready" for the first two calls.
+    const original = box.registry.list.bind(box.registry)
+    let calls = 0
+    box.registry.list = () => {
+      calls += 1
+      if (calls <= 2) throw new Error('workspace registry is not started yet')
+      return original()
+    }
+    await writeMigrationState({ supersededRemoteRoots: [], pendingSessionGrouping: [{ path: newLocal, id: 'session-wait' }] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual(target.attached, ['session-wait'])
+    void row
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a rewritten session log keeps its 0600 mode', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const oldLog = await seedStoredSession(box, 'session-mode', oldLocal, [{ type: 'session/append', seq: 1 }])
+    await chmod(oldLog, 0o600)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLog = join(storedSessionDir(box, newLocal, 'session-mode'), 'session.v4.jsonl.zstd')
+    assert.equal((await stat(newLog)).mode & 0o777, 0o600)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a plaintext log whose header is the whole file is still relocated', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-oneline')
+    await mkdir(dir, { recursive: true })
+    // No trailing newline: the header is the entire file.
+    const oldLog = join(dir, 'session.jsonl')
+    await writeFile(oldLog, `{"type":"session","id":"session-oneline","cwd":${JSON.stringify(oldLocal)},"version":4}`)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const text = await readFile(join(storedSessionDir(box, newLocal, 'session-oneline'), 'session.jsonl'), 'utf8')
+    assert.equal(JSON.parse(text.trim()).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a moved session with no workspace yet stays queued and groups once one is registered', async () => {
+  const box = await harness()
+  try {
+    // /srv/app has a workspace; /srv/other does not.
+    await seedWorkspace(box, '/srv/app')
+    const otherOld = mapRemoteToLocal('host1', '/srv/other')!
+    await seedStoredSession(box, 'session-nogroup', otherOld, [{ type: 'session/append', seq: 1 }])
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    const pending = (await sidecar(box)).pendingSessionGrouping
+    // Kept even though nothing covers it yet: the path still routes to a host.
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0]!.id, 'session-nogroup')
+
+    // The operator registers the workspace later; the queued entry now attaches.
+    const newPath = mapRemoteToLocal('host1', '/srv/other')!
+    const row = new FakeWorkspace('w-late', newPath, 'dev · other')
+    row.attachSession = async (sessionId: unknown) => { row.attached.push(String(sessionId)) }
+    box.registry.rows.push(row)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual(row.attached, ['session-nogroup'])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a root configured through a symlink still matches the canonical cwds DSH stores', async () => {
+  const box = await harness()
+  try {
+    // DSH registers workspaces through realpath, so a session header records the
+    // canonical cwd. A root that is itself a symlink is only path.resolve'd in
+    // the config; matching one spelling would silently relocate nothing.
+    const realRoot = join(box.box, 'real-root')
+    const linkRoot = join(box.box, 'link-root')
+    await mkdir(realRoot, { recursive: true })
+    await symlink(realRoot, linkRoot)
+    const canonical = await realpath(linkRoot)
+    const cwd = join(canonical, 'host1', encodeRemotePath('/srv/app'))
+    const dir = join(box.box, 'sessions', projectKey(cwd), encodeSegment('session-link'))
+    await seedStoredLog(dir, 'session-link', cwd, { events: [{ type: 'session/append', seq: 1 }] })
+
+    // Configure the root as the SYMLINK spelling, as the settings page would.
+    const summary = await relocateSessions({
+      dshHome: box.box,
+      oldRoot: linkRoot,
+      newRoot: join(box.box, 'new-root'),
+      liveSessionIds: new Set(),
+    })
+    assert.equal(summary.relocated.length, 1)
+    assert.equal(summary.failed.length, 0)
+    await assert.rejects(() => stat(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('live sessions on a just-created workspace row still trigger the confirmation', async () => {
+  const box = await harness()
+  try {
+    const seeded = await seedWorkspace(box, '/srv/app')
+    // The plugin's re-created row has no sessionIds until the next load, which
+    // is exactly the window the registry count misses.
+    const placeholder = seeded.path
+    box.liveAgents.push({
+      session: { id: 'session-open', header: { cwd: join(placeholder, 'sub') } },
+    })
+    const blocked = await box.core.changeRemoteRoot(box.newRoot, { force: false })
+    assert.equal(blocked.status, 'has-sessions')
+    assert.equal(blocked.sessions, 1)
+    assert.equal(box.updates.length, 0)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a queued session survives a root edit that makes its path unroutable', async () => {
+  const box = await harness()
+  try {
+    // A destination under no current routing root (the operator changed the root
+    // in the generic editor). The session log is still on disk, so the record of
+    // "needs its group back" must survive; dropping it would be permanent.
+    const orphan = join(box.box, 'unrouted-root', 'host1', encodeRemotePath('/srv/gone'))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(orphan), encodeSegment('session-orphan')), 'session-orphan', orphan, {
+      events: [{ type: 'session/append', seq: 1 }],
+    })
+    await writeMigrationState({ supersededRemoteRoots: [], pendingSessionGrouping: [{ path: orphan, id: 'session-orphan' }] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloaded = new Core(reloadCtx as never, readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }), box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [{ path: orphan, id: 'session-orphan' }])
+
+    // Once the log itself is gone, the entry can never be attached and is dropped.
+    await rm(join(box.box, 'sessions', projectKey(orphan)), { recursive: true, force: true })
+    const again = new Core(makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] }) as never,
+      readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }), box.registry)
+    again.applyRemoteRootOverride()
+    await again.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('sessionLogExists finds a log recorded under the other root spelling', async () => {
+  const box = await harness()
+  try {
+    const realRoot = join(box.box, 'real-new')
+    const linkRoot = join(box.box, 'link-new')
+    await mkdir(realRoot, { recursive: true })
+    await symlink(realRoot, linkRoot)
+    // The log lives under the LEXICAL spelling's project directory (the cwd the
+    // migration writes names the configured newRoot), while a recorded pending
+    // path may be the canonical one.
+    const lexical = join(linkRoot, 'host1', encodeRemotePath('/srv/app'))
+    const canonical = join(await realpath(linkRoot), 'host1', encodeRemotePath('/srv/app'))
+    assert.notEqual(projectKey(lexical), projectKey(canonical))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(lexical), encodeSegment('session-x')), 'session-x', lexical, { events: [] })
+    assert.equal(await sessionLogExists(box.box, lexical, 'session-x'), true)
+    assert.equal(await sessionLogExists(box.box, canonical, 'session-x'), true)
+    assert.equal(await sessionLogExists(box.box, canonical, 'session-absent'), false)
   } finally {
     await dispose(box)
   }

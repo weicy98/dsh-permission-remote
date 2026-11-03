@@ -1,9 +1,10 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { join as joinPath, posix, resolve as resolveLocalPath } from 'node:path'
+import { join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { FsError } from '@deepseek-ai/dsh-fs'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
@@ -35,7 +36,8 @@ import {
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, supersededRootsSnapshot, type RemoteRoute, type Route } from './router.ts'
-import { relocateSessions, type SessionRelocationSummary } from './session-relocate.ts'
+import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
+import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
@@ -358,6 +360,13 @@ class SshApi extends TypertRemoteService {
 }
 
 export class Core {
+  /** Migration bookkeeping loaded from its sidecar file; see `migration-state.ts`. */
+  private migrationState: MigrationState = emptyMigrationState()
+  /** Single-flight load of the sidecar, awaited before any state is mutated. */
+  private migrationStateLoaded: Promise<void> | null = null
+  /** False when the sidecar exists but could not be read; never overwrite then. */
+  private migrationStateWritable = true
+
   readonly pool: SshPool
   private config: PluginConfig
   private readonly status = new Map<string, Promise<RunnerStatus>>()
@@ -833,6 +842,9 @@ export class Core {
    * authoritative root.
    */
   async changeRemoteRoot(inputRoot: string, opts: { strategy?: MigrationStrategy, force: boolean, acceptedConflicts?: readonly string[] }): Promise<RemoteRootChange> {
+    // The detached resume may still be loading the sidecar; never mutate on the
+    // empty placeholder or the load would replace what this call recorded.
+    await this.ensureMigrationStateLoaded()
     const oldRoot = remoteRoot()
     const trimmed = inputRoot.trim()
     // A blank field means "go back to the built-in default", so the operator can
@@ -843,16 +855,14 @@ export class Core {
       // Pin an explicit spelling, but a blank field that already resolves to the
       // default must not persist the default path (it would stop tracking it).
       if (trimmed.length > 0 && this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
-      // Saving the root again is the documented way to catch up sessions that a
-      // migration had to skip because they were open: sweep every root this
-      // process migrated away from onto the current one.
-      const relocation = await this.relocateFromSupersededRoots(newRoot)
-      return {
-        status: 'unchanged',
-        oldRoot,
-        root: newRoot,
-        ...summaryCounts(relocation),
-      }
+      // Saving the root again catches up sessions an earlier migration had to
+      // skip because they were open: sweep every root this profile migrated
+      // away from onto the current one. A plain no-op save must not scan the
+      // store, so this only runs when such a root is actually known.
+      const roots = this.catchupRoots(newRoot)
+      if (roots.length === 0) return { status: 'unchanged', oldRoot, root: newRoot }
+      const relocation = await this.relocateFromRoots(roots, newRoot)
+      return { status: 'unchanged', oldRoot, root: newRoot, ...summaryCounts(relocation) }
     }
     const opened = this.remoteWorkspaceRows()
     // Plan before anything is asked or written: a target that is inside the old
@@ -863,7 +873,13 @@ export class Core {
     // also sends the conflict list it showed, a path that was not on that list
     // is asked again instead of being overwritten.
     const plan = await planRemoteRoot(oldRoot, newRoot, strategy)
-    const sessions = opened.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
+    // Count what is actually open on these placeholders, not only what the
+    // registry accounts for: a row this plugin created has an empty `sessionIds`
+    // until the next load attaches the moved sessions, so in the window between
+    // "migrated" and "restarted" the registry count reads zero and the operator
+    // would be migrated again without the confirmation.
+    const accounted = opened.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
+    const sessions = Math.max(accounted, this.liveSessionsUnder(opened))
     if (sessions > 0 && !opts.force) return { status: 'has-sessions', oldRoot, root: newRoot, sessions }
     if (!plan.targetWasEmpty && opts.strategy === undefined && plan.conflicts.length > 0) {
       return { status: 'needs-strategy', oldRoot, root: newRoot, conflicts: plan.conflicts }
@@ -939,13 +955,17 @@ export class Core {
     // server: an old placeholder that no registered workspace covers is then
     // refused by the entry guard instead of quietly becoming a local directory.
     addSupersededRoot(oldRoot)
-    // Move the stored sessions themselves before the old registrations
-    // disappear. Without this a session keeps pointing at the old root: its
-    // log sits in a project directory the new cwd contradicts, so DSH refuses
-    // to open it and the workspace service filters it from membership — the
-    // "migrated sessions vanish into Ungrouped" failure. Live sessions are
-    // skipped and keep routing until the operator closes them and saves again.
-    const relocation = await this.relocateStoredSessions(oldRoot, newRoot, created)
+    // Move the stored sessions onto the new root. Without this a session keeps
+    // naming the old root: the workspace registry filters it out of membership
+    // (it loses its sidebar group) and the entry guard refuses its cwd (it can
+    // no longer be used). Live sessions are skipped and keep routing until the
+    // operator closes them and saves again. Membership cannot be restored from
+    // this process — the registry caches headers at startup — so the moved ids
+    // are persisted and attached on the next plugin load.
+    const relocation = await this.relocateStoredSessions(oldRoot, newRoot)
+    const rootRecorded = this.recordSupersededRoot(oldRoot)
+    const pendingAdded = this.recordPendingGrouping(relocation)
+    if (rootRecorded || pendingAdded) await this.persistMigrationState()
     const stuck: string[] = []
     for (const item of relocating) {
       const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
@@ -965,66 +985,300 @@ export class Core {
   }
 
   /**
-   * Move stored sessions from every root this process migrated away from onto
-   * `current`, and account them to the workspace registered at their new
-   * placeholder. Used when saving the root that is already current: the
-   * catch-up pass for sessions a migration skipped while they were open.
+   * Roots an earlier migration left behind, for a catch-up sweep onto `current`.
+   *
+   * Reads both the persisted list (survives a restart) and the in-process one
+   * (a root migrated away from in this run), so the "close the session and
+   * save again" advice keeps working across restarts too.
    */
-  private async relocateFromSupersededRoots(current: string): Promise<SessionRelocationSummary> {
+  private catchupRoots(current: string): string[] {
+    const roots: string[] = []
+    for (const root of [...this.migrationState.supersededRemoteRoots, ...supersededRootsSnapshot()]) {
+      if (resolveLocalPath(root) === resolveLocalPath(current)) continue
+      if (!roots.includes(root)) roots.push(root)
+    }
+    return roots
+  }
+
+  /** Move stored sessions from each of `roots` onto `newRoot`. */
+  private async relocateFromRoots(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
     const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
-    for (const root of supersededRootsSnapshot()) {
-      if (root === current) continue
-      const part = await this.relocateStoredSessions(root, current, [])
+    const survivors = new Set<string>()
+    let pruned = false
+    for (const root of roots) {
+      const part = await this.relocateStoredSessions(root, newRoot)
       summary.relocated.push(...part.relocated)
       summary.skippedLive.push(...part.skippedLive)
       summary.failed.push(...part.failed)
+      // A root with any remaining session (moved, skipped, or stuck) stays
+      // routable and is scanned again next time; an empty one is dropped so a
+      // drained migration stops paying for a store scan on every startup.
+      if (part.relocated.length > 0 || part.skippedLive.length > 0 || part.failed.length > 0) {
+        survivors.add(resolveLocalPath(root))
+      } else {
+        pruned = true
+      }
     }
+    if (pruned && this.migrationState.supersededRemoteRoots.length > 0) {
+      const scanned = new Set(roots.map(root => resolveLocalPath(root)))
+      this.migrationState.supersededRemoteRoots = this.migrationState.supersededRemoteRoots
+        .filter(root => !scanned.has(resolveLocalPath(root)) || survivors.has(resolveLocalPath(root)))
+    }
+    // Only a change (a newly queued membership or a dropped root) needs a
+    // write; a sweep that found nothing must not rewrite settings.
+    if (this.recordPendingGrouping(summary) || pruned) await this.persistMigrationState()
     return summary
   }
 
   /**
-   * Rewrite each stored session whose header names `oldRoot`, move its
-   * directory to the project key the new cwd implies, and attach the id to the
-   * workspace registered there.
+   * Move every stored session whose header names `oldRoot` onto `newRoot`.
    *
    * Nothing here may fail the migration: the tree copy and the registry switch
    * already succeeded, so a stuck file is collected and reported instead.
-   * Membership attach is best-effort too — a session whose workspace row cannot
-   * take it stays "Ungrouped", which the sidebar tolerates and a re-save fixes.
+   * Membership is deliberately not attached here — the registry caches session
+   * headers at startup, so an immediate attach would validate against the
+   * stale cwd and throw; {@link resumeSessionMigrationState} retries on the
+   * next load with headers rebuilt from disk.
    */
-  private async relocateStoredSessions(oldRoot: string, newRoot: string, preferRows: readonly WorkspaceLike[]): Promise<SessionRelocationSummary> {
+  private async relocateStoredSessions(oldRoot: string, newRoot: string): Promise<SessionRelocationSummary> {
+    const live = this.liveSessionIds()
+    try {
+      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
+      // A scan failure is one error, not "every live session was skipped".
+      return { relocated: [], skippedLive: [], failed: [{ id: '*', reason: `the session store could not be scanned: ${errorText(error)}` }] }
+    }
+  }
+
+  /** Open sessions whose recorded cwd sits under one of the given placeholders. */
+  private liveSessionsUnder(rows: readonly { ws: WorkspaceLike }[]): number {
+    const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
+    const list = agents?.list?.() ?? []
+    if (list.length === 0) return 0
+    const roots = rows.map(row => resolveLocalPath(row.ws.path))
+    let count = 0
+    for (const agent of list) {
+      const cwd = agent.session?.header?.cwd
+      if (typeof cwd !== 'string' || cwd.length === 0) continue
+      const resolved = resolveLocalPath(cwd)
+      if (roots.some(root => resolved === root || resolved.startsWith(`${root}${sep}`))) count += 1
+    }
+    return count
+  }
+
+  /** Ids of sessions with a live writer; their files must never be moved. */
+  private liveSessionIds(): Set<string> {
     const live = new Set<string>()
     const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
     for (const agent of agents?.list?.() ?? []) {
       const id = agent.session?.id
       if (typeof id === 'string' && id.length > 0) live.add(id)
     }
-    let summary: SessionRelocationSummary
+    return live
+  }
+
+  /** Remember a migrated-away root in the persisted list; true when it was new. */
+  private recordSupersededRoot(root: string): boolean {
+    const resolved = resolveLocalPath(root)
+    if (this.migrationState.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) return false
+    this.migrationState.supersededRemoteRoots = [...this.migrationState.supersededRemoteRoots, resolved]
+    return true
+  }
+
+  /** Queue every moved session for a membership attach on a later load; true when it added one. */
+  private recordPendingGrouping(summary: SessionRelocationSummary): boolean {
+    // The registry can be unavailable here (a mismatched log elsewhere stops its
+    // init). Recording must still work, so fall back to the computed path; the
+    // flush resolves it by realpath later, when the registry is up.
+    let rows: WorkspaceLike[] | undefined
     try {
-      summary = await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
-    } catch (error) {
-      this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
-      return { relocated: [], skippedLive: [...live], failed: [] }
+      rows = this.workspaces.list()
+    } catch {
+      rows = undefined
     }
-    if (summary.relocated.length === 0 && summary.failed.length === 0) return summary
-    const rows = [...preferRows, ...this.workspaces.list()]
+    // Keyed by session id so a second migration (A→B then B→C in one process)
+    // overwrites the stale B path instead of leaving the id pointing nowhere.
+    const wanted = new Map(this.migrationState.pendingSessionGrouping.map(entry => [entry.id, entry.path]))
+    let changed = false
     for (const row of summary.relocated) {
-      const target = rows.find(item => resolveLocalPath(item.path) === resolveLocalPath(row.to))
-      const attach = target?.attachSession
-      if (attach === undefined) continue
-      try {
-        await attach.call(target, row.id)
-      } catch (error) {
-        this.ctx.logger?.warn(`[@dsh-permission-remote] session ${row.id} moved to ${row.to} but could not join its workspace: ${errorText(error)}`)
+      let path: string
+      if (rows !== undefined) {
+        // Record the workspace's OWN registered path (already canonical), not
+        // the string we computed: with a symlinked root the two differ, and a
+        // later attach validates against the registered path. When no workspace
+        // covers the destination yet the computed path is kept anyway, so a
+        // workspace registered later can still pick the session up.
+        const target = rows.find(item => sameRealPath(item.path, row.to))
+        path = target !== undefined ? target.path : row.to
+      } else {
+        path = row.to
       }
+      if (wanted.get(row.id) === path) continue
+      wanted.set(row.id, path)
+      changed = true
     }
+    if (changed) this.migrationState.pendingSessionGrouping = [...wanted].map(([id, path]) => ({ path, id }))
     if (summary.failed.length > 0) {
-      this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root to ${newRoot}: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
+      this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
     }
     if (summary.skippedLive.length > 0) {
-      this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on ${oldRoot}; closing them and saving the root again moves them`)
+      this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on the old root; closing them and saving the root again moves them`)
     }
-    return summary
+    return changed
+  }
+
+  /**
+   * Persist the migration bookkeeping to its sidecar document.
+   *
+   * Best-effort: the tree copy and the root switch already succeeded, so a
+   * failed write must not turn a completed migration into an apparent failure.
+   * The moved session is still correct on disk; losing the bookkeeping only
+   * means its group is restored by a later successful sweep.
+   */
+  private async persistMigrationState(): Promise<void> {
+    if (!this.migrationStateWritable) {
+      this.ctx.logger?.warn('[@dsh-permission-remote] the migration bookkeeping was not readable this run; leaving the file untouched rather than overwriting it')
+      return
+    }
+    try {
+      await writeMigrationState(this.migrationState)
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] the session migration bookkeeping could not be persisted: ${errorText(error)}`)
+    }
+  }
+
+  /**
+   * Load the sidecar once, before any code path mutates migration state.
+   *
+   * `resumeSessionMigrationState` runs detached from `apply`, so a "save and
+   * migrate" can arrive before the load finishes; both entry points await this
+   * single-flight promise, so a mutation never runs on the empty placeholder
+   * and the load can never replace already-recorded entries.
+   */
+  private ensureMigrationStateLoaded(): Promise<void> {
+    if (this.migrationStateLoaded === null) this.migrationStateLoaded = this.loadMigrationState()
+    return this.migrationStateLoaded
+  }
+
+  /** Load the sidecar bookkeeping into this instance (plugin load). */
+  private async loadMigrationState(): Promise<void> {
+    const { state, problem, readError } = await readMigrationState()
+    this.migrationState = state
+    // A file that exists but could not be read must not be overwritten: writing
+    // the empty fallback would destroy bookkeeping we merely lacked access to.
+    this.migrationStateWritable = readError !== true
+    if (problem !== undefined) this.ctx.logger?.warn(`[@dsh-permission-remote] ${problem}${readError === true ? '; it will not be overwritten this run' : '; starting from empty bookkeeping'}`)
+  }
+
+  /**
+   * Resume what an earlier run could not finish, from the plugin load.
+   *
+   * Restores the persisted superseded roots into the router (a session still
+   * on one must be refused as a remote placeholder, not silently treated as a
+   * local directory), sweeps them onto the current root, and attaches the
+   * sessions that were moved earlier. The registry rebuilds its header index
+   * per process, so an attach that had to fail mid-migration succeeds here —
+   * that is why the pending list is persisted instead of retried on the spot.
+   */
+  async resumeSessionMigrationState(): Promise<void> {
+    await this.ensureMigrationStateLoaded()
+    for (const root of this.migrationState.supersededRemoteRoots) addSupersededRoot(root)
+    if (this.migrationState.pendingSessionGrouping.length === 0 && this.migrationState.supersededRemoteRoots.length === 0) return
+    // Only sessions queued by an EARLIER load can be attached now: anything the
+    // catch-up sweep moves in this load still has the registry's startup header
+    // cache, so it must wait for the next load to read the rewritten header.
+    const preexisting = new Set(this.migrationState.pendingSessionGrouping.map(entry => entry.id))
+    // Wait for the registry first, but only briefly and never as a precondition
+    // for the sweep. Two constraints pull in opposite directions:
+    //   - the sweep renames directories, and between the rename and the header
+    //     promote a log briefly sits where its cwd says it does not; a registry
+    //     `list()` running concurrently would reject the whole store, so the
+    //     sweep must not overlap a healthy startup;
+    //   - a mismatched log is exactly what makes `Service.init` fail, and then
+    //     the registry never becomes ready — waiting first without a fallback
+    //     would deadlock, because the only thing that can repair the log is the
+    //     sweep.
+    // So: wait (bounded), sweep regardless of the outcome, flush only if ready.
+    const registryReady = await this.waitForWorkspaceRegistry()
+    const roots = this.catchupRoots(remoteRoot())
+    if (roots.length > 0) {
+      try {
+        await this.relocateFromRoots(roots, remoteRoot())
+      } catch (error) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] the session catch-up sweep failed: ${errorText(error)}`)
+      }
+    }
+    if (registryReady) {
+      await this.flushPendingSessionGrouping(preexisting)
+    } else {
+      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; session grouping is deferred to the next load (the sweep still ran)')
+    }
+  }
+
+  /** Poll the workspace registry until it answers, or give up after a short wait. */
+  private async waitForWorkspaceRegistry(): Promise<boolean> {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      try {
+        this.workspaces.list()
+        return true
+      } catch {
+        // Any throw here means "not usable yet"; wording differs by version.
+      }
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    return false
+  }
+
+  /**
+   * Attach each pending session to the workspace now registered at its path.
+   *
+   * Success removes the entry; a failure keeps it for the next load (the
+   * registry may still be indexing, or the workspace row may have been
+   * renamed since). Attaching is idempotent, so a retry after a partial run is
+   * safe.
+   */
+  async flushPendingSessionGrouping(onlyIds?: ReadonlySet<string>): Promise<void> {
+    if (this.migrationState.pendingSessionGrouping.length === 0) return
+    let rows: WorkspaceLike[]
+    try {
+      rows = this.workspaces.list()
+    } catch {
+      // Registry not up yet; leave every entry for a later load.
+      return
+    }
+    const remaining: Array<{ path: string, id: string }> = []
+    for (const entry of this.migrationState.pendingSessionGrouping) {
+      if (onlyIds !== undefined && !onlyIds.has(entry.id)) {
+        remaining.push(entry)
+        continue
+      }
+      const target = rows.find(item => sameRealPath(item.path, entry.path))
+      if (target === undefined) {
+        // No workspace covers the destination (yet, or any more). Keep the entry
+        // while the session log is still there: registering a workspace later
+        // groups it, and an operator editing the root in the generic editor
+        // (which changes routing but not the files) must not cost the record.
+        // Only a session whose log is gone can never be attached.
+        if (await sessionLogExists(resolveDshHome(), entry.path, entry.id)) remaining.push(entry)
+        continue
+      }
+      const attach = target.attachSession
+      if (attach === undefined) {
+        remaining.push(entry)
+        continue
+      }
+      try {
+        await attach.call(target, entry.id)
+      } catch (error) {
+        remaining.push(entry)
+        this.ctx.logger?.warn(`[@dsh-permission-remote] session ${entry.id} is at ${entry.path} but could not join its workspace yet: ${errorText(error)}`)
+      }
+    }
+    if (remaining.length !== this.migrationState.pendingSessionGrouping.length) {
+      this.migrationState.pendingSessionGrouping = remaining
+      await this.persistMigrationState()
+    }
   }
 
   /** Workspaces whose placeholder still routes, including ones registered during a copy. */
@@ -1407,6 +1661,12 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   }
   void core.autoTagWorkspaces().catch(error => {
     ctx.logger?.warn(`[@dsh-permission-remote] workspace title tagging failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
+  // Resume what an earlier root migration could not finish: sweep sessions
+  // still on a persisted old root and restore the workspace groups that had to
+  // wait for this load. Runs after load so a failure cannot block the plugin.
+  void core.resumeSessionMigrationState().catch(error => {
+    ctx.logger?.warn(`[@dsh-permission-remote] could not resume the session migration state: ${error instanceof Error ? error.message : String(error)}`)
   })
   ctx.logger?.info('[@dsh-permission-remote] loaded')
 }
@@ -1842,6 +2102,18 @@ function summaryCounts(summary: SessionRelocationSummary): {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Whether two paths name the same directory, canonicalizing symlinks when possible. */
+function sameRealPath(left: string, right: string): boolean {
+  const canon = (path: string): string => {
+    try {
+      return realpathSync(path)
+    } catch {
+      return resolveLocalPath(path)
+    }
+  }
+  return canon(left) === canon(right)
 }
 
 /** Run every disposer. The first failure is returned after the rest finish. */

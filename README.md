@@ -87,7 +87,17 @@ dsh plugin --profile web add dsh-permission-remote
 - 新目录不存在或是空的：把旧的 `remote` 目录整棵复制过去。
 - 新目录已有内容：自动合并——缺失的补上、完全相同的跳过、同名但内容不同的文件先不覆盖，页面上会问你要「保留目标（自动合并）」还是「用旧目录覆盖」。同名但一侧是目录、另一侧是文件的情况一律不动，会列在冲突里，由你手工处理。符号链接按链接原样复制、不跟随；目标里已有的符号链接保持不动并列为冲突，避免写穿链接。
 - 新目录不能放在旧目录里面（反过来也不行），否则直接报错，不会开始复制。
-- 工作区里有打开着的会话时，会先提示；迁移会按远端路径把这些工作区重新注册到新占位目录下，并把已存储的会话一起搬到新位置。正在打开的会话先留在原处（期间仍连着原服务器），关闭它们后再次保存即可补迁。
+- 工作区里有打开着的会话时，会先提示；迁移会按远端路径把这些工作区重新注册到新占位目录下，并把已存储的会话一起搬到新位置。会话的**分组**要等下次启动 DSH 时才会恢复（工作区注册表在启动时缓存会话头，插件无法在本次进程内安全改归属）；待归组记录保存在 `~/.dsh/data/dsh-permission-remote/migration.json`（权限 0600，属于插件自身状态，不放进设置页）。正在打开的会话先留在原处（期间仍连着原服务器），关闭它们后再次保存即可补迁，但补迁后的分组同样要再下一次启动才归位。
+
+**从旧版本升级：** 本修复只对之后发生的迁移生效。如果你的会话是在旧版本里迁移受损的（仍挂在旧占位根下、没有任何待归组记录），升级后不会被自动修好——需要手工告诉插件旧根在哪：
+
+1. 退出 DSH；
+2. 编辑 `~/.dsh/data/dsh-permission-remote/migration.json`（不存在就新建），把旧占位根加入废弃根列表，例如
+   `{ "version": 1, "supersededRemoteRoots": ["<旧根绝对路径>"], "pendingSessionGrouping": [] }`；
+3. 启动 DSH：启动时的补扫会把旧根下的会话搬到当前根、改好头部 cwd 并登记待归组；
+4. **再启动一次** DSH，分组即恢复。
+
+（补扫在每次启动都会跑；若旧根写错只是扫不到东西、不会损坏任何文件。）
 
 旧目录不会被删除，确认无误后可自行清理；迁移只搬本机的占位目录，不动远端服务器上的文件。若在通用设置编辑器里直接改这个值，会立即生效但**不会**迁移旧目录——要搬目录仍请用「保存并迁移」。本次运行期间，旧目录里的路径仍按「远端占位目录」解析——挂在旧占位目录上的会话还能继续连到那台服务器；但旧目录里没有已注册工作区覆盖时，会明确报错拒绝，而不是悄悄变成本地目录。重启后旧目录不再被识别。
 
@@ -257,7 +267,7 @@ The Settings page's **Remote root directory** is where every remote-workspace pl
 - merges when the target already has content: missing entries are added, identical files skipped, and a same-named file with different content is left alone until you choose **Keep target (auto-merge)** or **Overwrite from old root**. A name that is a directory on one side and a file on the other is never replaced; it is listed as a conflict for you to resolve by hand. A symlink is copied as a symlink and is never followed; a symlink already in the target is left untouched and listed as a conflict, so the copy cannot write through it;
 - refuses a target inside the old root (or the old root inside the target) before copying anything.
 
-If a workspace has a live session the page asks first; the migration re-registers those workspaces under the new placeholder paths and moves their stored sessions to the new root. Sessions that are open stay in place — they keep talking to their server through the superseded root — and follow once you close them and save again. The old directory is kept, so you can delete it once you are happy; only the local placeholder tree moves, and files on the remote servers are untouched. Editing the value in the generic settings editor takes effect immediately but does **not** migrate the old tree; use **Save and migrate** for that. For the rest of this process the old paths still read as remote placeholders, so a session left on one keeps talking to its server — and a placeholder no registered workspace covers is refused instead of quietly becoming a local directory. After a restart the old directory is no longer recognised.
+If a workspace has a live session the page asks first; the migration re-registers those workspaces under the new placeholder paths and moves their stored sessions to the new root. A moved session's **workspace grouping** is restored on the next DSH start (the registry caches session headers at startup, so the plugin cannot safely re-home them within the running process). Sessions that are open stay in place — they keep talking to their server through the superseded root — and follow once you close them and save again, but a session caught up this way is grouped one start later than the run that moved it. The old directory is kept, so you can delete it once you are happy; only the local placeholder tree moves, and files on the remote servers are untouched. Editing the value in the generic settings editor takes effect immediately but does **not** migrate the old tree; use **Save and migrate** for that. For the rest of this process the old paths still read as remote placeholders, so a session left on one keeps talking to its server — and a placeholder no registered workspace covers is refused instead of quietly becoming a local directory. After a restart the old directory is no longer recognised.
 
 **Host configuration backup** exports the host list as JSON with no passwords or key passphrases (those live only in the credential store). **Import and merge** updates or adds by host id, and only the fields the file actually contains: a row that only renames a host keeps its fingerprint, private-key path, and ops policy. A changed address drops the saved password and, when the file does not include a new fingerprint, clears the old host key. **Import and replace** makes the file the whole list, asks first, and moves hosts the file drops to **deleted hosts** so they can be restored. A host that was already deleted and still has workspaces stays in that list even when the file does not mention it. A merge takes host rows only and ignores the file's deleted-host records. After importing, test the connections again and re-enter secrets as needed; hosts set to `trust` in the file are reported by count. If the file changes an existing host's address, sets that host to `trust`, or relaxes `deny` to `ask`, the page asks before importing. A host the file adds is applied immediately.
 
