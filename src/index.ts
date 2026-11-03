@@ -911,9 +911,9 @@ export class Core {
     // this process — the registry caches headers at startup — so the moved ids
     // are persisted and attached on the next plugin load.
     const relocation = await this.relocateStoredSessions(oldRoot, newRoot)
-    this.recordSupersededRoot(oldRoot)
-    this.recordPendingGrouping(relocation)
-    await this.persistMigrationState()
+    const rootRecorded = this.recordSupersededRoot(oldRoot)
+    const pendingAdded = this.recordPendingGrouping(relocation)
+    if (rootRecorded || pendingAdded) await this.persistMigrationState()
     const stuck: string[] = []
     for (const item of relocating) {
       const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
@@ -951,14 +951,30 @@ export class Core {
   /** Move stored sessions from each of `roots` onto `newRoot`. */
   private async relocateFromRoots(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
     const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
+    const survivors = new Set<string>()
+    let pruned = false
     for (const root of roots) {
       const part = await this.relocateStoredSessions(root, newRoot)
       summary.relocated.push(...part.relocated)
       summary.skippedLive.push(...part.skippedLive)
       summary.failed.push(...part.failed)
+      // A root with any remaining session (moved, skipped, or stuck) stays
+      // routable and is scanned again next time; an empty one is dropped so a
+      // drained migration stops paying for a store scan on every startup.
+      if (part.relocated.length > 0 || part.skippedLive.length > 0 || part.failed.length > 0) {
+        survivors.add(resolveLocalPath(root))
+      } else {
+        pruned = true
+      }
     }
-    this.recordPendingGrouping(summary)
-    await this.persistMigrationState()
+    if (pruned && this.config.supersededRemoteRoots.length > 0) {
+      const scanned = new Set(roots.map(root => resolveLocalPath(root)))
+      this.config.supersededRemoteRoots = this.config.supersededRemoteRoots
+        .filter(root => !scanned.has(resolveLocalPath(root)) || survivors.has(resolveLocalPath(root)))
+    }
+    // Only a change (a newly queued membership or a dropped root) needs a
+    // write; a sweep that found nothing must not rewrite settings.
+    if (this.recordPendingGrouping(summary) || pruned) await this.persistMigrationState()
     return summary
   }
 
@@ -994,16 +1010,16 @@ export class Core {
     return live
   }
 
-  /** Remember a migrated-away root in the persisted list (also feeds routing). */
-  private recordSupersededRoot(root: string): void {
+  /** Remember a migrated-away root in the persisted list; true when it was new. */
+  private recordSupersededRoot(root: string): boolean {
     const resolved = resolveLocalPath(root)
-    if (!this.config.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) {
-      this.config.supersededRemoteRoots = [...this.config.supersededRemoteRoots, resolved]
-    }
+    if (this.config.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) return false
+    this.config.supersededRemoteRoots = [...this.config.supersededRemoteRoots, resolved]
+    return true
   }
 
-  /** Queue every moved session for a membership attach on a later load. */
-  private recordPendingGrouping(summary: SessionRelocationSummary): void {
+  /** Queue every moved session for a membership attach on a later load; true when it added one. */
+  private recordPendingGrouping(summary: SessionRelocationSummary): boolean {
     const known = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
     const added: Array<{ path: string, id: string }> = []
     for (const row of summary.relocated) {
@@ -1018,19 +1034,31 @@ export class Core {
     if (summary.skippedLive.length > 0) {
       this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on the old root; closing them and saving the root again moves them`)
     }
+    return added.length > 0
   }
 
-  /** Persist the migration bookkeeping next to the host rows. */
+  /**
+   * Persist the migration bookkeeping next to the host rows.
+   *
+   * Best-effort: the tree copy and the root switch already succeeded, so a
+   * settings write that fails must not turn a completed migration into an
+   * apparent failure. The moved session is still correct on disk; losing the
+   * bookkeeping only means its group is restored by a later successful save.
+   */
   private async persistMigrationState(): Promise<void> {
     const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
     if (row === undefined) {
       this.ctx.logger?.warn('[@dsh-permission-remote] settings row "permission-remote" is missing; the session migration bookkeeping was not persisted')
       return
     }
-    await this.ctx.settings.update(String(row.ns), {
-      supersededRemoteRoots: this.config.supersededRemoteRoots,
-      pendingSessionGrouping: this.config.pendingSessionGrouping,
-    })
+    try {
+      await this.ctx.settings.update(String(row.ns), {
+        supersededRemoteRoots: this.config.supersededRemoteRoots,
+        pendingSessionGrouping: this.config.pendingSessionGrouping,
+      })
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] the session migration bookkeeping could not be persisted: ${errorText(error)}`)
+    }
   }
 
   /**

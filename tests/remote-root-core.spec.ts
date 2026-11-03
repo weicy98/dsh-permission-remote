@@ -84,6 +84,7 @@ function makeCtx(options: {
   droppedSecrets: unknown[]
   liveAgents: Array<{ session?: { id?: string } }>
   failPersist?: boolean
+  failMigrationPersist?: boolean
 }) {
   return {
     logger: { info() {}, warn() {} },
@@ -92,6 +93,9 @@ function makeCtx(options: {
       describe: () => [{ ns: 'permission-remote' }],
       update: async (_ns: string, patch: Record<string, unknown>) => {
         if (options.failPersist === true) throw new Error('settings write refused')
+        if (options.failMigrationPersist === true && ('supersededRemoteRoots' in patch || 'pendingSessionGrouping' in patch)) {
+          throw new Error('migration bookkeeping write refused')
+        }
         options.updates.push(patch)
       },
     },
@@ -122,7 +126,7 @@ interface Harness {
   savedHome: string | undefined
 }
 
-async function harness(options: { sessions?: number, failPersist?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
+async function harness(options: { sessions?: number, failPersist?: boolean, failMigrationPersist?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
   const box = await mkdtemp(join(tmpdir(), 'dsh-root-core-'))
   const oldRoot = join(box, 'old-root')
   const newRoot = join(box, 'new-root')
@@ -130,7 +134,7 @@ async function harness(options: { sessions?: number, failPersist?: boolean, host
   const updates: Array<Record<string, unknown>> = []
   const droppedSecrets: unknown[] = []
   const liveAgents: Array<{ session?: { id?: string } }> = []
-  const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true })
+  const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true, failMigrationPersist: options.failMigrationPersist === true })
   const registry = new FakeRegistry()
   const config = readConfig({ hosts: options.hosts ?? [host()], deletedHosts: [], remoteRoot: oldRoot })
   const core = new Core(ctx as never, config, registry)
@@ -870,6 +874,92 @@ test('membership that cannot validate yet stays pending for the next load', asyn
     await reloaded.resumeSessionMigrationState()
     const stillPending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
     assert.deepEqual(stillPending, pending)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a plaintext log is relocated with its body preserved', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-plain')
+    await mkdir(dir, { recursive: true })
+    const body = '{"type":"session/append","seq":1,"data":{"t":"kept"}}\n{"type":"session/append","seq":2}\n'
+    const oldLog = join(dir, 'session.jsonl')
+    await writeFile(oldLog, `{"type":"session","id":"session-plain","cwd":${JSON.stringify(oldLocal)},"version":4}\n${body}`)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const text = await readFile(join(storedSessionDir(box, newLocal, 'session-plain'), 'session.jsonl'), 'utf8')
+    const cut = text.indexOf('\n')
+    assert.equal(JSON.parse(text.slice(0, cut)).cwd, newLocal)
+    assert.equal(text.slice(cut + 1), body)
+    await assert.rejects(() => readFile(oldLog), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a session id that needs path encoding is not mistaken for a mismatch', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const id = 'weird id:with chars'
+    const dir = join(box.box, 'sessions', projectKey(oldLocal), encodeSegment(id))
+    await seedStoredLog(dir, id, oldLocal, { name: 'session.v4.jsonl.zstd', events: [{ type: 'session/append', seq: 1 }] })
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    assert.equal(moved.sessionsFailed, 0)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(headerOf(await readFile(join(box.box, 'sessions', projectKey(newLocal), encodeSegment(id), 'session.v4.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a settings write that fails only for the bookkeeping does not fail the move', async () => {
+  const box = await harness({ failMigrationPersist: true })
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-keep', oldLocal, [{ type: 'session/append', seq: 1 }])
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 1)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, newLocal, 'session-keep'), 'session.v4.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a drained superseded root is pruned so startup stops rescanning it', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await seedStoredSession(box, 'session-drain', oldLocal, [{ type: 'session/append', seq: 1 }])
+    await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    // Simulated restart: the migration is done, old root holds nothing left.
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({
+      hosts: [host()],
+      deletedHosts: [],
+      remoteRoot: box.newRoot,
+      supersededRemoteRoots: [box.oldRoot],
+      pendingSessionGrouping: [],
+    })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    const lastSuperseded = box.updates.map(patch => patch.supersededRemoteRoots).filter(Array.isArray).at(-1) as string[]
+    assert.deepEqual(lastSuperseded, [])
   } finally {
     await dispose(box)
   }

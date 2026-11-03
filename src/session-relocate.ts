@@ -118,9 +118,18 @@ function sitsUnder(cwd: string, root: string): boolean {
 /** The session's placeholder path moved from `oldRoot` to `newRoot`. */
 export function mapPlaceholderCwd(cwd: string, oldRoot: string, newRoot: string): string {
   const trimmedOld = oldRoot.replace(/[\\/]+$/, '')
-  const rest = cwd.slice(trimmedOld.length).replace(/^[\\/]+/, '')
   const trimmedNew = newRoot.replace(/[\\/]+$/, '')
-  return rest.length === 0 ? trimmedNew : joinPath(trimmedNew, rest)
+  // Derive the remainder the same way {@link sitsUnder} tests membership, so a
+  // drive-letter or component case difference cannot slice the wrong span.
+  const rest = relativePath(trimmedOld, cwd)
+  if (rest === '' ) return trimmedNew
+  if (rest.startsWith('..') || rest.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rest)) {
+    // Not under oldRoot after all; fall back to the lexical prefix strip so a
+    // caller that already established membership keeps the old behaviour.
+    const lexical = cwd.slice(trimmedOld.length).replace(/^[\\/]+/, '')
+    return lexical.length === 0 ? trimmedNew : joinPath(trimmedNew, lexical)
+  }
+  return joinPath(trimmedNew, rest)
 }
 
 /** Structural scan result: complete frames plus an optional torn final frame. */
@@ -237,23 +246,24 @@ async function readLogHeader(path: string, size: number): Promise<{ header: Reco
  * tail byte-identical.
  */
 function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compression: boolean): Buffer {
+  if (!compression) return rewritePlainHeader(buffer, expectedId, to)
   const scan = scanLogFrames(buffer)
   if (scan.frames.length === 0) throw new Error('the log holds no complete header frame')
   const first = scan.frames[0]
-  const decoded = decodeHeader(compression ? buffer.subarray(first.start, first.end) : buffer.subarray(0, first.end), compression)
+  const decoded = decodeHeader(buffer.subarray(first.start, first.end), true)
   const header = decoded.header
   if (header.type !== 'session') throw new Error(`first record is not a Session header (type ${String(header.type)})`)
   if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
   if (typeof header.cwd !== 'string' || header.cwd.length === 0) throw new Error('header carries no cwd')
   const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
   const plaintext = Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8')
-  const head = compression ? zstdCompressSync(plaintext, CHECKSUM_OPTIONS) : plaintext
+  const head = zstdCompressSync(plaintext, CHECKSUM_OPTIONS)
   const bytes = Buffer.concat([head, buffer.subarray(first.end)])
   const check = scanLogFrames(bytes)
   if (check.frames.length !== scan.frames.length) {
     throw new Error(`complete frame count changed: ${scan.frames.length} → ${check.frames.length}`)
   }
-  const back = decodeHeader(compression ? bytes.subarray(check.frames[0].start, check.frames[0].end) : bytes.subarray(0, check.frames[0].end), compression).header
+  const back = decodeHeader(bytes.subarray(check.frames[0].start, check.frames[0].end), true).header
   if (back.cwd !== to) throw new Error('rewritten header does not read back with the new cwd')
   if (back.id !== expectedId) throw new Error('rewritten header does not read back with the same id')
   for (let i = 1; i < check.frames.length; i += 1) {
@@ -266,6 +276,18 @@ function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compressi
     if (!bytes.subarray(check.tornStart).equals(buffer.subarray(scan.tornStart))) throw new Error('the torn tail changed')
   }
   return bytes
+}
+
+/** Rewrite the first line of an uncompressed log, leaving the rest byte for byte. */
+function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buffer {
+  const cut = buffer.indexOf(10)
+  if (cut < 0) throw new Error('the log has no newline after its header line')
+  const header = JSON.parse(buffer.subarray(0, cut).toString('utf8')) as Record<string, unknown>
+  if (header.type !== 'session') throw new Error(`first record is not a Session header (type ${String(header.type)})`)
+  if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
+  if (typeof header.cwd !== 'string' || header.cwd.length === 0) throw new Error('header carries no cwd')
+  const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
+  return Buffer.concat([Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), buffer.subarray(cut + 1)])
 }
 
 /** Newest committed generation log in one session directory. */
@@ -408,7 +430,7 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   if (!sitsUnder(cwd, options.oldRoot)) return false
   const id = typeof header.id === 'string' ? header.id : ''
   if (id.length === 0) return fail(entry, 'header carries no id')
-  if (id !== entry) return fail(id, `directory name ${entry} does not match header id ${id}`)
+  if (encodeSegment(id) !== entry) return fail(id, `directory name ${entry} does not match encodeSegment(id) ${encodeSegment(id)}`)
   const to = mapPlaceholderCwd(cwd, options.oldRoot, options.newRoot)
   const destDir = joinPath(sessionsRoot, projectKey(to), encodeSegment(id))
   // Layout drift guard: the directory this log sits in is named by DSH's own
@@ -546,10 +568,19 @@ async function rewriteLogAt(
     const back = (await readLogHeader(path, published.length)).header
     if (back.id !== expectedId) throw new Error(`the published log reads back with id ${String(back.id)}`)
     if (back.cwd !== to) throw new Error(`the published log reads back with cwd ${String(back.cwd)}`)
-    const before = scanLogFrames(bytes)
-    const after = scanLogFrames(published)
-    if (after.frames.length !== before.frames.length) throw new Error('the published log lost complete frames')
-    if ((after.tornStart === undefined) !== (before.tornStart === undefined)) throw new Error('the published log changed the torn tail state')
+    if (compression) {
+      const before = scanLogFrames(bytes)
+      const after = scanLogFrames(published)
+      if (after.frames.length !== before.frames.length) throw new Error('the published log lost complete frames')
+      if ((after.tornStart === undefined) !== (before.tornStart === undefined)) throw new Error('the published log changed the torn tail state')
+    } else {
+      // Plaintext: the bytes past the first newline must be unchanged.
+      const beforeCut = bytes.indexOf(10)
+      const afterCut = published.indexOf(10)
+      if (beforeCut < 0 || afterCut < 0 || !published.subarray(afterCut + 1).equals(bytes.subarray(beforeCut + 1))) {
+        throw new Error('the published plaintext log changed its event body')
+      }
+    }
     return true
   } catch (error) {
     summary.failed.push({ id: expectedId, reason: `could not rewrite the header at ${path}: ${text(error)}` })
