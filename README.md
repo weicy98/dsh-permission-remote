@@ -150,11 +150,20 @@ dsh plugin --profile web add dsh-permission-remote
 
 ## 使用上要注意
 
-对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表还是本机的占位目录，里面看不到远端工程；右侧栏终端见上一节，它连的是远端。
+对话里的读文件、改文件、搜索和运行命令发生在远端。左侧的文件列表，以及输入框里的 `@` 补全，仍用本机文件系统扫占位目录，列不出远端文件。右侧栏的文件树列出远端目录里的内容，标题仍是这条占位路径，自动刷新不可用。手动刷新会再向远端要这一层的名字；文件是否存在、大小这些属性在大约 5 秒内可能仍是刚才的结果。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`，模型看到的是远端绝对路径。右侧栏终端见上一节，它连的是远端。
+
+**交付文件（`present`）在远端工作区里也能用。** DSH 的 `present` 只认本机文件：它逐个 `stat` 参数里的路径，再把路径写进会话事件，卡片打开时读的还是本机文件系统。不接管的话，远端会话每次交付都会报 `Cannot present ...: file not found`——路径指向的占位目录里只有目录，没有文件。插件接管这个调用：先按远端确认每个文件存在、是普通文件、不超过 32 MiB，再把字节复制到对应的占位路径，最后用这些占位路径调用官方的 `present`。所以卡片、侧栏预览和"在应用中打开"拿到的是本机真实文件；同时远端那份原件不动。参数和输出仍是官方形状，`description` 原样保留。
+
+由此有几点要知道：
+
+- **占位路径里会多出一份文件。** 复制品落在占位根（默认 `~/.dsh/remote`）下，权限 `0600`。同一个路径再次交付会覆盖成最新内容——事件里只记路径，卡片显示的是当前那份，不覆盖就会一直显示第一次的字节。
+- **超过 32 MiB 会被拒。** 报错里给出实际大小和远端真实路径，方便改用别的交付方式；截断的副本比拒绝更糟。
+- **单个文件失败即整次失败。** 任一文件缺失、是目录或超限，整次交付都不写事件，不会出现"只交付了一半"。
+- **只复制、不搬运。** 远端服务器上的文件不动；占位目录里的副本也不会因为远端文件后来改变而自动更新，需要重新交付一次。
 
 DSH 本身跑在 Windows 上时，远端工作区的对话只暴露远端 `bash`。`pwsh`、`powershell`、`cmd` 不会出现在原生工具列表里，官方那段 Windows 进程结束说明（`tool:pwsh`）在停在这个工作区时也会被盖住。回到本机目录后，这些 Windows 工具和原来的说明恢复。`minimal` 这类把提示词写成完整 persona 的预设不会被改写；挡住 Windows shell 的是工具列表过滤和执行守卫。内置预设的 `pwsh` 在祖先层，进入远端时会被从原生工具列表和 `ptc` SDK 正文里去掉。注册在 agent 本层的 `pwsh` 去不掉：SDK 正文仍可能列出它，原生列表会被滤掉，调用会被拒绝。文件工具的参数继续用工具返回的占位路径。
 
-模型用「运行代码」，或者会话要读取项目里的 `AGENTS.md` 时，读到的也是你电脑上的这个工作区目录，不是远端那一份。
+模型用「运行代码」时，跑的仍是你电脑上这个占位目录里的运行时，不是远端那一份。会话读取项目里的 `AGENTS.md`、`CLAUDE.md`（以及同名的 `.local`）时走文件系统接口，占位路径会读到远端那一份。`$DSH_HOME/AGENTS.md` 这种不在占位根下的全局文件仍是本机。每轮组装提示词会沿祖先目录对这些文件多做几次远端查询。提示词内容和本机那份不一样，已经缓存的前缀对不上。
 
 目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用上面的 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write` / `ssh_workspace`。
 
@@ -288,7 +297,16 @@ Ops commands, writes, and workspace registration are not wrapped in the remote w
 
 Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
 
-Run Code, and the session's reading of `AGENTS.md`, also use the workspace directory on your computer, not the copy on the remote host.
+Run Code still executes in the placeholder directory on your computer. The session's `AGENTS.md`, `CLAUDE.md`, and their `.local` files are read through the filesystem service, so a placeholder path reads the remote copy. A global file outside that placeholder, such as `$DSH_HOME/AGENTS.md`, stays on your computer. Each prompt walks the ancestor directories and stats those files on the remote host. The prompt text differs from the local copy, so a previously cached prefix no longer matches.
+
+**`present` works in a remote workspace too.** DSH's `present` only understands local files: it `stat`s each path, records the path in the session, and the delivery card opens that same path through your local filesystem. Left alone, every remote delivery failed with `Cannot present ...: file not found`, because the placeholder directory holds directories, not the remote file. The plugin takes the call over: it confirms on the remote that each file exists, is a regular file, and is at most 32 MiB, copies the bytes to the matching placeholder path, then calls the official `present` with those placeholder paths. The card, the sidebar preview, and open-in-application all get a real local file, and the original on the remote is untouched. Arguments and output keep the official shape, and `description` is passed through.
+
+A few consequences:
+
+- **A copy appears under the placeholder root** (default `~/.dsh/remote`), mode `0600`. Delivering the same path again replaces the copy: the event records only the path and the card shows whatever is there, so a second delivery of an updated file would otherwise keep showing the first bytes.
+- **Files over 32 MiB are refused**, naming the real size and the remote path. A silently truncated copy is worse than a refusal.
+- **One bad file fails the whole call.** A missing file, a directory, or an oversized one means no delivery event is written, so a half-delivered turn never reaches the log.
+- **Copy, not move.** The file on the remote host is untouched, and the placeholder copy is not refreshed when the remote file later changes; deliver it again.
 
 You can connect directly to one Linux or macOS machine. Jump hosts and Windows remotes are not supported. If the network drops, the operation in progress fails. Files already written on the remote stay there: reconnecting does not write them again and does not undo them.
 

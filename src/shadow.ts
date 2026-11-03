@@ -7,8 +7,15 @@
  * returns the wrapper and recurses.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open'] as const
+export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
+
+/**
+ * `present` is routed like the file tools but is not reimplemented remotely: the
+ * delivery event and the card that opens it both resolve paths with the local
+ * filesystem, so the remote path stages the bytes at the placeholder path and
+ * then calls the official tool. Its argument and output schemas stay official.
+ */
 
 /**
  * Why `terminal_open` refuses on a remote workspace.

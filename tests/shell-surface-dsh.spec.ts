@@ -303,3 +303,44 @@ test('the remote directory context sits right after the working-directory contex
     await host.close()
   }
 })
+
+test('terminal_open refuses through the real registry on a remote cwd and passes through locally', async () => {
+  // The refusal is the whole design for this tool: it would ask the local PTY
+  // backend for a shell, which opens on this computer inside the placeholder.
+  // A real ToolRuntime mount proves the wrapper is captured across scope
+  // layers — where a root- or preset-registered official tool used to be the
+  // doubt — and that a local session still reaches the official execute.
+  const host = await boot()
+  try {
+    host.preset.tools.register(defineTool({
+      name: 'terminal_open',
+      description: 'official persistent terminal',
+      parameters: { type: { type: 'string', description: 'backend type', required: true } },
+      output: {
+        schema: { type: 'object', additionalProperties: false, properties: { sessionId: { type: 'string' } } },
+        render: () => [{ type: 'text', text: '' }],
+      },
+      async execute() {
+        return { sessionId: 'official-1' }
+      },
+    }))
+    const remote = await host.makeAgent('term-remote', remoteCwd)
+    const local = await host.makeAgent('term-local', localCwd)
+    await host.created(remote)
+    await host.created(local)
+
+    type LooseTool = { execute: (args: unknown, exec: unknown) => Promise<unknown> }
+    const remoteTool = remote.ctx.tools.get('terminal_open', remote) as unknown as LooseTool
+    assert.ok(remoteTool, 'the wrapper shadows the preset tool for a remote session')
+    await assert.rejects(
+      () => remoteTool.execute({ type: 'shell' }, { agent: remote }),
+      /terminal_open is not available in a remote workspace/,
+    )
+    const localTool = local.ctx.tools.get('terminal_open', local) as unknown as LooseTool
+    assert.ok(localTool)
+    const result = await localTool.execute({ type: 'shell' }, { agent: local }) as { sessionId: string }
+    assert.equal(result.sessionId, 'official-1')
+  } finally {
+    await host.close()
+  }
+})

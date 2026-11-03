@@ -591,6 +591,82 @@ export async function runReadImage(
   return { path: toModelPath(remotePath, route), image }
 }
 
+/**
+ * One remote file copied to its placeholder path, for a tool that can
+ * only read the local filesystem.
+ *
+ * `present` resolves its arguments with `ctx.fs` and `stat`s the result, then
+ * the delivery card opens that same local path. On a remote session both look
+ * inside the placeholder tree, which only holds directories, so a real
+ * remote file was reported as "file not found" and no delivery ever landed.
+ * The event itself carries strings only, so the honest fix is a real local copy
+ * at the path the model already uses — not a rewritten path that would point
+ * the card at a file nobody can open.
+ */
+export interface StagedFile {
+  /** The placeholder path the delivery should name and the card should open. */
+  readonly path: string
+  /** Byte size of the copy. */
+  readonly bytes: number
+}
+
+/**
+ * Refuse a single file above this size. A card that opens a silently truncated
+ * copy is worse than saying the copy is too large.
+ */
+const PRESENT_CAP = 32 * 1024 * 1024
+
+/**
+ * Copy remote files into their placeholder directories so the local
+ * `present` tool and the card that opens its paths find real files.
+ *
+ * Everything is checked on the remote first: a missing path, a directory, or a
+ * file over {@link PRESENT_CAP} refuses the whole call and names the remote path
+ * the model can act on. Bytes land through `writeFileAtomic`, so a reader never
+ * observes a partial copy, and each delivery rewrites the file — the event
+ * records only the path, so a later delivery of an updated file has to land
+ * newest content at that same path.
+ */
+export async function stagePresentFiles(
+  hostApi: ToolHost,
+  route: RemoteRoute,
+  files: ReadonlyArray<{ path: string }>,
+  exec?: ToolExec,
+): Promise<StagedFile[]> {
+  throwIfAborted(exec?.signal)
+  const host = requireHost(hostApi, route.hostId)
+  const secret = await hostApi.secretOf(host)
+  const staged: StagedFile[] = []
+  for (const file of files) {
+    const requested = String(file.path ?? '').trim()
+    if (requested.length === 0) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
+    const remotePath = resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
+    let info: { isDirectory: boolean, size: number }
+    try {
+      info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
+    } catch (error) {
+      if (exec?.signal?.aborted === true) throw error
+      // A missing file is the model's path to fix; a dropped connection,
+      // permission denial, or SFTP fault is not. Telling it "no file" when the
+      // host is unreachable would send it hunting for a path that exists.
+      const message = error instanceof Error ? error.message : String(error)
+      if (NOT_FOUND.test(message)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+      throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
+    }
+    if (info.isDirectory) throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_FOUND')
+    if (info.size > PRESENT_CAP) {
+      throw new FsError(`Cannot present ${requested}: the remote file is ${info.size} bytes, over the ${PRESENT_CAP} byte delivery limit`, 'FS_NOT_FOUND')
+    }
+    const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP), exec?.signal)
+    // The placeholder spelling every other remote tool returns, so the model
+    // sees one path for one file whichever tool produced it.
+    const placeholder = toModelPath(remotePath, route)
+    await withSignal(writeFileAtomic(placeholder, data, { mode: 0o600, dirMode: 0o700 }), exec?.signal)
+    staged.push({ path: placeholder, bytes: data.length })
+  }
+  return staged
+}
+
 export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
   throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)

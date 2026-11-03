@@ -3,6 +3,7 @@ import { mkdir } from 'node:fs/promises'
 import { join as joinPath, posix, resolve as resolveLocalPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
+import { FsError } from '@deepseek-ai/dsh-fs'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
@@ -24,6 +25,7 @@ import {
   runRead,
   runReadImage,
   runWrite,
+  stagePresentFiles,
   throwIfAborted,
   withSignal,
   type RunnerStatus,
@@ -1209,7 +1211,14 @@ function markRemote(service: SshApi): void {
   })
 }
 
-const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
+/**
+ * Remote implementations of the routed file and shell tools.
+ *
+ * `working_directory` and `present` are dispatched before this table: the first
+ * commits a directory through the official service, the second stages files and
+ * delegates to the official tool, so neither has a runner of its own.
+ */
+const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
   read: (host, route, args, exec) => runRead(host, route, args, exec),
   write: (host, route, args, exec) => runWrite(host, route, args, exec),
@@ -1269,6 +1278,8 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     let installed = false
     try {
       installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) })
+    } catch (error) {
+      throw error
     } finally {
       if (!installed) seen.delete(agent)
     }
@@ -1337,6 +1348,53 @@ function commitRemoteWorkingDirectory(
   }, remote => {
     assertResolvedRemoteCwd(core, route.hostId, remote, headerCwd)
   })
+}
+
+/**
+ * Deliver remote files by staging them where the official `present` can see them.
+ *
+ * `present` is not a filesystem tool that can be reimplemented remotely: DSH
+ * checks `fs.lstat`/`fs.stat` for each path and then records an event the card
+ * opens through the same local filesystem. Both run on this computer, so a
+ * remote session's delivery has to leave a real file at a local path. The
+ * placeholder path is exactly that: the local backend can `stat` it and the
+ * card can open it.
+ *
+ * The copies are written first, then the official tool runs with the staged
+ * placeholder paths. Substituting them, rather than replaying the model's
+ * spelling, is what makes every accepted form work: a relative path, a
+ * placeholder path, and a real remote absolute path (`/home/me/out.pdf`,
+ * which bash can also use) are three spellings of one remote file. One failed
+ * copy refuses the whole call, so a partial delivery never reaches the log.
+ *
+ * The one behaviour that is not the official one: this rewrites the placeholder
+ * copy on every delivery. The event stores only the path, so the card shows
+ * whatever is there now — rewriting keeps a second delivery of an updated file
+ * showing current content instead of the first version.
+ */
+async function runPresent(
+  official: ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined,
+  host: ToolHost,
+  route: RemoteRoute,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  if (official === undefined) throw new Error('dsh-permission-remote: present is not mounted in this session')
+  const requested = Array.isArray(args.files) ? args.files : []
+  // No files means nothing to stage; hand it to the official tool, whose own
+  // "accepts 1 to N files" refusal already covers an empty or malformed list.
+  if (requested.length === 0) return official(args, exec)
+  const files = requested.map(file => {
+    const record = file as { path?: unknown }
+    if (typeof record.path !== 'string') throw new FsError('Cannot present a file: each entry needs a string path', 'FS_NOT_FOUND')
+    return { path: record.path }
+  })
+  const staged = await stagePresentFiles(host, route, files, exec)
+  // Replace each path with the staged one and keep every other field, so a
+  // description survives. The lists always line up: staging returns one entry
+  // per requested file or throws.
+  const presented = requested.map((file, index) => ({ ...(file as Record<string, unknown>), path: staged[index]!.path }))
+  return official({ ...args, files: presented }, exec)
 }
 
 interface CanonicalFs {
@@ -1427,6 +1485,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           }
           assertEnterableRemoteCwd(core, current, headerCwd)
           if (plan.name === 'working_directory') return commitRemoteWorkingDirectory(core, ctx, host, current, record, exec, headerCwd)
+          if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec)
           return RUNNERS[plan.name](host, current, record, exec, ctx)
         },
       }

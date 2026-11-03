@@ -39,3 +39,13 @@ test('a remote session refuses terminal_open instead of opening a local shell', 
   const plans = planShadows(name => name === 'terminal_open' || name === 'bash' ? { execute: async () => 'local' } : undefined)
   assert.deepEqual(plans.map(plan => plan.name), ['bash', 'terminal_open'])
 })
+
+test('present is routed so a remote session can deliver a file', () => {
+  // The official tool stats every path through the local filesystem, which
+  // never holds a remote file; without a shadow, `present` fails on every
+  // remote workspace with "file not found".
+  const plans = planShadows(name => name === 'present' || name === 'bash' ? { execute: async () => 'local' } : undefined)
+  const present = plans.find(plan => plan.name === 'present')
+  assert.ok(present, 'present must appear in the routed tool list')
+  assert.ok(present!.official, 'the official execute is captured for delegation')
+})

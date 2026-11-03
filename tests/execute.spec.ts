@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -549,5 +549,132 @@ test('working_directory rejects a remote directory that does not exist', async (
   await assert.rejects(
     () => runWorkingDirectory(api, route, { cd: '/srv/app/missing' }, { agent: {} }, async () => '/canonical'),
     /directory does not exist on the remote host: \/srv\/app\/missing/,
+  )
+})
+
+test('delivering a remote file copies it to its placeholder path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    // A real remote route's placeholder cwd is the mapped path under this root:
+    // the local backend can only stat what lives there.
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const exec = { signal: new AbortController().signal }
+    const api = {
+      pool: {
+        sftpStat: async () => ({ isDirectory: false, size: 5 }),
+        sftpRead: async () => Buffer.from('hello'),
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    const staged = await stagePresentFiles(api, sessionRoute, [{ path: 'out/report.txt' }], exec)
+    assert.deepEqual(staged.map(file => file.bytes), [5])
+    const target = staged[0]!.path
+    assert.match(target, /host1/)
+    assert.equal(await readFile(target, 'utf8'), 'hello')
+    // The delivered path is the placeholder the read tool already returns, not
+    // the remote spelling, because both the official tool and the card read locally.
+    assert.equal(target, posix.join(mapping, 'out/report.txt'))
+    assert.notEqual(target, '/srv/app/out/report.txt')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a missing remote file fails delivery instead of presenting an empty copy', async () => {
+  const api = {
+    pool: {
+      sftpStat: async () => {
+        throw new Error('No such file')
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'read-only' as const,
+  } satisfies ToolHost
+  await assert.rejects(
+    () => stagePresentFiles(api, route, [{ path: 'missing.txt' }], {}),
+    /no file at the remote path \/srv\/app\/missing\.txt/,
+  )
+})
+
+test('a remote directory is not delivered as a file', async () => {
+  let reads = 0
+  const api = {
+    pool: {
+      sftpStat: async () => ({ isDirectory: true, size: 4096 }),
+      sftpRead: async () => {
+        reads += 1
+        return Buffer.alloc(0)
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'read-only' as const,
+  } satisfies ToolHost
+  await assert.rejects(
+    () => stagePresentFiles(api, route, [{ path: 'src' }], {}),
+    /is a directory, not a file/,
+  )
+  assert.equal(reads, 0)
+})
+
+test('a second delivery of the same path replaces the earlier copy', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    let body = Buffer.from('first')
+    const api = {
+      pool: {
+        sftpStat: async () => ({ isDirectory: false, size: body.length }),
+        sftpRead: async () => body,
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    const [first] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {})
+    body = Buffer.from('second version')
+    const [second] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {})
+    assert.equal(first!.path, second!.path)
+    // The event records only the path, so the card shows whatever sits there:
+    // the later delivery has to overwrite the earlier bytes.
+    assert.equal(await readFile(second!.path, 'utf8'), 'second version')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a transport failure is reported as such, not as a missing file', async () => {
+  const api = {
+    pool: {
+      sftpStat: async () => {
+        throw new Error('Timed out while waiting for handshake')
+      },
+    } as unknown as SshPool,
+    hostOf: () => host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    resolveMode: async () => 'read-only' as const,
+  } satisfies ToolHost
+  // A connection fault must not read as "no file": that would send the model
+  // hunting for a path that exists on a host it simply cannot reach right now.
+  await assert.rejects(
+    () => stagePresentFiles(api, route, [{ path: 'report.txt' }], {}),
+    (error: unknown) => error instanceof Error
+      && /could not stat/.test(error.message)
+      && /Timed out while waiting for handshake/.test(error.message)
+      && !/no file at/.test(error.message),
   )
 })
