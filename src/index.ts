@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join as joinPath, posix, resolve as resolveLocalPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -1020,21 +1020,30 @@ export class Core {
 
   /** Queue every moved session for a membership attach on a later load; true when it added one. */
   private recordPendingGrouping(summary: SessionRelocationSummary): boolean {
-    const known = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
-    const added: Array<{ path: string, id: string }> = []
+    const rows = this.workspaces.list()
+    // Keyed by session id so a second migration (A→B then B→C in one process)
+    // overwrites the stale B path instead of leaving the id pointing nowhere.
+    const wanted = new Map(this.config.pendingSessionGrouping.map(entry => [entry.id, entry.path]))
+    let changed = false
     for (const row of summary.relocated) {
-      if (known.has(row.id)) continue
-      known.add(row.id)
-      added.push({ path: row.to, id: row.id })
+      // Record the workspace's OWN registered path (already canonical), not the
+      // string we computed: with a symlinked root the two differ, and a later
+      // attach validates against the registered path. A session with no
+      // workspace stays ungrouped on purpose, so it is not queued.
+      const target = rows.find(item => sameRealPath(item.path, row.to))
+      if (target === undefined) continue
+      if (wanted.get(row.id) === target.path) continue
+      wanted.set(row.id, target.path)
+      changed = true
     }
-    if (added.length > 0) this.config.pendingSessionGrouping = [...this.config.pendingSessionGrouping, ...added]
+    if (changed) this.config.pendingSessionGrouping = [...wanted].map(([id, path]) => ({ path, id }))
     if (summary.failed.length > 0) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
     }
     if (summary.skippedLive.length > 0) {
       this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on the old root; closing them and saving the root again moves them`)
     }
-    return added.length > 0
+    return changed
   }
 
   /**
@@ -1074,9 +1083,34 @@ export class Core {
   async resumeSessionMigrationState(): Promise<void> {
     for (const root of this.config.supersededRemoteRoots) addSupersededRoot(root)
     if (this.config.pendingSessionGrouping.length === 0 && this.config.supersededRemoteRoots.length === 0) return
+    // The registry service may still be initializing when this runs from the
+    // plugin load; `list()` throws until it is ready. Wait briefly rather than
+    // failing the only chance this process gets.
+    if (!(await this.waitForWorkspaceRegistry())) {
+      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; the session group restore will retry on the next load')
+      return
+    }
+    // Only sessions queued by an EARLIER load can be attached now: anything the
+    // catch-up sweep moves in this load still has the registry's startup header
+    // cache, so it must wait for the next load to read the rewritten header.
+    const preexisting = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
     const roots = this.catchupRoots(remoteRoot())
     if (roots.length > 0) await this.relocateFromRoots(roots, remoteRoot())
-    await this.flushPendingSessionGrouping()
+    await this.flushPendingSessionGrouping(preexisting)
+  }
+
+  /** Poll the workspace registry until it answers, or give up after a short wait. */
+  private async waitForWorkspaceRegistry(): Promise<boolean> {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        this.workspaces.list()
+        return true
+      } catch (error) {
+        if (!/not started|not ready|not initialized/i.test(errorText(error))) throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    return false
   }
 
   /**
@@ -1087,12 +1121,16 @@ export class Core {
    * renamed since). Attaching is idempotent, so a retry after a partial run is
    * safe.
    */
-  async flushPendingSessionGrouping(): Promise<void> {
+  async flushPendingSessionGrouping(onlyIds?: ReadonlySet<string>): Promise<void> {
     if (this.config.pendingSessionGrouping.length === 0) return
     const rows = this.workspaces.list()
     const remaining: Array<{ path: string, id: string }> = []
     for (const entry of this.config.pendingSessionGrouping) {
-      const target = rows.find(item => resolveLocalPath(item.path) === resolveLocalPath(entry.path))
+      if (onlyIds !== undefined && !onlyIds.has(entry.id)) {
+        remaining.push(entry)
+        continue
+      }
+      const target = rows.find(item => sameRealPath(item.path, entry.path))
       const attach = target?.attachSession
       if (target === undefined || attach === undefined) {
         remaining.push(entry)
@@ -1791,6 +1829,18 @@ function summaryCounts(summary: SessionRelocationSummary): {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Whether two paths name the same directory, canonicalizing symlinks when possible. */
+function sameRealPath(left: string, right: string): boolean {
+  const canon = (path: string): string => {
+    try {
+      return realpathSync(path)
+    } catch {
+      return resolveLocalPath(path)
+    }
+  }
+  return canon(left) === canon(right)
 }
 
 /** Run every disposer. The first failure is returned after the rest finish. */

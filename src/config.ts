@@ -74,6 +74,12 @@ export const Config = Schema.object({
    * in-memory router survives a restart: a session still on one must keep
    * being refused as a remote placeholder instead of silently becoming a
    * local directory, and the session catch-up sweep needs the list to find it.
+   *
+   * Internal bookkeeping, not operator input. It is `.volatile()` only because
+   * that is what lets `settings.update` persist it (`hosts`/`deletedHosts`
+   * work the same way). Both lists are sanitized on read, so an accidental
+   * edit self-heals: a dropped root is re-derived by a later migration, a
+   * dropped pending entry re-groups on the next relocation.
    */
   supersededRemoteRoots: Schema.array(Schema.string()).default([]).volatile(),
   /**
@@ -83,6 +89,7 @@ export const Config = Schema.object({
    * validate against the stale cwd and throw. Entries retry on the next
    * plugin load, when the registry reads headers from disk again.
    */
+  /** Relocated sessions awaiting a membership attach on the next load; see above. */
   pendingSessionGrouping: Schema.array(Schema.object({
     path: Schema.string().default(''),
     id: Schema.string().default(''),
@@ -242,14 +249,17 @@ export function readConfig(raw: unknown): PluginConfig {
   return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root(), supersededRemoteRoots, pendingSessionGrouping }
 }
 
-/** Keep absolute-looking non-empty roots, first spelling wins, order stable. */
+/** Keep absolute, non-empty roots, first spelling wins, order stable. */
 function normalizeRootList(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   const seen = new Set<string>()
   const out: string[] = []
   for (const item of value) {
-    if (typeof item !== 'string' || item.trim().length === 0) continue
+    if (typeof item !== 'string') continue
     const root = item.trim()
+    if (root.length === 0) continue
+    // A placeholder root is always absolute: POSIX, a drive letter, or UNC.
+    if (!(root.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(root) || root.startsWith('\\\\'))) continue
     if (seen.has(root)) continue
     seen.add(root)
     out.push(root)

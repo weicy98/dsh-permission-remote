@@ -1,5 +1,5 @@
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, join as joinPath, relative as relativePath, resolve as resolvePath } from 'node:path'
+import { basename, dirname, join as joinPath, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 
@@ -111,7 +111,9 @@ export function projectKey(cwd: string): string {
 function sitsUnder(cwd: string, root: string): boolean {
   const rel = relativePath(root, cwd)
   if (rel === '') return true
-  if (rel.startsWith('..')) return false
+  // Only a real parent escape is outside the root; a sibling named `..cache`
+  // must not be mistaken for one (hence the separator, not just a prefix).
+  if (rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../')) return false
   return !(rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel))
 }
 
@@ -290,6 +292,15 @@ function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buf
   return Buffer.concat([Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), buffer.subarray(cut + 1)])
 }
 
+/** The generation version of a canonical log filename, or undefined. */
+function logVersion(name: string): number | undefined {
+  const match = LOG_NAME.exec(name)
+  if (match === null) return undefined
+  if (match[1] === undefined) return 0
+  const version = Number(match[1])
+  return version === 0 ? undefined : version
+}
+
 /** Newest committed generation log in one session directory. */
 function newestLog(names: string[]): { name: string, version: number } | undefined {
   let best: { name: string, version: number } | undefined
@@ -462,16 +473,71 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   if (destExists) {
     return reconcileExistingDestination({ ...context, destDir, id, from: cwd, to })
   }
+  return moveAndRewrite({ ...context, destDir, id, from: cwd, to })
+}
+
+/**
+ * Move the session directory and rewrite its header, without ever exposing a
+ * log that sits in one project directory while its header names another.
+ *
+ * DSH's `list()` rejects the WHOLE store when any newest log's path disagrees
+ * with `projectKey(header.cwd)` (a plain error, not a skippable corruption).
+ * So every step that can fail — reading, the size ceiling, the frame scan, and
+ * the in-memory rewrite with its self-verification — runs BEFORE the directory
+ * is touched; a failure there leaves the session exactly as it was. Only then
+ * is the directory renamed and the precomputed bytes promoted with a single
+ * atomic rename. If that final rename fails the move is rolled back.
+ */
+async function moveAndRewrite(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
+  const { destDir, dir, id, to, from, logName, summary } = context
+  const fail = (reason: string): false => {
+    summary.failed.push({ id, reason })
+    return false
+  }
+  const sourceLog = joinPath(dir, logName)
+  const compression = logName.endsWith('.zstd')
+  // 1) All fallible work, with the directory still in place.
+  let rewritten: Buffer
+  try {
+    const size = (await stat(sourceLog)).size
+    if (size > MAX_REWRITE_BYTES) throw new Error(`the log is ${size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
+    const bytes = await readFile(sourceLog)
+    rewritten = rewriteHeader(bytes, id, to, compression)
+  } catch (error) {
+    return fail(`refusing to move the session: ${text(error)}`)
+  }
+  // 2) Stage the rewritten bytes next to the log. The dotted suffix is not a
+  // committed generation name, so DSH ignores it if this process dies here.
+  const staged = `${logName}.relocate-${process.pid}.tmp`
+  try {
+    await writeFile(joinPath(dir, staged), rewritten)
+  } catch (error) {
+    await rm(joinPath(dir, staged)).catch(() => undefined)
+    return fail(`could not stage the rewritten log: ${text(error)}`)
+  }
+  // 3) Move the whole directory (older generations and the session lock ride
+  // along), then 4) promote the staged bytes over the old-header newest log in
+  // one atomic rename.
   try {
     await mkdir(dirname(destDir), { recursive: true })
-    // Whole-directory rename: atomic on one filesystem, and the older format
-    // generations and session lock travel with the newest log.
     await rename(dir, destDir)
   } catch (error) {
-    return fail(id, `could not move the session directory: ${text(error)}`)
+    await rm(joinPath(dir, staged)).catch(() => undefined)
+    return fail(`could not move the session directory: ${text(error)}`)
   }
-  if (!(await rewriteLogAt(destDir, logName, id, to, head.compression, summary))) return false
-  summary.relocated.push({ id, from: cwd, to })
+  try {
+    await rename(joinPath(destDir, staged), joinPath(destDir, logName))
+  } catch (error) {
+    let rolledBack = true
+    try {
+      await rename(destDir, dir)
+      await rm(joinPath(dir, staged)).catch(() => undefined)
+    } catch {
+      rolledBack = false
+    }
+    return fail(`could not publish the rewritten log${rolledBack ? ' (the move was rolled back)' : ` (ROLLBACK FAILED — the session directory is left at ${destDir} with its header still naming the old root)`}: ${text(error)}`)
+  }
+  summary.relocated.push({ id, from, to })
   return true
 }
 
@@ -499,6 +565,12 @@ async function reconcileExistingDestination(context: RelocateContext & { destDir
   }
   const destLog = newestLog(names)
   if (destLog === undefined) return fail('the destination holds no committed generation to reconcile with')
+  // Reconciling across differing generations would rewrite the older one and
+  // discard the newer; refuse instead of guessing.
+  const sourceVersion = logVersion(context.logName)
+  if (sourceVersion === undefined || destLog.version !== sourceVersion) {
+    return fail(`the destination holds generation v${destLog.version}, the source v${String(sourceVersion)}; refusing an automatic reconcile across generations`)
+  }
   const destPath = joinPath(destDir, destLog.name)
   let destHeader: Record<string, unknown>
   let size: number

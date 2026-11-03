@@ -773,37 +773,6 @@ test('a directory whose name disagrees with projectKey(cwd) is refused loudly', 
   }
 })
 
-/** A registry whose attachSession validates a header cache, like the real one. */
-class ValidatingRegistry extends FakeRegistry {
-  /** id → header cwd the registry would answer from; undefined means "read the disk". */
-  constructor(readonly cache: Map<string, string>) {
-    super()
-  }
-
-  override create(dir: string, title?: string): Promise<WorkspaceLike> {
-    return super.create(dir, title)
-  }
-
-  /** Validate like the real registry: cached header cwd must equal the row path. */
-  attachInto(row: FakeWorkspace): void {
-    row.attachSession = async (sessionId: unknown) => {
-      const id = String(sessionId)
-      const cache = this.cache.get(id)
-      let cwd = cache
-      if (cwd === undefined) {
-        const bytes = await readFile(join(storedSessionDirAt(row.path, id), 'session.v4.jsonl.zstd'))
-        cwd = String(headerOf(bytes).cwd)
-      }
-      if (cwd !== row.path) throw new Error(`its cwd resolves to '${cwd}'`)
-      row.attached.push(id)
-    }
-  }
-}
-
-function storedSessionDirAt(workspacePath: string, id: string): string {
-  return join(process.env.DSH_HOME!, 'sessions', projectKey(workspacePath), encodeSegment(id))
-}
-
 test('a moved session joins its workspace on the next load, when the cache is fresh', async () => {
   const box = await harness()
   try {
@@ -960,6 +929,99 @@ test('a drained superseded root is pruned so startup stops rescanning it', async
     await reloaded.resumeSessionMigrationState()
     const lastSuperseded = box.updates.map(patch => patch.supersededRemoteRoots).filter(Array.isArray).at(-1) as string[]
     assert.deepEqual(lastSuperseded, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a fatal rewrite failure leaves the session exactly where it was, never half-moved', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const dir = storedSessionDir(box, oldLocal, 'session-bad')
+    await mkdir(dir, { recursive: true })
+    const checksum = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
+    const frames = [
+      zstdCompressSync(Buffer.from(`{"type":"session","id":"session-bad","cwd":${JSON.stringify(oldLocal)},"version":4}\n`, 'utf8'), checksum),
+      zstdCompressSync(Buffer.from('{"type":"session/append","seq":1}\n', 'utf8'), checksum),
+      Buffer.from('GARBAGE-THAT-IS-NOT-A-ZSTD-FRAME'),
+    ]
+    const oldLog = join(dir, 'session.v4.jsonl.zstd')
+    const original = Buffer.concat(frames)
+    await writeFile(oldLog, original)
+
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.status, 'changed')
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 1)
+
+    // Untouched: the log bytes are exactly as before the attempted migration.
+    assert.equal((await readFile(oldLog)).equals(original), true)
+    // Never created at the destination, so DSH never sees a mismatched log.
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    await assert.rejects(() => stat(storedSessionDir(box, newLocal, 'session-bad')), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a reconcile across different generations is refused rather than clobbering the newer one', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    // Source is v4, destination only holds a v3 generation.
+    await seedStoredSession(box, 'session-gen', oldLocal, [{ type: 'session/append', seq: 1 }])
+    const destDir = join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-gen'))
+    await seedRawLog(destDir, 'session.v3.jsonl.zstd', Buffer.from(`{"type":"session","id":"session-gen","cwd":${JSON.stringify(newLocal)},"version":3}\n`, 'utf8'))
+
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 0)
+    assert.equal(moved.sessionsFailed, 1)
+    // Neither generation was rewritten or deleted.
+    assert.equal(headerOf(await readFile(join(storedSessionDir(box, oldLocal, 'session-gen'), 'session.v4.jsonl.zstd'))).cwd, oldLocal)
+    assert.equal(headerOf(await readFile(join(destDir, 'session.v3.jsonl.zstd'))).cwd, newLocal)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('the group restore waits for a registry that is still starting up', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    // Session already moved to the new root by an earlier run.
+    const newLocal = join(box.newRoot, 'host1', encodeRemotePath('/srv/app'))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(newLocal), encodeSegment('session-wait')), 'session-wait', newLocal, { events: [{ type: 'session/append', seq: 1 }] })
+    const row = box.registry.rows.find(item => item.path === newLocal) ?? null
+    // Register the workspace row at the new path with an attach that records.
+    const target = new FakeWorkspace('w-new', newLocal, 'dev · app')
+    target.attachSession = async (sessionId: unknown) => { target.attached.push(sessionId) }
+    box.registry.rows.push(target)
+    // Make the registry "not ready" for the first two calls.
+    const original = box.registry.list.bind(box.registry)
+    let calls = 0
+    box.registry.list = () => {
+      calls += 1
+      if (calls <= 2) throw new Error('workspace registry is not started yet')
+      return original()
+    }
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloadConfig = readConfig({
+      hosts: [host()],
+      deletedHosts: [],
+      remoteRoot: box.newRoot,
+      supersededRemoteRoots: [],
+      pendingSessionGrouping: [{ path: newLocal, id: 'session-wait' }],
+    })
+    const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual(target.attached, ['session-wait'])
+    void row
   } finally {
     await dispose(box)
   }
