@@ -65,6 +65,11 @@ export function clearSupersededRoots(): void {
   supersededRoots.length = 0
 }
 
+/** The roots this process migrated away from, resolved; oldest first. */
+export function supersededRootsSnapshot(): string[] {
+  return [...supersededRoots]
+}
+
 /**
  * Every root a cwd may be a placeholder under, current one first.
  *

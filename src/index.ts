@@ -32,7 +32,8 @@ import {
 } from './execute.ts'
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
-import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, supersededRootsSnapshot, type RemoteRoute, type Route } from './router.ts'
+import { relocateSessions, type SessionRelocationSummary } from './session-relocate.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
@@ -150,6 +151,12 @@ export interface RemoteRootChange {
   conflicts?: string[]
   migration?: MigrationReport
   workspacesRemapped?: number
+  /** Stored sessions whose header and directory were moved onto the new root. */
+  sessionsRelocated?: number
+  /** Live sessions left in place on purpose; they follow once closed and the root is saved again. */
+  sessionsSkippedLive?: number
+  /** Sessions that could not be moved, reported so nothing is lost silently. */
+  sessionsFailed?: number
 }
 
 class SshApi extends TypertRemoteService {
@@ -802,7 +809,16 @@ export class Core {
       // Pin an explicit spelling, but a blank field that already resolves to the
       // default must not persist the default path (it would stop tracking it).
       if (trimmed.length > 0 && this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
-      return { status: 'unchanged', oldRoot, root: newRoot }
+      // Saving the root again is the documented way to catch up sessions that a
+      // migration had to skip because they were open: sweep every root this
+      // process migrated away from onto the current one.
+      const relocation = await this.relocateFromSupersededRoots(newRoot)
+      return {
+        status: 'unchanged',
+        oldRoot,
+        root: newRoot,
+        ...summaryCounts(relocation),
+      }
     }
     const opened = this.remoteWorkspaceRows()
     // Plan before anything is asked or written: a target that is inside the old
@@ -889,6 +905,13 @@ export class Core {
     // server: an old placeholder that no registered workspace covers is then
     // refused by the entry guard instead of quietly becoming a local directory.
     addSupersededRoot(oldRoot)
+    // Move the stored sessions themselves before the old registrations
+    // disappear. Without this a session keeps pointing at the old root: its
+    // log sits in a project directory the new cwd contradicts, so DSH refuses
+    // to open it and the workspace service filters it from membership — the
+    // "migrated sessions vanish into Ungrouped" failure. Live sessions are
+    // skipped and keep routing until the operator closes them and saves again.
+    const relocation = await this.relocateStoredSessions(oldRoot, newRoot, created)
     const stuck: string[] = []
     for (const item of relocating) {
       const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
@@ -904,7 +927,70 @@ export class Core {
     if (stuck.length > 0) {
       throw new Error(`the remote root is now ${newRoot}, but ${stuck.length} workspace registration(s) could not be removed from the old root (${stuck.join(', ')})`)
     }
-    return { status: 'changed', oldRoot, root: newRoot, migration, workspacesRemapped }
+    return { status: 'changed', oldRoot, root: newRoot, migration, workspacesRemapped, ...summaryCounts(relocation) }
+  }
+
+  /**
+   * Move stored sessions from every root this process migrated away from onto
+   * `current`, and account them to the workspace registered at their new
+   * placeholder. Used when saving the root that is already current: the
+   * catch-up pass for sessions a migration skipped while they were open.
+   */
+  private async relocateFromSupersededRoots(current: string): Promise<SessionRelocationSummary> {
+    const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
+    for (const root of supersededRootsSnapshot()) {
+      if (root === current) continue
+      const part = await this.relocateStoredSessions(root, current, [])
+      summary.relocated.push(...part.relocated)
+      summary.skippedLive.push(...part.skippedLive)
+      summary.failed.push(...part.failed)
+    }
+    return summary
+  }
+
+  /**
+   * Rewrite each stored session whose header names `oldRoot`, move its
+   * directory to the project key the new cwd implies, and attach the id to the
+   * workspace registered there.
+   *
+   * Nothing here may fail the migration: the tree copy and the registry switch
+   * already succeeded, so a stuck file is collected and reported instead.
+   * Membership attach is best-effort too — a session whose workspace row cannot
+   * take it stays "Ungrouped", which the sidebar tolerates and a re-save fixes.
+   */
+  private async relocateStoredSessions(oldRoot: string, newRoot: string, preferRows: readonly WorkspaceLike[]): Promise<SessionRelocationSummary> {
+    const live = new Set<string>()
+    const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
+    for (const agent of agents?.list?.() ?? []) {
+      const id = agent.session?.id
+      if (typeof id === 'string' && id.length > 0) live.add(id)
+    }
+    let summary: SessionRelocationSummary
+    try {
+      summary = await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
+      return { relocated: [], skippedLive: [...live], failed: [] }
+    }
+    if (summary.relocated.length === 0 && summary.failed.length === 0) return summary
+    const rows = [...preferRows, ...this.workspaces.list()]
+    for (const row of summary.relocated) {
+      const target = rows.find(item => resolveLocalPath(item.path) === resolveLocalPath(row.to))
+      const attach = target?.attachSession
+      if (attach === undefined) continue
+      try {
+        await attach.call(target, row.id)
+      } catch (error) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] session ${row.id} moved to ${row.to} but could not join its workspace: ${errorText(error)}`)
+      }
+    }
+    if (summary.failed.length > 0) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root to ${newRoot}: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
+    }
+    if (summary.skippedLive.length > 0) {
+      this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on ${oldRoot}; closing them and saving the root again moves them`)
+    }
+    return summary
   }
 
   /** Workspaces whose placeholder still routes, including ones registered during a copy. */
@@ -1564,6 +1650,19 @@ function installRemoteShellSurface(
     }
   }))
   return { sync, disposeDynamic }
+}
+
+/** Flattened relocation numbers for a `RemoteRootChange` result. */
+function summaryCounts(summary: SessionRelocationSummary): {
+  sessionsRelocated: number
+  sessionsSkippedLive: number
+  sessionsFailed: number
+} {
+  return {
+    sessionsRelocated: summary.relocated.length,
+    sessionsSkippedLive: summary.skippedLive.length,
+    sessionsFailed: summary.failed.length,
+  }
 }
 
 function errorText(error: unknown): string {

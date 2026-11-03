@@ -157,6 +157,12 @@ export interface RemoteRootChange {
   sessions?: number
   conflicts?: string[]
   workspacesRemapped?: number
+  /** Stored sessions whose header and directory were moved onto the new root. */
+  sessionsRelocated?: number
+  /** Live sessions left in place; they follow once closed and the root is saved again. */
+  sessionsSkippedLive?: number
+  /** Sessions that could not be moved. */
+  sessionsFailed?: number
   migration?: {
     copied: number
     skipped: number

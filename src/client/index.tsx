@@ -486,9 +486,23 @@ function Section(props: SectionProps): JSX.Element {
     }
   }
 
+  /** The relocation part of a root-change note: counts plus the open-session hint. */
+  function relocationNote(result: RemoteRootChange): string {
+    const moved = result.sessionsRelocated ?? 0
+    const skipped = result.sessionsSkippedLive ?? 0
+    const failed = result.sessionsFailed ?? 0
+    const parts: string[] = []
+    if (result.sessionsRelocated !== undefined || result.sessionsSkippedLive !== undefined || result.sessionsFailed !== undefined) {
+      parts.push(`${t('remoteRootSessionsMoved')} ${moved}`)
+      if (skipped > 0) parts.push(t('remoteRootSessionsOpen'))
+      if (failed > 0) parts.push(`${t('remoteRootSessionsFailed')} ${failed}`)
+    }
+    return parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
+  }
+
   async function applyRootResult(result: RemoteRootChange): Promise<void> {
     if (result.status === 'unchanged') {
-      note(t('remoteRootUnchanged'))
+      note(`${t('remoteRootUnchanged')}${relocationNote(result)}`)
       setRootDraft(result.root)
       await reloadRoot()
       return
@@ -507,7 +521,7 @@ function Section(props: SectionProps): JSX.Element {
       `${t('remoteRootRemapped')} ${result.workspacesRemapped ?? 0}`,
     ].join(' · ')
     const left = migration?.conflicts.length ?? 0
-    note(`${t('remoteRootChanged')} ${result.oldRoot} → ${result.root} · ${counts}${left > 0 ? ` · ${t('remoteRootConflictsLeft')} ${left}` : ''}`)
+    note(`${t('remoteRootChanged')} ${result.oldRoot} → ${result.root} · ${counts}${left > 0 ? ` · ${t('remoteRootConflictsLeft')} ${left}` : ''}${relocationNote(result)}`)
     setRootDraft(result.root)
     await reloadRoot()
     await reloadWorkspaces().catch(() => undefined)

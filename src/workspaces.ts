@@ -21,6 +21,14 @@ export interface WorkspaceLike {
   readonly createdAt: string
   readonly sessionIds: readonly unknown[]
   setTitle(title: string): Promise<void>
+  /**
+   * Present on the real registry's entities: account a session to this
+   * workspace after its log moved here. The registry validates the session's
+   * header cwd against this workspace's path, so a caller relocating logs must
+   * rewrite headers first. Absent on plain fakes; membership is then skipped
+   * and the session simply stays ungrouped, which the sidebar tolerates.
+   */
+  attachSession?(sessionId: unknown): Promise<void>
 }
 
 export interface WorkspaceRegistryLike {
