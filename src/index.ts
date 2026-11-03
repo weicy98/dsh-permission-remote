@@ -34,6 +34,7 @@ import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, supersededRootsSnapshot, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, type SessionRelocationSummary } from './session-relocate.ts'
+import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
@@ -346,6 +347,9 @@ class SshApi extends TypertRemoteService {
 }
 
 export class Core {
+  /** Migration bookkeeping loaded from its sidecar file; see `migration-state.ts`. */
+  private migrationState: MigrationState = emptyMigrationState()
+
   readonly pool: SshPool
   private config: PluginConfig
   private readonly status = new Map<string, Promise<RunnerStatus>>()
@@ -941,7 +945,7 @@ export class Core {
    */
   private catchupRoots(current: string): string[] {
     const roots: string[] = []
-    for (const root of [...this.config.supersededRemoteRoots, ...supersededRootsSnapshot()]) {
+    for (const root of [...this.migrationState.supersededRemoteRoots, ...supersededRootsSnapshot()]) {
       if (resolveLocalPath(root) === resolveLocalPath(current)) continue
       if (!roots.includes(root)) roots.push(root)
     }
@@ -967,9 +971,9 @@ export class Core {
         pruned = true
       }
     }
-    if (pruned && this.config.supersededRemoteRoots.length > 0) {
+    if (pruned && this.migrationState.supersededRemoteRoots.length > 0) {
       const scanned = new Set(roots.map(root => resolveLocalPath(root)))
-      this.config.supersededRemoteRoots = this.config.supersededRemoteRoots
+      this.migrationState.supersededRemoteRoots = this.migrationState.supersededRemoteRoots
         .filter(root => !scanned.has(resolveLocalPath(root)) || survivors.has(resolveLocalPath(root)))
     }
     // Only a change (a newly queued membership or a dropped root) needs a
@@ -1013,8 +1017,8 @@ export class Core {
   /** Remember a migrated-away root in the persisted list; true when it was new. */
   private recordSupersededRoot(root: string): boolean {
     const resolved = resolveLocalPath(root)
-    if (this.config.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) return false
-    this.config.supersededRemoteRoots = [...this.config.supersededRemoteRoots, resolved]
+    if (this.migrationState.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) return false
+    this.migrationState.supersededRemoteRoots = [...this.migrationState.supersededRemoteRoots, resolved]
     return true
   }
 
@@ -1031,7 +1035,7 @@ export class Core {
     }
     // Keyed by session id so a second migration (A→B then B→C in one process)
     // overwrites the stale B path instead of leaving the id pointing nowhere.
-    const wanted = new Map(this.config.pendingSessionGrouping.map(entry => [entry.id, entry.path]))
+    const wanted = new Map(this.migrationState.pendingSessionGrouping.map(entry => [entry.id, entry.path]))
     let changed = false
     for (const row of summary.relocated) {
       let path: string
@@ -1050,7 +1054,7 @@ export class Core {
       wanted.set(row.id, path)
       changed = true
     }
-    if (changed) this.config.pendingSessionGrouping = [...wanted].map(([id, path]) => ({ path, id }))
+    if (changed) this.migrationState.pendingSessionGrouping = [...wanted].map(([id, path]) => ({ path, id }))
     if (summary.failed.length > 0) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
     }
@@ -1061,27 +1065,26 @@ export class Core {
   }
 
   /**
-   * Persist the migration bookkeeping next to the host rows.
+   * Persist the migration bookkeeping to its sidecar document.
    *
    * Best-effort: the tree copy and the root switch already succeeded, so a
-   * settings write that fails must not turn a completed migration into an
-   * apparent failure. The moved session is still correct on disk; losing the
-   * bookkeeping only means its group is restored by a later successful save.
+   * failed write must not turn a completed migration into an apparent failure.
+   * The moved session is still correct on disk; losing the bookkeeping only
+   * means its group is restored by a later successful sweep.
    */
   private async persistMigrationState(): Promise<void> {
-    const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
-    if (row === undefined) {
-      this.ctx.logger?.warn('[@dsh-permission-remote] settings row "permission-remote" is missing; the session migration bookkeeping was not persisted')
-      return
-    }
     try {
-      await this.ctx.settings.update(String(row.ns), {
-        supersededRemoteRoots: this.config.supersededRemoteRoots,
-        pendingSessionGrouping: this.config.pendingSessionGrouping,
-      })
+      await writeMigrationState(this.migrationState)
     } catch (error) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] the session migration bookkeeping could not be persisted: ${errorText(error)}`)
     }
+  }
+
+  /** Load the sidecar bookkeeping into this instance (plugin load). */
+  private async loadMigrationState(): Promise<void> {
+    const { state, problem } = await readMigrationState()
+    this.migrationState = state
+    if (problem !== undefined) this.ctx.logger?.warn(`[@dsh-permission-remote] ${problem}; starting from empty bookkeeping`)
   }
 
   /**
@@ -1095,12 +1098,13 @@ export class Core {
    * that is why the pending list is persisted instead of retried on the spot.
    */
   async resumeSessionMigrationState(): Promise<void> {
-    for (const root of this.config.supersededRemoteRoots) addSupersededRoot(root)
-    if (this.config.pendingSessionGrouping.length === 0 && this.config.supersededRemoteRoots.length === 0) return
+    await this.loadMigrationState()
+    for (const root of this.migrationState.supersededRemoteRoots) addSupersededRoot(root)
+    if (this.migrationState.pendingSessionGrouping.length === 0 && this.migrationState.supersededRemoteRoots.length === 0) return
     // Only sessions queued by an EARLIER load can be attached now: anything the
     // catch-up sweep moves in this load still has the registry's startup header
     // cache, so it must wait for the next load to read the rewritten header.
-    const preexisting = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
+    const preexisting = new Set(this.migrationState.pendingSessionGrouping.map(entry => entry.id))
     // Sweep FIRST and independently of the registry. A mismatched session log
     // is exactly what makes the registry's Service.init fail (its list() throws
     // and never becomes available), so waiting for the registry before the
@@ -1145,7 +1149,7 @@ export class Core {
    * safe.
    */
   async flushPendingSessionGrouping(onlyIds?: ReadonlySet<string>): Promise<void> {
-    if (this.config.pendingSessionGrouping.length === 0) return
+    if (this.migrationState.pendingSessionGrouping.length === 0) return
     let rows: WorkspaceLike[]
     try {
       rows = this.workspaces.list()
@@ -1154,7 +1158,7 @@ export class Core {
       return
     }
     const remaining: Array<{ path: string, id: string }> = []
-    for (const entry of this.config.pendingSessionGrouping) {
+    for (const entry of this.migrationState.pendingSessionGrouping) {
       if (onlyIds !== undefined && !onlyIds.has(entry.id)) {
         remaining.push(entry)
         continue
@@ -1181,8 +1185,8 @@ export class Core {
         this.ctx.logger?.warn(`[@dsh-permission-remote] session ${entry.id} is at ${entry.path} but could not join its workspace yet: ${errorText(error)}`)
       }
     }
-    if (remaining.length !== this.config.pendingSessionGrouping.length) {
-      this.config.pendingSessionGrouping = remaining
+    if (remaining.length !== this.migrationState.pendingSessionGrouping.length) {
+      this.migrationState.pendingSessionGrouping = remaining
       await this.persistMigrationState()
     }
   }

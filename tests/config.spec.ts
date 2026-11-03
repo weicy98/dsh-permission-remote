@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { Config, connectionKeyChanged, normalizeLoginEnv, readConfig, type HostConfig } from '../src/config.ts'
+import { migrationStatePath, readMigrationState, writeMigrationState } from '../src/migration-state.ts'
 
 const host = (id: string): HostConfig => ({
   id,
@@ -86,4 +90,44 @@ test('renaming or retitling a host keeps the cached session', () => {
   assert.equal(connectionKeyChanged(base, { ...base, loginEnv: true }), false)
   assert.equal(connectionKeyChanged(base, { ...base, fingerprint: 'SHA256:abc' }), false)
   assert.equal(connectionKeyChanged(base, base), false)
+})
+
+test('migration bookkeeping lives in its own file, not in the settings schema', async () => {
+  const box = await mkdtemp(join(tmpdir(), 'dsh-mig-state-'))
+  const env = { DSH_HOME: box } as NodeJS.ProcessEnv
+  try {
+    // Nothing on disk yet: empty bookkeeping, no error.
+    const first = await readMigrationState(env)
+    assert.deepEqual(first.state, { supersededRemoteRoots: [], pendingSessionGrouping: [] })
+    assert.equal(first.problem, undefined)
+
+    await writeMigrationState({
+      supersededRemoteRoots: ['/old/root'],
+      pendingSessionGrouping: [{ path: '/new/host1/abc', id: 'session-1' }],
+    }, env)
+    const back = await readMigrationState(env)
+    assert.deepEqual(back.state.supersededRemoteRoots, ['/old/root'])
+    assert.deepEqual(back.state.pendingSessionGrouping, [{ path: '/new/host1/abc', id: 'session-1' }])
+
+    // Private permissions: the file names local paths.
+    const mode = (await stat(migrationStatePath(env))).mode & 0o777
+    assert.equal(mode & 0o077, 0, 'no group/other bits')
+
+    // A corrupt document degrades to empty bookkeeping instead of throwing.
+    await writeFile(migrationStatePath(env), '{not json', 'utf8')
+    const corrupt = await readMigrationState(env)
+    assert.deepEqual(corrupt.state, { supersededRemoteRoots: [], pendingSessionGrouping: [] })
+    assert.ok(corrupt.problem !== undefined)
+
+    // Entries are validated: relative roots and half-formed rows are dropped.
+    await writeFile(migrationStatePath(env), JSON.stringify({
+      supersededRemoteRoots: ['/', 'relative/path', 'C:\\old', ''],
+      pendingSessionGrouping: [{ path: '/a', id: 's1' }, { path: '', id: 's2' }, { path: '/a', id: 's1' }],
+    }), 'utf8')
+    const sanitized = await readMigrationState(env)
+    assert.deepEqual(sanitized.state.supersededRemoteRoots, ['/', 'C:\\old'])
+    assert.deepEqual(sanitized.state.pendingSessionGrouping, [{ path: '/a', id: 's1' }])
+  } finally {
+    await rm(box, { recursive: true, force: true })
+  }
 })

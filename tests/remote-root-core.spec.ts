@@ -10,6 +10,7 @@ import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 import { encodeSegment, projectKey, scanLogFrames } from '../src/session-relocate.ts'
+import { readMigrationState, writeMigrationState, migrationStatePath } from '../src/migration-state.ts'
 import { workspaceRoute, type WorkspaceLike } from '../src/workspaces.ts'
 
 /**
@@ -85,7 +86,6 @@ function makeCtx(options: {
   droppedSecrets: unknown[]
   liveAgents: Array<{ session?: { id?: string } }>
   failPersist?: boolean
-  failMigrationPersist?: boolean
 }) {
   return {
     logger: { info() {}, warn() {} },
@@ -94,9 +94,6 @@ function makeCtx(options: {
       describe: () => [{ ns: 'permission-remote' }],
       update: async (_ns: string, patch: Record<string, unknown>) => {
         if (options.failPersist === true) throw new Error('settings write refused')
-        if (options.failMigrationPersist === true && ('supersededRemoteRoots' in patch || 'pendingSessionGrouping' in patch)) {
-          throw new Error('migration bookkeeping write refused')
-        }
         options.updates.push(patch)
       },
     },
@@ -127,7 +124,7 @@ interface Harness {
   savedHome: string | undefined
 }
 
-async function harness(options: { sessions?: number, failPersist?: boolean, failMigrationPersist?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
+async function harness(options: { sessions?: number, failPersist?: boolean, readOnlyMigrationState?: boolean, hosts?: HostConfig[] } = {}): Promise<Harness> {
   const box = await mkdtemp(join(tmpdir(), 'dsh-root-core-'))
   const oldRoot = join(box, 'old-root')
   const newRoot = join(box, 'new-root')
@@ -135,7 +132,7 @@ async function harness(options: { sessions?: number, failPersist?: boolean, fail
   const updates: Array<Record<string, unknown>> = []
   const droppedSecrets: unknown[] = []
   const liveAgents: Array<{ session?: { id?: string } }> = []
-  const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true, failMigrationPersist: options.failMigrationPersist === true })
+  const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true })
   const registry = new FakeRegistry()
   const config = readConfig({ hosts: options.hosts ?? [host()], deletedHosts: [], remoteRoot: oldRoot })
   const core = new Core(ctx as never, config, registry)
@@ -144,6 +141,11 @@ async function harness(options: { sessions?: number, failPersist?: boolean, fail
   const savedHome = process.env.DSH_HOME
   process.env.DSH_HOME = box
   return { box, oldRoot, newRoot, registry, core, updates, droppedSecrets, liveAgents, savedHome }
+}
+
+/** The current sidecar bookkeeping for a harness box. */
+async function sidecar(box: Harness): Promise<{ supersededRemoteRoots: string[], pendingSessionGrouping: Array<{ path: string, id: string }> }> {
+  return (await readMigrationState({ DSH_HOME: box.box } as NodeJS.ProcessEnv)).state
 }
 
 async function dispose(box: Harness): Promise<void> {
@@ -577,9 +579,9 @@ test('a migration moves stored sessions onto the new root and queues their group
     // reported as finished.
     const recreated = box.registry.rows.find(row => row.path !== undefined && row.path !== oldLocal)
     assert.ok(recreated)
-    const pending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
-    assert.deepEqual(pending, [{ path: newLocal, id: 'session-move-1' }])
-    assert.equal((box.updates.at(-1)?.supersededRemoteRoots as string[]).includes(box.oldRoot), true)
+    const state = await sidecar(box)
+    assert.deepEqual(state.pendingSessionGrouping, [{ path: newLocal, id: 'session-move-1' }])
+    assert.equal(state.supersededRemoteRoots.includes(box.oldRoot), true)
     assert.deepEqual((recreated as FakeWorkspace).attached, [])
   } finally {
     await dispose(box)
@@ -795,23 +797,16 @@ test('a moved session joins its workspace on the next load, when the cache is fr
       if (headerOf(bytes).cwd !== row.path) throw new Error('stale header')
       ;(row as FakeWorkspace).attached.push(String(sessionId))
     }
-    const pendingBefore = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
+    const pendingBefore = (await sidecar(box)).pendingSessionGrouping
     assert.equal(pendingBefore.length, 1)
     // Simulated restart: a fresh Core over the same context, config and store.
     const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
-    const reloadConfig = readConfig({
-      hosts: [host()],
-      deletedHosts: [],
-      remoteRoot: box.newRoot,
-      supersededRemoteRoots: pendingBefore.length > 0 ? [box.oldRoot] : [],
-      pendingSessionGrouping: pendingBefore,
-    })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
     const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()
     assert.deepEqual((row as FakeWorkspace).attached, ['session-later'])
-    const cleared = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
-    assert.deepEqual(cleared, [])
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [])
   } finally {
     await dispose(box)
   }
@@ -830,20 +825,13 @@ test('membership that cannot validate yet stays pending for the next load', asyn
     // The destination is still named by the old root in a stale cache: attach
     // throws, and the entry must survive so the next load retries it.
     ;(row as FakeWorkspace).attachSession = async () => { throw new Error("its cwd resolves to the old root") }
-    const pending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
+    const pending = (await sidecar(box)).pendingSessionGrouping
     const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
-    const reloadConfig = readConfig({
-      hosts: [host()],
-      deletedHosts: [],
-      remoteRoot: box.newRoot,
-      supersededRemoteRoots: [box.oldRoot],
-      pendingSessionGrouping: pending,
-    })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
     const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()
-    const stillPending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
-    assert.deepEqual(stillPending, pending)
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, pending)
   } finally {
     await dispose(box)
   }
@@ -893,12 +881,14 @@ test('a session id that needs path encoding is not mistaken for a mismatch', asy
   }
 })
 
-test('a settings write that fails only for the bookkeeping does not fail the move', async () => {
-  const box = await harness({ failMigrationPersist: true })
+test('a bookkeeping write failure does not fail an otherwise successful move', async () => {
+  const box = await harness()
   try {
     await seedWorkspace(box, '/srv/app')
     const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
     await seedStoredSession(box, 'session-keep', oldLocal, [{ type: 'session/append', seq: 1 }])
+    // Make the sidecar path unwritable (a directory sits where the file goes).
+    await mkdir(migrationStatePath({ DSH_HOME: box.box } as NodeJS.ProcessEnv), { recursive: true })
     const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
     assert.equal(moved.status, 'changed')
     assert.equal(moved.sessionsRelocated, 1)
@@ -917,19 +907,13 @@ test('a drained superseded root is pruned so startup stops rescanning it', async
     await seedStoredSession(box, 'session-drain', oldLocal, [{ type: 'session/append', seq: 1 }])
     await box.core.changeRemoteRoot(box.newRoot, { force: true })
     // Simulated restart: the migration is done, old root holds nothing left.
+    await writeMigrationState({ supersededRemoteRoots: [box.oldRoot], pendingSessionGrouping: [] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
     const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
-    const reloadConfig = readConfig({
-      hosts: [host()],
-      deletedHosts: [],
-      remoteRoot: box.newRoot,
-      supersededRemoteRoots: [box.oldRoot],
-      pendingSessionGrouping: [],
-    })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
     const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()
-    const lastSuperseded = box.updates.map(patch => patch.supersededRemoteRoots).filter(Array.isArray).at(-1) as string[]
-    assert.deepEqual(lastSuperseded, [])
+    assert.deepEqual((await sidecar(box)).supersededRemoteRoots, [])
   } finally {
     await dispose(box)
   }
@@ -1017,14 +1001,9 @@ test('the group restore waits for a registry that is still starting up', async (
       if (calls <= 2) throw new Error('workspace registry is not started yet')
       return original()
     }
+    await writeMigrationState({ supersededRemoteRoots: [], pendingSessionGrouping: [{ path: newLocal, id: 'session-wait' }] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
     const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
-    const reloadConfig = readConfig({
-      hosts: [host()],
-      deletedHosts: [],
-      remoteRoot: box.newRoot,
-      supersededRemoteRoots: [],
-      pendingSessionGrouping: [{ path: newLocal, id: 'session-wait' }],
-    })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
     const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()
@@ -1082,7 +1061,7 @@ test('a moved session with no workspace yet stays queued and groups once one is 
     await seedStoredSession(box, 'session-nogroup', otherOld, [{ type: 'session/append', seq: 1 }])
     const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
     assert.equal(moved.sessionsRelocated, 1)
-    const pending = box.updates.map(patch => patch.pendingSessionGrouping).filter(Array.isArray).at(-1) as Array<{ path: string, id: string }>
+    const pending = (await sidecar(box)).pendingSessionGrouping
     // Kept even though nothing covers it yet: the path still routes to a host.
     assert.equal(pending.length, 1)
     assert.equal(pending[0]!.id, 'session-nogroup')
@@ -1093,10 +1072,7 @@ test('a moved session with no workspace yet stays queued and groups once one is 
     row.attachSession = async (sessionId: unknown) => { row.attached.push(String(sessionId)) }
     box.registry.rows.push(row)
     const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
-    const reloadConfig = readConfig({
-      hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot,
-      supersededRemoteRoots: [], pendingSessionGrouping: pending,
-    })
+    const reloadConfig = readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot })
     const reloaded = new Core(reloadCtx as never, reloadConfig, box.registry)
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()

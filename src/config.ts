@@ -69,31 +69,6 @@ export const Config = Schema.object({
    * The Settings action changes it and migrates the old tree there.
    */
   remoteRoot: Schema.string().default('').volatile(),
-  /**
-   * Placeholder roots this profile migrated away from, persisted so the
-   * in-memory router survives a restart: a session still on one must keep
-   * being refused as a remote placeholder instead of silently becoming a
-   * local directory, and the session catch-up sweep needs the list to find it.
-   *
-   * Internal bookkeeping, not operator input. It is `.volatile()` only because
-   * that is what lets `settings.update` persist it (`hosts`/`deletedHosts`
-   * work the same way). Both lists are sanitized on read, so an accidental
-   * edit self-heals: a dropped root is re-derived by a later migration, a
-   * dropped pending entry re-groups on the next relocation.
-   */
-  supersededRemoteRoots: Schema.array(Schema.string()).default([]).volatile(),
-  /**
-   * Sessions whose logs were relocated to a new root but whose workspace
-   * membership could not be restored in the same process: the workspace
-   * registry caches session headers at startup, so an immediate attach would
-   * validate against the stale cwd and throw. Entries retry on the next
-   * plugin load, when the registry reads headers from disk again.
-   */
-  /** Relocated sessions awaiting a membership attach on the next load; see above. */
-  pendingSessionGrouping: Schema.array(Schema.object({
-    path: Schema.string().default(''),
-    id: Schema.string().default(''),
-  })).default([]).volatile(),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -144,13 +119,6 @@ export interface DeletedHost {
   deletedAt: string
 }
 
-/** One relocated session waiting for its workspace membership to be restored. */
-export interface PendingSessionGrouping {
-  /** The workspace placeholder path the session now lives at. */
-  path: string
-  /** The session id to attach to that workspace. */
-  id: string
-}
 
 export interface PluginConfig {
   hosts: HostConfig[]
@@ -160,10 +128,6 @@ export interface PluginConfig {
   readonly rgRegistry: string
   /** Operator-chosen placeholder root, or empty for the built-in default. */
   remoteRoot: string
-  /** Roots this profile migrated away from; persisted across restarts. */
-  supersededRemoteRoots: string[]
-  /** Relocated sessions whose workspace membership still needs restoring. */
-  pendingSessionGrouping: PendingSessionGrouping[]
 }
 
 type HostRef = Volatile<unknown>
@@ -216,11 +180,6 @@ export function readConfig(raw: unknown): PluginConfig {
   const registryDefault = typeof record.rgRegistry === 'string' ? record.rgRegistry : ''
   const rootRef = refOf(record.remoteRoot)
   const rootDefault = typeof record.remoteRoot === 'string' ? record.remoteRoot : ''
-  const supersededRef = refOf(record.supersededRemoteRoots)
-  const pendingRef = refOf(record.pendingSessionGrouping)
-  // `Config()` validates these too, so hand it already-sanitized arrays.
-  const supersededRaw = normalizeRootList(supersededRef !== undefined ? supersededRef.get() : record.supersededRemoteRoots)
-  const pendingRaw = normalizePendingList(pendingRef !== undefined ? pendingRef.get() : record.pendingSessionGrouping)
   const parsed = Config({
     ...record,
     hosts: copyHostRows(hostRef !== undefined ? hostRef.get() : record.hosts),
@@ -229,58 +188,18 @@ export function readConfig(raw: unknown): PluginConfig {
     tagWorkspaceTitles: tagRef !== undefined ? tagRef.get() !== false : tagDefault,
     rgRegistry: registryRef !== undefined ? String(registryRef.get() ?? '') : registryDefault,
     remoteRoot: rootRef !== undefined ? String(rootRef.get() ?? '') : rootDefault,
-    supersededRemoteRoots: supersededRaw,
-    pendingSessionGrouping: pendingRaw,
   }) as unknown as { hosts?: unknown, deletedHosts?: unknown, maxConnections?: number }
   const maxConnections = parsed.maxConnections ?? 4
   const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
   const registry = (): string => String(registryRef === undefined ? registryDefault : registryRef.get() ?? '').trim()
   const root = (): string => String(rootRef === undefined ? rootDefault : rootRef.get() ?? '').trim()
-  // `Config()` returns volatile wrappers for these fields too; validate the
-  // resolved values and read the effective lists back through the refs.
-  const supersededRemoteRoots = normalizeRootList(supersededRaw)
-  const pendingSessionGrouping = normalizePendingList(pendingRaw)
   const ref = hostRef ?? parsed.hosts
   // `Config()` returns volatile wrappers for volatile fields even when the
   // input was a plain array, so prefer the parsed reference when present.
   const deletedRowRef = deletedRef ?? refOf(parsed.deletedHosts)
   const deletedRows = copyDeletedRows(deletedRowRef !== undefined ? deletedRowRef.get() : record.deletedHosts) ?? []
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, root, rootRef, deletedRowRef, deletedRows, supersededRemoteRoots, pendingSessionGrouping)
-  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root(), supersededRemoteRoots, pendingSessionGrouping }
-}
-
-/** Keep absolute, non-empty roots, first spelling wins, order stable. */
-function normalizeRootList(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const item of value) {
-    if (typeof item !== 'string') continue
-    const root = item.trim()
-    if (root.length === 0) continue
-    // A placeholder root is always absolute: POSIX, a drive letter, or UNC.
-    if (!(root.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(root) || root.startsWith('\\\\'))) continue
-    if (seen.has(root)) continue
-    seen.add(root)
-    out.push(root)
-  }
-  return out
-}
-
-/** Keep well-formed pending entries, deduped by session id (first wins). */
-function normalizePendingList(value: unknown): PendingSessionGrouping[] {
-  if (!Array.isArray(value)) return []
-  const seen = new Set<string>()
-  const out: PendingSessionGrouping[] = []
-  for (const item of value) {
-    if (!isRecord(item)) continue
-    const path = typeof item.path === 'string' ? item.path : ''
-    const id = typeof item.id === 'string' ? item.id : ''
-    if (path.length === 0 || id.length === 0 || seen.has(id)) continue
-    seen.add(id)
-    out.push({ path, id })
-  }
-  return out
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, root, rootRef, deletedRowRef, deletedRows)
+  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root() }
 }
 
 function refOf(value: unknown): HostRef | undefined {
@@ -296,8 +215,6 @@ function viewConfig(
   rootRef: HostRef | undefined,
   deletedRef: HostRef | undefined,
   deletedRows: DeletedHost[],
-  supersededRemoteRoots: string[],
-  pendingSessionGrouping: PendingSessionGrouping[],
 ): PluginConfig {
   return {
     get hosts() {
@@ -333,8 +250,6 @@ function viewConfig(
       if (rootRef === undefined) throw new Error('the remote root setting is not writable in this config')
       updateVolatile(rootRef, createVolatile(String(value ?? '')))
     },
-    supersededRemoteRoots,
-    pendingSessionGrouping,
   }
 }
 
