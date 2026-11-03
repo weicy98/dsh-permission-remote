@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { dirname, join, relative } from 'node:path'
@@ -9,7 +9,7 @@ import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
-import { encodeSegment, projectKey, scanLogFrames } from '../src/session-relocate.ts'
+import { encodeSegment, projectKey, relocateSessions, scanLogFrames } from '../src/session-relocate.ts'
 import { readMigrationState, writeMigrationState, migrationStatePath } from '../src/migration-state.ts'
 import { workspaceRoute, type WorkspaceLike } from '../src/workspaces.ts'
 
@@ -84,7 +84,7 @@ class FakeRegistry {
 function makeCtx(options: {
   updates: Array<Record<string, unknown>>
   droppedSecrets: unknown[]
-  liveAgents: Array<{ session?: { id?: string } }>
+  liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }>
   failPersist?: boolean
 }) {
   return {
@@ -119,7 +119,7 @@ interface Harness {
   updates: Array<Record<string, unknown>>
   droppedSecrets: unknown[]
   /** Agents the plugin sees through `ctx.get('agents')`; their session ids are "live". */
-  liveAgents: Array<{ session?: { id?: string } }>
+  liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }>
   /** `DSH_HOME` before the harness pinned it to the fixture box. */
   savedHome: string | undefined
 }
@@ -131,7 +131,7 @@ async function harness(options: { sessions?: number, failPersist?: boolean, read
   await mkdir(oldRoot, { recursive: true })
   const updates: Array<Record<string, unknown>> = []
   const droppedSecrets: unknown[] = []
-  const liveAgents: Array<{ session?: { id?: string } }> = []
+  const liveAgents: Array<{ session?: { id?: string, header?: { cwd?: string } } }> = []
   const ctx = makeCtx({ updates, droppedSecrets, liveAgents, failPersist: options.failPersist === true })
   const registry = new FakeRegistry()
   const config = readConfig({ hosts: options.hosts ?? [host()], deletedHosts: [], remoteRoot: oldRoot })
@@ -727,7 +727,9 @@ test('a rewrite that died before the cleanup only removes the stale source', asy
     const staleSource = await seedStoredSession(box, 'session-done', oldLocal, [{ type: 'session/append', seq: 1 }])
     const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
     assert.equal(moved.status, 'changed')
-    assert.equal(moved.sessionsRelocated, 1)
+    // Already relocated by the earlier run: cleaning up the stale copy must not
+    // count the same session as relocated a second time.
+    assert.equal(moved.sessionsRelocated, 0)
     assert.equal(moved.sessionsFailed, 0)
     await assert.rejects(() => readFile(staleSource), /ENOENT/)
     const dest = join(storedSessionDir(box, newLocal, 'session-done'), 'session.v4.jsonl.zstd')
@@ -1077,6 +1079,84 @@ test('a moved session with no workspace yet stays queued and groups once one is 
     reloaded.applyRemoteRootOverride()
     await reloaded.resumeSessionMigrationState()
     assert.deepEqual(row.attached, ['session-nogroup'])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a root configured through a symlink still matches the canonical cwds DSH stores', async () => {
+  const box = await harness()
+  try {
+    // DSH registers workspaces through realpath, so a session header records the
+    // canonical cwd. A root that is itself a symlink is only path.resolve'd in
+    // the config; matching one spelling would silently relocate nothing.
+    const realRoot = join(box.box, 'real-root')
+    const linkRoot = join(box.box, 'link-root')
+    await mkdir(realRoot, { recursive: true })
+    await symlink(realRoot, linkRoot)
+    const canonical = await realpath(linkRoot)
+    const cwd = join(canonical, 'host1', encodeRemotePath('/srv/app'))
+    const dir = join(box.box, 'sessions', projectKey(cwd), encodeSegment('session-link'))
+    await seedStoredLog(dir, 'session-link', cwd, { events: [{ type: 'session/append', seq: 1 }] })
+
+    // Configure the root as the SYMLINK spelling, as the settings page would.
+    const summary = await relocateSessions({
+      dshHome: box.box,
+      oldRoot: linkRoot,
+      newRoot: join(box.box, 'new-root'),
+      liveSessionIds: new Set(),
+    })
+    assert.equal(summary.relocated.length, 1)
+    assert.equal(summary.failed.length, 0)
+    await assert.rejects(() => stat(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('live sessions on a just-created workspace row still trigger the confirmation', async () => {
+  const box = await harness()
+  try {
+    const seeded = await seedWorkspace(box, '/srv/app')
+    // The plugin's re-created row has no sessionIds until the next load, which
+    // is exactly the window the registry count misses.
+    const placeholder = seeded.path
+    box.liveAgents.push({
+      session: { id: 'session-open', header: { cwd: join(placeholder, 'sub') } },
+    })
+    const blocked = await box.core.changeRemoteRoot(box.newRoot, { force: false })
+    assert.equal(blocked.status, 'has-sessions')
+    assert.equal(blocked.sessions, 1)
+    assert.equal(box.updates.length, 0)
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a queued session survives a root edit that makes its path unroutable', async () => {
+  const box = await harness()
+  try {
+    // A destination under no current routing root (the operator changed the root
+    // in the generic editor). The session log is still on disk, so the record of
+    // "needs its group back" must survive; dropping it would be permanent.
+    const orphan = join(box.box, 'unrouted-root', 'host1', encodeRemotePath('/srv/gone'))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(orphan), encodeSegment('session-orphan')), 'session-orphan', orphan, {
+      events: [{ type: 'session/append', seq: 1 }],
+    })
+    await writeMigrationState({ supersededRemoteRoots: [], pendingSessionGrouping: [{ path: orphan, id: 'session-orphan' }] }, { DSH_HOME: box.box } as NodeJS.ProcessEnv)
+    const reloadCtx = makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] })
+    const reloaded = new Core(reloadCtx as never, readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }), box.registry)
+    reloaded.applyRemoteRootOverride()
+    await reloaded.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [{ path: orphan, id: 'session-orphan' }])
+
+    // Once the log itself is gone, the entry can never be attached and is dropped.
+    await rm(join(box.box, 'sessions', projectKey(orphan)), { recursive: true, force: true })
+    const again = new Core(makeCtx({ updates: box.updates, droppedSecrets: box.droppedSecrets, liveAgents: [] }) as never,
+      readConfig({ hosts: [host()], deletedHosts: [], remoteRoot: box.newRoot }), box.registry)
+    again.applyRemoteRootOverride()
+    await again.resumeSessionMigrationState()
+    assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [])
   } finally {
     await dispose(box)
   }

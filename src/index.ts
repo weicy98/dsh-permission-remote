@@ -1,8 +1,9 @@
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { join as joinPath, posix, resolve as resolveLocalPath } from 'node:path'
+import { join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { CredentialRecord } from '@deepseek-ai/dsh-credentials/types'
@@ -33,7 +34,7 @@ import {
 import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, supersededRootsSnapshot, type RemoteRoute, type Route } from './router.ts'
-import { relocateSessions, type SessionRelocationSummary } from './session-relocate.ts'
+import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
@@ -831,7 +832,13 @@ export class Core {
     // also sends the conflict list it showed, a path that was not on that list
     // is asked again instead of being overwritten.
     const plan = await planRemoteRoot(oldRoot, newRoot, strategy)
-    const sessions = opened.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
+    // Count what is actually open on these placeholders, not only what the
+    // registry accounts for: a row this plugin created has an empty `sessionIds`
+    // until the next load attaches the moved sessions, so in the window between
+    // "migrated" and "restarted" the registry count reads zero and the operator
+    // would be migrated again without the confirmation.
+    const accounted = opened.reduce((sum, item) => sum + item.ws.sessionIds.length, 0)
+    const sessions = Math.max(accounted, this.liveSessionsUnder(opened))
     if (sessions > 0 && !opts.force) return { status: 'has-sessions', oldRoot, root: newRoot, sessions }
     if (!plan.targetWasEmpty && opts.strategy === undefined && plan.conflicts.length > 0) {
       return { status: 'needs-strategy', oldRoot, root: newRoot, conflicts: plan.conflicts }
@@ -1003,6 +1010,22 @@ export class Core {
     }
   }
 
+  /** Open sessions whose recorded cwd sits under one of the given placeholders. */
+  private liveSessionsUnder(rows: readonly { ws: WorkspaceLike }[]): number {
+    const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
+    const list = agents?.list?.() ?? []
+    if (list.length === 0) return 0
+    const roots = rows.map(row => resolveLocalPath(row.ws.path))
+    let count = 0
+    for (const agent of list) {
+      const cwd = agent.session?.header?.cwd
+      if (typeof cwd !== 'string' || cwd.length === 0) continue
+      const resolved = resolveLocalPath(cwd)
+      if (roots.some(root => resolved === root || resolved.startsWith(`${root}${sep}`))) count += 1
+    }
+    return count
+  }
+
   /** Ids of sessions with a live writer; their files must never be moved. */
   private liveSessionIds(): Set<string> {
     const live = new Set<string>()
@@ -1105,11 +1128,18 @@ export class Core {
     // catch-up sweep moves in this load still has the registry's startup header
     // cache, so it must wait for the next load to read the rewritten header.
     const preexisting = new Set(this.migrationState.pendingSessionGrouping.map(entry => entry.id))
-    // Sweep FIRST and independently of the registry. A mismatched session log
-    // is exactly what makes the registry's Service.init fail (its list() throws
-    // and never becomes available), so waiting for the registry before the
-    // sweep would deadlock: the log that stops the registry is the one only the
-    // sweep can fix. The sweep reads files and config only.
+    // Wait for the registry first, but only briefly and never as a precondition
+    // for the sweep. Two constraints pull in opposite directions:
+    //   - the sweep renames directories, and between the rename and the header
+    //     promote a log briefly sits where its cwd says it does not; a registry
+    //     `list()` running concurrently would reject the whole store, so the
+    //     sweep must not overlap a healthy startup;
+    //   - a mismatched log is exactly what makes `Service.init` fail, and then
+    //     the registry never becomes ready — waiting first without a fallback
+    //     would deadlock, because the only thing that can repair the log is the
+    //     sweep.
+    // So: wait (bounded), sweep regardless of the outcome, flush only if ready.
+    const registryReady = await this.waitForWorkspaceRegistry()
     const roots = this.catchupRoots(remoteRoot())
     if (roots.length > 0) {
       try {
@@ -1118,11 +1148,10 @@ export class Core {
         this.ctx.logger?.warn(`[@dsh-permission-remote] the session catch-up sweep failed: ${errorText(error)}`)
       }
     }
-    // Grouping needs the registry; retry briefly for a healthy but slow init.
-    if (await this.waitForWorkspaceRegistry()) {
+    if (registryReady) {
       await this.flushPendingSessionGrouping(preexisting)
     } else {
-      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; session grouping is deferred to the next load (sessions were still swept)')
+      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; session grouping is deferred to the next load (the sweep still ran)')
     }
   }
 
@@ -1165,12 +1194,12 @@ export class Core {
       }
       const target = rows.find(item => sameRealPath(item.path, entry.path))
       if (target === undefined) {
-        // Distinguish "its workspace was deleted" from "nothing is registered
-        // there yet". A path that still belongs to a host placeholder stays
-        // queued, so registering a workspace later groups the session; one that
-        // resolves to no remote workspace at all can never be attached and is
-        // dropped, so the list cannot grow without limit.
-        if (routeByCwd(entry.path).kind === 'remote') remaining.push(entry)
+        // No workspace covers the destination (yet, or any more). Keep the entry
+        // while the session log is still there: registering a workspace later
+        // groups it, and an operator editing the root in the generic editor
+        // (which changes routing but not the files) must not cost the record.
+        // Only a session whose log is gone can never be attached.
+        if (await sessionLogExists(resolveDshHome(), entry.path, entry.id)) remaining.push(entry)
         continue
       }
       const attach = target.attachSession

@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join as joinPath, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
@@ -47,7 +48,7 @@ const LOG_NAME = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/
 /** Hard ceiling for the in-memory header rewrite; real session logs are far below it. */
 const MAX_REWRITE_BYTES = 64 * 1024 * 1024
 /** First read of a header probe; a header frame is a few hundred bytes. */
-const HEADER_PROBE_BYTES = 64 * 1024
+const HEADER_PROBE_BYTES = 4 * 1024
 
 /** Whether this Node build can rewrite a Zstandard header frame. */
 export function zstdAvailable(): boolean {
@@ -108,7 +109,7 @@ export function projectKey(cwd: string): string {
  * way the filesystem folds it; a raw prefix comparison would miss a session
  * whose header spells the same path with a different drive-letter case.
  */
-function sitsUnder(cwd: string, root: string): boolean {
+function sitsUnderRoot(cwd: string, root: string): boolean {
   const rel = relativePath(root, cwd)
   if (rel === '') return true
   // Only a real parent escape is outside the root; a sibling named `..cache`
@@ -117,21 +118,54 @@ function sitsUnder(cwd: string, root: string): boolean {
   return !(rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel))
 }
 
-/** The session's placeholder path moved from `oldRoot` to `newRoot`. */
-export function mapPlaceholderCwd(cwd: string, oldRoot: string, newRoot: string): string {
-  const trimmedOld = oldRoot.replace(/[\\/]+$/, '')
-  const trimmedNew = newRoot.replace(/[\\/]+$/, '')
-  // Derive the remainder the same way {@link sitsUnder} tests membership, so a
-  // drive-letter or component case difference cannot slice the wrong span.
-  const rest = relativePath(trimmedOld, cwd)
-  if (rest === '' ) return trimmedNew
-  if (rest.startsWith('..') || rest.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rest)) {
-    // Not under oldRoot after all; fall back to the lexical prefix strip so a
-    // caller that already established membership keeps the old behaviour.
-    const lexical = cwd.slice(trimmedOld.length).replace(/^[\\/]+/, '')
-    return lexical.length === 0 ? trimmedNew : joinPath(trimmedNew, lexical)
+/**
+ * Every spelling of a placeholder root that a stored cwd may use.
+ *
+ * The configured root is only `path.resolve`d, but DSH registers workspaces
+ * through `realpath`, and a Session header records the canonical cwd. On an
+ * install where the root itself sits behind a symlink (`~/.dsh` is commonly a
+ * link), those two spellings differ — comparing against one of them silently
+ * matches nothing. Both are therefore candidates, the lexical one first so a
+ * genuine non-symlink path always wins.
+ */
+export function rootCandidateSpellings(root: string): string[] {
+  const trimmed = root.replace(/[\\/]+$/, '')
+  const out = [trimmed]
+  try {
+    const real = realpathSync(trimmed).replace(/[\\/]+$/, '')
+    if (real !== trimmed) out.push(real)
+  } catch {
+    // A root that does not exist yet has no canonical spelling; the lexical
+    // one is all there is.
   }
-  return joinPath(trimmedNew, rest)
+  return out
+}
+
+/** Whether `cwd` sits under any spelling of the root. */
+function sitsUnder(cwd: string, roots: readonly string[]): boolean {
+  return roots.some(root => sitsUnderRoot(cwd, root))
+}
+
+/**
+ * The session's placeholder path moved from `oldRoot` to `newRoot`.
+ *
+ * `olds` holds every accepted spelling of the old root; the one that actually
+ * contains `cwd` is the one whose remainder is carried over.
+ */
+export function mapPlaceholderCwd(cwd: string, olds: readonly string[], newRoot: string): string {
+  const trimmedNew = newRoot.replace(/[\\/]+$/, '')
+  for (const old of olds) {
+    const trimmedOld = old.replace(/[\\/]+$/, '')
+    const rest = relativePath(trimmedOld, cwd)
+    if (rest === '') return trimmedNew
+    if (rest.startsWith('..') || rest.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rest)) continue
+    return joinPath(trimmedNew, rest)
+  }
+  // No spelling contains it; fall back to the lexical prefix strip so a caller
+  // that already established membership keeps its old behaviour.
+  const trimmedOld = olds[0]!.replace(/[\\/]+$/, '')
+  const lexical = cwd.slice(trimmedOld.length).replace(/^[\\/]+/, '')
+  return lexical.length === 0 ? trimmedNew : joinPath(trimmedNew, lexical)
 }
 
 /** Structural scan result: complete frames plus an optional torn final frame. */
@@ -371,6 +405,9 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
     throw error
   }
   const live = options.liveSessionIds ?? new Set<string>()
+  // A symlinked root is only `path.resolve`d in the config while DSH stores
+  // canonical cwds, so match every spelling (see rootCandidateSpellings).
+  const oldRoots = rootCandidateSpellings(options.oldRoot)
   const touchedProjects = new Set<string>()
   for (const project of projects) {
     const projectDir = joinPath(sessionsRoot, project)
@@ -388,10 +425,13 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
       } catch {
         continue
       }
-      // Remove staging files a crash may have left behind: they are ignored by
-      // DSH but look like real logs, and would otherwise accumulate forever.
-      for (const name of names) {
-        if (/\.relocate-\d+\.tmp$/.test(name)) await rm(joinPath(dir, name), { force: true }).catch(() => undefined)
+      // Remove staging files a crashed run left behind: DSH ignores them but
+      // they look like real logs and would accumulate. Only a temp whose owner
+      // process is gone is removed — another live process may be mid-move.
+      const temps = names.filter(name => /\.relocate-\d+\.tmp$/.test(name))
+      for (const name of temps) {
+        const pid = Number(/\.relocate-(\d+)\.tmp$/.exec(name)![1])
+        if (pid === process.pid || !isProcessAlive(pid)) await rm(joinPath(dir, name), { force: true }).catch(() => undefined)
       }
       names = names.filter(name => !/\.relocate-\d+\.tmp$/.test(name))
       const log = newestLog(names)
@@ -399,7 +439,7 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
       // backend ignores it too.
       if (log === undefined) continue
       const moved = await relocateSession(
-        { sessionsRoot, projectDir, dir, entry, logName: log.name, options, live, summary },
+        { sessionsRoot, projectDir, dir, entry, logName: log.name, options, oldRoots, live, summary },
       )
       if (moved) touchedProjects.add(projectDir)
     }
@@ -421,13 +461,15 @@ interface RelocateContext {
   entry: string
   logName: string
   options: RelocateOptions
+  /** Every accepted spelling of `options.oldRoot`. */
+  oldRoots: readonly string[]
   live: ReadonlySet<string>
   summary: SessionRelocationSummary
 }
 
 /** Relocate one session directory; every failure is recorded on the summary. */
 async function relocateSession(context: RelocateContext): Promise<boolean> {
-  const { sessionsRoot, projectDir, dir, entry, logName, options, live, summary } = context
+  const { sessionsRoot, projectDir, dir, entry, logName, options, oldRoots, live, summary } = context
   const fail = (id: string, reason: string): false => {
     summary.failed.push({ id, reason })
     return false
@@ -448,11 +490,11 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   const header = head.header
   const cwd = header.cwd
   if (header.type !== 'session' || typeof cwd !== 'string' || cwd.length === 0) return false
-  if (!sitsUnder(cwd, options.oldRoot)) return false
+  if (!sitsUnder(cwd, oldRoots)) return false
   const id = typeof header.id === 'string' ? header.id : ''
   if (id.length === 0) return fail(entry, 'header carries no id')
   if (encodeSegment(id) !== entry) return fail(id, `directory name ${entry} does not match encodeSegment(id) ${encodeSegment(id)}`)
-  const to = mapPlaceholderCwd(cwd, options.oldRoot, options.newRoot)
+  const to = mapPlaceholderCwd(cwd, oldRoots, options.newRoot)
   const destDir = joinPath(sessionsRoot, projectKey(to), encodeSegment(id))
   // Layout drift guard: the directory this log sits in is named by DSH's own
   // encoder, so it must be either the project key of the header's cwd or — for
@@ -604,12 +646,12 @@ async function reconcileExistingDestination(context: RelocateContext & { destDir
     return fail(`the destination already holds session ${String(destHeader.id)}; refusing to overwrite it`)
   }
   if (destHeader.cwd === to) {
-    // Completed by an earlier run; only the stale source remains. The session
-    // is accounted for, so a moved signal lets the caller drop the old project
-    // directory when it emptied.
+    // Completed by an earlier run; only the stale source remains. Report the
+    // move (so the emptied old project directory is cleaned up) but do NOT
+    // count it as relocated again: the earlier run already counted it, and the
+    // UI would otherwise show one session twice across two runs.
     try {
       await rm(dir, { recursive: true, force: false })
-      summary.relocated.push({ id, from, to })
       return true
     } catch (error) {
       return fail(`the destination is already correct, but the stale source could not be removed: ${text(error)}`)
@@ -695,6 +737,37 @@ async function publish(path: string, bytes: Buffer): Promise<void> {
   await writeFile(temp, bytes, { mode: 0o600 })
   if (mode !== undefined) await chmod(temp, mode)
   await rename(temp, path)
+}
+
+/**
+ * Whether a stored session log still exists for `id` at `cwd`.
+ *
+ * Used to decide that a queued membership can never be restored (the session
+ * was deleted) without depending on routing: an operator editing the root in
+ * the generic settings editor changes routing but not the files, and dropping a
+ * pending entry then would lose the only record of a session that still needs
+ * its group back.
+ */
+export async function sessionLogExists(dshHome: string, cwd: string, id: string): Promise<boolean> {
+  const dir = joinPath(dshHome, 'sessions', projectKey(cwd), encodeSegment(id))
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch {
+    return false
+  }
+  return newestLog(names) !== undefined
+}
+
+/** Whether a pid still exists on this host (used to decide a temp file is orphaned). */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 function text(error: unknown): string {
