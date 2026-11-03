@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { clearStagedPresentFiles, finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -650,6 +651,52 @@ test('a second delivery of the same path replaces the earlier copy', async () =>
     // The event records only the path, so the card shows whatever sits there:
     // the later delivery has to overwrite the earlier bytes.
     assert.equal(await readFile(second!.path, 'utf8'), 'second version')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('unloading removes the delivery copies it staged', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-clear-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const api = {
+      pool: {
+        sftpStat: async () => ({ isDirectory: false, size: 5 }),
+        sftpRead: async () => Buffer.from('hello'),
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    const staged = await stagePresentFiles(api, sessionRoute, [{ path: 'out/report.txt' }], { signal: new AbortController().signal })
+    const target = staged[0]!.path
+    assert.equal(await readFile(target, 'utf8'), 'hello')
+    await clearStagedPresentFiles()
+    assert.equal(existsSync(target), false)
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('clearing delivery copies leaves files this process did not stage alone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-keep-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    // A file the operator put in the placeholder tree by hand. The clearer must
+    // only remove paths this process wrote, never everything under the root.
+    const foreign = join(mapping, 'out', 'foreign.txt')
+    await mkdir(join(mapping, 'out'), { recursive: true })
+    await writeFile(foreign, 'mine')
+    await clearStagedPresentFiles()
+    assert.equal(await readFile(foreign, 'utf8'), 'mine')
   } finally {
     delete process.env.DSH_SSH_REMOTE_ROOT
     await rm(root, { recursive: true, force: true })

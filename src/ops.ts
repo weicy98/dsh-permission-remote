@@ -14,10 +14,9 @@ import {
 import { atomicWriteScript } from './profile.ts'
 import { normalizeRemoteDirectory } from './router.ts'
 import { shJoin } from './shell-quote.ts'
-import type { SecretMaterial } from './ssh-pool.ts'
+import { isSftpMissing, type SecretMaterial } from './ssh-pool.ts'
 
 const READ_CAP = 1024 * 1024
-const NOT_FOUND = /no such file|cannot find|not found|does not exist/i
 const HOME_BEGIN = '__DSH_OPS_HOME_BEGIN__'
 const HOME_END = '__DSH_OPS_HOME_END__'
 
@@ -307,9 +306,12 @@ export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Rec
  * Whether a remote error says the path is not there. A bare SFTP code reads the
  * same for a typo and for a moved directory, so workspace registration turns it
  * into a hint instead of forwarding it.
+ *
+ * The numeric SFTP status wins when there is one: servers localise the message,
+ * so matching English text misses a `NO_SUCH_FILE` from a non-English sshd.
  */
 export function isRemoteMissing(error: unknown): boolean {
-  return error instanceof Error && NOT_FOUND.test(error.message)
+  return isSftpMissing(error)
 }
 
 /** `/` covers every remote path, and a workspace-write bind of it replaces the read-only root. */

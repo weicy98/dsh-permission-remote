@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join, posix } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
@@ -47,7 +47,7 @@ import { rgPlatformOf } from './rg-fetch.ts'
 import { mapRemoteToLocal, resolveRemotePath, toModelPath, workspaceBinding, type RemoteRoute } from './router.ts'
 import { loginEnvApply } from './login-env.ts'
 import { shJoin } from './shell-quote.ts'
-import { SshPool, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
+import { SshPool, isSftpMissing, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
 
 const require = createRequire(import.meta.url)
 const READ_CAP = 1024 * 1024
@@ -335,8 +335,6 @@ function sandboxRoots(hostApi: ToolHost, route: RemoteRoute, exec: ToolExec, sta
   return rootsFor(status, sandboxWorkspaceRoot(route, exec), hostApi.pool, host, secret)
 }
 
-const NOT_FOUND = /no such file|cannot find|not found|does not exist/i
-
 /**
  * A temp root that is not on disk becomes `''`, so the file profile does not
  * `--bind` it. A transient SFTP failure keeps the normalized path instead of
@@ -347,7 +345,7 @@ async function existingRemotePath(pool: SshPool, host: HostConfig, secret: Secre
   try {
     return await pool.sftpRealpath(host, secret, remotePath)
   } catch (error) {
-    if (error instanceof Error && NOT_FOUND.test(error.message)) return ''
+    if (isSftpMissing(error)) return ''
     return posix.normalize(remotePath)
   }
 }
@@ -617,6 +615,33 @@ export interface StagedFile {
 const PRESENT_CAP = 32 * 1024 * 1024
 
 /**
+ * Placeholder paths this process wrote a delivery copy to.
+ *
+ * A delivery card resolves its path when the user opens it, with no time limit,
+ * so a per-session cleanup would break a card that is still on screen. The only
+ * safe moment is plugin unload, and even then the copies are best-effort: the
+ * removal never touches a path this process did not stage, so a real local file
+ * that happens to share the spelling is left alone.
+ */
+const stagedPlaceholders = new Set<string>()
+
+/**
+ * Delete the delivery copies this process staged. Best-effort per path: one
+ * failure must not stop the rest, because this runs during teardown.
+ */
+export async function clearStagedPresentFiles(): Promise<void> {
+  const paths = [...stagedPlaceholders]
+  stagedPlaceholders.clear()
+  await Promise.all(paths.map(async target => {
+    try {
+      await rm(target, { force: true })
+    } catch {
+      // A copy the user already removed, or a directory that was never ours.
+    }
+  }))
+}
+
+/**
  * Copy remote files into their placeholder directories so the local
  * `present` tool and the card that opens its paths find real files.
  *
@@ -650,7 +675,7 @@ export async function stagePresentFiles(
       // permission denial, or SFTP fault is not. Telling it "no file" when the
       // host is unreachable would send it hunting for a path that exists.
       const message = error instanceof Error ? error.message : String(error)
-      if (NOT_FOUND.test(message)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+      if (isSftpMissing(error)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
       throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
     }
     if (info.isDirectory) throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_FOUND')
@@ -662,6 +687,7 @@ export async function stagePresentFiles(
     // sees one path for one file whichever tool produced it.
     const placeholder = toModelPath(remotePath, route)
     await withSignal(writeFileAtomic(placeholder, data, { mode: 0o600, dirMode: 0o700 }), exec?.signal)
+    stagedPlaceholders.add(placeholder)
     staged.push({ path: placeholder, bytes: data.length })
   }
   return staged

@@ -130,11 +130,73 @@ export interface OpenPty {
   onTransportClosed(listener: (error: Error) => void): () => void
 }
 
+/**
+ * SFTP status codes (draft-ietf-secsh-filexfer-02 §7). ssh2 copies the server's
+ * numeric status onto `error.code`, so a classification can read the code
+ * instead of guessing from the message: the wording is chosen by the server and
+ * is localised by some of them, but the code is not.
+ */
+export const SFTP_STATUS = {
+  OK: 0,
+  EOF: 1,
+  NO_SUCH_FILE: 2,
+  PERMISSION_DENIED: 3,
+  FAILURE: 4,
+  BAD_MESSAGE: 5,
+  NO_CONNECTION: 6,
+  CONNECTION_LOST: 7,
+  OP_UNSUPPORTED: 8,
+} as const
+
+/**
+ * An SSH or SFTP operation failed.
+ *
+ * `status` carries the protocol's numeric SFTP code when the server sent one.
+ * Callers must prefer it over the message: OpenSSH localises its error strings,
+ * and every SFTP server picks its own wording for a bare status.
+ */
 export class SshFailure extends Error {
-  constructor(message: string, readonly stage: string) {
+  constructor(
+    message: string,
+    readonly stage: string,
+    /** Numeric SFTP status, when the failure came from a STATUS response. */
+    readonly status?: number,
+  ) {
     super(message)
     this.name = 'SshFailure'
   }
+}
+
+/** The numeric SFTP status carried by an ssh2 error, when it has one. */
+export function sftpStatusOf(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'number' ? code : undefined
+}
+
+/** Build a failure from an ssh2 error, keeping its SFTP status. */
+function failureOf(error: Error, stage: string): SshFailure {
+  return new SshFailure(error.message, stage, sftpStatusOf(error))
+}
+
+/** The path is not there. The code is authoritative; the message is the fallback. */
+export function isSftpMissing(error: unknown): boolean {
+  if (error instanceof SshFailure) {
+    if (error.status === SFTP_STATUS.NO_SUCH_FILE) return true
+    // A status of FAILURE is what a server without a specific code sends; the
+    // message still distinguishes "no such file" for those.
+    if (error.status !== undefined && error.status !== SFTP_STATUS.FAILURE) return false
+  }
+  return error instanceof Error && /no such file|cannot find|not found|does not exist/i.test(error.message)
+}
+
+/** The server refused the operation on permissions. Code first, message second. */
+export function isSftpPermissionDenied(error: unknown): boolean {
+  if (error instanceof SshFailure) {
+    if (error.status === SFTP_STATUS.PERMISSION_DENIED) return true
+    if (error.status !== undefined && error.status !== SFTP_STATUS.FAILURE) return false
+  }
+  return error instanceof Error && /permission denied/i.test(error.message)
 }
 
 /**
@@ -797,7 +859,7 @@ async function closeLive(live: Live): Promise<void> {
 function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: boolean, size: number, mode?: number }> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-stat'))
+      if (error) reject(failureOf(error, 'sftp-stat'))
       else resolve({ isDirectory: stats.isDirectory(), size: stats.size, mode: typeof stats.mode === 'number' ? stats.mode : undefined })
     })
   })
@@ -810,7 +872,7 @@ function statSize(sftp: SftpLike, remotePath: string): Promise<number> {
 function readAll(sftp: SftpLike, remotePath: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     sftp.readFile(remotePath, (error, data) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-read'))
+      if (error) reject(failureOf(error, 'sftp-read'))
       else resolve(data)
     })
   })
@@ -819,7 +881,7 @@ function readAll(sftp: SftpLike, remotePath: string): Promise<Buffer> {
 function writeAll(sftp: SftpLike, remotePath: string, body: Buffer | string): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.writeFile(remotePath, body, error => {
-      if (error) reject(new SshFailure(error.message, 'sftp-write'))
+      if (error) reject(failureOf(error, 'sftp-write'))
       else resolve()
     })
   })
@@ -833,7 +895,7 @@ function writeAll(sftp: SftpLike, remotePath: string, body: Buffer | string): Pr
 function makeDirectory(sftp: SftpLike, remotePath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.mkdir(remotePath, error => {
-      if (error) reject(new SshFailure(error.message, 'sftp-mkdir'))
+      if (error) reject(failureOf(error, 'sftp-mkdir'))
       else resolve()
     })
   })
@@ -842,7 +904,7 @@ function makeDirectory(sftp: SftpLike, remotePath: string): Promise<void> {
 function realpathOf(sftp: SftpLike, remotePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     sftp.realpath(remotePath, (error, resolved) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-realpath'))
+      if (error) reject(failureOf(error, 'sftp-realpath'))
       else resolve(resolved)
     })
   })
@@ -852,7 +914,7 @@ function realpathOf(sftp: SftpLike, remotePath: string): Promise<string> {
 export async function probeOpenDir(sftp: SftpLike, remotePath: string): Promise<void> {
   const handle = await new Promise<Buffer>((resolve, reject) => {
     sftp.opendir(remotePath, (error, opened) => {
-      if (error || opened === undefined) reject(new SshFailure(error?.message ?? 'sftp opendir failed', 'sftp-list'))
+      if (error || opened === undefined) reject(error === undefined ? new SshFailure('sftp opendir failed', 'sftp-list') : failureOf(error, 'sftp-list'))
       else resolve(opened)
     })
   })
@@ -864,13 +926,12 @@ export async function probeOpenDir(sftp: SftpLike, remotePath: string): Promise<
 function readdir(sftp: SftpLike, remotePath: string): Promise<ReadonlyArray<{ filename: string, longname?: string, attrs: SftpStats }>> {
   return new Promise((resolve, reject) => {
     sftp.readdir(remotePath, (error, list) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-list'))
+      if (error) reject(failureOf(error, 'sftp-list'))
       else resolve(list)
     })
   })
 }
 
-const SFTP_NOT_FOUND = /no such file|cannot find|not found|does not exist/i
 const READ_CHUNK = 64 * 1024
 
 /**
@@ -908,7 +969,7 @@ function attrsFrom(stats: SftpStats, longname?: string): SftpAttrs {
 function readLinkOf(sftp: SftpLike, remotePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     sftp.readlink(remotePath, (error, target) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-readlink'))
+      if (error) reject(failureOf(error, 'sftp-readlink'))
       else if (target === undefined) reject(new SshFailure('Response missing link info', 'sftp-readlink'))
       else resolve(target)
     })
@@ -919,8 +980,8 @@ function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Promise<S
   return new Promise((resolve, reject) => {
     const finish = (error: Error | undefined, stats?: SftpStats) => {
       if (error) {
-        if (SFTP_NOT_FOUND.test(error.message)) resolve(undefined)
-        else reject(new SshFailure(error.message, follow ? 'sftp-stat' : 'sftp-lstat'))
+        if (isSftpMissing(error)) resolve(undefined)
+        else reject(failureOf(error, follow ? 'sftp-stat' : 'sftp-lstat'))
         return
       }
       if (stats === undefined) {
@@ -937,7 +998,7 @@ function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Promise<S
 function openRead(sftp: SftpLike, remotePath: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     sftp.open(remotePath, 'r', (error, handle) => {
-      if (error || handle === undefined) reject(new SshFailure(error?.message ?? 'sftp open failed', 'sftp-read'))
+      if (error || handle === undefined) reject(error === undefined ? new SshFailure('sftp open failed', 'sftp-read') : failureOf(error, 'sftp-read'))
       else resolve(handle)
     })
   })
@@ -947,7 +1008,7 @@ function readAt(sftp: SftpLike, handle: Buffer, position: number, length: number
   const buf = Buffer.alloc(length)
   return new Promise((resolve, reject) => {
     sftp.read(handle, buf, 0, length, position, (error, bytesRead) => {
-      if (error) reject(new SshFailure(error.message, 'sftp-read'))
+      if (error) reject(failureOf(error, 'sftp-read'))
       else resolve(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead))
     })
   })

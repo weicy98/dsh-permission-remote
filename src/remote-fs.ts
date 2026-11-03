@@ -22,7 +22,7 @@ import type { HostConfig } from './config.ts'
 import { composeCreatedPath } from './contain.ts'
 import { isRemoteMissing } from './ops.ts'
 import { normalizeRemoteDirectory, routeByCwd } from './router.ts'
-import { SshFailure, type RemoteDirEntry, type SecretMaterial, type SftpAttrs } from './ssh-pool.ts'
+import { SFTP_STATUS, SshFailure, isSftpPermissionDenied, type RemoteDirEntry, type SecretMaterial, type SftpAttrs } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
 
 /** Same ceiling `present` uses before it will copy a remote file. */
@@ -432,6 +432,21 @@ function containsRemote(runtime: Runtime, parent: FsTarget, child: FsTarget): bo
 const NOT_A_LINK = /not a symbolic link|not a symlink|^failure$|^invalid argument$/i
 
 /**
+ * Whether `readlink` failed because the path is not a link.
+ *
+ * SFTP has no dedicated code for this: OpenSSH answers EINVAL, which reaches us
+ * as `FAILURE` with "Invalid argument", and some servers send a bare "Failure".
+ * A `NO_SUCH_FILE` or permission code is a different answer and is handled by
+ * the caller. Guessing from text is only safe because every server that says
+ * something else is treated as unknown, which fails closed.
+ */
+function isNotALink(error: unknown): boolean {
+  if (!(error instanceof SshFailure)) return false
+  if (error.status !== undefined && error.status !== SFTP_STATUS.FAILURE) return false
+  return NOT_A_LINK.test(error.message.trim())
+}
+
+/**
  * STAT without `SSH_FILEXFER_ATTR_PERMISSIONS` has no mode, and ssh2 then
  * reports every type as false. A successful `OPENDIR` means this path is a
  * directory; the names are not read. Any other open error, other than
@@ -483,7 +498,7 @@ async function uncachedAttrs(
     throwIfFsAborted(signal)
     if (error instanceof FsError) throw error
     const message = error instanceof Error ? error.message : String(error)
-    if (isRemoteMissing(error) || /permission denied/i.test(message)) return info
+    if (isRemoteMissing(error) || isSftpPermissionDenied(error)) return info
     return { ...info, type: 'file' }
   }
 }
@@ -503,7 +518,8 @@ async function linkKind(
     throwIfFsAborted(signal)
     if (error instanceof FsError) throw error
     const message = error instanceof Error ? error.message : String(error)
-    if (NOT_A_LINK.test(message.trim()) || isRemoteMissing(error)) return 'not-link'
+    if (isNotALink(error)) return 'not-link'
+    if (isRemoteMissing(error)) return 'not-link'
     return 'unknown'
   }
 }
@@ -698,7 +714,7 @@ class MetaCache {
 function isSoftFailure(error: unknown): boolean {
   if (!(error instanceof SshFailure)) return false
   if (isRemoteMissing(error)) return false
-  return !/permission denied/i.test(error.message)
+  return !isSftpPermissionDenied(error)
 }
 
 /**
@@ -733,7 +749,7 @@ function asFs(error: unknown, signal?: AbortSignal): FsError {
   if (error instanceof FsError) return error
   const message = error instanceof Error ? error.message : String(error)
   if (isRemoteMissing(error)) return new FsError(message, 'FS_NOT_FOUND')
-  if (/permission denied/i.test(message)) return new FsError(message, 'FS_PERMISSION_DENIED')
+  if (isSftpPermissionDenied(error)) return new FsError(message, 'FS_PERMISSION_DENIED')
   if (/over the /i.test(message) && /byte limit/i.test(message)) return new FsError(message, 'FS_TOO_LARGE')
   return new FsError(message, 'FS_IO_ERROR')
 }

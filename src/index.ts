@@ -26,6 +26,7 @@ import {
   runRead,
   runReadImage,
   runWrite,
+  clearStagedPresentFiles,
   stagePresentFiles,
   throwIfAborted,
   withSignal,
@@ -1552,6 +1553,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     if (failure !== undefined) {
       ctx.logger?.warn(`[@dsh-permission-remote] plugin cleanup failed: ${errorText(failure)}`)
     }
+    // Delivery copies live in the placeholder tree and a card may still name
+    // them, so this is the only safe moment to remove them.
+    void clearStagedPresentFiles()
     void core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
