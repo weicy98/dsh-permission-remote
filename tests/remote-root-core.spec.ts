@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { randomBytes } from 'node:crypto'
 import { dirname, join, relative } from 'node:path'
 import test from 'node:test'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
@@ -942,13 +943,18 @@ test('a fatal rewrite failure leaves the session exactly where it was, never hal
     const dir = storedSessionDir(box, oldLocal, 'session-bad')
     await mkdir(dir, { recursive: true })
     const checksum = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
+    // A large, incompressible event frame so the whole log exceeds the 64 KiB
+    // header probe: the header then reads fine and the failure happens inside
+    // moveAndRewrite's pre-rename scan, which is the branch this test covers.
+    const bigEvent = zstdCompressSync(Buffer.concat([Buffer.from('{"type":"session/append","seq":1,"pad":"'), randomBytes(200_000), Buffer.from('"}\n')]), checksum)
     const frames = [
       zstdCompressSync(Buffer.from(`{"type":"session","id":"session-bad","cwd":${JSON.stringify(oldLocal)},"version":4}\n`, 'utf8'), checksum),
-      zstdCompressSync(Buffer.from('{"type":"session/append","seq":1}\n', 'utf8'), checksum),
+      bigEvent,
       Buffer.from('GARBAGE-THAT-IS-NOT-A-ZSTD-FRAME'),
     ]
     const oldLog = join(dir, 'session.v4.jsonl.zstd')
     const original = Buffer.concat(frames)
+    assert.ok(original.length > 64 * 1024)
     await writeFile(oldLog, original)
 
     const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
@@ -958,6 +964,8 @@ test('a fatal rewrite failure leaves the session exactly where it was, never hal
 
     // Untouched: the log bytes are exactly as before the attempted migration.
     assert.equal((await readFile(oldLog)).equals(original), true)
+    // No staging temp left behind.
+    assert.equal((await readdir(dir)).some(name => /\.relocate-\d+\.tmp$/.test(name)), false)
     // Never created at the destination, so DSH never sees a mismatched log.
     const newLocal = mapRemoteToLocal('host1', '/srv/app')!
     await assert.rejects(() => stat(storedSessionDir(box, newLocal, 'session-bad')), /ENOENT/)
@@ -1022,6 +1030,23 @@ test('the group restore waits for a registry that is still starting up', async (
     await reloaded.resumeSessionMigrationState()
     assert.deepEqual(target.attached, ['session-wait'])
     void row
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('a rewritten session log keeps its 0600 mode', async () => {
+  const box = await harness()
+  try {
+    await seedWorkspace(box, '/srv/app')
+    const oldLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const oldLog = await seedStoredSession(box, 'session-mode', oldLocal, [{ type: 'session/append', seq: 1 }])
+    await chmod(oldLog, 0o600)
+    const moved = await box.core.changeRemoteRoot(box.newRoot, { force: true })
+    assert.equal(moved.sessionsRelocated, 1)
+    const newLocal = mapRemoteToLocal('host1', '/srv/app')!
+    const newLog = join(storedSessionDir(box, newLocal, 'session-mode'), 'session.v4.jsonl.zstd')
+    assert.equal((await stat(newLog)).mode & 0o777, 0o600)
   } finally {
     await dispose(box)
   }

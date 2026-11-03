@@ -1020,20 +1020,34 @@ export class Core {
 
   /** Queue every moved session for a membership attach on a later load; true when it added one. */
   private recordPendingGrouping(summary: SessionRelocationSummary): boolean {
-    const rows = this.workspaces.list()
+    // The registry can be unavailable here (a mismatched log elsewhere stops its
+    // init). Recording must still work, so fall back to the computed path; the
+    // flush resolves it by realpath later, when the registry is up.
+    let rows: WorkspaceLike[] | undefined
+    try {
+      rows = this.workspaces.list()
+    } catch {
+      rows = undefined
+    }
     // Keyed by session id so a second migration (A→B then B→C in one process)
     // overwrites the stale B path instead of leaving the id pointing nowhere.
     const wanted = new Map(this.config.pendingSessionGrouping.map(entry => [entry.id, entry.path]))
     let changed = false
     for (const row of summary.relocated) {
-      // Record the workspace's OWN registered path (already canonical), not the
-      // string we computed: with a symlinked root the two differ, and a later
-      // attach validates against the registered path. A session with no
-      // workspace stays ungrouped on purpose, so it is not queued.
-      const target = rows.find(item => sameRealPath(item.path, row.to))
-      if (target === undefined) continue
-      if (wanted.get(row.id) === target.path) continue
-      wanted.set(row.id, target.path)
+      let path: string
+      if (rows !== undefined) {
+        // Record the workspace's OWN registered path (already canonical), not
+        // the string we computed: with a symlinked root the two differ, and a
+        // later attach validates against the registered path. A session with no
+        // workspace stays ungrouped on purpose, so it is not queued.
+        const target = rows.find(item => sameRealPath(item.path, row.to))
+        if (target === undefined) continue
+        path = target.path
+      } else {
+        path = row.to
+      }
+      if (wanted.get(row.id) === path) continue
+      wanted.set(row.id, path)
       changed = true
     }
     if (changed) this.config.pendingSessionGrouping = [...wanted].map(([id, path]) => ({ path, id }))
@@ -1083,30 +1097,39 @@ export class Core {
   async resumeSessionMigrationState(): Promise<void> {
     for (const root of this.config.supersededRemoteRoots) addSupersededRoot(root)
     if (this.config.pendingSessionGrouping.length === 0 && this.config.supersededRemoteRoots.length === 0) return
-    // The registry service may still be initializing when this runs from the
-    // plugin load; `list()` throws until it is ready. Wait briefly rather than
-    // failing the only chance this process gets.
-    if (!(await this.waitForWorkspaceRegistry())) {
-      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; the session group restore will retry on the next load')
-      return
-    }
     // Only sessions queued by an EARLIER load can be attached now: anything the
     // catch-up sweep moves in this load still has the registry's startup header
     // cache, so it must wait for the next load to read the rewritten header.
     const preexisting = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
+    // Sweep FIRST and independently of the registry. A mismatched session log
+    // is exactly what makes the registry's Service.init fail (its list() throws
+    // and never becomes available), so waiting for the registry before the
+    // sweep would deadlock: the log that stops the registry is the one only the
+    // sweep can fix. The sweep reads files and config only.
     const roots = this.catchupRoots(remoteRoot())
-    if (roots.length > 0) await this.relocateFromRoots(roots, remoteRoot())
-    await this.flushPendingSessionGrouping(preexisting)
+    if (roots.length > 0) {
+      try {
+        await this.relocateFromRoots(roots, remoteRoot())
+      } catch (error) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] the session catch-up sweep failed: ${errorText(error)}`)
+      }
+    }
+    // Grouping needs the registry; retry briefly for a healthy but slow init.
+    if (await this.waitForWorkspaceRegistry()) {
+      await this.flushPendingSessionGrouping(preexisting)
+    } else {
+      this.ctx.logger?.warn('[@dsh-permission-remote] the workspace registry was not ready; session grouping is deferred to the next load (sessions were still swept)')
+    }
   }
 
   /** Poll the workspace registry until it answers, or give up after a short wait. */
   private async waitForWorkspaceRegistry(): Promise<boolean> {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
       try {
         this.workspaces.list()
         return true
-      } catch (error) {
-        if (!/not started|not ready|not initialized/i.test(errorText(error))) throw error
+      } catch {
+        // Any throw here means "not usable yet"; wording differs by version.
       }
       await new Promise(resolve => setTimeout(resolve, 250))
     }
@@ -1123,7 +1146,13 @@ export class Core {
    */
   async flushPendingSessionGrouping(onlyIds?: ReadonlySet<string>): Promise<void> {
     if (this.config.pendingSessionGrouping.length === 0) return
-    const rows = this.workspaces.list()
+    let rows: WorkspaceLike[]
+    try {
+      rows = this.workspaces.list()
+    } catch {
+      // Registry not up yet; leave every entry for a later load.
+      return
+    }
     const remaining: Array<{ path: string, id: string }> = []
     for (const entry of this.config.pendingSessionGrouping) {
       if (onlyIds !== undefined && !onlyIds.has(entry.id)) {
@@ -1131,8 +1160,13 @@ export class Core {
         continue
       }
       const target = rows.find(item => sameRealPath(item.path, entry.path))
-      const attach = target?.attachSession
-      if (target === undefined || attach === undefined) {
+      if (target === undefined) {
+        // No workspace covers this path any more (deleted, or never registered):
+        // stop retrying so the list does not grow forever.
+        continue
+      }
+      const attach = target.attachSession
+      if (attach === undefined) {
         remaining.push(entry)
         continue
       }

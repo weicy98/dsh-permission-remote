@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join as joinPath, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
@@ -384,6 +384,12 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
       } catch {
         continue
       }
+      // Remove staging files a crash may have left behind: they are ignored by
+      // DSH but look like real logs, and would otherwise accumulate forever.
+      for (const name of names) {
+        if (/\.relocate-\d+\.tmp$/.test(name)) await rm(joinPath(dir, name), { force: true }).catch(() => undefined)
+      }
+      names = names.filter(name => !/\.relocate-\d+\.tmp$/.test(name))
       const log = newestLog(names)
       // A directory without a committed generation is not a session; the
       // backend ignores it too.
@@ -473,7 +479,7 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   if (destExists) {
     return reconcileExistingDestination({ ...context, destDir, id, from: cwd, to })
   }
-  return moveAndRewrite({ ...context, destDir, id, from: cwd, to })
+  return moveAndRewrite({ ...context, destDir, id, from: cwd, to, compression: head.compression })
 }
 
 /**
@@ -488,19 +494,20 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
  * is the directory renamed and the precomputed bytes promoted with a single
  * atomic rename. If that final rename fails the move is rolled back.
  */
-async function moveAndRewrite(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
-  const { destDir, dir, id, to, from, logName, summary } = context
+async function moveAndRewrite(context: RelocateContext & { destDir: string, id: string, from: string, to: string, compression: boolean }): Promise<boolean> {
+  const { destDir, dir, id, to, from, logName, summary, compression } = context
   const fail = (reason: string): false => {
     summary.failed.push({ id, reason })
     return false
   }
   const sourceLog = joinPath(dir, logName)
-  const compression = logName.endsWith('.zstd')
   // 1) All fallible work, with the directory still in place.
   let rewritten: Buffer
+  let srcMode: number | undefined
   try {
-    const size = (await stat(sourceLog)).size
-    if (size > MAX_REWRITE_BYTES) throw new Error(`the log is ${size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
+    const info = await stat(sourceLog)
+    if (info.size > MAX_REWRITE_BYTES) throw new Error(`the log is ${info.size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
+    srcMode = info.mode & 0o777
     const bytes = await readFile(sourceLog)
     rewritten = rewriteHeader(bytes, id, to, compression)
   } catch (error) {
@@ -508,9 +515,12 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
   }
   // 2) Stage the rewritten bytes next to the log. The dotted suffix is not a
   // committed generation name, so DSH ignores it if this process dies here.
+  // Keep the original file's mode: a fresh file would be created world-readable
+  // (session logs are 0600) and several users may share the machine.
   const staged = `${logName}.relocate-${process.pid}.tmp`
   try {
     await writeFile(joinPath(dir, staged), rewritten)
+    if (srcMode !== undefined) await chmod(joinPath(dir, staged), srcMode)
   } catch (error) {
     await rm(joinPath(dir, staged)).catch(() => undefined)
     return fail(`could not stage the rewritten log: ${text(error)}`)
@@ -663,8 +673,17 @@ async function rewriteLogAt(
 /** Write bytes through a same-directory temp file, then rename over the target. */
 async function publish(path: string, bytes: Buffer): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
+  // Preserve the mode of the file being replaced; a new temp file would
+  // otherwise be world-readable where session logs are 0600.
+  let mode: number | undefined
+  try {
+    mode = (await stat(path)).mode & 0o777
+  } catch {
+    mode = undefined
+  }
   const temp = `${path}.relocate-${process.pid}.tmp`
   await writeFile(temp, bytes)
+  if (mode !== undefined) await chmod(temp, mode)
   await rename(temp, path)
 }
 
