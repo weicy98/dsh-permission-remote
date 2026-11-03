@@ -132,6 +132,7 @@
   "remoteRootForce": "仍然迁移",
   "remoteRootSessionsMoved": "已迁移会话",
   "remoteRootSessionsOpen": "打开中的会话已留在原处，关闭它们后再次保存即可补迁",
+  "remoteRootSessionsRegroup": "重启 DSH 后自动恢复分组",
   "remoteRootSessionsFailed": "未能迁移",
   "remoteRootConflicts": "新目录里已有同名的不同文件，数量：",
   "remoteRootConflictHint": "可以选择保留目标已有文件（只补缺失），或用旧目录覆盖这些文件。",

@@ -1,36 +1,53 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join as joinPath, resolve as resolvePath, sep } from 'node:path'
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join as joinPath, relative as relativePath, resolve as resolvePath } from 'node:path'
 import { constants as zconst, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 
 /**
  * Relocate stored sessions after a remote-root migration.
  *
- * `Core.changeRemoteRoot` copies the placeholder tree and re-registers every
- * workspace at the new root, but each Session's header keeps naming the old
- * root. DSH derives a Session's storage location from that `cwd`
- * (`<sessions>/<projectKey(cwd)>/<id>/`), so every older Session would end up
- * in a directory its own header contradicts, and the workspace service would
- * filter it from membership — the sidebar shows it under "ungrouped" and
- * opening it fails with "header id and cwd identify" corruption.
+ * What actually breaks when `Core.changeRemoteRoot` re-registers the
+ * workspaces at a new root without touching the sessions — the session logs
+ * themselves stay consistent, because each log already sits in the project
+ * directory its own header names, and the backend keeps loading it:
  *
- * The repair is the one DSH itself would have to do: rewrite only the header
- * frame (or first line) so the `cwd` names the new placeholder, keep every
- * event frame byte for byte (history must keep reading exactly as written),
- * move the directory to the project key the new `cwd` implies, and let the
- * caller re-attach the id to the workspace registered at the new path.
+ * 1. The workspace registry filters a session out of membership when the
+ *    canonical cwd of its header differs from the workspace path, so every
+ *    older session drops out of its sidebar group.
+ * 2. The plugin's entry guard refuses a cwd on an old placeholder that no
+ *    registered workspace covers, so the session can no longer be used.
  *
- * The layout mirrors `@deepseek-ai/dsh-session-persistence-jsonl`; the
- * persistence service exposes no path or rename operation, so the file surgery
- * happens here. Sessions that are currently live are skipped — their writer
- * owns the file — and keep working through the superseded-root routing until
- * they are closed and the operator saves the root again.
+ * The repair restores both by moving the session to the new root: rewrite only
+ * the header frame (or first line) so the `cwd` names the new placeholder,
+ * keep every following byte — complete event frames and a torn final frame
+ * alike — exactly as written, and move the session directory to the project
+ * key the new `cwd` implies. The move is a whole-directory rename, so older
+ * format generations and the session lock travel with it.
+ *
+ * Sessions that are currently live are skipped: their writer owns the files.
+ * The workspace registry also caches session headers at startup, so attaching
+ * a just-moved session to its workspace is left to the caller to retry on the
+ * next plugin load, when the registry reads headers from disk again.
+ *
+ * The filename, segment-encoding, project-key, and frame-scanning rules mirror
+ * `@deepseek-ai/dsh-session-persistence-jsonl`; the persistence service
+ * exposes no path or rename operation, so the file surgery happens here.
  */
 
 const ZSTD_MAGIC = 0xfd2fb528
 const SESSION_FORMAT_VERSION = 4
 const CHECKSUM_OPTIONS = { params: { [zconst.ZSTD_c_checksumFlag]: 1 } }
-const LOG_NAME = /^session\.v(\d+)\.jsonl(?:\.zstd)?$/
+/**
+ * Generation filenames, DSH's canonical rule: generation 0 is written without
+ * a version tag (`session.jsonl[.zstd]`), later generations carry the tag. A
+ * literal `session.v0.jsonl` is explicitly not a committed generation and is
+ * ignored here, exactly like the backend ignores it.
+ */
+const LOG_NAME = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/
+/** Hard ceiling for the in-memory header rewrite; real session logs are far below it. */
+const MAX_REWRITE_BYTES = 64 * 1024 * 1024
+/** First read of a header probe; a header frame is a few hundred bytes. */
+const HEADER_PROBE_BYTES = 64 * 1024
 
 /** Whether this Node build can rewrite a Zstandard header frame. */
 export function zstdAvailable(): boolean {
@@ -41,7 +58,9 @@ export function zstdAvailable(): boolean {
  * Encode one Session id as a single safe path segment.
  *
  * Kept verbatim against `@deepseek-ai/dsh-session-persistence-jsonl`; a
- * divergence would move a log to a directory DSH does not look in.
+ * divergence would move a log to a directory DSH does not look in. The drift
+ * guard in {@link relocateSessions} turns any divergence into a loud failure
+ * instead of a silent move to a wrong directory.
  */
 export function encodeSegment(raw: string): string {
   if (raw.length === 0) throw new Error('cannot encode an empty path segment')
@@ -82,13 +101,18 @@ export function projectKey(cwd: string): string {
   return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
 }
 
-/** Whether `cwd` is the root itself or a path inside it, on either separator. */
+/**
+ * Whether `cwd` is the root itself or a path inside it.
+ *
+ * `path.relative` is used so Windows drive-letter and component case fold the
+ * way the filesystem folds it; a raw prefix comparison would miss a session
+ * whose header spells the same path with a different drive-letter case.
+ */
 function sitsUnder(cwd: string, root: string): boolean {
-  const trimmed = root.replace(/[\\/]+$/, '')
-  if (cwd === trimmed) return true
-  if (!cwd.startsWith(trimmed)) return false
-  const next = cwd[trimmed.length] ?? ''
-  return next === '/' || next === '\\'
+  const rel = relativePath(root, cwd)
+  if (rel === '') return true
+  if (rel.startsWith('..')) return false
+  return !(rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel))
 }
 
 /** The session's placeholder path moved from `oldRoot` to `newRoot`. */
@@ -96,19 +120,31 @@ export function mapPlaceholderCwd(cwd: string, oldRoot: string, newRoot: string)
   const trimmedOld = oldRoot.replace(/[\\/]+$/, '')
   const rest = cwd.slice(trimmedOld.length).replace(/^[\\/]+/, '')
   const trimmedNew = newRoot.replace(/[\\/]+$/, '')
-  return rest.length === 0 ? trimmedNew : `${trimmedNew}/${rest}`
+  return rest.length === 0 ? trimmedNew : joinPath(trimmedNew, rest)
 }
 
-/** Split a log into complete Zstandard frames without decompressing them. */
-function scanFrames(buffer: Buffer): Array<{ start: number, end: number }> {
+/** Structural scan result: complete frames plus an optional torn final frame. */
+interface FrameScan {
+  frames: Array<{ start: number, end: number }>
+  /** Start of an incomplete final frame; the backend treats it as committed prefix. */
+  tornStart?: number
+}
+
+/**
+ * Locate complete frames without decompressing their blocks, mirroring the
+ * backend's scanner including its tolerance: an incomplete final frame is a
+ * torn tail (a crash mid-append — DSH opens such logs as a committed prefix),
+ * not an error. Structural corruption inside a complete frame still throws.
+ */
+export function scanLogFrames(buffer: Buffer): FrameScan {
   const frames: Array<{ start: number, end: number }> = []
   let offset = 0
   while (offset < buffer.length) {
     const start = offset
-    if (buffer.length - offset < 4) throw new Error(`torn frame header at byte ${offset}`)
+    if (buffer.length - offset < 4) return { frames, tornStart: start }
     if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) throw new Error(`invalid frame magic at byte ${offset}`)
     offset += 4
-    if (offset === buffer.length) throw new Error(`torn frame header at byte ${start}`)
+    if (offset === buffer.length) return { frames, tornStart: start }
     const descriptor = buffer.readUInt8(offset)
     offset += 1
     if ((descriptor & 24) !== 0) throw new Error(`reserved frame-header bit at byte ${offset - 1}`)
@@ -119,10 +155,10 @@ function scanFrames(buffer: Buffer): Array<{ start: number, end: number }> {
     const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
     const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
     const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
-    if (buffer.length - offset < remainingHeaderBytes) throw new Error(`torn frame header at byte ${start}`)
+    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start }
     offset += remainingHeaderBytes
     for (;;) {
-      if (buffer.length - offset < 3) throw new Error(`torn block header at byte ${offset}`)
+      if (buffer.length - offset < 3) return { frames, tornStart: start }
       const blockHeader = buffer.readUIntLE(offset, 3)
       offset += 3
       const lastBlock = (blockHeader & 1) !== 0
@@ -133,89 +169,117 @@ function scanFrames(buffer: Buffer): Array<{ start: number, end: number }> {
       if (lastBlock) break
     }
     if (checksum) {
-      if (buffer.length - offset < 4) throw new Error(`torn frame checksum at byte ${offset}`)
+      if (buffer.length - offset < 4) return { frames, tornStart: start }
       offset += 4
     }
-    if (offset > buffer.length) throw new Error(`frame at byte ${start} runs past the end of the file`)
+    if (offset > buffer.length) return { frames, tornStart: start }
     frames.push({ start, end: offset })
   }
-  return frames
+  return { frames }
 }
 
-/** Parse a decompressed frame into its non-empty JSONL records. */
-function records(plaintext: Buffer): unknown[] {
-  const out: unknown[] = []
-  for (const line of plaintext.toString('utf8').split('\n')) {
-    if (line.trim().length === 0) continue
-    out.push(JSON.parse(line))
+/** Decode the newest log's header from a probed prefix or a complete buffer. */
+function decodeHeader(bytes: Buffer, compression: boolean): { header: Record<string, unknown>, headerEnd: number } {
+  if (compression) {
+    const scan = scanLogFrames(bytes)
+    if (scan.frames.length === 0) throw new Error('the log holds no complete header frame')
+    const text = zstdDecompressSync(bytes.subarray(scan.frames[0].start, scan.frames[0].end))
+    if (text.length === 0 || text.indexOf(10) !== text.length - 1) throw new Error('first frame is not exactly one header line')
+    return { header: JSON.parse(text.subarray(0, -1).toString('utf8')) as Record<string, unknown>, headerEnd: scan.frames[0].end }
   }
-  return out
+  const cut = bytes.indexOf(10)
+  if (cut < 0) throw new Error('the log has no newline after its header line')
+  return { header: JSON.parse(bytes.subarray(0, cut).toString('utf8')) as Record<string, unknown>, headerEnd: cut + 1 }
 }
 
 /**
- * Rewrite only the header of a log and leave every other frame untouched.
+ * Read just enough of a log to decode its header.
  *
- * The event frames are opaque on purpose: they are committed history, and the
- * old placeholder path inside messages must keep reading exactly as written.
- * The result is proven before it is returned — frame count unchanged, header
- * reads back with the new cwd, every following frame byte-identical.
+ * The scan phase runs over every stored session, so reading each log whole
+ * would drag hundreds of megabytes through I/O on a single settings save. A
+ * header frame is tiny; the probe starts at 64 KiB and grows only when it
+ * genuinely lands inside a larger first frame.
  */
-function rewriteHeader(buffer: Buffer, expectedId: string, to: string): Buffer {
-  const frames = scanFrames(buffer)
-  if (frames.length === 0) throw new Error('log has no frames')
-  const headerText = zstdDecompressSync(buffer.subarray(frames[0].start, frames[0].end))
-  if (headerText.length === 0 || headerText.indexOf(10) !== headerText.length - 1) {
-    throw new Error('first frame is not exactly one header line')
+async function readLogHeader(path: string, size: number): Promise<{ header: Record<string, unknown>, headerEnd: number, compression: boolean }> {
+  if (size === 0) throw new Error('the log is empty')
+  const handle = await open(path, 'r')
+  try {
+    let want = Math.min(size, HEADER_PROBE_BYTES)
+    for (;;) {
+      const chunk = Buffer.alloc(want)
+      const { bytesRead } = await handle.read(chunk, 0, want, 0)
+      const view = chunk.subarray(0, bytesRead)
+      const compression = view.length >= 4 && view.readUInt32LE(0) === ZSTD_MAGIC
+      try {
+        const decoded = decodeHeader(view, compression)
+        return { ...decoded, compression }
+      } catch (error) {
+        // A probe can stop inside the first frame; read more and retry. Any
+        // other failure (bad magic, corrupt block, no header record) is real.
+        const torn = compression && scanLogFrames(view).frames.length === 0
+        if (!torn || bytesRead >= size || bytesRead < want) throw error
+        want = Math.min(size, want * 4)
+      }
+    }
+  } finally {
+    await handle.close()
   }
-  const header = JSON.parse(headerText.subarray(0, -1).toString('utf8')) as Record<string, unknown>
+}
+
+/**
+ * Rewrite only the header of a log and leave every other byte untouched.
+ *
+ * Complete event frames and a torn final frame are preserved byte for byte:
+ * re-encoding them would change committed history, and the old placeholder
+ * path inside messages must keep reading exactly as written. The result is
+ * proven before it is returned — complete-frame count unchanged, header reads
+ * back with the new cwd, every following complete frame byte-identical, torn
+ * tail byte-identical.
+ */
+function rewriteHeader(buffer: Buffer, expectedId: string, to: string, compression: boolean): Buffer {
+  const scan = scanLogFrames(buffer)
+  if (scan.frames.length === 0) throw new Error('the log holds no complete header frame')
+  const first = scan.frames[0]
+  const decoded = decodeHeader(compression ? buffer.subarray(first.start, first.end) : buffer.subarray(0, first.end), compression)
+  const header = decoded.header
   if (header.type !== 'session') throw new Error(`first record is not a Session header (type ${String(header.type)})`)
   if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
   if (typeof header.cwd !== 'string' || header.cwd.length === 0) throw new Error('header carries no cwd')
   const rewritten = { ...header, version: header.version ?? SESSION_FORMAT_VERSION, cwd: to }
-  const frame = zstdCompressSync(Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8'), CHECKSUM_OPTIONS)
-  const bytes = Buffer.concat([frame, buffer.subarray(frames[0].end)])
-  const check = scanFrames(bytes)
-  if (check.length !== frames.length) throw new Error(`frame count changed: ${frames.length} → ${check.length}`)
-  const back = JSON.parse(zstdDecompressSync(bytes.subarray(check[0].start, check[0].end)).subarray(0, -1).toString('utf8')) as Record<string, unknown>
+  const plaintext = Buffer.from(`${JSON.stringify(rewritten)}\n`, 'utf8')
+  const head = compression ? zstdCompressSync(plaintext, CHECKSUM_OPTIONS) : plaintext
+  const bytes = Buffer.concat([head, buffer.subarray(first.end)])
+  const check = scanLogFrames(bytes)
+  if (check.frames.length !== scan.frames.length) {
+    throw new Error(`complete frame count changed: ${scan.frames.length} → ${check.frames.length}`)
+  }
+  const back = decodeHeader(compression ? bytes.subarray(check.frames[0].start, check.frames[0].end) : bytes.subarray(0, check.frames[0].end), compression).header
   if (back.cwd !== to) throw new Error('rewritten header does not read back with the new cwd')
-  for (let i = 1; i < frames.length; i += 1) {
-    const before = buffer.subarray(frames[i].start, frames[i].end)
-    const after = bytes.subarray(check[i].start, check[i].end)
+  if (back.id !== expectedId) throw new Error('rewritten header does not read back with the same id')
+  for (let i = 1; i < check.frames.length; i += 1) {
+    const before = buffer.subarray(scan.frames[i].start, scan.frames[i].end)
+    const after = bytes.subarray(check.frames[i].start, check.frames[i].end)
     if (before.length !== after.length || !before.equals(after)) throw new Error(`frame ${i} changed`)
+  }
+  if (scan.tornStart !== undefined) {
+    if (check.tornStart === undefined) throw new Error('the rewritten log lost its torn tail')
+    if (!bytes.subarray(check.tornStart).equals(buffer.subarray(scan.tornStart))) throw new Error('the torn tail changed')
   }
   return bytes
 }
 
-/** The same repair for an uncompressed log. */
-function rewritePlainHeader(buffer: Buffer, expectedId: string, to: string): Buffer {
-  const text = buffer.toString('utf8')
-  const cut = text.indexOf('\n')
-  if (cut < 0) throw new Error('log has no newline after the header')
-  const header = JSON.parse(text.slice(0, cut)) as Record<string, unknown>
-  if (header.type !== 'session') throw new Error('first record is not a Session header')
-  if (header.id !== expectedId) throw new Error(`header id ${String(header.id)} does not match directory ${expectedId}`)
-  return Buffer.from(`${JSON.stringify({ ...header, cwd: to })}\n${text.slice(cut + 1)}`, 'utf8')
-}
-
-/** Newest generation log in one session directory, as `name` plus version. */
-function newestLog(dir: string, names: string[]): { name: string, version: number } | undefined {
+/** Newest committed generation log in one session directory. */
+function newestLog(names: string[]): { name: string, version: number } | undefined {
   let best: { name: string, version: number } | undefined
   for (const name of names) {
     const match = LOG_NAME.exec(name)
     if (match === null) continue
-    const version = Number(match[1])
+    // A version-zero tag is not canonical; the backend ignores such names.
+    if (match[1] !== undefined && Number(match[1]) === 0) continue
+    const version = match[1] === undefined ? 0 : Number(match[1])
     if (best === undefined || version > best.version) best = { name, version }
   }
   return best
-}
-
-/** Read a session header without assuming a compression. */
-function readHeader(bytes: Buffer, name: string): Record<string, unknown> {
-  if (name.endsWith('.zstd')) {
-    const frames = scanFrames(bytes)
-    return JSON.parse(zstdDecompressSync(bytes.subarray(frames[0].start, frames[0].end)).subarray(0, -1).toString('utf8')) as Record<string, unknown>
-  }
-  return JSON.parse(bytes.toString('utf8').split('\n')[0]) as Record<string, unknown>
 }
 
 /** Outcome of one relocation pass over the session store. */
@@ -240,13 +304,20 @@ export interface RelocateOptions {
 }
 
 /**
- * Move every stored session whose header sits under `oldRoot` to `newRoot`.
+ * One relocation pass: move every stored session whose header sits under
+ * `oldRoot` to `newRoot`.
  *
- * Per-session failures are collected, not thrown: a migration that already
- * switched roots must not be failed by one stuck file, and the remaining rows
- * are reported so the operator hears about them. An old project directory is
- * removed only once it holds nothing, so a directory with foreign entries is
- * left alone.
+ * The session directory is renamed whole — atomic on one filesystem, and it
+ * carries the older format generations and the session lock with it — then the
+ * header is rewritten at the destination. Every step is idempotent: a run
+ * that died after the rename but before the rewrite finds its destination on
+ * the next run and finishes there; a run that died after the rewrite finds the
+ * destination already correct and only removes the leftover source copy.
+ *
+ * A destination that belongs to a different session is never overwritten; the
+ * clash is reported as a failure so the operator decides. Per-session failures
+ * are collected, not thrown: a migration that already switched roots must not
+ * be failed by one stuck file.
  */
 export async function relocateSessions(options: RelocateOptions): Promise<SessionRelocationSummary> {
   const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
@@ -263,7 +334,7 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
     throw error
   }
   const live = options.liveSessionIds ?? new Set<string>()
-  const touchedOldProjects = new Set<string>()
+  const touchedProjects = new Set<string>()
   for (const project of projects) {
     const projectDir = joinPath(sessionsRoot, project)
     let entries: string[]
@@ -280,49 +351,17 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
       } catch {
         continue
       }
-      const log = newestLog(dir, names)
+      const log = newestLog(names)
+      // A directory without a committed generation is not a session; the
+      // backend ignores it too.
       if (log === undefined) continue
-      let bytes: Buffer
-      let header: Record<string, unknown>
-      try {
-        bytes = await readFile(joinPath(dir, log.name))
-        header = readHeader(bytes, log.name)
-      } catch (error) {
-        summary.failed.push({ id: entry, reason: `unreadable log: ${text(error)}` })
-        continue
-      }
-      const cwd = header.cwd
-      if (typeof cwd !== 'string' || !sitsUnder(cwd, options.oldRoot)) continue
-      const id = typeof header.id === 'string' ? header.id : entry
-      if (live.has(id)) {
-        summary.skippedLive.push(id)
-        continue
-      }
-      const to = mapPlaceholderCwd(cwd, options.oldRoot, options.newRoot)
-      const targetDir = joinPath(sessionsRoot, projectKey(to), encodeSegment(id))
-      try {
-        if (resolvePath(dir) === resolvePath(targetDir)) continue
-        if (await exists(joinPath(targetDir, log.name))) {
-          throw new Error(`the destination already holds a log for ${id}`)
-        }
-        const rewritten = log.name.endsWith('.zstd')
-          ? rewriteHeader(bytes, id, to)
-          : rewritePlainHeader(bytes, id, to)
-        await publish(joinPath(targetDir, log.name), rewritten)
-        // Prove the move before the old copy disappears.
-        const check = await readFile(joinPath(targetDir, log.name))
-        const checkHeader = readHeader(check, log.name)
-        if (checkHeader.id !== id || checkHeader.cwd !== to) throw new Error('the new log does not read back with the moved identity')
-        if (log.name.endsWith('.zstd') && scanFrames(check).length !== scanFrames(bytes).length) throw new Error('the new log lost frames')
-        await rm(dir, { recursive: true, force: false })
-        touchedOldProjects.add(projectDir)
-        summary.relocated.push({ id, from: cwd, to })
-      } catch (error) {
-        summary.failed.push({ id, reason: text(error) })
-      }
+      const moved = await relocateSession(
+        { sessionsRoot, projectDir, dir, entry, logName: log.name, options, live, summary },
+      )
+      if (moved) touchedProjects.add(projectDir)
     }
   }
-  for (const projectDir of touchedOldProjects) {
+  for (const projectDir of touchedProjects) {
     try {
       if ((await readdir(projectDir)).length === 0) await rm(projectDir, { recursive: true, force: false })
     } catch {
@@ -332,14 +371,189 @@ export async function relocateSessions(options: RelocateOptions): Promise<Sessio
   return summary
 }
 
-/** Whether a path exists. */
-async function exists(path: string): Promise<boolean> {
+interface RelocateContext {
+  sessionsRoot: string
+  projectDir: string
+  dir: string
+  entry: string
+  logName: string
+  options: RelocateOptions
+  live: ReadonlySet<string>
+  summary: SessionRelocationSummary
+}
+
+/** Relocate one session directory; every failure is recorded on the summary. */
+async function relocateSession(context: RelocateContext): Promise<boolean> {
+  const { sessionsRoot, projectDir, dir, entry, logName, options, live, summary } = context
+  const fail = (id: string, reason: string): false => {
+    summary.failed.push({ id, reason })
+    return false
+  }
+  const logPath = joinPath(dir, logName)
+  let size: number
   try {
-    await stat(path)
+    size = (await stat(logPath)).size
+  } catch (error) {
+    return fail(entry, `unreadable log: ${text(error)}`)
+  }
+  let head: { header: Record<string, unknown>, headerEnd: number, compression: boolean }
+  try {
+    head = await readLogHeader(logPath, size)
+  } catch (error) {
+    return fail(entry, `unreadable header: ${text(error)}`)
+  }
+  const header = head.header
+  const cwd = header.cwd
+  if (header.type !== 'session' || typeof cwd !== 'string' || cwd.length === 0) return false
+  if (!sitsUnder(cwd, options.oldRoot)) return false
+  const id = typeof header.id === 'string' ? header.id : ''
+  if (id.length === 0) return fail(entry, 'header carries no id')
+  if (id !== entry) return fail(id, `directory name ${entry} does not match header id ${id}`)
+  const to = mapPlaceholderCwd(cwd, options.oldRoot, options.newRoot)
+  const destDir = joinPath(sessionsRoot, projectKey(to), encodeSegment(id))
+  // Layout drift guard: the directory this log sits in is named by DSH's own
+  // encoder, so it must be either the project key of the header's cwd or — for
+  // a run that renamed the directory but died before rewriting the header —
+  // the project key of the destination. Anything else means the encoders
+  // diverged and any destination computed here would be wrong: stop loudly.
+  const here = basename(projectDir)
+  const expectedProject = projectKey(cwd)
+  if (here !== expectedProject && here !== projectKey(to)) {
+    return fail(id, `project directory ${here} matches neither projectKey(cwd) ${expectedProject} nor projectKey(newCwd): the layout encoder drifted`)
+  }
+  if (live.has(id)) {
+    summary.skippedLive.push(id)
+    return false
+  }
+  if (resolvePath(dir) === resolvePath(destDir)) {
+    // Renamed by an earlier run that died before the rewrite: finish it here.
+    if (!(await rewriteLogAt(destDir, logName, id, to, head.compression, summary))) return false
+    summary.relocated.push({ id, from: cwd, to })
+    return true
+  }
+  let destExists = false
+  try {
+    destExists = (await stat(destDir)).isDirectory()
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return fail(id, text(error))
+  }
+  if (destExists) {
+    return reconcileExistingDestination({ ...context, destDir, id, from: cwd, to })
+  }
+  try {
+    await mkdir(dirname(destDir), { recursive: true })
+    // Whole-directory rename: atomic on one filesystem, and the older format
+    // generations and session lock travel with the newest log.
+    await rename(dir, destDir)
+  } catch (error) {
+    return fail(id, `could not move the session directory: ${text(error)}`)
+  }
+  if (!(await rewriteLogAt(destDir, logName, id, to, head.compression, summary))) return false
+  summary.relocated.push({ id, from: cwd, to })
+  return true
+}
+
+/**
+ * Finish or refuse when a directory already exists at the destination.
+ *
+ * The destination is authoritative when it already carries this session with
+ * the new cwd (an earlier run completed the rewrite and died before removing
+ * its source): the source is a stale copy and is removed. A destination whose
+ * header still names the old root was renamed but never rewritten — finish it
+ * in place. Anything else is reported instead of guessed at, so a clash never
+ * silently overwrites a log.
+ */
+async function reconcileExistingDestination(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
+  const { destDir, dir, id, from, to, options: _options, summary } = context
+  const fail = (reason: string): false => {
+    summary.failed.push({ id, reason })
+    return false
+  }
+  let names: string[]
+  try {
+    names = await readdir(destDir)
+  } catch (error) {
+    return fail(`unreadable destination: ${text(error)}`)
+  }
+  const destLog = newestLog(names)
+  if (destLog === undefined) return fail('the destination holds no committed generation to reconcile with')
+  const destPath = joinPath(destDir, destLog.name)
+  let destHeader: Record<string, unknown>
+  let size: number
+  try {
+    size = (await stat(destPath)).size
+    destHeader = (await readLogHeader(destPath, size)).header
+  } catch (error) {
+    return fail(`unreadable destination header: ${text(error)}`)
+  }
+  if (destHeader.id !== id) {
+    return fail(`the destination already holds session ${String(destHeader.id)}; refusing to overwrite it`)
+  }
+  if (destHeader.cwd === to) {
+    // Completed by an earlier run; only the stale source remains. The session
+    // is accounted for, so a moved signal lets the caller drop the old project
+    // directory when it emptied.
+    try {
+      await rm(dir, { recursive: true, force: false })
+      summary.relocated.push({ id, from, to })
+      return true
+    } catch (error) {
+      return fail(`the destination is already correct, but the stale source could not be removed: ${text(error)}`)
+    }
+  }
+  if (destHeader.cwd === from) {
+    // Renamed earlier and the rewrite never ran: finish it in place, then drop
+    // the stale source. A stuck source is reported but the session is already
+    // correct, so the next run's reconcile branch removes it.
+    const compression = destLog.name.endsWith('.zstd')
+    if (!(await rewriteLogAt(destDir, destLog.name, id, to, compression, summary))) return false
+    try {
+      await rm(dir, { recursive: true, force: false })
+    } catch (error) {
+      summary.failed.push({ id, reason: `the session was repaired at its destination, but the stale source could not be removed: ${text(error)}` })
+    }
+    summary.relocated.push({ id, from, to })
+    return true
+  }
+  return fail(`the destination header names ${String(destHeader.cwd)}, which is neither the old nor the new root; refusing to touch it`)
+}
+
+/**
+ * Rewrite the newest log's header inside its directory and prove the result.
+ *
+ * The file is read whole (bounded by {@link MAX_REWRITE_BYTES}), rewritten in
+ * memory, published through a temp file, and read back — the same
+ * self-verification before commitment the backend applies to its own writes.
+ */
+async function rewriteLogAt(
+  dir: string,
+  logName: string,
+  expectedId: string,
+  to: string,
+  compression: boolean,
+  summary: SessionRelocationSummary,
+): Promise<boolean> {
+  const path = joinPath(dir, logName)
+  try {
+    const size = (await stat(path)).size
+    if (size > MAX_REWRITE_BYTES) throw new Error(`the log is ${size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
+    const bytes = await readFile(path)
+    const rewritten = rewriteHeader(bytes, expectedId, to, compression)
+    await publish(path, rewritten)
+    // Read the published log back and prove it: header decodes with the moved
+    // identity, complete-frame count and torn-tail state are unchanged.
+    const published = await readFile(path)
+    const back = (await readLogHeader(path, published.length)).header
+    if (back.id !== expectedId) throw new Error(`the published log reads back with id ${String(back.id)}`)
+    if (back.cwd !== to) throw new Error(`the published log reads back with cwd ${String(back.cwd)}`)
+    const before = scanLogFrames(bytes)
+    const after = scanLogFrames(published)
+    if (after.frames.length !== before.frames.length) throw new Error('the published log lost complete frames')
+    if ((after.tornStart === undefined) !== (before.tornStart === undefined)) throw new Error('the published log changed the torn tail state')
     return true
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-    throw error
+    summary.failed.push({ id: expectedId, reason: `could not rewrite the header at ${path}: ${text(error)}` })
+    return false
   }
 }
 
@@ -354,15 +568,3 @@ async function publish(path: string, bytes: Buffer): Promise<void> {
 function text(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
-
-/** Records of one frame, exported for tests that assert on event history. */
-export function frameRecords(plaintext: Buffer): unknown[] {
-  return records(plaintext)
-}
-
-/** Frame scanner exported for tests that need byte ranges. */
-export function scanLogFrames(buffer: Buffer): Array<{ start: number, end: number }> {
-  return scanFrames(buffer)
-}
-
-export { sep }

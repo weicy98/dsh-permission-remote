@@ -809,16 +809,14 @@ export class Core {
       // Pin an explicit spelling, but a blank field that already resolves to the
       // default must not persist the default path (it would stop tracking it).
       if (trimmed.length > 0 && this.config.remoteRoot !== newRoot) await this.commitRemoteRoot(newRoot)
-      // Saving the root again is the documented way to catch up sessions that a
-      // migration had to skip because they were open: sweep every root this
-      // process migrated away from onto the current one.
-      const relocation = await this.relocateFromSupersededRoots(newRoot)
-      return {
-        status: 'unchanged',
-        oldRoot,
-        root: newRoot,
-        ...summaryCounts(relocation),
-      }
+      // Saving the root again catches up sessions an earlier migration had to
+      // skip because they were open: sweep every root this profile migrated
+      // away from onto the current one. A plain no-op save must not scan the
+      // store, so this only runs when such a root is actually known.
+      const roots = this.catchupRoots(newRoot)
+      if (roots.length === 0) return { status: 'unchanged', oldRoot, root: newRoot }
+      const relocation = await this.relocateFromRoots(roots, newRoot)
+      return { status: 'unchanged', oldRoot, root: newRoot, ...summaryCounts(relocation) }
     }
     const opened = this.remoteWorkspaceRows()
     // Plan before anything is asked or written: a target that is inside the old
@@ -905,13 +903,17 @@ export class Core {
     // server: an old placeholder that no registered workspace covers is then
     // refused by the entry guard instead of quietly becoming a local directory.
     addSupersededRoot(oldRoot)
-    // Move the stored sessions themselves before the old registrations
-    // disappear. Without this a session keeps pointing at the old root: its
-    // log sits in a project directory the new cwd contradicts, so DSH refuses
-    // to open it and the workspace service filters it from membership — the
-    // "migrated sessions vanish into Ungrouped" failure. Live sessions are
-    // skipped and keep routing until the operator closes them and saves again.
-    const relocation = await this.relocateStoredSessions(oldRoot, newRoot, created)
+    // Move the stored sessions onto the new root. Without this a session keeps
+    // naming the old root: the workspace registry filters it out of membership
+    // (it loses its sidebar group) and the entry guard refuses its cwd (it can
+    // no longer be used). Live sessions are skipped and keep routing until the
+    // operator closes them and saves again. Membership cannot be restored from
+    // this process — the registry caches headers at startup — so the moved ids
+    // are persisted and attached on the next plugin load.
+    const relocation = await this.relocateStoredSessions(oldRoot, newRoot)
+    this.recordSupersededRoot(oldRoot)
+    this.recordPendingGrouping(relocation)
+    await this.persistMigrationState()
     const stuck: string[] = []
     for (const item of relocating) {
       const local = this.placeholderAt(newRoot, item.hostId, item.remotePath)
@@ -931,66 +933,154 @@ export class Core {
   }
 
   /**
-   * Move stored sessions from every root this process migrated away from onto
-   * `current`, and account them to the workspace registered at their new
-   * placeholder. Used when saving the root that is already current: the
-   * catch-up pass for sessions a migration skipped while they were open.
+   * Roots an earlier migration left behind, for a catch-up sweep onto `current`.
+   *
+   * Reads both the persisted list (survives a restart) and the in-process one
+   * (a root migrated away from in this run), so the "close the session and
+   * save again" advice keeps working across restarts too.
    */
-  private async relocateFromSupersededRoots(current: string): Promise<SessionRelocationSummary> {
+  private catchupRoots(current: string): string[] {
+    const roots: string[] = []
+    for (const root of [...this.config.supersededRemoteRoots, ...supersededRootsSnapshot()]) {
+      if (resolveLocalPath(root) === resolveLocalPath(current)) continue
+      if (!roots.includes(root)) roots.push(root)
+    }
+    return roots
+  }
+
+  /** Move stored sessions from each of `roots` onto `newRoot`. */
+  private async relocateFromRoots(roots: readonly string[], newRoot: string): Promise<SessionRelocationSummary> {
     const summary: SessionRelocationSummary = { relocated: [], skippedLive: [], failed: [] }
-    for (const root of supersededRootsSnapshot()) {
-      if (root === current) continue
-      const part = await this.relocateStoredSessions(root, current, [])
+    for (const root of roots) {
+      const part = await this.relocateStoredSessions(root, newRoot)
       summary.relocated.push(...part.relocated)
       summary.skippedLive.push(...part.skippedLive)
       summary.failed.push(...part.failed)
     }
+    this.recordPendingGrouping(summary)
+    await this.persistMigrationState()
     return summary
   }
 
   /**
-   * Rewrite each stored session whose header names `oldRoot`, move its
-   * directory to the project key the new cwd implies, and attach the id to the
-   * workspace registered there.
+   * Move every stored session whose header names `oldRoot` onto `newRoot`.
    *
    * Nothing here may fail the migration: the tree copy and the registry switch
    * already succeeded, so a stuck file is collected and reported instead.
-   * Membership attach is best-effort too — a session whose workspace row cannot
-   * take it stays "Ungrouped", which the sidebar tolerates and a re-save fixes.
+   * Membership is deliberately not attached here — the registry caches session
+   * headers at startup, so an immediate attach would validate against the
+   * stale cwd and throw; {@link resumeSessionMigrationState} retries on the
+   * next load with headers rebuilt from disk.
    */
-  private async relocateStoredSessions(oldRoot: string, newRoot: string, preferRows: readonly WorkspaceLike[]): Promise<SessionRelocationSummary> {
+  private async relocateStoredSessions(oldRoot: string, newRoot: string): Promise<SessionRelocationSummary> {
+    const live = this.liveSessionIds()
+    try {
+      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
+      // A scan failure is one error, not "every live session was skipped".
+      return { relocated: [], skippedLive: [], failed: [{ id: '*', reason: `the session store could not be scanned: ${errorText(error)}` }] }
+    }
+  }
+
+  /** Ids of sessions with a live writer; their files must never be moved. */
+  private liveSessionIds(): Set<string> {
     const live = new Set<string>()
     const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
     for (const agent of agents?.list?.() ?? []) {
       const id = agent.session?.id
       if (typeof id === 'string' && id.length > 0) live.add(id)
     }
-    let summary: SessionRelocationSummary
-    try {
-      summary = await relocateSessions({ oldRoot, newRoot, liveSessionIds: live })
-    } catch (error) {
-      this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
-      return { relocated: [], skippedLive: [...live], failed: [] }
+    return live
+  }
+
+  /** Remember a migrated-away root in the persisted list (also feeds routing). */
+  private recordSupersededRoot(root: string): void {
+    const resolved = resolveLocalPath(root)
+    if (!this.config.supersededRemoteRoots.some(item => resolveLocalPath(item) === resolved)) {
+      this.config.supersededRemoteRoots = [...this.config.supersededRemoteRoots, resolved]
     }
-    if (summary.relocated.length === 0 && summary.failed.length === 0) return summary
-    const rows = [...preferRows, ...this.workspaces.list()]
+  }
+
+  /** Queue every moved session for a membership attach on a later load. */
+  private recordPendingGrouping(summary: SessionRelocationSummary): void {
+    const known = new Set(this.config.pendingSessionGrouping.map(entry => entry.id))
+    const added: Array<{ path: string, id: string }> = []
     for (const row of summary.relocated) {
-      const target = rows.find(item => resolveLocalPath(item.path) === resolveLocalPath(row.to))
-      const attach = target?.attachSession
-      if (attach === undefined) continue
-      try {
-        await attach.call(target, row.id)
-      } catch (error) {
-        this.ctx.logger?.warn(`[@dsh-permission-remote] session ${row.id} moved to ${row.to} but could not join its workspace: ${errorText(error)}`)
-      }
+      if (known.has(row.id)) continue
+      known.add(row.id)
+      added.push({ path: row.to, id: row.id })
     }
+    if (added.length > 0) this.config.pendingSessionGrouping = [...this.config.pendingSessionGrouping, ...added]
     if (summary.failed.length > 0) {
-      this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root to ${newRoot}: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
+      this.ctx.logger?.warn(`[@dsh-permission-remote] ${summary.failed.length} session(s) could not follow the remote root: ${summary.failed.map(item => `${item.id} (${item.reason})`).join('; ')}`)
     }
     if (summary.skippedLive.length > 0) {
-      this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on ${oldRoot}; closing them and saving the root again moves them`)
+      this.ctx.logger?.info(`[@dsh-permission-remote] left ${summary.skippedLive.length} open session(s) on the old root; closing them and saving the root again moves them`)
     }
-    return summary
+  }
+
+  /** Persist the migration bookkeeping next to the host rows. */
+  private async persistMigrationState(): Promise<void> {
+    const row = this.ctx.settings.describe().find(item => String(item.ns) === 'permission-remote')
+    if (row === undefined) {
+      this.ctx.logger?.warn('[@dsh-permission-remote] settings row "permission-remote" is missing; the session migration bookkeeping was not persisted')
+      return
+    }
+    await this.ctx.settings.update(String(row.ns), {
+      supersededRemoteRoots: this.config.supersededRemoteRoots,
+      pendingSessionGrouping: this.config.pendingSessionGrouping,
+    })
+  }
+
+  /**
+   * Resume what an earlier run could not finish, from the plugin load.
+   *
+   * Restores the persisted superseded roots into the router (a session still
+   * on one must be refused as a remote placeholder, not silently treated as a
+   * local directory), sweeps them onto the current root, and attaches the
+   * sessions that were moved earlier. The registry rebuilds its header index
+   * per process, so an attach that had to fail mid-migration succeeds here —
+   * that is why the pending list is persisted instead of retried on the spot.
+   */
+  async resumeSessionMigrationState(): Promise<void> {
+    for (const root of this.config.supersededRemoteRoots) addSupersededRoot(root)
+    if (this.config.pendingSessionGrouping.length === 0 && this.config.supersededRemoteRoots.length === 0) return
+    const roots = this.catchupRoots(remoteRoot())
+    if (roots.length > 0) await this.relocateFromRoots(roots, remoteRoot())
+    await this.flushPendingSessionGrouping()
+  }
+
+  /**
+   * Attach each pending session to the workspace now registered at its path.
+   *
+   * Success removes the entry; a failure keeps it for the next load (the
+   * registry may still be indexing, or the workspace row may have been
+   * renamed since). Attaching is idempotent, so a retry after a partial run is
+   * safe.
+   */
+  async flushPendingSessionGrouping(): Promise<void> {
+    if (this.config.pendingSessionGrouping.length === 0) return
+    const rows = this.workspaces.list()
+    const remaining: Array<{ path: string, id: string }> = []
+    for (const entry of this.config.pendingSessionGrouping) {
+      const target = rows.find(item => resolveLocalPath(item.path) === resolveLocalPath(entry.path))
+      const attach = target?.attachSession
+      if (target === undefined || attach === undefined) {
+        remaining.push(entry)
+        continue
+      }
+      try {
+        await attach.call(target, entry.id)
+      } catch (error) {
+        remaining.push(entry)
+        this.ctx.logger?.warn(`[@dsh-permission-remote] session ${entry.id} is at ${entry.path} but could not join its workspace yet: ${errorText(error)}`)
+      }
+    }
+    if (remaining.length !== this.config.pendingSessionGrouping.length) {
+      this.config.pendingSessionGrouping = remaining
+      await this.persistMigrationState()
+    }
   }
 
   /** Workspaces whose placeholder still routes, including ones registered during a copy. */
@@ -1280,6 +1370,12 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   }
   void core.autoTagWorkspaces().catch(error => {
     ctx.logger?.warn(`[@dsh-permission-remote] workspace title tagging failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
+  // Resume what an earlier root migration could not finish: sweep sessions
+  // still on a persisted old root and restore the workspace groups that had to
+  // wait for this load. Runs after load so a failure cannot block the plugin.
+  void core.resumeSessionMigrationState().catch(error => {
+    ctx.logger?.warn(`[@dsh-permission-remote] could not resume the session migration state: ${error instanceof Error ? error.message : String(error)}`)
   })
   ctx.logger?.info('[@dsh-permission-remote] loaded')
 }

@@ -132,6 +132,7 @@
   "remoteRootForce": "Migrate anyway",
   "remoteRootSessionsMoved": "sessions moved",
   "remoteRootSessionsOpen": "Open sessions were left in place; close them and save again to move them",
+  "remoteRootSessionsRegroup": "grouping is restored after DSH restarts",
   "remoteRootSessionsFailed": "failed",
   "remoteRootConflicts": "The target already has different files with the same names:",
   "remoteRootConflictHint": "Keep the target's files (add only missing ones), or overwrite them from the old root.",
