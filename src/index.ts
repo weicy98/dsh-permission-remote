@@ -1334,6 +1334,43 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   void api
 
   const seen = new Set<AgentLike>()
+  const denied = new Map<AgentLike, () => void>()
+  const disarmRemoteDeny = (agent: AgentLike) => {
+    const remove = denied.get(agent)
+    if (remove === undefined) return
+    remove()
+  }
+  const armRemoteDeny = (agent: AgentLike) => {
+    if (denied.has(agent)) return
+    let removeGuard: (() => void) | undefined
+    try {
+      removeGuard = agent.ctx.tools.guard(() => REMOTE_SURFACE_UNMOUNTED)
+    } catch (error) {
+      ctx.logger?.warn(`[@dsh-permission-remote] remote tools stay unmounted and local tools could not be denied for agent ${agentLabel(agent)}: ${errorText(error)}`)
+      return
+    }
+    let dropped = false
+    const drop = () => {
+      if (dropped) return
+      dropped = true
+      denied.delete(agent)
+      unregisters.delete(drop)
+      try {
+        removeGuard?.()
+      } catch (error) {
+        ctx.logger?.warn(`[@dsh-permission-remote] remote deny guard removal failed for agent ${agentLabel(agent)}: ${errorText(error)}`)
+      }
+    }
+    denied.set(agent, drop)
+    unregisters.add(drop)
+    // Plugin unload runs `unregisters`. That does not run when only this agent
+    // is destroyed, and `denied` would keep the agent alive.
+    try {
+      agent.ctx.effect(() => drop)
+    } catch (error) {
+      ctx.logger?.warn(`[@dsh-permission-remote] remote deny guard is not tied to agent ${agentLabel(agent)}: ${errorText(error)}`)
+    }
+  }
   const attach = (agent: AgentLike) => {
     if (seen.has(agent)) return
     seen.add(agent)
@@ -1341,15 +1378,32 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     try {
       installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) })
     } catch (error) {
+      // Shadows did not register. A remote session would otherwise keep the
+      // official tools and run them in the placeholder directory.
+      if (!installed && sessionIsRemote(ctx, agent)) armRemoteDeny(agent)
       throw error
     } finally {
       if (!installed) seen.delete(agent)
     }
+    disarmRemoteDeny(agent)
   }
   ctx.on('agent/created', ({ agent }) => attach(agent))
   const agents = ctx.get('agents') as { list?: () => AgentLike[] } | undefined
   if (typeof agents?.list === 'function') {
-    for (const agent of agents.list()) attach(agent)
+    // These agents predate this plugin load, so each one is already running
+    // somewhere. One agent whose shadows cannot mount must not abort the sweep:
+    // a throw out of `apply` fails the plugin load, and then NO session gets
+    // the remote surface. A remote agent that cannot arm is denied every tool
+    // call until a later install succeeds. A local failure still leaves the
+    // official tools. New agents keep fail-closed creation through the listener
+    // above. The next plugin load retries an agent that did not arm.
+    for (const agent of agents.list()) {
+      try {
+        attach(agent)
+      } catch (error) {
+        ctx.logger?.warn(`[@dsh-permission-remote] shadow install failed for agent ${agentLabel(agent)}: ${errorText(error)}`)
+      }
+    }
   }
   void core.autoTagWorkspaces().catch(error => {
     ctx.logger?.warn(`[@dsh-permission-remote] workspace title tagging failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -1814,8 +1868,19 @@ function releaseShadows(disposeDynamic: () => void, disposers: Array<() => void>
   return failure ?? permanent
 }
 
+/** Returned for every tool while a remote agent has no mounted shadows. */
+const REMOTE_SURFACE_UNMOUNTED = 'SSH tools did not mount for this remote workspace, so tool calls are refused'
+
 function agentLabel(agent: AgentLike): string {
   return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'
+}
+
+function sessionIsRemote(ctx: HostContext, agent: AgentLike): boolean {
+  try {
+    return routeByCwd(effectiveCwd(ctx, { agent }, agent.session?.header?.cwd)).kind === 'remote'
+  } catch {
+    return false
+  }
 }
 
 function withRemoteTimeout(definition: object): object {

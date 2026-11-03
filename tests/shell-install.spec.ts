@@ -268,7 +268,7 @@ test('powershell and cmd are denied only when they are restrictable', async () =
   assert.deepEqual(session.denies, ['pwsh'])
 })
 
-test('a non-unknown restrict error fails remote agent creation and drops both registration sets', async () => {
+test('a non-unknown restrict error fails remote agent creation, drops both registration sets, and refuses every tool', async () => {
   const session = surface({
     headerCwd: remoteCwd,
     restrictError: name => name === 'powershell' ? new Error('tools registry is closed') : undefined,
@@ -278,7 +278,11 @@ test('a non-unknown restrict error fails remote agent creation and drops both re
   assert.equal(session.activeTools().length, 0)
   assert.deepEqual(session.denies, [])
   assert.equal(session.activeSections().length, 0)
-  assert.equal(session.activeGuards(), 0)
+  // Official bash/read stay registered after the throw. The unmounted-surface
+  // guard refuses every name until a later install removes it.
+  assert.equal(session.activeGuards(), 1)
+  assert.match(session.guard('bash') ?? '', /did not mount/)
+  assert.match(session.guard('pwsh') ?? '', /did not mount/)
   assert.equal(session.restrictCalls.includes('powershell'), true)
   assert.equal(session.restrictCalls.includes('cmd'), false)
 })

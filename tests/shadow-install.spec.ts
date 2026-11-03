@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
+import { SshPool } from '../src/ssh-pool.ts'
 
 const remoteCwd = mapRemoteToLocal('host1', '/srv/app')!
 
@@ -23,7 +27,7 @@ function agentFor(cwd: string, register: (definition: { name: string }) => () =>
         get: (_name?: string): { execute: () => Promise<unknown> } | undefined => ({ execute: async () => 'official' }),
         register,
         restrict: () => () => undefined,
-        guard: () => () => undefined,
+        guard: (_guard: (execution: { name: string }) => string | undefined) => () => undefined,
       },
       systemPrompt: {
         section: () => () => undefined,
@@ -45,6 +49,8 @@ function agentFor(cwd: string, register: (definition: { name: string }) => () =>
 function plugin(): Context {
   const ctx = new Context()
   ctx.provide('settings', settings())
+  // `secretOf` runs through the credentials service on every remote call.
+  ctx.provide('credentials', { readRecord: async () => undefined, modifyRecord: async () => undefined })
   return ctx
 }
 
@@ -377,13 +383,94 @@ test('terminal_open refuses on a remote workspace and still calls the local tool
   assert.deepEqual(official, ['terminal_open'])
 })
 
-test('an existing remote agent that cannot be shadowed fails plugin load', () => {
+test('an existing remote agent that cannot be shadowed refuses every tool call', () => {
   const ctx = plugin()
+  const warnings: string[] = []
+  ;(ctx as unknown as { logger: { info(message: string): void, warn(message: string): void } }).logger = { info: () => undefined, warn: (message: string) => { warnings.push(message) } }
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
   const { agent } = agentFor(remoteCwd, () => {
     throw new Error('register failed')
   })
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => {
+      const index = guards.indexOf(guard)
+      if (index >= 0) guards.splice(index, 1)
+    }
+  }
   ctx.provide('agents', { list: () => [agent] })
-  assert.throws(() => apply(ctx, { hosts: [], maxConnections: 4 }), /register failed/)
+  // Failing the load here used to leave EVERY session bare. This one agent
+  // stays up, but its official bash/read would run in the placeholder, so
+  // every tool call is refused until a later install mounts the shadows.
+  assert.doesNotThrow(() => apply(ctx, { hosts: [], maxConnections: 4 }))
+  assert.equal(warnings.some(message => message.includes('register failed')), true)
+  assert.equal(guards.length, 1)
+  assert.match(guards[0]!({ name: 'bash' }) ?? '', /did not mount/)
+  assert.match(guards[0]!({ name: 'ssh_exec' }) ?? '', /did not mount/)
+})
+
+test('destroying the agent drops the deny guard', () => {
+  const ctx = plugin()
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
+  const { agent, cleanups } = agentFor(remoteCwd, () => {
+    throw new Error('register failed')
+  })
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => {
+      const index = guards.indexOf(guard)
+      if (index >= 0) guards.splice(index, 1)
+    }
+  }
+  ctx.provide('agents', { list: () => [agent] })
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  assert.equal(guards.length, 1)
+  for (const cleanup of cleanups) cleanup()
+  assert.equal(guards.length, 0)
+  for (const cleanup of cleanups) cleanup()
+  assert.equal(guards.length, 0)
+})
+
+test('an existing local agent that cannot be shadowed keeps its official tools', () => {
+  const ctx = plugin()
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
+  const { agent } = agentFor('/tmp/not-a-remote-workspace', () => {
+    throw new Error('register failed')
+  })
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => undefined
+  }
+  ctx.provide('agents', { list: () => [agent] })
+  assert.doesNotThrow(() => apply(ctx, { hosts: [], maxConnections: 4 }))
+  assert.equal(guards.length, 0)
+})
+
+test('a later successful install removes the deny guard', async () => {
+  const ctx = plugin()
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
+  const registered: string[] = []
+  let fail = true
+  const { agent } = agentFor(remoteCwd, () => () => undefined)
+  agent.ctx.tools.register = ((definition: { name: string }) => {
+    if (fail) throw new Error('register failed')
+    registered.push(definition.name)
+    return () => undefined
+  }) as typeof agent.ctx.tools.register
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => {
+      const index = guards.indexOf(guard)
+      if (index >= 0) guards.splice(index, 1)
+    }
+  }
+  ctx.provide('agents', { list: () => [agent] })
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  assert.match(guards[0]!({ name: 'read' }) ?? '', /did not mount/)
+  fail = false
+  await created(ctx, agent)
+  assert.equal(registered.includes('bash'), true)
+  assert.equal(guards.some(guard => /did not mount/.test(guard({ name: 'bash' }) ?? '')), false)
 })
 
 test('working_directory output carries the remote directory as an optional field', async () => {
@@ -461,4 +548,111 @@ test('working_directory merges remote into the real official schema, not a repla
   assert.ok(schema!.properties?.remote)
   // `remote` is optional: required still lists only cwd.
   assert.deepEqual(schema!.required, ['cwd'])
+})
+
+test('present runs the official tool after staging the remote bytes', async () => {
+  const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  const tools: Array<{ name: string, output?: { schema?: Record<string, unknown> }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  let seen: unknown
+  const official = {
+    name: 'present',
+    description: 'official delivery',
+    output: { schema: { type: 'object', additionalProperties: false, properties: { turn: { type: 'integer' } }, required: ['turn'] } },
+    execute: async (args: unknown) => {
+      seen = args
+      return { turn: 1, files: [] }
+    },
+  }
+  const { agent } = agentFor(remoteCwd, definition => {
+    tools.push(definition as never)
+    return () => undefined
+  })
+  agent.ctx.tools.get = ((name?: string) => name === 'present' ? official : { execute: async () => 'official' }) as typeof agent.ctx.tools.get
+  await created(ctx, agent)
+  const present = tools.find(tool => tool.name === 'present')
+  assert.ok(present, 'present must be shadowed so the remote session can deliver')
+  // The official argument and output schemas are preserved: only the path values
+  // change, never the shape the model or the log sees.
+  assert.deepEqual(present!.output?.schema, official.output.schema)
+
+  // A missing host is the signal that remote staging was reached: the wrapper
+  // refuses there, before the official execute would record a delivery for a
+  // path the local backend cannot open.
+  await assert.rejects(
+    () => present!.execute({ files: [{ path: 'out/report.pdf' }] }, { agent }),
+    /not configured/,
+  )
+  assert.equal(seen, undefined)
+})
+
+test('a remote delivery leaves openable bytes at the staged path', async () => {
+  // The delivery card and the official tool both read the local filesystem, so
+  // the wrapper has to leave a real file at the path it presents. Point the
+  // placeholder root inside this workspace so the test copy is allowed and
+  // clean up afterwards.
+  const root = await mkdtemp(join(process.cwd(), '.present-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  const { setRemoteRootOverride } = await import('../src/router.ts')
+  try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const ctx = pluginWithWorkspaces([cwd], cwd)
+    apply(ctx, { hosts: [{ id: 'host1', name: 'dev', host: '10.0.0.5', port: 22, username: 'me', auth: 'key', privateKeyPath: '', fingerprint: 'SHA256:abc', opsPolicy: 'ask' }], maxConnections: 4 })
+    const originalStat = SshPool.prototype.sftpStat
+    const originalRead = SshPool.prototype.sftpRead
+    SshPool.prototype.sftpStat = async () => ({ isDirectory: false, size: 3 })
+    SshPool.prototype.sftpRead = async () => Buffer.from('pdf')
+    const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+    let presented: { files: Array<{ path: string, description?: string }> } | undefined
+    const { agent } = agentFor(cwd, definition => {
+      tools.push(definition as never)
+      return () => undefined
+    })
+    agent.ctx.tools.get = ((name?: string) => name === 'present'
+      ? { execute: async (args: { files: Array<{ path: string, description?: string }> }) => { presented = args; return { turn: 1, files: args.files } } }
+      : { execute: async () => 'official' }) as typeof agent.ctx.tools.get
+    try {
+      await created(ctx, agent)
+      const present = tools.find(tool => tool.name === 'present')
+      await present!.execute({ files: [{ path: 'out/report.pdf', description: 'the report' }] }, { agent })
+    } finally {
+      SshPool.prototype.sftpStat = originalStat
+      SshPool.prototype.sftpRead = originalRead
+    }
+    assert.ok(presented, 'the official tool runs once the bytes are staged')
+    const staged = presented!.files[0]!
+    assert.match(staged.path, /host1/)
+    assert.equal(staged.description, 'the report', 'the description survives staging')
+    assert.equal(await readFile(staged.path, 'utf8'), 'pdf')
+  } finally {
+    setRemoteRootOverride(null)
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('one unarmable agent does not stop the startup sweep from arming the rest', async () => {
+  const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
+  const warnings: string[] = []
+  ;(ctx as unknown as { logger: { info(message: string): void, warn(message: string): void } }).logger = { info: () => undefined, warn: (message: string) => { warnings.push(message) } }
+  // The failing agent is listed first: with an unguarded sweep its throw used
+  // to escape `apply`, which fails the plugin load and leaves EVERY session
+  // bare — a remote workspace then runs bash/pwsh on this computer.
+  const bad = agentFor(remoteCwd, () => {
+    throw new Error('register failed')
+  }).agent
+  const healthy: Array<{ name: string }> = []
+  const good = agentFor(remoteCwd, definition => {
+    healthy.push(definition as never)
+    return () => undefined
+  }).agent
+  ctx.provide('agents', { list: () => [bad, good] })
+  await assert.doesNotReject(() => Promise.resolve(apply(ctx, { hosts: [], maxConnections: 4 })))
+  const names = healthy.map(tool => tool.name)
+  assert.equal(names.includes('bash'), true, 'the agent after the failed one must still get its shadows')
+  assert.equal(names.includes('terminal_open'), true)
+  assert.equal(names.includes('present'), true)
+  assert.equal(warnings.some(message => message.includes('register failed')), true, 'the failed agent is named in the log')
 })
