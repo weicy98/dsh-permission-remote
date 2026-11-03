@@ -350,6 +350,10 @@ class SshApi extends TypertRemoteService {
 export class Core {
   /** Migration bookkeeping loaded from its sidecar file; see `migration-state.ts`. */
   private migrationState: MigrationState = emptyMigrationState()
+  /** Single-flight load of the sidecar, awaited before any state is mutated. */
+  private migrationStateLoaded: Promise<void> | null = null
+  /** False when the sidecar exists but could not be read; never overwrite then. */
+  private migrationStateWritable = true
 
   readonly pool: SshPool
   private config: PluginConfig
@@ -804,6 +808,9 @@ export class Core {
    * authoritative root.
    */
   async changeRemoteRoot(inputRoot: string, opts: { strategy?: MigrationStrategy, force: boolean, acceptedConflicts?: readonly string[] }): Promise<RemoteRootChange> {
+    // The detached resume may still be loading the sidecar; never mutate on the
+    // empty placeholder or the load would replace what this call recorded.
+    await this.ensureMigrationStateLoaded()
     const oldRoot = remoteRoot()
     const trimmed = inputRoot.trim()
     // A blank field means "go back to the built-in default", so the operator can
@@ -1096,6 +1103,10 @@ export class Core {
    * means its group is restored by a later successful sweep.
    */
   private async persistMigrationState(): Promise<void> {
+    if (!this.migrationStateWritable) {
+      this.ctx.logger?.warn('[@dsh-permission-remote] the migration bookkeeping was not readable this run; leaving the file untouched rather than overwriting it')
+      return
+    }
     try {
       await writeMigrationState(this.migrationState)
     } catch (error) {
@@ -1103,11 +1114,27 @@ export class Core {
     }
   }
 
+  /**
+   * Load the sidecar once, before any code path mutates migration state.
+   *
+   * `resumeSessionMigrationState` runs detached from `apply`, so a "save and
+   * migrate" can arrive before the load finishes; both entry points await this
+   * single-flight promise, so a mutation never runs on the empty placeholder
+   * and the load can never replace already-recorded entries.
+   */
+  private ensureMigrationStateLoaded(): Promise<void> {
+    if (this.migrationStateLoaded === null) this.migrationStateLoaded = this.loadMigrationState()
+    return this.migrationStateLoaded
+  }
+
   /** Load the sidecar bookkeeping into this instance (plugin load). */
   private async loadMigrationState(): Promise<void> {
-    const { state, problem } = await readMigrationState()
+    const { state, problem, readError } = await readMigrationState()
     this.migrationState = state
-    if (problem !== undefined) this.ctx.logger?.warn(`[@dsh-permission-remote] ${problem}; starting from empty bookkeeping`)
+    // A file that exists but could not be read must not be overwritten: writing
+    // the empty fallback would destroy bookkeeping we merely lacked access to.
+    this.migrationStateWritable = readError !== true
+    if (problem !== undefined) this.ctx.logger?.warn(`[@dsh-permission-remote] ${problem}${readError === true ? '; it will not be overwritten this run' : '; starting from empty bookkeeping'}`)
   }
 
   /**
@@ -1121,7 +1148,7 @@ export class Core {
    * that is why the pending list is persisted instead of retried on the spot.
    */
   async resumeSessionMigrationState(): Promise<void> {
-    await this.loadMigrationState()
+    await this.ensureMigrationStateLoaded()
     for (const root of this.migrationState.supersededRemoteRoots) addSupersededRoot(root)
     if (this.migrationState.pendingSessionGrouping.length === 0 && this.migrationState.supersededRemoteRoots.length === 0) return
     // Only sessions queued by an EARLIER load can be attached now: anything the

@@ -109,12 +109,16 @@ export function projectKey(cwd: string): string {
  * way the filesystem folds it; a raw prefix comparison would miss a session
  * whose header spells the same path with a different drive-letter case.
  */
+function isEscapingRelative(rel: string): boolean {
+  // A real parent escape only: `..` alone or `..` followed by a separator. A
+  // sibling literally named `..cache` is inside the root, not outside it.
+  return rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../')
+}
+
 function sitsUnderRoot(cwd: string, root: string): boolean {
   const rel = relativePath(root, cwd)
   if (rel === '') return true
-  // Only a real parent escape is outside the root; a sibling named `..cache`
-  // must not be mistaken for one (hence the separator, not just a prefix).
-  if (rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../')) return false
+  if (isEscapingRelative(rel)) return false
   return !(rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel))
 }
 
@@ -158,7 +162,7 @@ export function mapPlaceholderCwd(cwd: string, olds: readonly string[], newRoot:
     const trimmedOld = old.replace(/[\\/]+$/, '')
     const rest = relativePath(trimmedOld, cwd)
     if (rest === '') return trimmedNew
-    if (rest.startsWith('..') || rest.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rest)) continue
+    if (isEscapingRelative(rest) || rest.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rest)) continue
     return joinPath(trimmedNew, rest)
   }
   // No spelling contains it; fall back to the lexical prefix strip so a caller
@@ -749,14 +753,32 @@ async function publish(path: string, bytes: Buffer): Promise<void> {
  * its group back.
  */
 export async function sessionLogExists(dshHome: string, cwd: string, id: string): Promise<boolean> {
-  const dir = joinPath(dshHome, 'sessions', projectKey(cwd), encodeSegment(id))
-  let names: string[]
+  const segment = encodeSegment(id)
+  const sessionsRoot = joinPath(dshHome, 'sessions')
+  // Fast path: the spelling the path was recorded with.
   try {
-    names = await readdir(dir)
+    if (newestLog(await readdir(joinPath(sessionsRoot, projectKey(cwd), segment))) !== undefined) return true
+  } catch {
+    // Fall through to the full search.
+  }
+  // A symlinked root makes the recorded path's `projectKey` name a different
+  // folder than the one the log actually lives in, and `realpath` cannot
+  // recover the lexical spelling. Session ids are unique, so look the segment
+  // up across every project directory instead of trusting the path.
+  let projects: string[]
+  try {
+    projects = await readdir(sessionsRoot)
   } catch {
     return false
   }
-  return newestLog(names) !== undefined
+  for (const project of projects) {
+    try {
+      if (newestLog(await readdir(joinPath(sessionsRoot, project, segment))) !== undefined) return true
+    } catch {
+      // Not in this project directory; keep looking.
+    }
+  }
+  return false
 }
 
 /** Whether a pid still exists on this host (used to decide a temp file is orphaned). */

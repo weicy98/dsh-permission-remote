@@ -46,9 +46,15 @@ export function emptyMigrationState(): MigrationState {
   return { supersededRemoteRoots: [], pendingSessionGrouping: [] }
 }
 
-/** Where the bookkeeping lives for this DSH home. */
+/**
+ * Where the bookkeeping lives for this DSH home.
+ *
+ * Under the plugin's own `data/` directory, alongside other plugins' state, not
+ * in `storages/` — that is DSH's own storage-unit directory and enumerating or
+ * relocating it should stay DSH's business.
+ */
 export function migrationStatePath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env.DSH_HOME || undefined, env), 'storages', STATE_FILE_NAME)
+  return join(resolveDshHome(env.DSH_HOME || undefined, env), 'data', 'dsh-permission-remote', STATE_FILE_NAME)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -114,20 +120,40 @@ function serialize(state: MigrationState): string {
  * lost pending attach (the session stays where it was moved to, merely
  * ungrouped), which a later migration rebuilds — so this never throws.
  */
-export async function readMigrationState(env: NodeJS.ProcessEnv = process.env): Promise<{ state: MigrationState, problem?: string }> {
+export interface ReadMigrationStateResult {
+  state: MigrationState
+  /** A human-readable note when the file was absent-but-corrupt or a newer shape. */
+  problem?: string
+  /**
+   * The file exists but could not be read (EACCES/EBUSY/…). Distinct from a
+   * missing or corrupt file: the caller must NOT overwrite it, or it would
+   * clobber bookkeeping it simply was not allowed to see.
+   */
+  readError?: boolean
+}
+
+export async function readMigrationState(env: NodeJS.ProcessEnv = process.env): Promise<ReadMigrationStateResult> {
   let text: string
   try {
     text = await readFile(migrationStatePath(env), 'utf8')
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
+    // Missing is the normal first run — safe to write a fresh document later.
     if (code === 'ENOENT') return { state: emptyMigrationState() }
-    return { state: emptyMigrationState(), problem: `the migration bookkeeping could not be read: ${code ?? String(error)}` }
+    return { state: emptyMigrationState(), problem: `the migration bookkeeping could not be read: ${code ?? String(error)}`, readError: true }
   }
+  let raw: unknown
   try {
-    return { state: parseMigrationState(JSON.parse(text)) }
+    raw = JSON.parse(text)
   } catch {
+    // Corrupt but readable: degrade to empty and allow a rewrite to heal it.
     return { state: emptyMigrationState(), problem: 'the migration bookkeeping file is not valid JSON' }
   }
+  const state = parseMigrationState(raw)
+  if (isRecord(raw) && raw.version !== undefined && raw.version !== STATE_VERSION) {
+    return { state, problem: `the migration bookkeeping was written by a different version (${String(raw.version)}); reading what it can` }
+  }
+  return { state }
 }
 
 /**

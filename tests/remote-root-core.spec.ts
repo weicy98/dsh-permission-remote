@@ -9,7 +9,7 @@ import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { readConfig, type HostConfig } from '../src/config.ts'
 import { Core } from '../src/index.ts'
 import { clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, remoteRoot, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
-import { encodeSegment, projectKey, relocateSessions, scanLogFrames } from '../src/session-relocate.ts'
+import { encodeSegment, projectKey, relocateSessions, scanLogFrames, sessionLogExists } from '../src/session-relocate.ts'
 import { readMigrationState, writeMigrationState, migrationStatePath } from '../src/migration-state.ts'
 import { workspaceRoute, type WorkspaceLike } from '../src/workspaces.ts'
 
@@ -1157,6 +1157,28 @@ test('a queued session survives a root edit that makes its path unroutable', asy
     again.applyRemoteRootOverride()
     await again.resumeSessionMigrationState()
     assert.deepEqual((await sidecar(box)).pendingSessionGrouping, [])
+  } finally {
+    await dispose(box)
+  }
+})
+
+test('sessionLogExists finds a log recorded under the other root spelling', async () => {
+  const box = await harness()
+  try {
+    const realRoot = join(box.box, 'real-new')
+    const linkRoot = join(box.box, 'link-new')
+    await mkdir(realRoot, { recursive: true })
+    await symlink(realRoot, linkRoot)
+    // The log lives under the LEXICAL spelling's project directory (the cwd the
+    // migration writes names the configured newRoot), while a recorded pending
+    // path may be the canonical one.
+    const lexical = join(linkRoot, 'host1', encodeRemotePath('/srv/app'))
+    const canonical = join(await realpath(linkRoot), 'host1', encodeRemotePath('/srv/app'))
+    assert.notEqual(projectKey(lexical), projectKey(canonical))
+    await seedStoredLog(join(box.box, 'sessions', projectKey(lexical), encodeSegment('session-x')), 'session-x', lexical, { events: [] })
+    assert.equal(await sessionLogExists(box.box, lexical, 'session-x'), true)
+    assert.equal(await sessionLogExists(box.box, canonical, 'session-x'), true)
+    assert.equal(await sessionLogExists(box.box, canonical, 'session-absent'), false)
   } finally {
     await dispose(box)
   }

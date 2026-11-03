@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -127,6 +127,23 @@ test('migration bookkeeping lives in its own file, not in the settings schema', 
     const sanitized = await readMigrationState(env)
     assert.deepEqual(sanitized.state.supersededRemoteRoots, ['/', 'C:\\old'])
     assert.deepEqual(sanitized.state.pendingSessionGrouping, [{ path: '/a', id: 's1' }])
+  } finally {
+    await rm(box, { recursive: true, force: true })
+  }
+})
+
+test('a bookkeeping file from another version is read but reported', async () => {
+  const box = await mkdtemp(join(tmpdir(), 'dsh-mig-ver-'))
+  const env = { DSH_HOME: box } as NodeJS.ProcessEnv
+  try {
+    await writeMigrationState({ supersededRemoteRoots: ['/old'], pendingSessionGrouping: [] }, env)
+    const raw = JSON.parse(await readFile(migrationStatePath(env), 'utf8'))
+    raw.version = 999
+    raw.pendingSessionGrouping = [{ path: '/a', id: 's1' }]
+    await writeFile(migrationStatePath(env), JSON.stringify(raw), 'utf8')
+    const result = await readMigrationState(env)
+    assert.ok(result.problem !== undefined && /version/.test(result.problem))
+    assert.deepEqual(result.state.pendingSessionGrouping, [{ path: '/a', id: 's1' }])
   } finally {
     await rm(box, { recursive: true, force: true })
   }
