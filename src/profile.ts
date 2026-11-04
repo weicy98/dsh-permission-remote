@@ -149,11 +149,19 @@ export function globArgv(rg: string, pattern: string): string[] {
  * `mode` is the target's existing permission bits; only `undefined` (a new file)
  * keeps the remote umask. Mode `000` is a real value and must be restored.
  */
-export function atomicWriteScript(directory: string, tmp: string, target: string, mode?: number): string {
+export function atomicWriteScript(directory: string, tmp: string, target: string, mode?: number, options: { noClobber?: boolean } = {}): string {
   const quotedTarget = shJoin([target])
+  const quotedTmp = shJoin([tmp])
   const bits = mode === undefined ? undefined : mode & 0o7777
   const chmod = bits === undefined ? '' : ` && chmod ${bits.toString(8)} ${quotedTarget}`
-  const write = `if test -d ${quotedTarget}; then echo 'remote path is a directory' >&2; false; else cat > ${shJoin([tmp])} && mv -f ${shJoin([tmp, target])}${chmod}; fi`
-  const cleanup = `{ status=$?; rm -f ${shJoin([tmp])}; exit $status; }`
+  // `mv -n` is the atomic no-clobber publication. It leaves the temp file in
+  // place when the destination exists; checking that condition lets the caller
+  // report a typed conflict instead of a generic write failure, even if a
+  // non-cooperating writer creates the target between the guard and the rename.
+  const rename = options.noClobber === true
+    ? `mv -n ${quotedTmp} ${quotedTarget} || true; if [ -e ${quotedTmp} ]; then if [ -e ${quotedTarget} ] || [ -L ${quotedTarget} ]; then echo 'remote target already exists' >&2; fi; false; fi`
+    : `mv -f ${quotedTmp} ${quotedTarget}`
+  const write = `if test -d ${quotedTarget}; then echo 'remote path is a directory' >&2; false; else cat > ${quotedTmp} && ${rename}${chmod}; fi`
+  const cleanup = `{ status=$?; rm -f ${quotedTmp}; exit $status; }`
   return `mkdir -p ${shJoin([directory])} && ${write} || ${cleanup}`
 }

@@ -98,3 +98,10 @@ test('an unreported mode leaves the new file on the remote umask', () => {
   const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/file', undefined)
   assert.doesNotMatch(script, /chmod/)
 })
+
+test('a createIfAbsent write uses an atomic no-clobber rename and reports collisions', () => {
+  const script = atomicWriteScript('/srv/app', '/srv/app/.dsh-tmp', '/srv/app/new.txt', undefined, { noClobber: true })
+  assert.match(script, /mv -n '\/srv\/app\/\.dsh-tmp' '\/srv\/app\/new\.txt'/)
+  assert.match(script, /remote target already exists/)
+  assert.match(script, /rm -f '\/srv\/app\/\.dsh-tmp'/)
+})

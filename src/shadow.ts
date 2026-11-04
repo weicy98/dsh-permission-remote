@@ -1,13 +1,14 @@
 /**
  * Tool shadowing for one agent.
  *
- * Presets register bash/read/write/edit/read_image/glob/grep on an ancestor
- * scope. A registration on the root context does not cover them. The wrapper
- * must close over the official execute captured BEFORE register: a later get()
- * returns the wrapper and recurses.
+ * Presets register their tools on an ancestor scope. A registration on the
+ * root context does not cover them. The wrapper must close over the official
+ * execute captured BEFORE register: a later get() returns the wrapper and
+ * recurses. `read`, `write`, and `edit` are deliberately absent: the remote
+ * filesystem backend serves them through the official tools.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'] as const
+export const ROUTED_TOOLS = ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
 
 /**

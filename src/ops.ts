@@ -4,7 +4,6 @@ import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig, OpsPolicy } from './config.ts'
 import {
   capturedText,
-  resolveCreatedPath,
   throwIfAborted,
   withSignal,
   type ApprovalDetail,
@@ -12,6 +11,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { atomicWriteScript } from './profile.ts'
+import { resolveCreatedPath } from './remote-write.ts'
 import { normalizeRemoteDirectory } from './router.ts'
 import { shJoin } from './shell-quote.ts'
 import { isSftpMissing, type SecretMaterial } from './ssh-pool.ts'
@@ -169,7 +169,7 @@ export async function runSshRead(hostApi: ToolHost, host: HostConfig, args: Reco
   throwIfAborted(exec?.signal)
   const secret = await hostApi.secretOf(host)
   const remotePath = await resolveOpsPath(hostApi, host, secret, String(args.file_path ?? ''))
-  const bytes = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP), exec?.signal)
+  const bytes = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP, exec?.signal), exec?.signal)
   const text = bytes.toString('utf8')
   const all = text.split(/\n/)
   const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1
@@ -282,7 +282,7 @@ export async function runSshWrite(hostApi: ToolHost, host: HostConfig, args: Rec
     const info = await withSignal(hostApi.pool.sftpStat(host, secret, target), exec.signal)
     if (info.isDirectory) throw new Error(`remote path is a directory: ${target}`)
     mode = info.mode
-    before = (await withSignal(hostApi.pool.sftpRead(host, secret, target, READ_CAP), exec.signal)).toString('utf8')
+    before = (await withSignal(hostApi.pool.sftpRead(host, secret, target, READ_CAP, exec.signal), exec.signal)).toString('utf8')
   } catch (error) {
     if (exec.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
     if (!isRemoteMissing(error)) throw error

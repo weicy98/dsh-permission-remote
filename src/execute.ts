@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -10,21 +9,16 @@ import {
   SandboxUnavailableError,
   WIDER_MODES,
   approveEscalation,
-  escalationHintMarker,
-  sandboxDenialMarker,
   validateEscalationArgs,
   type SandboxMode,
 } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig } from './config.ts'
 import { distroInstallFor, parseOsRelease, type DistroInstall } from './install-commands.ts'
-import { composeCreatedPath } from './contain.ts'
+import { remoteRoots } from './remote-write.ts'
 import {
-  atomicWriteScript,
-  bwrapFileProfileArgs,
   bwrapProfileArgs,
   bwrapProbeArgv,
   fileWritableRoots,
-  fileWriteAllowed,
   globArgv,
   grepArgv,
   sandboxDenied,
@@ -103,9 +97,6 @@ export interface ToolHost {
     }): string
   }
 }
-
-const denialMarker = sandboxDenialMarker
-const hintMarker = escalationHintMarker
 
 /** Remote kernel and machine type, without the rest of a full probe. */
 export async function remoteFacts(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<HostFacts> {
@@ -252,9 +243,10 @@ export async function cacheRgBinary(platform: string, binary: Buffer, env: NodeJ
   return target
 }
 
-export async function effectiveMode(host: ToolHost, exec: ToolExec, args: { sandbox_permissions?: string, justification?: string }, toolName: string, subject: string): Promise<SandboxMode> {
-  return host.resolveMode(exec, args.sandbox_permissions, args.justification, toolName, subject)
+export async function effectiveMode(host: ToolHost, exec: ToolExec, args: { sandbox_permissions?: string, justification?: string }, toolName: string, subject: string, detail?: ApprovalDetail): Promise<SandboxMode> {
+  return host.resolveMode(exec, args.sandbox_permissions, args.justification, toolName, subject, detail)
 }
+
 
 const SANDBOX_MODES: readonly SandboxMode[] = ['read-only', 'workspace-write', 'danger-full-access']
 
@@ -314,9 +306,8 @@ function appendLine(base: string, line: string): string {
   return line.length === 0 ? base : `${base}\n${line}`
 }
 
-async function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
-  const workspaceRoot = await canonicalRemotePath(pool, host, secret, workspace)
-  return { workspaceRoot, tmp: status.roots.tmp, userTmp: status.roots.userTmp }
+function rootsFor(status: RunnerStatus, workspace: string, pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteFileRoots> {
+  return remoteRoots(status, workspace, pool, host, secret)
 }
 
 /**
@@ -346,14 +337,6 @@ async function existingRemotePath(pool: SshPool, host: HostConfig, secret: Secre
     return await pool.sftpRealpath(host, secret, remotePath)
   } catch (error) {
     if (isSftpMissing(error)) return ''
-    return posix.normalize(remotePath)
-  }
-}
-
-async function canonicalRemotePath(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
-  try {
-    return await pool.sftpRealpath(host, secret, remotePath)
-  } catch {
     return posix.normalize(remotePath)
   }
 }
@@ -415,16 +398,6 @@ function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileR
   }
   const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
   return seatbeltBashCommand(mode, writable, workdir, body)
-}
-
-/** File writes bind the real temp directories. Bash keeps its private tmpfs. */
-function fileCommand(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, script: string): string {
-  if (status.sandboxTool === 'bwrap') {
-    const profile = bwrapFileProfileArgs(mode, roots) ?? []
-    return shJoin(['bwrap', ...profile, '--chdir', roots.workspaceRoot, '--', 'bash', '-c', script])
-  }
-  const writable = mode === 'workspace-write' ? fileWritableRoots(mode, roots) : []
-  return seatbeltBashCommand(mode, writable, roots.workspaceRoot, script)
 }
 
 export interface BackgroundOutcome {
@@ -503,76 +476,6 @@ async function startBackground(
   return { kind: 'background', jobId: id, cwd }
 }
 
-export async function runRead(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
-  throwIfAborted(exec?.signal)
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const bytes = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, READ_CAP), exec?.signal)
-  const text = bytes.toString('utf8')
-  const all = text.split(/\n/)
-  const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1
-  const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : 2000
-  const slice = all.slice(offset - 1, offset - 1 + limit)
-  return {
-    path: toModelPath(remotePath, route),
-    offset,
-    lines: slice.map((line, index) => ({ number: offset + index, text: line })),
-    totalLines: all.length,
-  }
-}
-
-export async function runWrite(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const status = await hostApi.statusOf(host)
-  const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'write', 'operation')
-  const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
-  const target = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
-  if (!fileWriteAllowed(mode, target, roots)) {
-    throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
-  }
-  let before: string | null = null
-  try {
-    before = (await withSignal(hostApi.pool.sftpRead(host, secret, target, READ_CAP), exec.signal)).toString('utf8')
-  } catch (error) {
-    if (exec.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
-    before = null
-  }
-  const content = String(args.content ?? '')
-  await commitFile(hostApi, host, secret, status, mode, roots, target, content, exec.signal)
-  return {
-    path: toModelPath(target, route),
-    operation: before === null ? 'create' : 'update',
-    before,
-    after: content,
-  }
-}
-
-export async function runEdit(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec: ToolExec): Promise<Record<string, unknown>> {
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const status = await hostApi.statusOf(host)
-  const mode = await effectiveMode(hostApi, exec, args as { sandbox_permissions?: string, justification?: string }, 'edit', 'operation')
-  const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
-  const real = await resolveCreatedPath(hostApi.pool, host, secret, remotePath)
-  if (!fileWriteAllowed(mode, real, roots)) {
-    throw new FsError(`${denialMarker(mode)}\n${hintMarker('operation')}`, 'FS_SANDBOX_DENIED')
-  }
-  const before = (await withSignal(hostApi.pool.sftpRead(host, secret, real, READ_CAP), exec.signal)).toString('utf8')
-  const oldString = String(args.old_string ?? '')
-  const newString = String(args.new_string ?? '')
-  const replaceAll = args.replace_all === true
-  const count = before.split(oldString).length - 1
-  if (count === 0) throw new Error(`old_string was not found in ${toModelPath(real, route)}`)
-  if (!replaceAll && count !== 1) throw new Error(`old_string matched ${count} times; pass replace_all or include more context`)
-  const after = replaceAll ? before.replaceAll(oldString, newString) : before.replace(oldString, newString)
-  await commitFile(hostApi, host, secret, status, mode, roots, real, after, exec.signal)
-  return { path: toModelPath(real, route), before, after }
-}
-
 export async function runReadImage(
   hostApi: ToolHost,
   route: RemoteRoute,
@@ -584,7 +487,7 @@ export async function runReadImage(
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
   const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP), exec?.signal)
+  const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP, exec?.signal), exec?.signal)
   const image = await save(data, posix.basename(remotePath))
   return { path: toModelPath(remotePath, route), image }
 }
@@ -718,7 +621,7 @@ export async function stagePresentFiles(
     }
     let data: Buffer
     try {
-      data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP), exec?.signal)
+      data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP, exec?.signal), exec?.signal)
     } catch (error) {
       if (exec?.signal?.aborted === true) throw error
       const message = error instanceof Error ? error.message : String(error)
@@ -823,48 +726,6 @@ export async function runWorkingDirectory(
   if (exec.agent === undefined) throw new Error('working_directory requires an agent Session')
   const cwd = await setDirectory(local)
   return { cwd, remote }
-}
-
-export async function resolveCreatedPath(pool: SshPool, host: HostConfig, secret: SecretMaterial, lexicalPath: string): Promise<string> {
-  let cursor = posix.normalize(lexicalPath)
-  const missing: string[] = []
-  while (true) {
-    try {
-      const real = await pool.sftpRealpath(host, secret, cursor)
-      return composeCreatedPath(real, missing)
-    } catch {
-      if (cursor === '/') return composeCreatedPath('/', missing)
-      missing.unshift(posix.basename(cursor))
-      const parent = posix.dirname(cursor)
-      if (parent === cursor) return composeCreatedPath(cursor, missing)
-      cursor = parent
-    }
-  }
-}
-
-async function commitFile(
-  hostApi: ToolHost,
-  host: HostConfig,
-  secret: SecretMaterial,
-  status: RunnerStatus,
-  mode: SandboxMode,
-  roots: RemoteFileRoots,
-  target: string,
-  content: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  throwIfAborted(signal)
-  if (mode !== 'danger-full-access' && !status.sandbox.available) {
-    throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
-  }
-  const directory = posix.dirname(target)
-  const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
-  const script = atomicWriteScript(directory, tmp, target)
-  const wrapped = mode === 'danger-full-access'
-    ? script
-    : fileCommand(status, mode, roots, script)
-  const result = await hostApi.pool.exec(host, secret, wrapped, 20_000, signal, content)
-  if (result.code !== 0) throw new Error(result.stderr || 'remote write failed')
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {

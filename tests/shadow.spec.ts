@@ -10,8 +10,8 @@ test('shadow plans close over the official execute captured before register', as
       return 'local'
     },
   }
-  const plans = planShadows(name => name === 'read' || name === 'bash' ? official : undefined)
-  assert.deepEqual(plans.map(plan => plan.name), ['bash', 'read'])
+  const plans = planShadows(name => name === 'read_image' || name === 'bash' ? official : undefined)
+  assert.deepEqual(plans.map(plan => plan.name), ['bash', 'read_image'])
   const bash = plans[0]!
   const result = await dispatchShadow(bash.official, false, async () => {
     calls.push('remote')
@@ -48,4 +48,11 @@ test('present is routed so a remote session can deliver a file', () => {
   const present = plans.find(plan => plan.name === 'present')
   assert.ok(present, 'present must appear in the routed tool list')
   assert.ok(present!.official, 'the official execute is captured for delegation')
+})
+
+test('official read, write, and edit tools stay outside the shadow plan', () => {
+  const plans = planShadows(name => ({ execute: async () => name }))
+  const names = plans.map(plan => String(plan.name))
+  assert.deepEqual(names, ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'])
+  assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit'), false)
 })

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { clearStagedPresentFiles, finishBackground, runBash, runEdit, runGlob, runWorkingDirectory, runWrite, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { clearStagedPresentFiles, finishBackground, runBash, runGlob, runWorkingDirectory, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -127,54 +127,6 @@ test('a glob that exits 2 is still a command failure', async () => {
     () => runGlob(api, route, { pattern: '*.ts' }, {}),
     (error: unknown) => error instanceof Error && error.name === 'Error' && error.message === 'rg exploded',
   )
-})
-
-test('cancelling a write does not turn the read into a missing file', async () => {
-  const controller = new AbortController()
-  controller.abort()
-  let writes = 0
-  const api = {
-    pool: {
-      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
-      sftpRead: () => new Promise<Buffer>(() => undefined),
-      exec: async () => {
-        writes += 1
-        return { ...killed(), code: 0, signal: null }
-      },
-    } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'danger-full-access' as const,
-  } satisfies ToolHost
-  await assert.rejects(
-    () => runWrite(api, route, { file_path: '/srv/app/note.txt', content: 'next' }, { signal: controller.signal }),
-    (error: unknown) => error instanceof Error && error.name === 'AbortError',
-  )
-  assert.equal(writes, 0)
-})
-
-test('a missing file is still created', async () => {
-  let writes = 0
-  const api = {
-    pool: {
-      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
-      sftpRead: async () => {
-        throw new Error('ENOENT')
-      },
-      exec: async () => {
-        writes += 1
-        return { ...killed(), code: 0, signal: null }
-      },
-    } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'danger-full-access' as const,
-  } satisfies ToolHost
-  const written = await runWrite(api, route, { file_path: '/srv/app/note.txt', content: 'next' }, {})
-  assert.equal(written.operation, 'create')
-  assert.equal(writes, 1)
 })
 
 test('a foreground bash result survives a JSON round trip', async () => {
@@ -320,33 +272,6 @@ test('the snapshot stays inside bwrap and seatbelt', async () => {
   assert.match(seatbelt.command(), /FROM_RC/)
   assert.match(seatbelt.command(), /printf READY/)
   assert.doesNotMatch(seatbelt.command(), /--noprofile/)
-})
-
-test('a file write does not load startup files', async () => {
-  let command = ''
-  const api = {
-    pool: {
-      sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
-      sftpRead: async () => {
-        throw new Error('ENOENT')
-      },
-      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
-        command = argv
-        return { ...killed(), code: 0, signal: null }
-      },
-    } as unknown as SshPool,
-    hostOf: () => ({ ...host, loginEnv: true }),
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'danger-full-access' as const,
-    loginEnvOf: async () => {
-      throw new Error('file writes must not read startup files')
-    },
-  } satisfies ToolHost
-  const written = await runWrite(api, route, { file_path: '/srv/app/note.txt', content: 'next' }, {})
-  assert.equal(written.operation, 'create')
-  assert.doesNotMatch(command, /__dsh_login/)
-  assert.doesNotMatch(command, /--noprofile/)
 })
 
 test('working_directory reports the remote directory alongside the placeholder', async () => {
@@ -498,43 +423,6 @@ test('workspace-write binds the live directory when the header is not on this ho
   assert.match(local.command(), /'--bind' '\/private\/srv\/app\/src' '\/private\/srv\/app\/src'/)
   assert.doesNotMatch(local.command(), /'--bind' '\/srv\/app' '\/srv\/app'/)
   assert.doesNotMatch(local.command(), /'--bind' '\/srv' '\/srv'/)
-})
-
-test('workspace-write file tools keep the pin when the session has cd to /etc', async () => {
-  const opened = mapRemoteToLocal('host1', '/srv/app')!
-  let command = ''
-  let writes = 0
-  const api = {
-    pool: {
-      sftpRealpath: async (_host: HostConfig, _secret: unknown, path: string) => path,
-      sftpRead: async () => Buffer.from('before'),
-      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
-        writes += 1
-        command = argv
-        return { ...killed(), code: 0, signal: null }
-      },
-    } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => bwrapStatus,
-    resolveMode: async () => 'workspace-write' as const,
-  } satisfies ToolHost
-  const atEtc: RemoteRoute = { ...route, remoteCwd: '/etc', placeholderCwd: mapRemoteToLocal('host1', '/etc')! }
-  const exec = { agent: { session: { header: { cwd: opened } } } }
-  await assert.rejects(
-    () => runWrite(api, atEtc, { file_path: '/etc/passwd', content: 'x' }, exec),
-    /file access denied under workspace-write/,
-  )
-  await assert.rejects(
-    () => runEdit(api, atEtc, { file_path: '/etc/passwd', old_string: 'a', new_string: 'b' }, exec),
-    /file access denied under workspace-write/,
-  )
-  assert.equal(writes, 0)
-  const written = await runWrite(api, atEtc, { file_path: '/srv/app/note.txt', content: 'next' }, exec)
-  assert.equal(written.operation, 'update')
-  assert.match(command, /'--bind' '\/srv\/app' '\/srv\/app'/)
-  assert.match(command, /'--chdir' '\/srv\/app'/)
-  assert.doesNotMatch(command, /'--bind' '\/etc'/)
 })
 
 test('working_directory rejects a remote directory that does not exist', async () => {

@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises'
 import { join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
-import { FsError } from '@deepseek-ai/dsh-fs'
+import { FsError, type FsTarget, type FsVersion } from '@deepseek-ai/dsh-fs'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { ESCALATION_TARGETS } from '@deepseek-ai/dsh-sandbox'
 import { ToolArgsError, parameterSchemaSpecToJsonSchema, validateArgs, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
@@ -19,13 +19,10 @@ import {
   remoteFacts,
   probeHost,
   runBash,
-  runEdit,
   runGlob,
   runGrep,
   runWorkingDirectory,
-  runRead,
   runReadImage,
-  runWrite,
   clearStagedPresentFiles,
   stagePresentFiles,
   throwIfAborted,
@@ -56,7 +53,7 @@ import {
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
-import { installRemoteFs } from './remote-fs.ts'
+import { installRemoteFs, remoteFsInstalled } from './remote-fs.ts'
 import { installRemoteUploads } from './uploads.ts'
 import {
   createdWorkspaceTitle,
@@ -96,7 +93,9 @@ interface HostContext {
   }
   workspaceRegistry: WorkspaceRegistryLike
   get(service: string): unknown
+  emit?(event: 'fs/observed', target: FsTarget, observation: { kind: 'present', version: FsVersion }, actor: unknown): void
   on(event: 'agent/created', listener: (payload: { agent: AgentLike }) => void): () => void
+  on(event: 'approval/request', listener: (request: ApprovalRequestLike, next: () => Promise<unknown>) => Promise<unknown>): () => void
   /** Fired after any surface writes a settings section (`ns` is its id). */
   on(event: 'settings/document-updated', listener: (ns: unknown, revision: number) => void): () => void
   /**
@@ -131,7 +130,8 @@ interface AgentContext {
     getContextOrder(name: string): number
   }
   get(service: string): unknown
-  on(event: 'session/event', listener: (session: unknown, event: { type: string, data?: { cwd?: string } }) => void): () => void
+  on(event: 'session/event', listener: (session: unknown, event: { type: string, data?: { cwd?: string, callId?: string, name?: string, arguments?: string } }) => void): () => void
+  on(event: 'approval/request', listener: (request: ApprovalRequestLike, next: () => Promise<unknown>) => Promise<unknown>): () => void
   on(event: 'system-prompt/assemble', listener: (assembly: PromptToolsAssembly, context: PromptAssembleContext, next: () => Promise<PromptToolsAssembly>) => Promise<PromptToolsAssembly>): () => void
   effect(dispose: () => void): void
 }
@@ -139,6 +139,14 @@ interface AgentContext {
 interface AgentLike {
   ctx: AgentContext
   session?: { header?: { cwd?: string }, id?: string }
+}
+
+interface ApprovalRequestLike {
+  agent: AgentLike
+  toolName: string
+  callId?: string
+  reason?: string
+  displayReason?: { en: string, [locale: string]: string }
 }
 
 interface GrantPayload {
@@ -386,6 +394,9 @@ export class Core {
   private readonly remoteTrees = new Set<(hostId: string) => void>()
   /** The first apply installs the configured root; only a later change keeps the previous one routable. */
   private remoteRootApplied = false
+  /** tool/call args for the approval-detail bridge, bounded and per session. */
+  private readonly toolCalls = new Map<string, { filePath?: string, cwd?: string }>()
+  private readonly sessionCwds = new Map<string, string>()
 
   constructor(
     private readonly ctx: HostContext,
@@ -1498,6 +1509,66 @@ export class Core {
     return opened.kind === 'remote' && opened.hostId === route.hostId
   }
 
+  /** Record the live cwd and raw tool-call args for approval presentation. */
+  rememberSessionEvent(sessionId: string | undefined, event: { type: string, data?: { cwd?: string, callId?: string, name?: string, arguments?: string } }): void {
+    if (sessionId === undefined) return
+    if (event.type === 'working-directory/change' && typeof event.data?.cwd === 'string') {
+      this.sessionCwds.set(sessionId, event.data.cwd)
+      if (this.sessionCwds.size > 1024) {
+        const oldest = this.sessionCwds.keys().next().value
+        if (oldest !== undefined) this.sessionCwds.delete(oldest)
+      }
+      return
+    }
+    if (event.type !== 'tool/call' || typeof event.data?.callId !== 'string') return
+    if (event.data.name !== 'write' && event.data.name !== 'edit') return
+    let filePath: string | undefined
+    if (typeof event.data.arguments === 'string') {
+      try {
+        const parsed = JSON.parse(event.data.arguments) as { file_path?: unknown }
+        if (typeof parsed.file_path === 'string') filePath = parsed.file_path
+      } catch {
+        // A malformed/truncated argument string only loses presentation detail.
+      }
+    }
+    this.toolCalls.set(`${sessionId}\0${event.data.callId}`, { filePath, cwd: this.sessionCwds.get(sessionId) })
+    if (this.toolCalls.size > 1024) {
+      const oldest = this.toolCalls.keys().next().value
+      if (oldest !== undefined) this.toolCalls.delete(oldest)
+    }
+  }
+
+  toolCallDetail(sessionId: string | undefined, callId: string | undefined): { filePath?: string, cwd?: string } | undefined {
+    if (sessionId === undefined || callId === undefined) return undefined
+    return this.toolCalls.get(`${sessionId}\0${callId}`)
+  }
+
+  forgetSession(sessionId: string | undefined): void {
+    if (sessionId === undefined) return
+    this.sessionCwds.delete(sessionId)
+    const prefix = `${sessionId}\0`
+    for (const key of this.toolCalls.keys()) {
+      if (key.startsWith(prefix)) this.toolCalls.delete(key)
+    }
+  }
+
+  /** Probe data for the fs write path, without exposing the whole Core. */
+  async statusOf(host: HostConfig): Promise<RunnerStatus> {
+    return this.probe(host.id)
+  }
+
+  /**
+   * Whether the session that supplied a sandbox policy was opened on `hostId`.
+   * A policy without a session cannot prove that boundary, so it is refused.
+   */
+  allowsRemoteSession(sessionId: string | undefined, hostId: string): boolean {
+    if (sessionId === undefined || sessionId.length === 0) return false
+    const agents = this.ctx.get('agents') as { list?: () => AgentLike[] } | undefined
+    const agent = (agents?.list?.() ?? []).find(item => String(item.session?.id ?? '') === sessionId)
+    if (agent === undefined) return false
+    return this.allowsRemoteCwd({ kind: 'remote', hostId, remoteCwd: '/', placeholderCwd: '/' }, agent.session?.header?.cwd)
+  }
+
   toolHost(jobs: ToolHost['jobs']): ToolHost {
     return {
       pool: this.pool,
@@ -1568,9 +1639,6 @@ function markRemote(service: SshApi): void {
  */
 const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
-  read: (host, route, args, exec) => runRead(host, route, args, exec),
-  write: (host, route, args, exec) => runWrite(host, route, args, exec),
-  edit: (host, route, args, exec) => runEdit(host, route, args, exec),
   read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
     const attachments = ctx.get('attachments') as { saveImage(input: { data: Buffer, mediaType: string, name: string }): Promise<Record<string, unknown>> } | undefined
     if (attachments === undefined) throw new Error('no attachment service is mounted')
@@ -1588,6 +1656,50 @@ const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present'>, 
   },
 }
 
+/**
+ * The official write/edit tools own their approval prompts, so the plugin
+ * cannot pass host/path detail through `resolveMode` anymore. The approval
+ * request event carries the call id; the matching `tool/call` event carries the
+ * raw arguments. Enrich only remote write/edit prompts and leave every other
+ * approval untouched.
+ */
+export function installRemoteApprovalDetail(ctx: AgentContext, core: Core): () => void {
+  const register = ctx.on as unknown as (
+    event: 'approval/request',
+    listener: (request: ApprovalRequestLike, next: () => Promise<unknown>) => Promise<unknown>,
+    options?: { prepend?: boolean },
+  ) => () => void
+  return register('approval/request', async (request, next) => {
+    // Non-write/edit approvals are not ours to decorate. Return their
+    // delegation exactly once; never put `next()` inside the catch below.
+    if (request.toolName !== 'write' && request.toolName !== 'edit') return next()
+    try {
+      const session = request.agent.session
+      const cached = core.toolCallDetail(session?.id, request.callId)
+      const cwd = cached?.cwd ?? session?.header?.cwd
+      const route = routeByCwd(cwd)
+      if (route.kind !== 'remote') return next()
+      const requested = cached?.filePath ?? ''
+      const host = core.requireHost(route.hostId)
+      const label = host.name || host.host || route.hostId
+      const path = requested.length > 0 ? resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd) : route.remoteCwd
+      const action = request.toolName === 'write' ? 'write' : 'edit'
+      const currentEn = request.displayReason?.en ?? request.reason ?? ''
+      const currentZh = request.displayReason?.zh ?? currentEn
+      const mutable = request as { displayReason?: { en: string, [locale: string]: string } }
+      mutable.displayReason = {
+        ...request.displayReason,
+        en: currentEn.length > 0 ? `SSH ${label}: ${action} ${path} — ${currentEn}` : `SSH ${label}: ${action} ${path}`,
+        zh: currentZh.length > 0 ? `SSH ${label}：${action} ${path} — ${currentZh}` : `SSH ${label}：${action} ${path}`,
+      }
+    } catch {
+      // Approval presentation is best effort; the approval service owns the
+      // decision and any error from next().
+    }
+    return await next()
+  }, { prepend: true })
+}
+
 export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const ctx = rawCtx as unknown as HostContext
   const core = new Core(ctx, readConfig(rawConfig), ctx.workspaceRegistry)
@@ -1598,6 +1710,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   ctx.effect(() => ctx.on('settings/document-updated', ns => core.onSettingsUpdated(ns)))
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
+  let fsPatchReady = false
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => async () => {
     // One agent disposer must not skip the remaining agents or the pool.
@@ -1628,6 +1741,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   rawCtx.inject(['fs'], bridged => {
     const ready = bridged as unknown as HostContext
     const removeFs = installRemoteFs(ready, core)
+    fsPatchReady = removeFs !== undefined || remoteFsInstalled(ready)
     const removeUploads = installRemoteUploads(ready, core)
     const unbinds: Array<() => void> = []
     if (removeFs !== undefined) {
@@ -1696,7 +1810,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     seen.add(agent)
     let installed = false
     try {
-      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) })
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady)
     } catch (error) {
       // Shadows did not register. A remote session would otherwise keep the
       // official tools and run them in the placeholder directory.
@@ -1894,7 +2008,7 @@ async function assertLocalWorkingDirectory(
   if (route.kind === 'remote') assertEnterableRemoteCwd(core, route, headerCwd)
 }
 
-function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void): boolean {
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
   // original project in `header.cwd`, decides the first shell surface.
@@ -1903,6 +2017,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
   let disposeDynamic = (): void => {}
   try {
     const plans = planShadows(name => agent.ctx.tools.get(name, agent))
+    disposers.push(installRemoteApprovalDetail(agent.ctx, core))
     const hasOfficialBash = plans.some(plan => plan.name === 'bash' && plan.official !== undefined)
     const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
     for (const plan of plans) {
@@ -1934,7 +2049,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
       disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
-    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers)
+    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady)
     disposeDynamic = surface.disposeDynamic
     surface.sync(opened)
   } catch (error) {
@@ -1960,6 +2075,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     // Each disposer still runs: one throw must not leave the guard or the
     // schema filter attached, or leave this agent in `seen`.
     const failure = releaseShadows(disposeDynamic, disposers)
+    core.forgetSession(agent.session?.id)
     unregisters.delete(drop)
     try {
       forget()
@@ -1996,6 +2112,7 @@ function installRemoteShellSurface(
   headerCwd: string | undefined,
   hasOfficialBash: boolean,
   disposers: Array<() => void>,
+  fsReady: () => boolean,
 ): { sync(route: Route): void, disposeDynamic(): void } {
   const dynamic: Array<() => void> = []
   let applied: Route = { kind: 'local' }
@@ -2093,8 +2210,11 @@ function installRemoteShellSurface(
   }
 
   disposers.push(agent.ctx.tools.guard(execution => {
-    if (!isWindowsShell(execution.name)) return undefined
-    return windowsShellGuardReason(routeByCwd(effectiveCwd(ctx, execution, headerCwd)).kind === 'remote')
+    const remote = routeByCwd(effectiveCwd(ctx, execution, headerCwd)).kind === 'remote'
+    if (isWindowsShell(execution.name)) return windowsShellGuardReason(remote)
+    if (!remote || fsReady()) return undefined
+    if (execution.name === 'read' || execution.name === 'write' || execution.name === 'edit') return REMOTE_FS_UNPATCHED
+    return undefined
   }))
   disposers.push(agent.ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembled = await next()
@@ -2133,6 +2253,7 @@ function installRemoteShellSurface(
     }))
   }
   disposers.push(agent.ctx.on('session/event', (_session, event) => {
+    core.rememberSessionEvent(agent.session?.id, event)
     if (event.type !== 'working-directory/change') return
     if (typeof event.data?.cwd !== 'string') return
     const route = routeByCwd(event.data.cwd)
@@ -2217,6 +2338,9 @@ function releaseShadows(disposeDynamic: () => void, disposers: Array<() => void>
 
 /** Returned for every tool while a remote agent has no mounted shadows. */
 const REMOTE_SURFACE_UNMOUNTED = 'SSH tools did not mount for this remote workspace, so tool calls are refused'
+
+/** Official file tools would use the local backend if ctx.fs never got the remote patch. */
+const REMOTE_FS_UNPATCHED = 'the remote filesystem patch is unavailable, so file tools are refused instead of writing into the local placeholder'
 
 function agentLabel(agent: AgentLike): string {
   return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'

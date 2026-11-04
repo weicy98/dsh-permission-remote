@@ -268,13 +268,22 @@ test('powershell and cmd are denied only when they are restrictable', async () =
   assert.deepEqual(session.denies, ['pwsh'])
 })
 
+test('official file tools are denied when the remote fs patch never mounted', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false })
+  await session.created()
+  assert.match(session.guard('read') ?? '', /remote filesystem patch/)
+  assert.match(session.guard('write') ?? '', /remote filesystem patch/)
+  assert.match(session.guard('edit') ?? '', /remote filesystem patch/)
+})
+
 test('a non-unknown restrict error fails remote agent creation, drops both registration sets, and refuses every tool', async () => {
   const session = surface({
     headerCwd: remoteCwd,
     restrictError: name => name === 'powershell' ? new Error('tools registry is closed') : undefined,
   })
   await assert.rejects(() => session.created(), /tools registry is closed/)
-  assert.ok(session.toolCount('read') > 0)
+  // read is no longer shadowed; the official tool is left untouched.
+  assert.equal(session.toolCount('read'), 0)
   assert.equal(session.activeTools().length, 0)
   assert.deepEqual(session.denies, [])
   assert.equal(session.activeSections().length, 0)

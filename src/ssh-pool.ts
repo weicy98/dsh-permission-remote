@@ -419,7 +419,8 @@ export class SshPool {
     }
   }
 
-  async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string, maxBytes?: number): Promise<Buffer> {
+  async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string, maxBytes?: number, signal?: AbortSignal): Promise<Buffer> {
+    if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
     const session = await this.sftp(host, secret)
     if (maxBytes !== undefined) {
       const size = await statSize(session, remotePath)
@@ -427,8 +428,12 @@ export class SshPool {
       // Enforce the cap on the bytes actually read too: the size above is only
       // the pre-read stat, and a file that grows afterwards must not be pulled
       // whole into memory.
-      return readAllCapped(session, remotePath, maxBytes)
+      return readAllCapped(session, remotePath, maxBytes, signal)
     }
+    // A caller that supplied a signal expects the read to be cancellable even
+    // without a byte cap. Use the chunked path with no practical cap rather
+    // than the eager readFile helper, which cannot observe an abort.
+    if (signal !== undefined) return readAllCapped(session, remotePath, Number.MAX_SAFE_INTEGER, signal)
     return readAll(session, remotePath)
   }
 
@@ -612,6 +617,7 @@ export class SshPool {
 
   /** Chunks from one open handle. Stopping the generator closes the handle. */
   async *sftpReadChunks(host: HostConfig, secret: SecretMaterial, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
+    if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
     const session = await this.sftp(host, secret)
     yield* readOpenChunks(session, remotePath, signal)
   }
@@ -1001,10 +1007,10 @@ function readAll(sftp: SftpLike, remotePath: string): Promise<Buffer> {
 }
 
 /** Read a file, aborting as soon as more than `maxBytes` have arrived. */
-async function readAllCapped(sftp: SftpLike, remotePath: string, maxBytes: number): Promise<Buffer> {
+async function readAllCapped(sftp: SftpLike, remotePath: string, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
   let total = 0
   const parts: Buffer[] = []
-  for await (const chunk of readOpenChunks(sftp, remotePath)) {
+  for await (const chunk of readOpenChunks(sftp, remotePath, signal)) {
     total += chunk.length
     if (total > maxBytes) throw new SshFailure(`file is over the ${maxBytes} byte limit`, 'sftp-read')
     parts.push(chunk)

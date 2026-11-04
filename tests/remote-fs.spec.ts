@@ -6,7 +6,8 @@ import test from 'node:test'
 import { FsError, FsTargetKey, type FsDirEntry, type FsTarget } from '@deepseek-ai/dsh-fs'
 import type { HostConfig } from '../src/config.ts'
 import { installRemoteFs, type RemoteAccess } from '../src/remote-fs.ts'
-import { addSupersededRoot, clearSupersededRoots, encodeRemotePath, setRemoteRootOverride } from '../src/router.ts'
+import { parseRemoteVersion, remoteVersionToken } from '../src/remote-write.ts'
+import { addSupersededRoot, clearSupersededRoots, encodeRemotePath, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 import { listingType, probeOpenDir, readOpenChunks, readOpenRange, SshFailure, type RemoteDirEntry, type SftpAttrs } from '../src/ssh-pool.ts'
 
 const root = mkdtempSync(path.join(tmpdir(), 'dsh-remote-fs-'))
@@ -74,11 +75,11 @@ function createHarness(warnings: string[] = [], options?: { now?: () => number, 
     async readBytes(_target?: FsTarget, _signal?: AbortSignal, _maxBytes?: number): Promise<Uint8Array> { return new Uint8Array() }
     async readByteRange(_target?: FsTarget, _range?: { offset: number, length: number }, _signal?: AbortSignal): Promise<Uint8Array> { return new Uint8Array() }
     async listDir(_target?: FsTarget, _signal?: AbortSignal): Promise<Array<{ name: string, type: string }>> { return [] }
-    async writeText(_target?: FsTarget, _content?: string): Promise<string> {
+    async writeText(_target?: FsTarget, _content?: string, _expected?: unknown, _signal?: AbortSignal, _policy?: unknown): Promise<any> {
       this.writes += 1
       return 'original-write'
     }
-    async editText(_target?: FsTarget, _edit?: unknown): Promise<string> {
+    async editText(_target?: FsTarget, _edit?: unknown, _expected?: unknown, _signal?: AbortSignal, _policy?: unknown): Promise<any> {
       this.edits += 1
       return 'original-edit'
     }
@@ -91,6 +92,7 @@ function createHarness(warnings: string[] = [], options?: { now?: () => number, 
   const access: RemoteAccess = {
     requireHost: () => host,
     async secret() { return {} },
+    allowsRemoteSession: () => true,
     pool: {
       sftpRealpath: (_host, _secret, remotePath) => pool.realpath(remotePath),
       sftpAttrs: (_host, _secret, remotePath, follow) => pool.attrs(remotePath, follow),
@@ -177,6 +179,9 @@ test('a placeholder subdirectory and a superseded root both list the remote dire
 
 test('readByteRange reads one window, an oversize file is FS_TOO_LARGE, and a NUL byte is FS_NOT_TEXT', async () => {
   const { backend, pool } = createHarness()
+  pool.attrs = async remotePath => remotePath === REMOTE
+    ? { type: 'directory', size: 0, mtime: 1, mode: 0o040755 }
+    : remotePath.endsWith('/missing') ? undefined : { type: 'file', size: 4, mtime: 1, mode: 0o100644 }
   pool.read = async () => {
     pool.reads += 1
     throw new Error('whole file')
@@ -684,4 +689,399 @@ test('a directory that becomes a symlink is rejected before listDir follows it',
     (error: unknown) => error instanceof FsError && error.code === 'FS_PERMISSION_DENIED',
   )
   assert.equal(backend.contains(workspace, link), false)
+})
+
+
+test('writeText and editText run remotely with versions and preserve literal replacement', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'hello\nworld'
+  const calls: string[] = []
+  pool.attrs = async (remotePath, _follow) =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1, mode: 0o755 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    calls.push(command)
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' },
+    sandboxTool: 'bwrap',
+    roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux',
+    ripgrep: 'system',
+    ripgrepPath: '/usr/bin/rg',
+    install: null,
+  })
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const written = await backend.writeText(target, 'hello\nworld', undefined, undefined, policy)
+  assert.equal(written.operation, 'update')
+  assert.equal(written.after, 'hello\nworld')
+  assert.equal(written.before, 'hello\nworld')
+
+  const edited = await backend.editText(target, { oldString: 'world', newString: 'there', replaceAll: false }, { version: written.version }, undefined, policy)
+  assert.equal(edited.after, 'hello\nthere')
+  assert.equal(content, 'hello\nthere')
+  assert.notEqual(edited.version, written.version)
+  assert.ok(calls.some(command => /chmod 755/.test(command)))
+  await assert.rejects(
+    () => backend.writeText(target, 'x', { kind: 'replaceIfVersion', version: written.version }, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_STALE_VERSION',
+  )
+  // atomic write + current/after high-resolution version probes per mutation
+  assert.equal(calls.length, 7)
+})
+
+test('writeText keeps the local backend and refuses an absent session boundary', async () => {
+  const { backend, pool, access } = createHarness()
+  const local: FsTarget = { targetKey: FsTargetKey('/tmp/local'), displayPath: '/tmp/local' }
+  assert.equal(await backend.writeText(local, 'x'), 'original-write')
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access as unknown as { allowsRemoteSession: unknown }).allowsRemoteSession = () => false
+  const target = await backend.resolve(placeholder('a.ts'))
+  await assert.rejects(
+    () => backend.writeText(target, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+})
+
+
+test('concurrent remote writes to one target are serialized', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'initial'
+  let active = 0
+  let maximum = 0
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' },
+    sandboxTool: 'bwrap',
+    roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux',
+    ripgrep: 'system',
+    ripgrepPath: '/usr/bin/rg',
+    install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, _command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    active += 1
+    maximum = Math.max(maximum, active)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    active -= 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  await Promise.all([
+    backend.writeText(target, 'one', undefined, undefined, policy),
+    backend.writeText(target, 'two', undefined, undefined, policy),
+  ])
+  assert.equal(maximum, 1)
+  assert.equal(content, 'two')
+})
+
+
+test('a failed version probe fails closed instead of reporting a false stale write', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'hello'
+  let probes = 0
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (command.includes('stat -c')) {
+      probes += 1
+      return probes === 1
+        ? { code: 0, signal: null, stdout: '12:34:5:1700000000.000000001\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+        : { code: 1, signal: null, stdout: '', stderr: 'stat unavailable', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const before = await backend.stat(target)
+  assert.ok(before?.version)
+  await assert.rejects(
+    () => backend.writeText(target, 'next', { kind: 'replaceIfVersion', version: before.version }, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_IO_ERROR',
+  )
+  assert.equal(content, 'hello')
+})
+
+
+test('remote edit normalizes CRLF and treats replacement text literally', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'one\r\ntwo'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, _command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const written = await backend.writeText(target, 'one\r\ntwo', undefined, undefined, policy)
+  assert.equal(written.before, 'one\ntwo')
+  assert.equal(written.after, 'one\ntwo')
+  const edited = await backend.editText(target, { oldString: 'one', newString: '$&', replaceAll: false }, { version: written.version }, undefined, policy)
+  assert.equal(edited.after, '$&\ntwo')
+  assert.equal(content, '$&\r\ntwo')
+})
+
+
+test('remote edit reports a size cap and a missing target like fs-local', async () => {
+  const { backend, pool, access } = createHarness()
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/large.ts` || remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: 40 * 1024 * 1024, mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => ({ code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false })
+  pool.read = async () => { throw new SshFailure('file is 40 MiB, over the 32 MiB byte limit', 'sftp-read') }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const large = await backend.resolve(placeholder('large.ts'))
+  await assert.rejects(
+    () => backend.editText(large, { oldString: 'a', newString: 'b', replaceAll: false }, undefined, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_TOO_LARGE',
+  )
+  pool.attrs = async () => undefined
+  const missing = await backend.resolve(placeholder('missing.ts'))
+  await assert.rejects(
+    () => backend.editText(missing, { oldString: 'a', newString: 'b', replaceAll: false }, undefined, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_STALE_VERSION',
+  )
+})
+
+
+test('a write whose final realpath escapes the workspace is denied', async () => {
+  const { backend, pool, access } = createHarness()
+  pool.realpath = async remotePath => remotePath.endsWith('/a.ts') ? `${REMOTE}/../outside.ts` : remotePath
+  pool.attrs = async () => ({ type: 'file', size: 1, mtime: 1 })
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => ({ code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false })
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  await assert.rejects(
+    () => backend.writeText(target, 'x', undefined, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+})
+
+
+test('a guarded write fails closed when strong evidence disappears', async () => {
+  const { backend, pool, access } = createHarness()
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: 5, mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from('hello')
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => ({ code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false })
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const expected = remoteVersionToken({ base: '1:5', strong: '99:88:5:1700000000.000000001', generation: 1 })
+  await assert.rejects(
+    () => backend.writeText(target, 'next', { kind: 'replaceIfVersion', version: expected }, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_IO_ERROR',
+  )
+})
+
+
+test('seconds-only stat falls back to a content digest that still guards writes', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'stable'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (command.includes('stat -c')) {
+      return { code: 0, signal: null, stdout: '12:34:5:1700000000\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const before = await backend.stat(target)
+  assert.ok(before?.version)
+  assert.ok(parseRemoteVersion(before.version)?.hash)
+  const written = await backend.writeText(target, 'next', { kind: 'replaceIfVersion', version: before.version }, undefined, policy)
+  assert.equal(written.after, 'next')
+  assert.equal(content, 'next')
+})
+
+
+test('relative traversal from a remote cwd stays in the remote namespace', async () => {
+  const { backend } = createHarness()
+  const escaped = await backend.resolve('../../../../etc/passwd', { cwd: placeholder() })
+  const escapedRoute = routeByCwd(String(escaped.targetKey))
+  assert.equal(escapedRoute.kind, 'remote')
+  if (escapedRoute.kind === 'remote') assert.equal(escapedRoute.remoteCwd, '/etc/passwd')
+
+  const sibling = await backend.resolve('../sibling.ts', { cwd: placeholder('src') })
+  const siblingRoute = routeByCwd(String(sibling.targetKey))
+  assert.equal(siblingRoute.kind, 'remote')
+  if (siblingRoute.kind === 'remote') assert.equal(siblingRoute.remoteCwd, '/home/me/project/sibling.ts')
+})
+
+
+test('a remote target outside the policy workspace is refused before any remote write', async () => {
+  const { backend, access } = createHarness()
+  let writes = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+    writes += 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const outside = await backend.resolve('../../../../etc/passwd', { cwd: placeholder() })
+  await assert.rejects(
+    () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+  assert.equal(writes, 0)
+})
+
+
+test('createIfAbsent reports a remote collision as FS_NOT_OBSERVED', async () => {
+  const { backend, pool, access } = createHarness()
+  pool.attrs = async () => undefined
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => ({
+    code: 23, signal: null, stdout: '', stderr: 'remote target already exists', timedOut: false, stdoutTruncated: false, stderrTruncated: false,
+  })
+  const target = await backend.resolve(placeholder('new.ts'))
+  await assert.rejects(
+    () => backend.writeText(target, 'x', { kind: 'createIfAbsent' }, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_NOT_OBSERVED',
+  )
+})
+
+
+test('a version race after the pre-check maps to FS_STALE_VERSION', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'old'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (stdin !== undefined) {
+      return { code: 24, signal: null, stdout: '', stderr: 'remote file version changed', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    if (command.includes('stat -c')) {
+      return { code: 0, signal: null, stdout: '12:34:3:1700000000.000000001\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  const before = await backend.stat(target)
+  assert.ok(before?.version)
+  await assert.rejects(
+    () => backend.writeText(target, 'next', { kind: 'replaceIfVersion', version: before.version }, undefined, policy),
+    (error: unknown) => codeOf(error) === 'FS_STALE_VERSION',
+  )
+  assert.equal(content, 'old')
+})
+
+
+test('an aborted write never starts and maps to FS_ABORTED', async () => {
+  const { backend, access } = createHarness()
+  const controller = new AbortController()
+  controller.abort()
+  let writes = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+    writes += 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const target = await backend.resolve(placeholder('a.ts'))
+  await assert.rejects(
+    () => backend.writeText(target, 'x', undefined, controller.signal, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_ABORTED',
+  )
+  assert.equal(writes, 0)
+})
+
+
+test('a write whose post-state disappeared fails as an IO error', async () => {
+  const { backend, pool, access } = createHarness()
+  let gone = false
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts` && !gone
+      ? { type: 'file', size: 4, mtime: 1 }
+      : remotePath === REMOTE
+        ? { type: 'directory', size: 0, mtime: 1 }
+        : undefined
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, _command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (stdin !== undefined) gone = true
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const target = await backend.resolve(placeholder('a.ts'))
+  await assert.rejects(
+    () => backend.writeText(target, 'next', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_IO_ERROR',
+  )
+})
+
+
+test('lstat is a metadata-only fast path and does not spawn a shell stat', async () => {
+  const { backend, pool, access } = createHarness()
+  let execs = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+    execs += 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  pool.attrs = async () => ({ type: 'file', size: 4, mtime: 1, mode: 0o100644 })
+  const info = await backend.lstat(placeholder('a.ts'))
+  assert.equal(info?.type, 'file')
+  assert.equal(execs, 0)
 })
