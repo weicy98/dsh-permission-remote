@@ -687,7 +687,16 @@ export async function stagePresentFiles(
     const ticket = stagedEpoch
     let info: { isDirectory: boolean, size: number, type?: string }
     try {
-      info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
+      // `sftpStat` follows the final link, so it cannot tell a symlink from a
+      // real file. Use `lstat` where the pool provides it; the stat fallback is
+      // only for older test doubles.
+      if (typeof hostApi.pool.sftpAttrs === 'function') {
+        const attrs = await withSignal(hostApi.pool.sftpAttrs(host, secret, remotePath, false), exec?.signal)
+        if (attrs === undefined) throw new FsError(`no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+        info = { isDirectory: attrs.type === 'directory', size: attrs.size, type: attrs.type }
+      } else {
+        info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
+      }
     } catch (error) {
       if (exec?.signal?.aborted === true) throw error
       // A missing file is the model's path to fix; a dropped connection,
@@ -695,18 +704,29 @@ export async function stagePresentFiles(
       // host is unreachable would send it hunting for a path that exists.
       const message = error instanceof Error ? error.message : String(error)
       if (isSftpMissing(error)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+      if (error instanceof FsError) throw error
       throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
     }
-    if (info.isDirectory) throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_DIRECTORY')
-    // A FIFO, socket, or device would block or never end the read. Only a plain
-    // file is presentable; older stat fakes omit `type`, so leave them allowed.
+    if (info.isDirectory) {
+      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_REGULAR_FILE')
+    }
     if (info.type !== undefined && info.type !== 'file') {
-      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is not a regular file`, 'FS_IO_ERROR')
+      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is not a regular file`, 'FS_NOT_REGULAR_FILE')
     }
     if (info.size > PRESENT_CAP) {
       throw new FsError(`Cannot present ${requested}: the remote file is ${info.size} bytes, over the ${PRESENT_CAP} byte delivery limit`, 'FS_TOO_LARGE')
     }
-    const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP), exec?.signal)
+    let data: Buffer
+    try {
+      data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP), exec?.signal)
+    } catch (error) {
+      if (exec?.signal?.aborted === true) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      if (/over the .*byte limit/i.test(message)) {
+        throw new FsError(`Cannot present ${requested}: the remote file is over the ${PRESENT_CAP} byte delivery limit`, 'FS_TOO_LARGE')
+      }
+      throw error
+    }
     // The placeholder spelling every other remote tool returns, so the model
     // sees one path for one file whichever tool produced it.
     const placeholder = toModelPath(remotePath, route)

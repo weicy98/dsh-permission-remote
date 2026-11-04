@@ -21,7 +21,7 @@ import { FsError, FsTargetKey, FsVersion, type FsDirEntry, type FsInfo, type FsP
 import type { HostConfig } from './config.ts'
 import { composeCreatedPath } from './contain.ts'
 import { isRemoteMissing } from './ops.ts'
-import { normalizeRemoteDirectory, routeByCwd } from './router.ts'
+import { normalizeRemoteDirectory, routeByCwd, workspaceBinding } from './router.ts'
 import { SFTP_STATUS, SshFailure, isSftpPermissionDenied, type RemoteDirEntry, type SecretMaterial, type SftpAttrs } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
 
@@ -66,6 +66,7 @@ export interface FsContext {
 interface RemoteIdentity {
   readonly hostId: string
   readonly remoteReal: string
+  readonly at: number
 }
 
 interface Place {
@@ -136,12 +137,13 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
   const surface = fs as FsSurface
   const identity = new Map<string, RemoteIdentity>()
   const originals = bindOriginals(surface)
+  const now = options?.now ?? Date.now
   const meta = new MetaCache(
-    options?.now ?? Date.now,
+    now,
     options?.metaTtlMs ?? REALPATH_TTL_MS,
     options?.attrTtlMs ?? ATTR_TTL_MS,
   )
-  const runtime = { access, identity, originals, meta }
+  const runtime = { access, identity, originals, meta, now }
   const restorers: Array<() => void> = []
   try {
     restorers.push(replaceMethod(surface, 'resolve', (requested, opts) => resolveRemote(runtime, requested, opts)))
@@ -180,6 +182,7 @@ interface Runtime {
   readonly identity: Map<string, RemoteIdentity>
   readonly originals: Originals
   readonly meta: MetaCache
+  readonly now: () => number
 }
 
 async function resolveRemote(runtime: Runtime, requested: string, opts?: { cwd?: string, signal?: AbortSignal }): Promise<FsTarget> {
@@ -194,7 +197,7 @@ async function resolveRemote(runtime: Runtime, requested: string, opts?: { cwd?:
     const secret = await runtime.access.secret(host)
     throwIfFsAborted(opts?.signal)
     const remoteReal = await realRemote(runtime, host, secret, route.remoteCwd, opts?.signal)
-    runtime.identity.set(lexical, { hostId: route.hostId, remoteReal })
+    runtime.identity.set(lexical, { hostId: route.hostId, remoteReal, at: runtime.now() })
     return { targetKey: FsTargetKey(lexical), displayPath: lexical }
   } catch (error) {
     throwIfFsAborted(opts?.signal)
@@ -205,7 +208,7 @@ async function resolveRemote(runtime: Runtime, requested: string, opts?: { cwd?:
     // placeholder spelling is enough for the following stat to decide.
     const stale = runtime.meta.realpath(host.id, route.remoteCwd, true)
     if (stale !== undefined) {
-      runtime.identity.set(lexical, { hostId: route.hostId, remoteReal: stale })
+      runtime.identity.set(lexical, { hostId: route.hostId, remoteReal: stale, at: runtime.now() })
     }
     return { targetKey: FsTargetKey(lexical), displayPath: lexical }
   }
@@ -219,19 +222,20 @@ async function lstatRemote(runtime: Runtime, requested: string, opts: { cwd?: st
   const route = routeByCwd(lexical)
   if (route.kind !== 'remote') return runtime.originals.lstat(requested, opts, signal)
   const host = hostOf(runtime, route.hostId)
-  const fresh = runtime.meta.attrs(host.id, route.remoteCwd, false, false)
-  if (fresh.hit) return fresh.value === undefined ? undefined : pathInfo(fresh.value)
   try {
     const secret = await runtime.access.secret(host)
     throwIfFsAborted(signal)
-    // The path itself, not its target: a symlink must stay a symlink here.
-    const info = await attrsFor(runtime, host, secret, route.remoteCwd, false, signal)
+    // This is deliberately not served from the attribute cache: a directory
+    // can be replaced by a symlink between two sidebar clicks.
+    const info = await uncachedAttrs(runtime, host, secret, route.remoteCwd, false, signal)
     throwIfFsAborted(signal)
-    // Seen as a link: drop any realpath cached for it, so the next resolve
-    // follows the current target instead of answering from a stale one.
+    // Seen as a link: drop any realpath/attribute cache for it, so the next
+    // resolve follows the current target instead of a stale one.
     if (info?.type === 'symlink') {
       runtime.identity.delete(lexical)
       runtime.meta.forgetRealpath(host.id, route.remoteCwd)
+      runtime.meta.forgetAttrs(host.id, route.remoteCwd, true)
+      runtime.meta.forgetAttrs(host.id, route.remoteCwd, false)
     }
     runtime.meta.rememberAttrs(host.id, route.remoteCwd, false, info)
     return info === undefined ? undefined : pathInfo(info)
@@ -258,11 +262,11 @@ async function statRemote(runtime: Runtime, target: FsTarget, signal?: AbortSign
 }
 
 async function listRemote(runtime: Runtime, target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {
-  const place = placeOf(runtime, target)
-  if (place === undefined) return runtime.originals.listDir(target, signal)
-  throwIfFsAborted(signal)
   const parentKey = String(target.targetKey)
   try {
+    const place = await verifiedPlace(runtime, target, 'directory', signal)
+    if (place === undefined) return runtime.originals.listDir(target, signal)
+    throwIfFsAborted(signal)
     const secret = await runtime.access.secret(place.host)
     const info = await attrsFor(runtime, place.host, secret, place.remote, true, signal)
     throwIfFsAborted(signal)
@@ -323,7 +327,7 @@ async function childEntry(
 }
 
 async function readRemoteText(runtime: Runtime, target: FsTarget, signal?: AbortSignal): Promise<string> {
-  const place = placeOf(runtime, target)
+  const place = await verifiedPlace(runtime, target, 'any', signal)
   if (place === undefined) return runtime.originals.readText(target, signal)
   let total = 0
   let text = ''
@@ -335,10 +339,10 @@ async function readRemoteText(runtime: Runtime, target: FsTarget, signal?: Abort
   return text
 }
 
-function streamRemoteText(runtime: Runtime, target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
-  const place = placeOf(runtime, target)
+async function streamRemoteText(runtime: Runtime, target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
+  const place = await verifiedPlace(runtime, target, 'any', signal)
   if (place === undefined) return runtime.originals.streamText(target, signal)
-  return Promise.resolve(decodeRemoteText(runtime, place, target.displayPath, signal))
+  return decodeRemoteText(runtime, place, target.displayPath, signal)
 }
 
 async function* decodeRemoteText(runtime: Runtime, place: Place, display: string, signal?: AbortSignal): AsyncGenerator<string> {
@@ -376,10 +380,10 @@ function decodeChunk(decoder: TextDecoder, chunk: Buffer | undefined, stream: bo
 }
 
 async function readRemoteBytes(runtime: Runtime, target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
-  const place = placeOf(runtime, target)
-  if (place === undefined) return runtime.originals.readBytes(target, signal, maxBytes)
-  throwIfFsAborted(signal)
   try {
+    const place = await verifiedPlace(runtime, target, 'any', signal)
+    if (place === undefined) return runtime.originals.readBytes(target, signal, maxBytes)
+    throwIfFsAborted(signal)
     const secret = await runtime.access.secret(place.host)
     const data = await runtime.access.pool.sftpRead(place.host, secret, place.remote, maxBytes)
     throwIfFsAborted(signal)
@@ -395,25 +399,14 @@ async function readRemoteRange(
   range: { offset: number, length: number },
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  const place = placeOf(runtime, target)
-  if (place === undefined) return runtime.originals.readByteRange(target, range, signal)
   if (!Number.isSafeInteger(range.offset) || range.offset < 0 || !Number.isSafeInteger(range.length) || range.length < 0) {
     throw new FsError('read range is not a non-negative safe integer', 'FS_IO_ERROR')
   }
-  throwIfFsAborted(signal)
-  if (range.length === 0) {
-    try {
-      const secret = await runtime.access.secret(place.host)
-      const info = await attrsFor(runtime, place.host, secret, place.remote, true, signal)
-      throwIfFsAborted(signal)
-      if (info === undefined) throw new FsError(`no entry at "${target.displayPath}"`, 'FS_NOT_FOUND')
-      if (info.type !== 'file') throw new FsError(`"${target.displayPath}" is not a regular file`, 'FS_NOT_REGULAR_FILE')
-      return new Uint8Array()
-    } catch (error) {
-      throw asFs(error, signal)
-    }
-  }
   try {
+    const place = await verifiedPlace(runtime, target, 'any', signal)
+    if (place === undefined) return runtime.originals.readByteRange(target, range, signal)
+    throwIfFsAborted(signal)
+    if (range.length === 0) return new Uint8Array()
     const secret = await runtime.access.secret(place.host)
     const data = await runtime.access.pool.sftpReadAt(place.host, secret, place.remote, range.offset, range.length)
     throwIfFsAborted(signal)
@@ -431,8 +424,10 @@ async function readRemoteRange(
  * locally may use the original lexical check.
  */
 function containsRemote(runtime: Runtime, parent: FsTarget, child: FsTarget): boolean {
-  const left = runtime.identity.get(String(parent.targetKey))
-  const right = runtime.identity.get(String(child.targetKey))
+  const rawLeft = runtime.identity.get(String(parent.targetKey))
+  const rawRight = runtime.identity.get(String(child.targetKey))
+  const left = rawLeft !== undefined && runtime.meta.isRealpathFresh(rawLeft.at) ? rawLeft : undefined
+  const right = rawRight !== undefined && runtime.meta.isRealpathFresh(rawRight.at) ? rawRight : undefined
   if (left !== undefined && right !== undefined) {
     if (left.hostId !== right.hostId) return false
     return remotePathInside(left.remoteReal, right.remoteReal)
@@ -624,10 +619,67 @@ async function walkReal(runtime: Runtime, host: HostConfig, secret: SecretMateri
 function placeOf(runtime: Runtime, target: FsTarget): Place | undefined {
   const key = String(target.targetKey)
   const recorded = runtime.identity.get(key)
-  if (recorded !== undefined) return { host: hostOf(runtime, recorded.hostId), remote: recorded.remoteReal }
+  if (recorded !== undefined && runtime.meta.isRealpathFresh(recorded.at)) {
+    return { host: hostOf(runtime, recorded.hostId), remote: recorded.remoteReal }
+  }
   const route = routeByCwd(key)
   if (route.kind !== 'remote') return undefined
   return { host: hostOf(runtime, route.hostId), remote: route.remoteCwd }
+}
+
+/**
+ * Verify a remote target immediately before an operation follows it.
+ *
+ * `resolve` is not enough: a directory can be replaced by a symlink after its
+ * realpath was cached. This always asks the server for a fresh `lstat` of the
+ * exact path the caller named, follows an inside-workspace link explicitly,
+ * and rejects a link whose target leaves the workspace. The caller can then
+ * consume `place.remote` without a stale identity deciding containment.
+ */
+async function verifiedPlace(
+  runtime: Runtime,
+  target: FsTarget,
+  expected: 'file' | 'directory' | 'any',
+  signal?: AbortSignal,
+): Promise<Place | undefined> {
+  const key = String(target.targetKey)
+  const route = routeByCwd(key)
+  if (route.kind !== 'remote') return undefined
+  const host = hostOf(runtime, route.hostId)
+  const secret = await runtime.access.secret(host)
+  throwIfFsAborted(signal)
+  const lexical = route.remoteCwd
+  let info = await uncachedAttrs(runtime, host, secret, lexical, false, signal)
+  throwIfFsAborted(signal)
+  if (info === undefined) throw new FsError(`no entry at "${target.displayPath}"`, 'FS_NOT_FOUND')
+
+  let effective = lexical
+  if (info.type === 'symlink') {
+    const real = normalizeRemoteDirectory(await runtime.access.pool.sftpRealpath(host, secret, lexical))
+    throwIfFsAborted(signal)
+    if (real === null) throw new FsError(`remote path is not absolute: ${lexical}`, 'FS_IO_ERROR')
+    const binding = workspaceBinding(key)
+    if (binding === null || !remotePathInside(binding.remotePath, real)) {
+      throw new FsError(`"${target.displayPath}" points outside its workspace`, 'FS_PERMISSION_DENIED')
+    }
+    effective = real
+    runtime.identity.set(key, { hostId: route.hostId, remoteReal: real, at: runtime.now() })
+    runtime.meta.rememberRealpath(host.id, lexical, real)
+    runtime.meta.forgetAttrs(host.id, lexical, true)
+    info = await uncachedAttrs(runtime, host, secret, real, true, signal)
+    throwIfFsAborted(signal)
+    if (info === undefined) throw new FsError(`no entry at "${target.displayPath}"`, 'FS_NOT_FOUND')
+  }
+
+  const type = info.type
+  if (expected === 'directory' && type !== 'directory') {
+    throw new FsError(`"${target.displayPath}" is not a directory`, 'FS_NOT_DIRECTORY')
+  }
+  if (expected === 'file' && type !== 'file') {
+    throw new FsError(`"${target.displayPath}" is not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  runtime.meta.rememberAttrs(host.id, lexical, true, info)
+  return { host, remote: effective }
 }
 
 function hostOf(runtime: Runtime, hostId: string): HostConfig {
@@ -695,6 +747,16 @@ class MetaCache {
   /** Drop one path's cached realpath after it was observed as a symlink. */
   forgetRealpath(hostId: string, remotePath: string): void {
     this.realPaths.delete(`${hostId}\0${remotePath}`)
+  }
+
+  /** Drop one path's cached attributes after its type changed. */
+  forgetAttrs(hostId: string, remotePath: string, follow: boolean): void {
+    this.attrEntries.delete(`${hostId}\0${follow ? 's' : 'l'}\0${remotePath}`)
+  }
+
+  /** Whether an identity captured at `at` is still inside the realpath window. */
+  isRealpathFresh(at: number): boolean {
+    return this.now() - at < this.realTtl
   }
 
   attrs(hostId: string, remotePath: string, follow: boolean, stale: boolean): MetaHit<SftpAttrs | undefined> | MetaMiss {

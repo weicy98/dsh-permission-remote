@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -436,6 +437,11 @@ export class SshPool {
     await writeAll(session, remotePath, body)
   }
 
+  async sftpRename(host: HostConfig, secret: SecretMaterial, fromPath: string, toPath: string): Promise<void> {
+    const session = await this.sftp(host, secret)
+    await renameRemote(session, fromPath, toPath)
+  }
+
   async sftpRealpath(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string> {
     const session = await this.sftp(host, secret)
     return realpathOf(session, remotePath)
@@ -450,7 +456,8 @@ export class SshPool {
     const session = await this.sftp(host, secret)
     const rows = await readdir(session, remotePath)
     return rows
-      .filter(row => row.filename !== '.' && row.filename !== '..' && row.attrs.isDirectory())
+      .filter(row => row.filename.length > 0 && row.filename !== '.' && row.filename !== '..'
+        && !row.filename.includes('/') && !row.filename.includes('\\') && row.attrs.isDirectory())
       .map(row => ({
         name: row.filename,
         path: remotePath === '/' ? `/${row.filename}` : `${remotePath.replace(/\/$/, '')}/${row.filename}`,
@@ -508,7 +515,18 @@ export class SshPool {
     if (dir.length > 0) {
       await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000)
     }
-    await this.sftpWrite(host, secret, remotePath, body)
+    // Write beside the target and rename over it. A dropped connection or a
+    // full disk leaves the old target intact instead of truncating it with the
+    // SFTP `w` open. The caller has already checked the final component is not
+    // a symlink; the rename replaces the directory entry, never its target.
+    const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
+    try {
+      await this.sftpWrite(host, secret, temporary, body)
+      await this.sftpRename(host, secret, temporary, remotePath)
+    } catch (error) {
+      await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
+      throw error
+    }
   }
 
   async sftpAttrs(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
@@ -856,6 +874,9 @@ interface SftpLike {
   open(path: string, flags: string, callback: (error: Error | undefined, handle: Buffer) => void): void
   read(handle: Buffer, buffer: Buffer, offset: number, length: number, position: number, callback: (error: Error | undefined, bytesRead: number, buffer: Buffer, position: number) => void): void
   close(handle: Buffer, callback: (error: Error | undefined) => void): void
+  rename(oldPath: string, newPath: string, callback: (error: Error | undefined) => void): void
+  /** OpenSSH's atomic POSIX rename extension, when the server offers it. */
+  ext_openssh_rename?(oldPath: string, newPath: string, callback: (error: Error | undefined) => void): void
   /** `attrs` is optional in ssh2: `mkdir(path, callback)` sends an empty ATTRS. */
   mkdir(path: string, callback: (error: Error | undefined) => void): void
   end(callback?: () => void): void
@@ -917,7 +938,9 @@ function statInfo(sftp: SftpLike, remotePath: string): Promise<{ isDirectory: bo
         isDirectory: stats.isDirectory(),
         size: stats.size,
         mode: typeof stats.mode === 'number' ? stats.mode : undefined,
-        type: listingType(stats),
+        // Do not turn an absent permission field into `'other'`: callers must
+        // know that the server did not answer the type question.
+        type: typeof stats.mode === 'number' ? listingType(stats) : undefined,
       })
     })
   })
@@ -1046,23 +1069,67 @@ function readLinkOf(sftp: SftpLike, remotePath: string): Promise<string> {
   })
 }
 
-function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
-  return new Promise((resolve, reject) => {
-    const finish = (error: Error | undefined, stats?: SftpStats) => {
-      if (error) {
-        if (isSftpMissing(error)) resolve(undefined)
-        else reject(failureOf(error, follow ? 'sftp-stat' : 'sftp-lstat'))
-        return
-      }
-      if (stats === undefined) {
-        resolve(undefined)
-        return
-      }
-      resolve(attrsFrom(stats))
+/** Rename with the POSIX-overwrite extension first, then the standard request. */
+async function renameRemote(sftp: SftpLike, fromPath: string, toPath: string): Promise<void> {
+  const call = (method: 'ext' | 'standard'): Promise<void> => new Promise((resolve, reject) => {
+    const done = (error: Error | undefined): void => {
+      if (error) reject(failureOf(error, 'sftp-rename'))
+      else resolve()
     }
-    if (follow) sftp.stat(remotePath, finish)
-    else sftp.lstat(remotePath, finish)
+    if (method === 'ext' && sftp.ext_openssh_rename !== undefined) sftp.ext_openssh_rename(fromPath, toPath, done)
+    else sftp.rename(fromPath, toPath, done)
   })
+  if (sftp.ext_openssh_rename === undefined) {
+    await call('standard')
+    return
+  }
+  try {
+    await call('ext')
+  } catch {
+    // Some servers advertise the extension but reject it; standard rename is
+    // still safe for a new temporary target and fails rather than truncating.
+    await call('standard')
+  }
+}
+
+async function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
+  let stats: SftpStats
+  try {
+    stats = await new Promise<SftpStats>((resolve, reject) => {
+      const finish = (error: Error | undefined, value?: SftpStats): void => {
+        if (error) reject(error)
+        else if (value === undefined) reject(new SshFailure('stat returned no attributes', follow ? 'sftp-stat' : 'sftp-lstat'))
+        else resolve(value)
+      }
+      if (follow) sftp.stat(remotePath, finish)
+      else sftp.lstat(remotePath, finish)
+    })
+  } catch (error) {
+    if (isSftpMissing(error)) return undefined
+    throw failureOf(error instanceof Error ? error : new Error(String(error)), follow ? 'sftp-stat' : 'sftp-lstat')
+  }
+  const info = attrsFrom(stats)
+  if (info.mode !== undefined || info.type !== 'other') return info
+  // Some SFTP servers omit SSH_FILEXFER_ATTR_PERMISSIONS. Distinguish the
+  // types this code actually needs instead of reporting every path as
+  // `other`: readlink proves a symlink, an OPENDIR probe proves a directory,
+  // and an ordinary file is the remaining non-link, non-directory case.
+  if (!follow) {
+    try {
+      await readLinkOf(sftp, remotePath)
+      return { ...info, type: 'symlink' }
+    } catch (error) {
+      if (isSftpMissing(error) || isSftpPermissionDenied(error)) return info
+      // A non-link readlink error is the expected "not a symlink" answer.
+    }
+  }
+  try {
+    await probeOpenDir(sftp, remotePath)
+    return { ...info, type: 'directory' }
+  } catch (error) {
+    if (isSftpMissing(error) || isSftpPermissionDenied(error)) return info
+    return { ...info, type: 'file' }
+  }
 }
 
 function openRead(sftp: SftpLike, remotePath: string): Promise<Buffer> {

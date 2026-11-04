@@ -243,7 +243,9 @@ test('lstat of a mode-less symlink stays a symlink when readdir would follow it'
   const followed = await backend.stat(await backend.resolve(placeholder('link')))
   assert.equal(followed?.type, 'file')
   assert.deepEqual(listed, [`${REMOTE}/link`])
-  assert.deepEqual(linked, [`${REMOTE}/link`])
+  // lstat is deliberately not served from the attribute cache; a second call
+  // re-probes readlink so a swap between clicks cannot hide.
+  assert.deepEqual(linked, [`${REMOTE}/link`, `${REMOTE}/link`])
 })
 
 test('a mode-less lstat stays other when readlink cannot prove it is not a symlink', async () => {
@@ -659,4 +661,20 @@ test('a symlink observed in a listing drops the child identity so the next resol
   pool.readDir = async () => [{ name: 'link', type: 'symlink', size: 1, mtime: 2 }]
   await backend.listDir(workspace)
   assert.equal(backend.contains(workspace, await backend.resolve(placeholder('link'))), false)
+})
+
+test('a directory that becomes a symlink is rejected before listDir follows it', async () => {
+  const { backend, pool } = createHarness()
+  pool.realpath = async remotePath => (remotePath.endsWith('/link') ? '/etc' : remotePath)
+  pool.attrs = async (remotePath, follow) =>
+    remotePath.endsWith('/link') && !follow
+      ? { type: 'symlink', size: 1, mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  const workspace = await backend.resolve(placeholder())
+  const link = await backend.resolve(placeholder('link'))
+  await assert.rejects(
+    () => backend.listDir(link),
+    (error: unknown) => error instanceof FsError && error.code === 'FS_PERMISSION_DENIED',
+  )
+  assert.equal(backend.contains(workspace, link), false)
 })

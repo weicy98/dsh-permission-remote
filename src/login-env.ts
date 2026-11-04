@@ -108,75 +108,109 @@ export function loginEnvSnapshot(result: LoginEnvRead): string {
   return kept.length > 0 ? `${kept}\n` : ''
 }
 
-/** A complete `declare -x NAME` or `export NAME` assignment, with or without `=`. */
-function declarationName(line: string): string | undefined {
-  const match = /^(?:declare\s+-x|export)\s+([A-Za-z_][A-Za-z0-9_]*)(?:=|$)/.exec(line)
-  return match?.[1]
+interface DeclarationBlock {
+  readonly name: string
+  readonly block: string
+  readonly next: number
+}
+
+/**
+ * Parse one complete `export -p` declaration starting at `index`.
+ *
+ * `export -p` prints either `declare -x NAME` (exported but unset) or
+ * `declare -x NAME=<quoted value>`. Only literal quoted values and simple
+ * literals are accepted; anything after the closing quote is rejected. A
+ * bashrc trap that prints `declare -x A=1; touch /tmp/pwn` must never be
+ * treated as a declaration.
+ */
+function parseDeclaration(lines: readonly string[], index: number): DeclarationBlock | null {
+  const line = lines[index] ?? ''
+  const match = /^(?:declare\s+-x|export)\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$/.exec(line)
+  if (match === null) return null
+  const name = match[1]!
+  const rest = match[2] ?? ''
+  if (rest.length === 0) return { name, block: line, next: index + 1 }
+  if (!rest.startsWith('=')) return null
+  const value = rest.slice(1)
+  if (value.length === 0) return { name, block: line, next: index + 1 }
+
+  let block = line
+  let current = value
+  let end = index
+  for (;;) {
+    const scanned = scanQuotedValue(current)
+    if (scanned === 'invalid') return null
+    if (scanned === 'unclosed') {
+      end += 1
+      if (end >= lines.length) return null
+      current += `\n${lines[end] ?? ''}`
+      block += `\n${lines[end] ?? ''}`
+      continue
+    }
+    if (scanned.rest.trim().length > 0) return null
+    return { name, block, next: end + 1 }
+  }
+}
+
+/**
+ * Scan the value part of a declaration.
+ *
+ * A complete literal returns the text after its closing quote. A value that
+ * continues on the next line is `unclosed`; an unquoted value with shell syntax
+ * is `invalid`.
+ */
+function scanQuotedValue(value: string): { rest: string } | 'unclosed' | 'invalid' {
+  const first = value[0]
+  if (first === '"' || first === "'") return scanQuote(value, first, first)
+  if (first === '$' && value[1] === "'") return scanQuote(value, '$', "'")
+  // A bare literal produced by a shell that does not quote simple values is
+  // safe when it contains no shell metacharacters or whitespace.
+  if (/^[A-Za-z0-9_./:+=,-]*$/.test(value)) return { rest: '' }
+  return 'invalid'
+}
+
+function scanQuote(value: string, opener: string, closer: string): { rest: string } | 'unclosed' | 'invalid' {
+  let index = opener === '$' ? 2 : 1
+  while (index < value.length) {
+    const char = value[index] ?? ''
+    if (char === '\\' && closer !== "'") {
+      index += 2
+      continue
+    }
+    if (char === closer) return { rest: value.slice(index + 1) }
+    if (closer === '"' && (char === '`' || (char === '$' && value[index + 1] === '('))) return 'invalid'
+    if (closer === '"' && char === '$' && value[index + 1] !== '{') {
+      // `export -p` escapes literal dollars as `\$`; an unescaped dollar is a
+      // command substitution or expansion the capture did not produce.
+      return 'invalid'
+    }
+    index += 1
+  }
+  return 'unclosed'
 }
 
 /**
  * Drop session-state assignments without cutting a quoted value that happens
  * to contain a line looking like one. `export -p` keeps a newline inside
- * quotes, and an unbalanced session-state value is kept: discarding the rest
- * of the text would throw away later variables such as `PATH`.
+ * quotes.
  *
  * Only complete `declare -x NAME...` / `export NAME...` assignments are
  * trusted. `export -p` prints nothing else, so any other line is stray output
  * (a bashrc `EXIT` trap, a banner) and must never be eval'd on a later command.
- * A stray line makes the whole capture untrustworthy, so the entire block is
- * dropped — the same outcome as a timeout or a truncated read.
+ * A stray or malformed line makes the whole capture untrustworthy, so the
+ * entire block is dropped — the same outcome as a timeout or a truncated read.
  */
 function stripSessionState(text: string): string {
   const lines = text.split('\n')
   const kept: string[] = []
   let index = 0
   while (index < lines.length) {
-    const line = lines[index] ?? ''
-    const name = declarationName(line)
-    if (name === undefined) return ''
-    let end = index
-    let block = line
-    while (!quotesBalanced(block) && end + 1 < lines.length) {
-      end += 1
-      block += `\n${lines[end] ?? ''}`
-    }
-    if (!quotesBalanced(block)) return ''
-    if (!SESSION_STATE.has(name)) kept.push(block)
-    index = end + 1
+    const declaration = parseDeclaration(lines, index)
+    if (declaration === null) return ''
+    if (!SESSION_STATE.has(declaration.name)) kept.push(declaration.block)
+    index = declaration.next
   }
   return kept.join('\n').replace(/^\n+/, '').replace(/\n+$/, '')
-}
-
-/** True when `"..."`, `'...'`, and `$'...'` quotes opened in `text` are closed. */
-function quotesBalanced(text: string): boolean {
-  let state: 'none' | 'double' | 'single' | 'ansi' = 'none'
-  let index = 0
-  while (index < text.length) {
-    const char = text[index] ?? ''
-    if (state === 'none') {
-      if (char === '"') state = 'double'
-      else if (char === "'") state = 'single'
-      else if (char === '$' && text[index + 1] === "'") {
-        state = 'ansi'
-        index += 1
-      }
-      index += 1
-      continue
-    }
-    if (state === 'single') {
-      if (char === "'") state = 'none'
-      index += 1
-      continue
-    }
-    if (char === '\\') {
-      index += 2
-      continue
-    }
-    if (char === "'" && state === 'ansi') state = 'none'
-    else if (char === '"' && state === 'double') state = 'none'
-    index += 1
-  }
-  return state === 'none'
 }
 
 /**

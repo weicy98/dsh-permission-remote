@@ -960,6 +960,11 @@ export class Core {
       }
       throw new Error(`registering workspaces at ${newRoot} failed: ${errorText(error)}; the old root is still in use`)
     }
+    // Record the old root before the settings switch. If the process dies
+    // between the settings write and the session relocation, the next load must
+    // still know which old root to sweep; a record for a failed switch is
+    // harmless because catchup excludes the still-current root.
+    if (this.recordSupersededRoot(oldRoot)) await this.persistMigrationState()
     try {
       await this.commitRemoteRoot(newRoot)
     } catch (error) {
@@ -976,12 +981,6 @@ export class Core {
     // server: an old placeholder that no registered workspace covers is then
     // refused by the entry guard instead of quietly becoming a local directory.
     addSupersededRoot(oldRoot)
-    // Persist the old root BEFORE any session directory is renamed. A crash
-    // between the directory rename and the header rewrite leaves a log under the
-    // new project key whose header still names the old root; DSH's `list()`
-    // rejects the whole store in that state. This record is what lets the next
-    // load's resume sweep find that session and finish the rewrite.
-    if (this.recordSupersededRoot(oldRoot)) await this.persistMigrationState()
     // Move the stored sessions onto the new root. Without this a session keeps
     // naming the old root: the workspace registry filters it out of membership
     // (it loses its sidebar group) and the entry guard refuses its cwd (it can
@@ -1106,7 +1105,7 @@ export class Core {
    */
   private async relocateStoredSessions(oldRoot: string, newRoot: string): Promise<SessionRelocationSummary> {
     try {
-      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: () => this.liveSessionIds() })
+      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: () => this.liveSessionIds(), repairBodies: true })
     } catch (error) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
       // A scan failure is one error, not "every live session was skipped".

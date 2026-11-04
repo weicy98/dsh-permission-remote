@@ -19,6 +19,7 @@ import type { HostConfig } from './config.ts'
 import { isRemoteMissing } from './ops.ts'
 import { normalizeRemoteDirectory, routeByCwd, type RemoteRoute } from './router.ts'
 import { settleThen, type SecretMaterial } from './ssh-pool.ts'
+import { remotePathInside } from './workspaces.ts'
 
 /** Same ceiling `present` uses before it will copy a remote file. */
 const UPLOAD_CAP = 32 * 1024 * 1024
@@ -298,9 +299,11 @@ async function uploadOne(
   signal: AbortSignal | undefined,
 ): Promise<Outcome> {
   if (isAborted(signal)) throw abortError()
+  let home: string
   let remotePath: string
   try {
-    remotePath = remoteUploadPath(await homeOf(access, homes, host), ref.attachmentId, ref.name)
+    home = await homeOf(access, homes, host)
+    remotePath = remoteUploadPath(home, ref.attachmentId, ref.name)
   } catch (error) {
     if (isAborted(signal) || isAbort(error)) throw abortError()
     ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: ${errorText(error)}`)
@@ -309,6 +312,9 @@ async function uploadOne(
   try {
     const secret = await access.secret(host)
     if (isAborted(signal)) throw abortError()
+    if (access.pool.sftpAttrs !== undefined) {
+      await assertUploadParent(access, host, secret, home, remotePath)
+    }
     // Refuse a pre-existing symbolic link: `sftpPutFile` opens with `w`, so
     // following the link would truncate a file outside the upload directory.
     if (access.pool.sftpAttrs !== undefined) {
@@ -367,6 +373,45 @@ async function resolveHome(access: UploadAccess, host: HostConfig): Promise<stri
   const home = normalizeRemoteDirectory(await access.pool.sftpRealpath(host, secret, '.'))
   if (home === null) throw new Error('remote home is not an absolute path')
   return home
+}
+
+/**
+ * Refuse a symlink anywhere between the login home and the upload leaf.
+ *
+ * Checking only the leaf lets a pre-placed `~/.dsh-permission-remote` (or a
+ * digest directory) redirect `mkdir`, `chmod`, and `writeFile` outside the
+ * upload area. Existing components are checked with `lstat`; missing ones are
+ * created later by `sftpPutFile`, whose same-directory temporary rename keeps
+ * the final write atomic.
+ */
+async function assertUploadParent(
+  access: UploadAccess,
+  host: HostConfig,
+  secret: SecretMaterial,
+  home: string,
+  remotePath: string,
+): Promise<void> {
+  const attrsOf = access.pool.sftpAttrs
+  if (attrsOf === undefined) return
+  const parent = posix.dirname(remotePath)
+  const rel = posix.relative(home, parent)
+  if (rel === '' || rel.startsWith('..') || posix.isAbsolute(rel)) {
+    if (rel !== '') throw new Error('upload path escapes the remote home')
+    return
+  }
+  let cursor = home
+  for (const part of rel.split('/').filter(part => part.length > 0)) {
+    cursor = posix.join(cursor, part)
+    const attrs = await attrsOf(host, secret, cursor, false)
+    if (attrs === undefined) return
+    if (attrs.type === 'symlink' || attrs.type !== 'directory') {
+      throw new Error(`upload directory ${cursor} is not a real directory`)
+    }
+    const real = normalizeRemoteDirectory(await access.pool.sftpRealpath(host, secret, cursor))
+    if (real === null || !remotePathInside(home, real)) {
+      throw new Error(`upload directory ${cursor} escapes the remote home`)
+    }
+  }
 }
 
 function acceptable(ref: FileRef): boolean {

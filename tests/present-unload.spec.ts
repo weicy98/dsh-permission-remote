@@ -148,7 +148,7 @@ test('present refuses a non-regular remote file instead of blocking on it', asyn
     } satisfies ToolHost
     await assert.rejects(
       () => stagePresentFiles(api, sessionRoute, [{ path: 'pipe' }], { signal: new AbortController().signal }),
-      (error: unknown) => error instanceof FsError && error.code === 'FS_IO_ERROR',
+      (error: unknown) => error instanceof FsError && error.code === 'FS_NOT_REGULAR_FILE',
     )
   } finally {
     if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT

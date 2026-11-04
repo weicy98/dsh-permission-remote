@@ -600,8 +600,10 @@ test('a remote delivery leaves openable bytes at the staged path', async () => {
     const ctx = pluginWithWorkspaces([cwd], cwd)
     apply(ctx, { hosts: [{ id: 'host1', name: 'dev', host: '10.0.0.5', port: 22, username: 'me', auth: 'key', privateKeyPath: '', fingerprint: 'SHA256:abc', opsPolicy: 'ask' }], maxConnections: 4 })
     const originalStat = SshPool.prototype.sftpStat
+    const originalAttrs = SshPool.prototype.sftpAttrs
     const originalRead = SshPool.prototype.sftpRead
     SshPool.prototype.sftpStat = async () => ({ isDirectory: false, size: 3 })
+    SshPool.prototype.sftpAttrs = async () => ({ type: 'file', size: 3, mtime: 1 })
     SshPool.prototype.sftpRead = async () => Buffer.from('pdf')
     const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
     let presented: { files: Array<{ path: string, description?: string }> } | undefined
@@ -618,6 +620,7 @@ test('a remote delivery leaves openable bytes at the staged path', async () => {
       await present!.execute({ files: [{ path: 'out/report.pdf', description: 'the report' }] }, { agent })
     } finally {
       SshPool.prototype.sftpStat = originalStat
+      SshPool.prototype.sftpAttrs = originalAttrs
       SshPool.prototype.sftpRead = originalRead
     }
     assert.ok(presented, 'the official tool runs once the bytes are staged')

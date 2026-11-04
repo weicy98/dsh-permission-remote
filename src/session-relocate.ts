@@ -471,6 +471,12 @@ export interface RelocateOptions {
    * started is still caught.
    */
   liveSessionIds?: ReadonlySet<string> | (() => ReadonlySet<string>)
+  /**
+   * Also repair the body of sessions already under `newRoot` whose historical
+   * `working-directory/change` events still name an old root. Used by the
+   * startup catch-up sweep for sessions migrated by older versions.
+   */
+  repairBodies?: boolean
 }
 
 /**
@@ -593,8 +599,17 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   const header = head.header
   const cwd = header.cwd
   if (header.type !== 'session' || typeof cwd !== 'string' || cwd.length === 0) return false
-  if (!sitsUnder(cwd, oldRoots)) return false
   const id = typeof header.id === 'string' ? header.id : ''
+  if (!sitsUnder(cwd, oldRoots)) {
+    // A previous version rewrote only the header. Its sessions now sit under
+    // newRoot with an old working-directory/change event in the body; repair
+    // those in place instead of requiring the old source directory to exist.
+    if (options.repairBodies === true && sitsUnder(cwd, rootCandidateSpellings(options.newRoot))) {
+      if (id.length === 0 || encodeSegment(id) !== entry) return false
+      return rewriteLogAt(dir, logName, id, cwd, oldRoots, options.newRoot, head.compression, summary, liveOf)
+    }
+    return false
+  }
   if (id.length === 0) return fail(entry, 'header carries no id')
   if (encodeSegment(id) !== entry) return fail(id, `directory name ${entry} does not match encodeSegment(id) ${encodeSegment(id)}`)
   const to = mapPlaceholderCwd(cwd, oldRoots, options.newRoot)
@@ -615,7 +630,7 @@ async function relocateSession(context: RelocateContext): Promise<boolean> {
   }
   if (resolvePath(dir) === resolvePath(destDir)) {
     // Renamed by an earlier run that died before the rewrite: finish it here.
-    if (!(await rewriteLogAt(destDir, logName, id, to, oldRoots, options.newRoot, head.compression, summary))) return false
+    if (!(await rewriteLogAt(destDir, logName, id, to, oldRoots, options.newRoot, head.compression, summary, liveOf))) return false
     summary.relocated.push({ id, from: cwd, to })
     return true
   }
@@ -744,7 +759,7 @@ async function moveAndRewrite(context: RelocateContext & { destDir: string, id: 
  * silently overwrites a log.
  */
 async function reconcileExistingDestination(context: RelocateContext & { destDir: string, id: string, from: string, to: string }): Promise<boolean> {
-  const { destDir, dir, id, from, to, summary, oldRoots } = context
+  const { destDir, dir, id, from, to, summary, oldRoots, liveOf } = context
   const fail = (reason: string): false => {
     summary.failed.push({ id, reason })
     return false
@@ -776,10 +791,12 @@ async function reconcileExistingDestination(context: RelocateContext & { destDir
     return fail(`the destination already holds session ${String(destHeader.id)}; refusing to overwrite it`)
   }
   if (destHeader.cwd === to) {
-    // Completed by an earlier run; only the stale source remains. Report the
-    // move (so the emptied old project directory is cleaned up) but do NOT
-    // count it as relocated again: the earlier run already counted it, and the
-    // UI would otherwise show one session twice across two runs.
+    // Completed by an earlier run; only the stale source remains. Rewrite the
+    // destination body once before deleting the source: an older version of
+    // this plugin rewrote only the header, leaving an old
+    // `working-directory/change` path in the body.
+    const compression = destLog.name.endsWith('.zstd')
+    if (!(await rewriteLogAt(destDir, destLog.name, id, to, oldRoots, context.options.newRoot, compression, summary, liveOf))) return false
     try {
       await rm(dir, { recursive: true, force: false })
       return true
@@ -792,7 +809,7 @@ async function reconcileExistingDestination(context: RelocateContext & { destDir
     // the stale source. A stuck source is reported but the session is already
     // correct, so the next run's reconcile branch removes it.
     const compression = destLog.name.endsWith('.zstd')
-    if (!(await rewriteLogAt(destDir, destLog.name, id, to, oldRoots, context.options.newRoot, compression, summary))) return false
+    if (!(await rewriteLogAt(destDir, destLog.name, id, to, oldRoots, context.options.newRoot, compression, summary, liveOf))) return false
     try {
       await rm(dir, { recursive: true, force: false })
     } catch (error) {
@@ -820,14 +837,35 @@ async function rewriteLogAt(
   newRoot: string,
   compression: boolean,
   summary: SessionRelocationSummary,
+  liveOf?: () => ReadonlySet<string>,
 ): Promise<boolean> {
   const path = joinPath(dir, logName)
   try {
-    const size = (await stat(path)).size
+    const beforeStat = await stat(path)
+    const size = beforeStat.size
     if (size > MAX_REWRITE_BYTES) throw new Error(`the log is ${size} bytes, above the ${MAX_REWRITE_BYTES}-byte rewrite ceiling`)
+    if (liveOf?.().has(expectedId) === true) {
+      summary.skippedLive.push(expectedId)
+      return false
+    }
     const bytes = await readFile(path)
-    const { bytes: rewritten } = rewriteHeader(bytes, expectedId, to, oldRoots, newRoot, compression)
-    await publish(path, rewritten)
+    const result = rewriteHeader(bytes, expectedId, to, oldRoots, newRoot, compression)
+    if (result.retainedOldRoot) {
+      const retained = oldRoots[0] ?? ''
+      if (retained.length > 0) {
+        summary.retainedRoots ??= []
+        if (!summary.retainedRoots.includes(retained)) summary.retainedRoots.push(retained)
+      }
+    }
+    if (liveOf?.().has(expectedId) === true) {
+      summary.skippedLive.push(expectedId)
+      return false
+    }
+    const afterStat = await stat(path)
+    if (afterStat.size !== beforeStat.size || afterStat.mtimeMs !== beforeStat.mtimeMs) {
+      throw new Error('the log changed while it was being rewritten')
+    }
+    await publish(path, result.bytes)
     // Read the published log back and prove it: header decodes with the moved
     // identity, complete-frame count and torn-tail state are unchanged.
     const published = await readFile(path)

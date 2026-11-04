@@ -1,5 +1,5 @@
 export const MANUAL_INSTALLS = [
-  { title: 'Debian/Ubuntu', command: 'sudo apt-get update && sudo apt-get install -y bubblewrap' },
+  { title: 'Debian/Ubuntu', command: 'sudo apt-get update; sudo apt-get install -y bubblewrap' },
   { title: 'Fedora/RHEL', command: 'sudo dnf install -y bubblewrap' },
   { title: 'Arch', command: 'sudo pacman -S bubblewrap' },
   { title: 'Alpine', command: 'sudo apk add bubblewrap' },

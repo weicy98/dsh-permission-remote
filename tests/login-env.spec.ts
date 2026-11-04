@@ -42,6 +42,10 @@ test('a stray line after the declarations drops the whole capture', () => {
   // must never be eval'd on a later command.
   assert.equal(read('declare -x A=1\nINJECTED_FROM_EXIT\n'), '')
   assert.equal(read('declare -x A=1\ndeclare -x B=2\nrm -rf /tmp/x\n'), '')
+  // A valid declaration prefix must not smuggle a shell command through.
+  assert.equal(read('declare -x A=1; touch /tmp/pwn\n'), '')
+  assert.equal(read('declare -x A="x"; rm -rf /tmp/x\n'), '')
+  assert.equal(read('declare -x A=$(touch /tmp/pwn)\n'), '')
   // A trailing blank line is trimmed before the scan and stays harmless.
   assert.equal(read('declare -x A=1\n\n'), 'declare -x A=1\n')
 })
