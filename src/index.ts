@@ -1059,7 +1059,7 @@ export class Core {
     const survivors = new Set<string>()
     let pruned = false
     for (const root of roots) {
-      const part = await this.relocateStoredSessions(root, newRoot)
+      const part = await this.relocateStoredSessions(root, newRoot, true)
       summary.relocated.push(...part.relocated)
       summary.skippedLive.push(...part.skippedLive)
       summary.failed.push(...part.failed)
@@ -1103,9 +1103,9 @@ export class Core {
    * stale cwd and throw; {@link resumeSessionMigrationState} retries on the
    * next load with headers rebuilt from disk.
    */
-  private async relocateStoredSessions(oldRoot: string, newRoot: string): Promise<SessionRelocationSummary> {
+  private async relocateStoredSessions(oldRoot: string, newRoot: string, repairBodies = false): Promise<SessionRelocationSummary> {
     try {
-      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: () => this.liveSessionIds(), repairBodies: true })
+      return await relocateSessions({ oldRoot, newRoot, liveSessionIds: () => this.liveSessionIds(), repairBodies })
     } catch (error) {
       this.ctx.logger?.warn(`[@dsh-permission-remote] could not scan the session store while migrating to ${newRoot}: ${errorText(error)}`)
       // A scan failure is one error, not "every live session was skipped".

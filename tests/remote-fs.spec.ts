@@ -186,13 +186,20 @@ test('readByteRange reads one window, an oversize file is FS_TOO_LARGE, and a NU
   assert.equal(Buffer.from(window).toString(), 'hi')
   assert.deepEqual(pool.readAts, [{ offset: 3, length: 2 }])
   assert.equal(pool.reads, 0)
-  pool.attrs = async remotePath => remotePath.endsWith('/missing') ? undefined : { type: 'file', size: 4, mtime: 1, mode: 0o100644 }
+  pool.attrs = async remotePath => remotePath === REMOTE
+    ? { type: 'directory', size: 0, mtime: 1, mode: 0o040755 }
+    : remotePath.endsWith('/missing') ? undefined : { type: 'file', size: 4, mtime: 1, mode: 0o100644 }
   const empty = await backend.readByteRange(file, { offset: 0, length: 0 })
   assert.equal(empty.length, 0)
   assert.equal(pool.readAts.length, 1)
   const missing = await backend.resolve(placeholder('missing'))
   await assert.rejects(() => backend.readByteRange(missing, { offset: 0, length: 0 }), (error: unknown) => {
     assert.equal(codeOf(error), 'FS_NOT_FOUND')
+    return true
+  })
+  const directory = await backend.resolve(placeholder())
+  await assert.rejects(() => backend.readByteRange(directory, { offset: 0, length: 0 }), (error: unknown) => {
+    assert.equal(codeOf(error), 'FS_NOT_REGULAR_FILE')
     return true
   })
 

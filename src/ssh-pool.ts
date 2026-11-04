@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { Client, type ConnectConfig } from './ssh2-client.ts'
 import type { HostConfig } from './config.ts'
@@ -457,7 +457,8 @@ export class SshPool {
     const rows = await readdir(session, remotePath)
     return rows
       .filter(row => row.filename.length > 0 && row.filename !== '.' && row.filename !== '..'
-        && !row.filename.includes('/') && !row.filename.includes('\\') && row.attrs.isDirectory())
+        && !row.filename.includes('/') && !row.filename.includes('\\')
+        && attrsFrom(row.attrs, row.longname).type === 'directory')
       .map(row => ({
         name: row.filename,
         path: remotePath === '/' ? `/${row.filename}` : `${remotePath.replace(/\/$/, '')}/${row.filename}`,
@@ -509,12 +510,21 @@ export class SshPool {
    * the remote umask: `sftpUpload` marks a binary executable, and a document
    * must not become one.
    */
-  async sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string): Promise<void> {
+  async sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string, allowedRoot?: string): Promise<void> {
     const body = await readFile(localPath)
     const dir = remotePath.slice(0, remotePath.lastIndexOf('/'))
     if (dir.length > 0) {
       await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000)
+      if (allowedRoot !== undefined) {
+        const realDir = await this.sftpRealpath(host, secret, dir)
+        if (!remotePathWithin(allowedRoot, realDir)) {
+          throw new Error(`upload directory ${dir} escapes ${allowedRoot}`)
+        }
+      }
     }
+    // A replacement should keep the old file's mode; a new file keeps the
+    // remote umask. Read this before the rename replaces the directory entry.
+    const previous = await this.sftpAttrs(host, secret, remotePath, false).catch(() => undefined)
     // Write beside the target and rename over it. A dropped connection or a
     // full disk leaves the old target intact instead of truncating it with the
     // SFTP `w` open. The caller has already checked the final component is not
@@ -522,7 +532,18 @@ export class SshPool {
     const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
     try {
       await this.sftpWrite(host, secret, temporary, body)
-      await this.sftpRename(host, secret, temporary, remotePath)
+      try {
+        await this.sftpRename(host, secret, temporary, remotePath)
+      } catch {
+        // Standard SFTP rename is allowed to refuse an existing target. The
+        // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
+        // atomic because the temporary file is in the same directory.
+        const moved = await this.exec(host, secret, `mv -f ${shJoin([temporary, remotePath])}`, 20_000)
+        if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload rename failed')
+      }
+      if (previous?.mode !== undefined) {
+        await this.exec(host, secret, `chmod ${previous.mode.toString(8)} ${shJoin([remotePath])}`, 15_000).catch(() => undefined)
+      }
     } catch (error) {
       await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
       throw error
@@ -531,7 +552,27 @@ export class SshPool {
 
   async sftpAttrs(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
     const session = await this.sftp(host, secret)
-    return attrsOf(session, remotePath, follow)
+    const info = await attrsOf(session, remotePath, follow)
+    if (info === undefined || info.mode !== undefined || info.type !== 'other') return info
+    // A mode-less server cannot distinguish a FIFO/device from a regular file
+    // through SFTP attributes. Ask the login shell for the remaining known
+    // types; if the shell cannot answer, keep `other` and fail closed.
+    return { ...info, type: await this.classifyRemoteType(host, secret, remotePath, follow) }
+  }
+
+  private async classifyRemoteType(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<SftpAttrs['type']> {
+    const path = shJoin([remotePath])
+    const command = follow
+      ? `if [ -d ${path} ]; then echo directory; elif [ -f ${path} ]; then echo file; else echo other; fi`
+      : `if [ -L ${path} ]; then echo symlink; elif [ -d ${path} ]; then echo directory; elif [ -f ${path} ]; then echo file; else echo other; fi`
+    try {
+      const result = await this.exec(host, secret, command, 15_000)
+      const kind = result.stdout.trim()
+      if (result.code === 0 && (kind === 'file' || kind === 'directory' || kind === 'symlink' || kind === 'other')) return kind
+    } catch {
+      // Fall through to the fail-closed answer.
+    }
+    return 'other'
   }
 
   /** The symlink target. A non-link rejects; the caller decides which errors mean that. */
@@ -1069,6 +1110,12 @@ function readLinkOf(sftp: SftpLike, remotePath: string): Promise<string> {
   })
 }
 
+/** Whether a remote path is `root` or below it. */
+function remotePathWithin(root: string, candidate: string): boolean {
+  const rel = posix.relative(posix.normalize(root), posix.normalize(candidate))
+  return rel === '' || (!rel.startsWith('..') && !posix.isAbsolute(rel))
+}
+
 /** Rename with the POSIX-overwrite extension first, then the standard request. */
 async function renameRemote(sftp: SftpLike, fromPath: string, toPath: string): Promise<void> {
   const call = (method: 'ext' | 'standard'): Promise<void> => new Promise((resolve, reject) => {
@@ -1128,7 +1175,10 @@ async function attrsOf(sftp: SftpLike, remotePath: string, follow: boolean): Pro
     return { ...info, type: 'directory' }
   } catch (error) {
     if (isSftpMissing(error) || isSftpPermissionDenied(error)) return info
-    return { ...info, type: 'file' }
+    // Unknown type: leave it for the public `sftpAttrs` wrapper to classify
+    // with the login shell. Never guess `file` here, or a FIFO can reach
+    // `sftpRead` and block forever.
+    return info
   }
 }
 

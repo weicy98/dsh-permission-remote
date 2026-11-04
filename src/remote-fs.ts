@@ -245,6 +245,22 @@ async function lstatRemote(runtime: Runtime, requested: string, opts: { cwd?: st
 }
 
 async function statRemote(runtime: Runtime, target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined> {
+  const key = String(target.targetKey)
+  const recorded = runtime.identity.get(key)
+  // A fresh identity has already been through resolve. If there is none (for
+  // example a child target created by listDir), verify the final component
+  // before the follow-stat below can leave the workspace.
+  if (recorded === undefined || !runtime.meta.isRealpathFresh(recorded.at)) {
+    try {
+      const verified = await verifiedPlace(runtime, target, 'any', signal)
+      if (verified === undefined) return runtime.originals.stat(target, signal)
+    } catch (error) {
+      if (error instanceof FsError && error.code === 'FS_NOT_FOUND') return undefined
+      const fallback = placeOf(runtime, target)
+      if (fallback === undefined) return runtime.originals.stat(target, signal)
+      return softenAttrs(error, signal, runtime.meta.attrs(fallback.host.id, fallback.remote, true, true), infoOf, () => runtime.originals.stat(target, signal))
+    }
+  }
   const place = placeOf(runtime, target)
   if (place === undefined) return runtime.originals.stat(target, signal)
   throwIfFsAborted(signal)
@@ -403,7 +419,9 @@ async function readRemoteRange(
     throw new FsError('read range is not a non-negative safe integer', 'FS_IO_ERROR')
   }
   try {
-    const place = await verifiedPlace(runtime, target, 'any', signal)
+    // A zero-length range is still a request against the target: do not let a
+    // directory or special file succeed just because no bytes are requested.
+    const place = await verifiedPlace(runtime, target, range.length === 0 ? 'file' : 'any', signal)
     if (place === undefined) return runtime.originals.readByteRange(target, range, signal)
     throwIfFsAborted(signal)
     if (range.length === 0) return new Uint8Array()

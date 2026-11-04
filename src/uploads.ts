@@ -35,7 +35,7 @@ export interface UploadAccess {
     sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number }>
     /** `lstat` (follow=false) so an existing symbolic link can be refused. */
     sftpAttrs?(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number } | undefined>
-    sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string): Promise<void>
+    sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string, allowedRoot?: string): Promise<void>
   }
 }
 
@@ -347,7 +347,7 @@ async function uploadOne(
       return { kind: 'failed' }
     }
     if (info !== undefined && info.size === ref.bytes) return { kind: 'ready', remotePath }
-    await access.pool.sftpPutFile(host, secret, ref.hostPath, remotePath)
+    await access.pool.sftpPutFile(host, secret, ref.hostPath, remotePath, home)
     if (isAborted(signal)) return { kind: 'ready', remotePath, aborted: true }
     return { kind: 'ready', remotePath }
   } catch (error) {
