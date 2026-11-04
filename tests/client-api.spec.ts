@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { callHost, readHosts, readWorkspaces, writeRgRegistry, type ClientFace } from '../src/client/api.ts'
+import { callHost, readHosts, readWorkspaces, writeRgRegistry, writeTransferLimits, type ClientFace } from '../src/client/api.ts'
 
 interface Recorded {
   readonly endpoint: string
@@ -131,4 +131,74 @@ test('saving the download source sets one volatile path with the loaded revision
     ops: [{ op: 'set', path: ['rgRegistry'], value: 'https://mirror.example.test' }],
     revision: 7,
   }])
+})
+
+test('transfer limits are read back, with 0 preserved as "no limit"', async () => {
+  const { face } = fakeFace(undefined)
+  // The describe() double has no namespaces; assert the documented defaults.
+  const loaded = await readHosts(face)
+  assert.equal(loaded.transferMaxBytes, 32 * 1024 * 1024)
+  assert.equal(loaded.transferTimeoutMs, 120_000)
+
+  const stored = {
+    namespaces: [{
+      ns: 'permission-remote',
+      revision: 7,
+      value: { hosts: [], transferMaxBytes: 0, transferTimeoutMs: 0 },
+    }],
+  }
+  const zero = await readHosts({
+    connection: face.connection,
+    remote: { settings: { describe: async () => ({ namespaces: stored.namespaces }), mutate: async () => undefined } },
+  } as unknown as ClientFace)
+  assert.equal(zero.transferMaxBytes, 0)
+  assert.equal(zero.transferTimeoutMs, 0)
+})
+
+test('saving the transfer limits writes both fields in one mutation', async () => {
+  const calls: Array<{ endpoint: string, payload: unknown }> = []
+  const face = {
+    connection: {
+      rpc: { async call(_channel: string, endpoint: string, payload: unknown) { calls.push({ endpoint, payload }); return { ok: true } } },
+    },
+    remote: {
+      settings: {
+        async describe() { return { namespaces: [] } },
+        async mutate(ns: string, ops: Array<{ op: string, path: string[], value: unknown }>, revision?: number) {
+          calls.push({ endpoint: 'mutate', payload: { ns, ops, revision } })
+          return undefined
+        },
+      },
+    },
+  } as unknown as ClientFace
+  await writeTransferLimits(face, 1024, 5000, 3)
+  assert.deepEqual(calls, [{
+    endpoint: 'mutate',
+    payload: {
+      ns: 'permission-remote',
+      ops: [
+        { op: 'set', path: ['transferMaxBytes'], value: 1024 },
+        { op: 'set', path: ['transferTimeoutMs'], value: 5000 },
+      ],
+      revision: 3,
+    },
+  }])
+})
+
+test('a negative transfer limit is clamped to the "no limit" sentinel', async () => {
+  const calls: unknown[] = []
+  const face = {
+    connection: { rpc: { async call() { return { ok: true } } } },
+    remote: {
+      settings: {
+        async describe() { return { namespaces: [] } },
+        async mutate(_ns: string, ops: unknown) { calls.push(ops); return undefined },
+      },
+    },
+  } as unknown as ClientFace
+  await writeTransferLimits(face, -1, Number.NaN, 1)
+  assert.deepEqual(calls, [[
+    { op: 'set', path: ['transferMaxBytes'], value: 0 },
+    { op: 'set', path: ['transferTimeoutMs'], value: 0 },
+  ]])
 })

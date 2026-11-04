@@ -46,8 +46,12 @@ function result(overrides: Partial<ExecResult> = {}): ExecResult {
 interface OpsApi {
   api: ToolHost
   commands: string[]
+  /** Payloads written to a remote command's stdin, one per `exec`. */
+  bodies: Array<string | Buffer | undefined>
   reads: string[]
   stats: string[]
+  /** lstat probes, with the `follow` flag the caller asked for. */
+  attrs: Array<{ path: string, follow: boolean }>
   workspaces: Array<{ hostId: string, remotePath: string, title: string | undefined }>
   modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]>
 }
@@ -56,23 +60,27 @@ const markedHome = `__DSH_OPS_HOME_BEGIN__\n/home/ops\n__DSH_OPS_HOME_END__\n`
 
 function api(options: {
   mode?: 'read-only' | 'workspace-write' | 'danger-full-access'
-  exec?: (command: string) => ExecResult
+  exec?: (command: string, stdin?: string | Buffer) => ExecResult
   read?: (path: string) => Buffer
   stat?: (path: string) => { isDirectory: boolean, size: number, mode: number }
+  attrs?: (path: string, follow: boolean) => { type: 'file' | 'directory' | 'symlink' | 'other', size: number, mode?: number } | undefined
   /** Fail the registration the way Core.registerWorkspace would. */
   register?: (remotePath: string) => void
 } = {}): OpsApi {
   forgetOpsHost('prod1')
   const commands: string[] = []
+  const bodies: Array<string | Buffer | undefined> = []
   const reads: string[] = []
   const stats: string[] = []
+  const attrs: OpsApi['attrs'] = []
   const workspaces: OpsApi['workspaces'] = []
   const modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]> = []
   const pool = {
-    exec: async (_host: HostConfig, _secret: unknown, command: string) => {
+    exec: async (_host: HostConfig, _secret: unknown, command: string, _timeoutMs?: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
       commands.push(command)
-      if (command.includes('"$HOME"')) return options.exec?.(command) ?? result({ stdout: markedHome })
-      return options.exec?.(command) ?? result()
+      bodies.push(stdin)
+      if (command.includes('"$HOME"')) return options.exec?.(command, stdin) ?? result({ stdout: markedHome })
+      return options.exec?.(command, stdin) ?? result()
     },
     sftpRead: async (_host: HostConfig, _secret: unknown, path: string) => {
       reads.push(path)
@@ -83,6 +91,11 @@ function api(options: {
       stats.push(path)
       if (options.stat !== undefined) return options.stat(path)
       return { isDirectory: false, size: 24, mode: 0o100644 }
+    },
+    sftpAttrs: async (_host: HostConfig, _secret: unknown, path: string, follow: boolean) => {
+      attrs.push({ path, follow })
+      if (options.attrs !== undefined) return options.attrs(path, follow)
+      return { type: 'file' as const, size: 24, mode: 0o100644 }
     },
     sftpRealpath: async (_host: HostConfig, _secret: unknown, path: string) => path,
   } as unknown as SshPool
@@ -108,8 +121,10 @@ function api(options: {
       },
     },
     commands,
+    bodies,
     reads,
     stats,
+    attrs,
     workspaces,
     modes,
   }

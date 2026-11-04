@@ -836,7 +836,10 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
     }
     fallback = setTimeout(() => finish(null, 'KILL'), 2000)
   }
-  const timer = timeoutMs > 0 ? setTimeout(() => stop('timeout'), timeoutMs) : undefined
+  // Node's timer clock is a signed 32-bit millisecond count: a larger delay
+  // overflows and fires after 1 ms. Callers cap their own values, but clamp
+  // here too so no caller can turn a big timeout into an instant failure.
+  const timer = timeoutMs > 0 ? setTimeout(() => stop('timeout'), Math.min(timeoutMs, 2 ** 31 - 1)) : undefined
   try {
     client.exec(command, (error, opened) => {
       if (error) {

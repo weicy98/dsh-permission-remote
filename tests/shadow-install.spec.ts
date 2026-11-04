@@ -130,6 +130,8 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   const write = tools.find(tool => tool.name === 'ssh_write')
   const hosts = tools.find(tool => tool.name === 'ssh_hosts')
   const workspace = tools.find(tool => tool.name === 'ssh_workspace')
+  const upload = tools.find(tool => tool.name === 'ssh_upload')
+  const download = tools.find(tool => tool.name === 'ssh_download')
   assert.equal(exec?.parameters.type, 'object')
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
@@ -145,6 +147,30 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   assert.deepEqual(write?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   await assert.rejects(async () => exec!.execute({}, {}), /invalid arguments/)
   await assert.rejects(async () => workspace!.execute({ host: 'lo' }, {}), /invalid arguments/)
+  // Transfers create a file on one side, so they use the write-class gate.
+  assert.deepEqual(upload?.parameters.required, ['host', 'local_path', 'remote_path'])
+  assert.deepEqual(download?.parameters.required, ['host', 'remote_path', 'local_path'])
+  assert.deepEqual(upload?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
+  assert.deepEqual(download?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
+  await assert.rejects(async () => upload!.execute({ host: 'lo' }, {}), /invalid arguments/)
+  await assert.rejects(async () => download!.execute({ host: 'lo' }, {}), /invalid arguments/)
+})
+
+test('a saved transfer ceiling reaches a tool registered earlier', async () => {
+  const ctx = plugin()
+  apply(ctx, { hosts: [], maxConnections: 4, transferMaxBytes: 1024, transferTimeoutMs: 5000 })
+  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+  const { agent } = agentFor('/tmp/not-a-remote-workspace', definition => {
+    tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+    return () => undefined
+  })
+  await created(ctx, agent)
+  const upload = tools.find(tool => tool.name === 'ssh_upload')
+  assert.ok(upload !== undefined)
+  // The limit is read per call, not captured at registration, so a Settings
+  // save lands on the next transfer in this same session. A missing host is
+  // refused first, which is enough to prove the tool still reflects config.
+  await assert.rejects(() => upload!.execute({ host: 'nope', local_path: '/tmp/a', remote_path: '/tmp/b' }, {}), /unknown SSH host/)
 })
 
 test('a session that walks into a placeholder no workspace owns is refused', async () => {

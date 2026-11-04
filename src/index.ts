@@ -32,7 +32,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { sniffImage } from './image.ts'
-import { hostLabel, isRemoteMissing, opsHostView, renderOpsExec, renderOpsRead, renderSshWorkspace, resolveOpsHost, runSshExec, runSshRead, runSshWorkspace, runSshWrite, forgetOpsHost } from './ops.ts'
+import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
@@ -517,6 +517,11 @@ export class Core {
 
   listHosts(): HostConfig[] {
     return this.config.hosts
+  }
+
+  /** Ceiling and deadline for one ssh_upload / ssh_download; `0` means no limit. */
+  transferLimits(): OpsTransferLimits {
+    return { maxBytes: this.config.transferMaxBytes, timeoutMs: this.config.transferTimeoutMs }
   }
 
   async trust(hostId: string, fingerprint: string): Promise<void> {
@@ -2496,9 +2501,12 @@ function publishOpsTool(tool: {
 function opsTools(core: Core): object[] {
   const hostApi = core.toolHost(undefined)
   const pick = (args: Record<string, unknown>) => core.requireOpsHost(String(args.host ?? ''))
+  // Read per call, not per registration: a Settings save applies to the next
+  // transfer even in a session that is already open.
+  const limits = () => core.transferLimits()
   return [publishOpsTool({
       name: 'ssh_hosts',
-      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
+      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, uploads, downloads, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
       parameters: {},
       output: textOutput(value => {
         const hosts = Array.isArray(value.hosts) ? value.hosts as Array<ReturnType<typeof opsHostView>> : []
@@ -2571,6 +2579,36 @@ function opsTools(core: Core): object[] {
         const record = args as Record<string, unknown>
         const host = pick(record)
         return runSshWrite(hostApi, host, record, exec)
+      },
+    }), publishOpsTool({
+      name: 'ssh_upload',
+      description: 'Copy one local file to a configured SSH host over SFTP. This is for ops on a machine that is not your current workspace. local_path is an absolute path on the machine running DSH (not the remote host, and not a placeholder path when the session itself is remote); remote_path is an absolute remote path or starts with "~/". The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates the original, an existing file keeps its permission bits, and a new file uses the remote umask. The filesystem root "/" is refused, and so is a final symlink, a directory, or a special file (FIFO/device). Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      parameters: {
+        host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
+        local_path: { type: 'string', required: true, description: 'Absolute path on the machine running DSH' },
+        remote_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },
+        ...OPS_ESCALATION,
+      },
+      output: textOutput(renderOpsUpload),
+      execute(args: unknown, exec: ToolExec) {
+        const record = args as Record<string, unknown>
+        const host = pick(record)
+        return runSshUpload(hostApi, host, record, exec, limits())
+      },
+    }), publishOpsTool({
+      name: 'ssh_download',
+      description: 'Copy one file from a configured SSH host to a local path over SFTP. This is for ops on a machine that is not your current workspace. remote_path is an absolute remote path or starts with "~/"; local_path is an absolute path on the machine running DSH whose parent directory already exists. The file is replaced atomically and gets mode 0600. A remote symlink, directory, or special file (FIFO/device) is refused, and so is a local directory or symlink at the target. Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. Downloading writes a local file, so it is gated like ssh_write: on an "ask" host it needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      parameters: {
+        host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
+        remote_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },
+        local_path: { type: 'string', required: true, description: 'Absolute path on the machine running DSH; its parent must already exist' },
+        ...OPS_ESCALATION,
+      },
+      output: textOutput(renderOpsDownload),
+      execute(args: unknown, exec: ToolExec) {
+        const record = args as Record<string, unknown>
+        const host = pick(record)
+        return runSshDownload(hostApi, host, record, exec, limits())
       },
     })]
 }
