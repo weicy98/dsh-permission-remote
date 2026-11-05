@@ -33,7 +33,13 @@ interface Pool {
   readAts: Array<{ offset: number, length: number }>
 }
 
-function createHarness(warnings: string[] = [], options?: { now?: () => number, metaTtlMs?: number, attrTtlMs?: number }) {
+function createHarness(warnings: string[] = [], options?: {
+  now?: () => number
+  metaTtlMs?: number
+  attrTtlMs?: number
+  /** Model a provider that does not implement the optional mutation methods. */
+  withoutOptionalMutations?: boolean
+}) {
   const pool: Pool = {
     reads: 0,
     readAts: [],
@@ -87,8 +93,33 @@ function createHarness(warnings: string[] = [], options?: { now?: () => number, 
       this.watched += 1
       return async () => undefined
     }
+    // The provider's own local implementations. The remote patch must refuse a
+    // remote target before any of these runs, and leave a local target alone.
+    patches: string[] = []
+    deletes: string[] = []
+    moves: string[] = []
+    async patchText(target?: FsTarget): Promise<unknown> {
+      this.patches.push(String(target?.targetKey))
+      return 'original-patch'
+    }
+    async deleteFile(target?: FsTarget): Promise<unknown> {
+      this.deletes.push(String(target?.targetKey))
+      return 'original-delete'
+    }
+    async moveFile(source?: FsTarget, destination?: FsTarget): Promise<unknown> {
+      this.moves.push(`${String(source?.targetKey)}->${String(destination?.targetKey)}`)
+      return 'original-move'
+    }
   }
   const backend = new Backend()
+  if (options?.withoutOptionalMutations === true) {
+    // Own properties shadow the prototype; delete both so the provider really
+    // lacks the methods when `installRemoteFs` binds the optional surface.
+    for (const key of ['patchText', 'deleteFile', 'moveFile'] as const) {
+      Reflect.deleteProperty(backend, key)
+      Reflect.deleteProperty(Object.getPrototypeOf(backend) as object, key)
+    }
+  }
   const access: RemoteAccess = {
     requireHost: () => host,
     async secret() { return {} },
@@ -1234,4 +1265,70 @@ test('a write to another workspace on the same host is refused', async () => {
     (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
   )
   assert.equal(writes, 0)
+})
+
+test('a mutating fs method the backend does not implement remotely refuses only a remote target', async () => {
+  const { backend } = createHarness()
+  const remote = await backend.resolve(placeholder('a.ts'))
+  const remoteB = await backend.resolve(placeholder('b.ts'))
+  const local: FsTarget = { targetKey: FsTargetKey('/tmp/local'), displayPath: '/tmp/local' }
+
+  // `apply_patch` reaches `patchText`, and a delete/move reaches its own method.
+  // None of them has a remote implementation, so each must be refused instead
+  // of running the provider's local code against the placeholder spelling.
+  for (const [label, run] of [
+    ['patchText', () => backend.patchText(remote)],
+    ['deleteFile', () => backend.deleteFile(remote)],
+    ['moveFile', () => backend.moveFile(remote, remoteB)],
+  ] as const) {
+    await assert.rejects(run, (error: unknown) => {
+      assert.equal(codeOf(error), 'FS_SANDBOX_DENIED', `${label} must be refused, not run locally`)
+      assert.match((error as Error).message, /cannot be changed by this operation/)
+      return true
+    }, label)
+  }
+  assert.deepEqual(backend.patches, [])
+  assert.deepEqual(backend.deletes, [])
+  assert.deepEqual(backend.moves, [])
+
+  // A move is a two-path operation: a remote destination alone is enough.
+  await assert.rejects(
+    () => backend.moveFile(local, remoteB),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+  // The provider's own implementation still runs for local targets.
+  assert.equal(await backend.patchText(local), 'original-patch')
+  assert.equal(await backend.deleteFile(local), 'original-delete')
+  assert.equal(await backend.moveFile(local, local), 'original-move')
+  assert.deepEqual(backend.patches, ['/tmp/local'])
+  assert.deepEqual(backend.deletes, ['/tmp/local'])
+  assert.deepEqual(backend.moves, ['/tmp/local->/tmp/local'])
+})
+
+test('uninstalling restores the provider mutation methods', async () => {
+  const { backend, remove, Backend } = createHarness()
+  const remote = await backend.resolve(placeholder('a.ts'))
+  assert.notEqual(backend.patchText, Backend.prototype.patchText)
+  remove()
+  assert.equal(backend.patchText, Backend.prototype.patchText)
+  assert.equal(backend.deleteFile, Backend.prototype.deleteFile)
+  assert.equal(backend.moveFile, Backend.prototype.moveFile)
+  // Without the patch a remote-looking key is just a string to the provider;
+  // this test only checks the restore, not that a local write would be safe.
+  assert.equal(await backend.patchText(remote), 'original-patch')
+})
+
+test('a provider without the optional mutation methods is still installed and not wrapped', async () => {
+  const warnings: string[] = []
+  const { backend } = createHarness(warnings, { withoutOptionalMutations: true })
+  // Nothing to wrap, so nothing is added: the tool layer sees the missing
+  // method instead of a refusal claiming this plugin blocked an operation it
+  // never received.
+  assert.equal(backend.patchText, undefined)
+  assert.equal(backend.deleteFile, undefined)
+  assert.equal(backend.moveFile, undefined)
+  // A missing optional mutation is not a reason to skip the whole patch.
+  const remote = await backend.resolve(placeholder())
+  assert.equal(String(remote.targetKey), placeholder())
+  assert.deepEqual(warnings, [])
 })

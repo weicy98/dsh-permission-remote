@@ -26,6 +26,8 @@ import {
   type FsEditRequest,
   type FsInfo,
   type FsPathInfo,
+  type FsDeleteOutcome,
+  type FsMoveOutcome,
   type FsTarget,
   type FsWriteIntent,
   type FsWriteOutcome,
@@ -116,6 +118,15 @@ interface Originals {
   readByteRange(target: FsTarget, range: { offset: number, length: number }, signal?: AbortSignal): Promise<Uint8Array>
   writeText(target: FsTarget, content: string, expected?: FsWriteIntent, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsWriteOutcome>
   editText(target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsEditOutcome>
+  /**
+   * The remaining mutating methods of the fs service definition. They are NOT
+   * reimplemented remotely (yet), so they stay optional here and are refused
+   * for a remote target instead of falling through to the local backend. A
+   * local target still reaches the mounted provider unchanged.
+   */
+  patchText?(target: FsTarget, hunks: readonly unknown[], expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsEditOutcome>
+  deleteFile?(target: FsTarget, expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsDeleteOutcome>
+  moveFile?(source: FsTarget, destination: FsTarget, options: { hunks?: readonly unknown[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsMoveOutcome>
   contains(parent: FsTarget, child: FsTarget): boolean
   watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>>
 }
@@ -179,7 +190,7 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
   }
   const surface = fs as FsSurface
   const identity = new Map<string, RemoteIdentity>()
-  const originals = bindOriginals(surface)
+  const originals = bindOptionalMutations(surface, bindOriginals(surface))
   const now = options?.now ?? Date.now
   const meta = new MetaCache(
     now,
@@ -204,6 +215,9 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
     restorers.push(replaceMethod(surface, 'watch', (target, changed, signal) => watchRemote(runtime, target, changed, signal)))
     restorers.push(replaceMethod(surface, 'writeText', (target, content, expected, signal, policy) => writeRemoteText(runtime, target, content, expected, signal, policy)))
     restorers.push(replaceMethod(surface, 'editText', (target, edit, expected, signal, policy) => editRemoteText(runtime, target, edit, expected, signal, policy)))
+    guardRemoteMutation(surface, originals, restorers, 'patchText')
+    guardRemoteMutation(surface, originals, restorers, 'deleteFile')
+    guardRemoteMutation(surface, originals, restorers, 'moveFile')
     Object.defineProperty(fs, MARKER, { value: true, configurable: true, enumerable: false })
   } catch (error) {
     for (const restore of restorers) restore()
@@ -1402,6 +1416,76 @@ function bindOriginals(fs: FsSurface): Originals {
     contains: fs.contains.bind(fs),
     watch: fs.watch.bind(fs),
   }
+}
+
+/**
+ * The optional mutating methods, bound when the mounted provider has them.
+ *
+ * Kept apart from `bindOriginals` so the required surface stays required: a
+ * provider without `patchText` is a legal composition, and the guard has to
+ * look at the real method before deciding to wrap it.
+ */
+function bindOptionalMutations(fs: FsSurface, originals: Originals): Originals {
+  const patch = fs as unknown as Partial<Record<'patchText' | 'deleteFile' | 'moveFile', (...args: never[]) => unknown>>
+  if (typeof patch.patchText === 'function') originals.patchText = patch.patchText.bind(fs) as Originals['patchText']
+  if (typeof patch.deleteFile === 'function') originals.deleteFile = patch.deleteFile.bind(fs) as Originals['deleteFile']
+  if (typeof patch.moveFile === 'function') originals.moveFile = patch.moveFile.bind(fs) as Originals['moveFile']
+  return originals
+}
+
+/**
+ * Refuse a mutating fs method this backend does not implement remotely.
+ *
+ * `writeText` and `editText` are reimplemented; `patchText`, `deleteFile`, and
+ * `moveFile` are not. Leaving them on the mounted provider would run the
+ * provider's own local implementation against the placeholder spelling, which
+ * really is a path on this computer: `apply_patch` would then edit a local file
+ * that only looks like the remote one, and `present`/uploads may already have
+ * put a real file there. A remote target is refused with FS_SANDBOX_DENIED so
+ * the model is told the operation is unavailable rather than silently writing
+ * to the wrong machine; a local target still reaches the provider unchanged.
+ *
+ * The method is absent from the mounted service in some compositions. Nothing
+ * is replaced then, so the tool layer sees the missing method instead of a
+ * refusal that would claim this plugin blocked something it never saw.
+ */
+function guardRemoteMutation(
+  surface: FsSurface,
+  originals: Originals,
+  restorers: Array<() => void>,
+  key: 'patchText' | 'deleteFile' | 'moveFile',
+): void {
+  const saved = originals[key]
+  if (typeof saved !== 'function') return
+  const own = Object.hasOwn(surface, key)
+  const targetOf = (value: unknown): string => {
+    const record = typeof value === 'object' && value !== null ? value as { targetKey?: unknown } : undefined
+    return String(record?.targetKey ?? '')
+  }
+  // The fs contract declares every mutation async, so a refusal is a rejected
+  // promise like any other provider failure, not a synchronous throw.
+  const refuse = (displayPath: string): Promise<never> => Promise.reject(new FsError(
+    `remote workspace: ${displayPath} cannot be changed by this operation; use write or edit instead`,
+    'FS_SANDBOX_DENIED',
+  ))
+  const replacement = key === 'moveFile'
+    // A move touches two paths. Either side being remote is enough to make a
+    // local call wrong: the source would be copied from this computer, or the
+    // destination written onto it.
+    ? (source: FsTarget, destination: FsTarget, ...rest: unknown[]) => {
+      if (routeByCwd(targetOf(source)).kind === 'remote') return refuse(String(source?.displayPath ?? 'the source'))
+      if (routeByCwd(targetOf(destination)).kind === 'remote') return refuse(String(destination?.displayPath ?? 'the destination'))
+      return (saved as (...args: unknown[]) => unknown).call(surface, source, destination, ...rest)
+    }
+    : (target: FsTarget, ...rest: unknown[]) => {
+      if (routeByCwd(targetOf(target)).kind === 'remote') return refuse(String(target?.displayPath ?? 'the target'))
+      return (saved as (...args: unknown[]) => unknown).call(surface, target, ...rest)
+    }
+  ;(surface as unknown as Record<string, unknown>)[key] = replacement
+  restorers.push(() => {
+    if (own) (surface as unknown as Record<string, unknown>)[key] = saved
+    else Reflect.deleteProperty(surface, key)
+  })
 }
 
 function replaceMethod<K extends keyof Originals>(fs: FsSurface, key: K, next: Originals[K]): () => void {

@@ -2236,7 +2236,7 @@ function installRemoteShellSurface(
     const remote = routeByCwd(effectiveCwd(ctx, execution, headerCwd)).kind === 'remote'
     if (isWindowsShell(execution.name)) return windowsShellGuardReason(remote)
     if (!remote || fsReady()) return undefined
-    if (execution.name === 'read' || execution.name === 'write' || execution.name === 'edit') return REMOTE_FS_UNPATCHED
+    if (FS_SURFACE_TOOLS.has(execution.name)) return REMOTE_FS_UNPATCHED
     return undefined
   }))
   disposers.push(agent.ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
@@ -2364,6 +2364,20 @@ const REMOTE_SURFACE_UNMOUNTED = 'SSH tools did not mount for this remote worksp
 
 /** Official file tools would use the local backend if ctx.fs never got the remote patch. */
 const REMOTE_FS_UNPATCHED = 'the remote filesystem patch is unavailable, so file tools are refused instead of writing into the local placeholder'
+
+/**
+ * Every official tool that reads or mutates through `ctx.fs`.
+ *
+ * `apply_patch` and `str_replace_editor` are not in the default preset, but a
+ * composition that enables either one would otherwise reach the unpatched
+ * provider: `apply_patch` calls `patchText`/`deleteFile`/`moveFile`, and
+ * `str_replace_editor` calls `writeText`. Naming them here keeps the refusal
+ * tied to the capability, not to whichever tools this deployment happens to
+ * mount.
+ */
+const FS_SURFACE_TOOLS: ReadonlySet<string> = new Set([
+  'read', 'read_image', 'write', 'edit', 'apply_patch', 'str_replace_editor',
+])
 
 function agentLabel(agent: AgentLike): string {
   return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'

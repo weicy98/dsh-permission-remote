@@ -274,6 +274,21 @@ test('official file tools are denied when the remote fs patch never mounted', as
   assert.match(session.guard('read') ?? '', /remote filesystem patch/)
   assert.match(session.guard('write') ?? '', /remote filesystem patch/)
   assert.match(session.guard('edit') ?? '', /remote filesystem patch/)
+  assert.match(session.guard('read_image') ?? '', /remote filesystem patch/)
+  // Not in the default preset, but a composition may mount them: both mutate
+  // through ctx.fs and would reach the unpatched local provider.
+  assert.match(session.guard('apply_patch') ?? '', /remote filesystem patch/)
+  assert.match(session.guard('str_replace_editor') ?? '', /remote filesystem patch/)
+  // Tools that do not touch ctx.fs are left to their own guards.
+  assert.equal(session.guard('bash'), undefined)
+  assert.equal(session.guard('grep'), undefined)
+})
+
+test('the fs guard does not fire on a local session', async () => {
+  const session = surface({ headerCwd: localCwd, officialBash: false })
+  await session.created()
+  assert.equal(session.guard('write'), undefined)
+  assert.equal(session.guard('apply_patch'), undefined)
 })
 
 test('a non-unknown restrict error fails remote agent creation, drops both registration sets, and refuses every tool', async () => {
