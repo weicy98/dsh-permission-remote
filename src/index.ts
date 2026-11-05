@@ -1787,6 +1787,10 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => async () => {
     ptcDisposed = true
+    // The fs/subprocess patches are removed below; a later run must not see
+    // a stale "ready" flag and route through a half-unloaded world.
+    fsPatchReady = false
+    worldReady = false
     // One agent disposer must not skip the remaining agents or the pool.
     const failure = settleDisposers([...unregisters])
     unregisters.clear()

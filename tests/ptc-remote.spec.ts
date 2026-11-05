@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { attachRemotePtc, type PtcRunResult, type PtcRunSpec, type RemotePtcDeps } from '../src/ptc-remote.ts'
+import { remoteWorldContext } from '../src/remote-world.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 
 const host = {
@@ -45,7 +46,7 @@ test('a local cwd reaches the original runtime and remote preflight fails closed
   const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps(env))
   try {
     assert.deepEqual(await value.run({ program: 'return 1', cwd: '/tmp/local', timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local' } }), { logs: ['local'] })
-    const remote = await value.run({ program: 'return 1', cwd: placeholder, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/srv/app' } })
+    const remote = await value.run({ program: 'return 1', cwd: placeholder, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: placeholder } })
     assert.equal(remote.error?.kind, 'exception')
     assert.match(remote.error?.message ?? '', /execution world is not installed/u)
     assert.match(value.executionInstructions, /remote workspace/u)
@@ -55,4 +56,86 @@ test('a local cwd reaches the original runtime and remote preflight fails closed
     await rm(home, { recursive: true, force: true })
   }
   assert.equal(value.executionInstructions, 'base instructions')
+})
+
+
+test('a local session cannot use working_directory to run code on a remote host', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-remote-gate-'))
+  const env = { DSH_HOME: home }
+  const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
+  const value = runtime()
+  const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps(env))
+  try {
+    const result = await value.run({
+      program: 'return 1',
+      cwd: placeholder,
+      timeoutMs: 1000,
+      bindings: [],
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local-project' },
+    })
+    assert.equal(result.error?.kind, 'exception')
+    assert.match(result.error?.message ?? '', /Session was opened on that SSH host/u)
+    assert.equal(value.calls, 0)
+  } finally {
+    restore()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('run_code refuses a policy root belonging to a different SSH host', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-remote-gate-'))
+  const env = { DSH_HOME: home }
+  const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
+  const other = mapRemoteToLocal('h2', '/srv/app', env)!
+  const value = runtime()
+  const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps(env))
+  try {
+    const result = await value.run({ program: 'return 1', cwd: placeholder, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: other } })
+    assert.equal(result.error?.kind, 'exception')
+    assert.match(result.error?.message ?? '', /different SSH host/u)
+    assert.equal(value.calls, 0)
+  } finally {
+    restore()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+
+test('a cd-to-root cwd still pins the sandbox root to the session workspace', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-remote-root-'))
+  const env = { DSH_HOME: home }
+  const workspace = mapRemoteToLocal('h1', '/srv/app', env)!
+  const rootCwd = mapRemoteToLocal('h1', '/', env)!
+  const captured: Array<{ remoteCwd: string, remoteRoot: string }> = []
+  const value = runtime()
+  value.run = async (spec: PtcRunSpec) => {
+    const world = remoteWorldContext.getStore()
+    if (world !== undefined) captured.push({ remoteCwd: world.remoteCwd, remoteRoot: world.remoteRoot })
+    return { logs: [String(spec.cwd)] }
+  }
+  const base = deps(env)
+  const custom: RemotePtcDeps = {
+    ...base,
+    worldReady: () => true,
+    fsReady: () => true,
+    pool: { sftpRealpath: async (_host: unknown, _secret: unknown, path: string) => path } as never,
+    statusOf: async () => ({
+      os: 'linux', sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap',
+      ripgrep: 'system', ripgrepPath: '/usr/bin/rg', roots: { workspaceRoot: '/', tmp: '/tmp', userTmp: '/tmp' },
+      home: '/home/dev', node: { available: true, path: '/usr/bin/node', version: '22.20.0', major: 22 }, install: null,
+    }),
+    ensureWorker: async () => ({
+      workerLocalPaths: ['/host/process.js'], workerRemotePath: '/home/dev/process.mjs',
+      persistentWorkerRemotePath: '/home/dev/persistent-process.mjs', shimRemotePath: '/home/dev/ptc-shim.mjs', digest: 'x',
+    }),
+  }
+  const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, custom)
+  try {
+    const result = await value.run({ program: 'return 1', cwd: rootCwd, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'workspace-write', workspaceRoot: workspace } })
+    assert.equal(result.error, undefined, JSON.stringify(result))
+    assert.deepEqual(captured, [{ remoteCwd: '/', remoteRoot: '/srv/app' }])
+  } finally {
+    restore()
+    await rm(home, { recursive: true, force: true })
+  }
 })

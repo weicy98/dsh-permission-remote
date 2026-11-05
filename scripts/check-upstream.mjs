@@ -54,7 +54,6 @@ const rows = [
   ['DSH', entry.dshVersion, expected?.dshVersion === entry.dshVersion ? 'same' : 'new'],
   ['ptc-runtime-node', entry.ptcRuntimeNodeVersion, expected?.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion ? 'same' : 'new'],
   ['process.js sha256', entry.processSha256, expected?.processSha256 === entry.processSha256 ? 'same' : 'changed'],
-  ['persistent-process.js sha256', entry.persistentProcessSha256, expected?.persistentProcessSha256 === entry.persistentProcessSha256 ? 'same' : 'changed'],
   ['lib/index.js sha256', entry.indexSha256, expected?.indexSha256 === entry.indexSha256 ? 'same' : 'changed'],
   ['dsh-subprocess control sha256', entry.controlSha256, expected?.controlSha256 === entry.controlSha256 ? 'same' : 'changed'],
   ['control fd', String(entry.controlFd), String(expected?.controlFd)],
@@ -73,7 +72,6 @@ if (probes.failures.length > 0) {
 }
 const changed = expected === undefined
   || entry.processSha256 !== expected.processSha256
-  || entry.persistentProcessSha256 !== expected.persistentProcessSha256
   || entry.indexSha256 !== expected.indexSha256
   || entry.controlSha256 !== expected.controlSha256
   || entry.controlFd !== expected.controlFd

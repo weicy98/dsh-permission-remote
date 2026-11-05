@@ -145,3 +145,23 @@ test('a host-local overlay manifest extends the package baseline without rebuild
     await rm(home, { recursive: true, force: true })
   }
 })
+
+
+test('a manifest entry matches by worker bytes, not the DSH version label', async () => {
+  const root = await fixture()
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-bytes-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const worker = locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true })
+    const entry = { ...manifestEntryFor(worker), dshVersion: '9.9.9', ptcRuntimeNodeVersion: '9.9.9' }
+    writeOverlayManifest({ contractVersion: 1, verified: [entry] })
+    const accepted = locateUpstreamWorker({ DSH_INSTALL_ROOT: root })
+    assert.equal(accepted.processHash, worker.processHash)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(root, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
+  }
+})

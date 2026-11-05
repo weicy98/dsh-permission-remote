@@ -20,6 +20,7 @@ import { rmSync, statSync } from 'node:fs'
 import { createServer } from 'node:net'
 
 const HANDSHAKE = '__DSH_PTC_READY__'
+const AUTH = '__DSH_PTC_AUTH__'
 const args = process.argv.slice(2)
 const separator = args.indexOf('--')
 if (separator < 2 || separator === args.length - 1) {
@@ -123,23 +124,50 @@ function readFirstLine() {
   })
 }
 
-function handleConnection(server, accepted) {
+function handleConnection(server, accepted, kind) {
   if (socket !== undefined) {
     accepted.destroy()
     return
   }
-  socket = accepted
-  for (const other of servers) {
-    if (other === server) continue
-    try {
-      other.close()
-    } catch {
-      // Already closed.
+  if (kind === 'unix') {
+    socket = accepted
+    for (const other of servers) {
+      if (other === server) continue
+      try { other.close() } catch {}
     }
+    spawnWorker(accepted)
+    return
   }
-  // The socket directory is private to the remote user and the host verifies
-  // the token in the handshake before it uses the forwarded stream.
-  spawnWorker(accepted)
+  let buffer = ''
+  const onData = chunk => {
+    buffer += chunk.toString('utf8')
+    const newline = buffer.indexOf('\n')
+    if (newline === -1) return
+    const line = buffer.slice(0, newline).replace(/\r$/u, '')
+    if (line !== `${AUTH} ${token}`) {
+      accepted.destroy()
+      return
+    }
+    accepted.off('data', onData)
+    // Preserve bytes the host wrote after the auth line (the first control
+    // frame may share a TCP/Unix read).
+    const rest = buffer.slice(newline + 1)
+    if (rest.length > 0) accepted.unshift(Buffer.from(rest))
+    // Removing the auth listener leaves the socket paused; keep it paused so
+    // bytes arriving before the worker takes fd 7 stay buffered for it.
+    accepted.pause()
+    socket = accepted
+    for (const other of servers) {
+      if (other === server) continue
+      try {
+        other.close()
+      } catch {
+        // Already closed.
+      }
+    }
+    spawnWorker(accepted)
+  }
+  accepted.on('data', onData)
 }
 
 function listenUnix(path) {
@@ -151,7 +179,7 @@ function listenUnix(path) {
       try { server.close() } catch {}
       reject(error)
     })
-    server.on('connection', accepted => handleConnection(server, accepted))
+    server.on('connection', accepted => handleConnection(server, accepted, 'unix'))
     server.listen(path, () => resolve({ kind: 'unix', path }))
   })
 }
@@ -165,7 +193,7 @@ function listenTcp() {
       try { server.close() } catch {}
       reject(error)
     })
-    server.on('connection', accepted => handleConnection(server, accepted))
+    server.on('connection', accepted => handleConnection(server, accepted, 'tcp'))
     server.listen(0, '127.0.0.1', () => {
       const address = server.address()
       if (typeof address !== 'object' || address === null) {
@@ -179,6 +207,11 @@ function listenTcp() {
 
 function handshakeValue(endpoint) {
   return endpoint.kind === 'unix' ? `unix:${endpoint.path}` : `tcp:127.0.0.1:${endpoint.port}`
+}
+
+function shutdown() {
+  if (child === undefined) finish(0)
+  else killGroup()
 }
 
 function spawnWorker(accepted) {
@@ -201,6 +234,19 @@ function spawnWorker(accepted) {
     process.stderr.write(`ptc-shim: spawn failed: ${error instanceof Error ? error.message : String(error)}\n`)
     finish(127)
     return
+  }
+  // The shim can be SIGKILLed by the host/channel teardown, in which case
+  // process exit handlers never run. A tiny detached watchdog observes the
+  // shim pid and kills the detached worker process group if the shim vanishes
+  // without a normal shutdown.
+  try {
+    const watchdog = spawn('/bin/sh', ['-c', `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done; kill -KILL -${child.pid} 2>/dev/null || true`], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    watchdog.unref()
+  } catch {
+    // The normal exit handler still covers everything except SIGKILL.
   }
   child.stdout?.on('data', chunk => process.stdout.write(chunk))
   child.stderr?.on('data', chunk => process.stderr.write(chunk))
@@ -238,11 +284,11 @@ async function main() {
   if (endpoints.length === 0) throw new Error('could not bind a Unix socket or a loopback TCP port')
   process.stderr.write(`${HANDSHAKE} ${token} ${endpoints.map(handshakeValue).join(' ')}\n`)
 
-  process.stdin.on('end', killGroup)
-  process.stdin.on('close', killGroup)
-  process.on('SIGTERM', killGroup)
-  process.on('SIGINT', killGroup)
-  process.on('SIGHUP', killGroup)
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
+  process.on('SIGHUP', shutdown)
   process.on('exit', cleanup)
 }
 

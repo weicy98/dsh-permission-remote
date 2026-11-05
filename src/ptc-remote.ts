@@ -149,9 +149,9 @@ function installWrap(value: unknown, deps: RemotePtcDeps): (() => void) | undefi
 async function canonical(pool: SshPool, host: HostConfig, secret: SecretMaterial, remotePath: string, signal?: AbortSignal): Promise<string> {
   try {
     return await pool.sftpRealpath(host, secret, remotePath)
-  } catch {
+  } catch (error) {
     if (signal?.aborted === true) throw abortError()
-    return posix.normalize(remotePath)
+    throw new Error(`remote workspace path ${JSON.stringify(remotePath)} could not be resolved: ${messageOf(error)}`)
   }
 }
 
@@ -172,10 +172,27 @@ async function dispatch(
   }
   const env = deps.env ?? process.env
   const route = routeByCwd(spec.cwd, env)
+  const policyRoot = spec.sandboxPolicy?.workspaceRoot
+  const policyBinding = typeof policyRoot === 'string' ? workspaceBinding(policyRoot, env) : null
   if (route.kind !== 'remote') {
+    // A remote session whose live cwd became unusable must not silently fall
+    // back to a local process. If the session's pinned workspace is remote,
+    // refuse instead.
+    if (policyBinding !== null) {
+      return failure('exception', 'run_code cwd is not inside the remote workspace; refusing to run on this computer')
+    }
     // Clear an enclosing remote context so a nested local run cannot inherit
     // the outer host/worker mapping.
     return remoteWorldContext.run(undefined, () => originalRun.call(runtime, spec))
+  }
+  if (typeof policyRoot !== 'string' || policyRoot.length === 0) {
+    return failure('exception', 'run_code did not include the session workspace root; refusing to run remotely without a pinned sandbox root')
+  }
+  if (policyBinding === null) {
+    return failure('exception', 'run_code is only available when the Session was opened on that SSH host; this cwd is a remote placeholder but the session workspace is local')
+  }
+  if (policyBinding.hostId !== route.hostId) {
+    return failure('exception', 'run_code session is opened on a different SSH host than its cwd')
   }
   if (deps.disposed?.() === true) return failure('abort', 'the SSH workspace plugin was unloaded, so the remote run_code was not started')
 
@@ -234,9 +251,15 @@ async function dispatch(
   if (budget !== null && remaining() !== null && remaining()! <= 0) {
     return failure('timeout', 'run_code timed out while preparing the remote program')
   }
-  const remoteCwd = await canonical(deps.pool, host, secret, route.remoteCwd, spec.signal)
-  const binding = workspaceBinding(route.placeholderCwd, env)
-  const remoteRoot = await canonical(deps.pool, host, secret, binding?.remotePath ?? route.remoteCwd, spec.signal)
+  let remoteCwd: string
+  let remoteRoot: string
+  try {
+    remoteCwd = await canonical(deps.pool, host, secret, route.remoteCwd, spec.signal)
+    remoteRoot = await canonical(deps.pool, host, secret, policyBinding.remotePath, spec.signal)
+  } catch (error) {
+    if (spec.signal?.aborted === true) return failure('abort', 'run_code was aborted')
+    return failure('exception', messageOf(error))
+  }
   const world: RemoteWorld = {
     host,
     secret,

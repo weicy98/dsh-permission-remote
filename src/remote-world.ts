@@ -163,6 +163,7 @@ class RemotePtcHandle implements SubprocessHandle {
   private exec: RemoteExecHandle | undefined
   private forward: Duplex | undefined
   private settled = false
+  private terminated = false
   private resolveDone: (value: SubprocessOutcome) => void = () => undefined
   private rejectDone: (error: Error) => void = () => undefined
   private readonly token = randomBytes(16).toString('hex')
@@ -184,14 +185,24 @@ class RemotePtcHandle implements SubprocessHandle {
       this.resolveDone = resolve
       this.rejectDone = reject
     })
-    this.socketPath = `${posix.dirname(world.workerRemotePath)}/run-${randomBytes(6).toString('hex')}.sock`
+    const tempRoot = world.status.roots.userTmp.length > 0
+      ? world.status.roots.userTmp
+      : world.status.roots.tmp.length > 0 ? world.status.roots.tmp : '/tmp'
+    this.socketPath = posix.join(tempRoot, `dsh-ptc-${randomBytes(8).toString('hex')}.sock`)
     void this.start()
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer !== undefined) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = undefined
+    }
   }
 
   private fail(error: Error): void {
     if (this.settled) return
     this.settled = true
-    if (this.handshakeTimer !== undefined) clearTimeout(this.handshakeTimer)
+    this.clearHandshakeTimer()
     this.rejectHandshake?.(error)
     this.rejectHandshake = undefined
     this.stdout.end()
@@ -205,7 +216,7 @@ class RemotePtcHandle implements SubprocessHandle {
   private finish(result: ExecResult): void {
     if (this.settled) return
     this.settled = true
-    if (this.handshakeTimer !== undefined) clearTimeout(this.handshakeTimer)
+    this.clearHandshakeTimer()
     if (!this.ready) {
       this.rejectHandshake?.(new Error('PTC worker exited before the control-channel handshake'))
       this.rejectHandshake = undefined
@@ -232,6 +243,11 @@ class RemotePtcHandle implements SubprocessHandle {
         ...argv,
       ])
       this.exec = await this.transport.exec(this.world.host, this.world.secret, shimCommand, this.spec.signal)
+      if (this.terminated || this.settled) {
+        this.exec.close()
+        return
+      }
+      this.handshakeTimer = setTimeout(() => this.fail(new Error('PTC shim did not print a control-channel handshake')), 10_000)
       this.exec.stdout.on('data', chunk => {
         if (!this.settled) this.stdout.write(chunk)
       })
@@ -241,18 +257,23 @@ class RemotePtcHandle implements SubprocessHandle {
         result => this.finish(result),
         error => this.fail(error instanceof Error ? error : new Error(String(error))),
       )
-      this.handshakeTimer = setTimeout(() => this.fail(new Error('PTC shim did not print a control-channel handshake')), 10_000)
       const endpoint = await this.waitForHandshake()
+      // The timeout covers the shim handshake only. A long-running PTC
+      // program legitimately keeps the control channel open for minutes.
+      this.clearHandshakeTimer()
       let forward: Duplex | undefined
+      let usedTcp = endpoint.unixPath === undefined
       if (endpoint.unixPath !== undefined) {
         try {
           forward = await this.transport.forwardOutStreamLocal(this.world.host, this.world.secret, endpoint.unixPath, this.spec.signal)
         } catch (error) {
           if (endpoint.tcpPort === undefined) throw error
+          usedTcp = true
         }
       }
       if (forward === undefined && endpoint.tcpPort !== undefined) {
         forward = await this.transport.forwardOutTcp(this.world.host, this.world.secret, '127.0.0.1', endpoint.tcpPort, this.spec.signal)
+        usedTcp = true
       }
       if (forward === undefined) throw new Error('PTC shim reported no usable forwarding endpoint')
       this.forward = forward
@@ -260,6 +281,9 @@ class RemotePtcHandle implements SubprocessHandle {
         forward.destroy()
         return
       }
+      // TCP has no Unix socket permissions; require the shim token so a local
+      // user who wins the accept race cannot take over the control channel.
+      if (usedTcp) forward.write(`__DSH_PTC_AUTH__ ${this.token}\n`)
       this.control.attach(forward)
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)))
@@ -326,7 +350,9 @@ class RemotePtcHandle implements SubprocessHandle {
 
   terminate(): void {
     if (this.settled) return
-    this.exec?.close()
+    this.terminated = true
+    if (this.exec !== undefined) this.exec.close()
+    else this.fail(new Error('PTC worker terminated before the SSH channel was opened'))
     this.forward?.destroy()
   }
 

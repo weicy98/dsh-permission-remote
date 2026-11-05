@@ -10,20 +10,19 @@ hashes it, and uploads the exact bytes to the SSH host.
 | Fact | Value |
 | --- | --- |
 | Worker entry | `lib/process.js`, `runNodeMain(openInheritedControlChannel(), Number(process.argv[2]), process)` |
-| Persistent worker entry | `lib/persistent-process.js`, `runPersistentMain(...)`; uploaded as `persistent-process.mjs` |
+| Persistent worker entry | Not used/uploaded: the 0.2.2 runtime uses `process.js` for `repl`/`script` modes |
 | Persistent mode | Built `process.js` handles `programFormat: repl` or `script`; `persistent-process.js` is the REPL-default legacy entry |
 | Control descriptor | fd 7 |
-| Shim handshake | `__DSH_PTC_READY__ <token> [unix:<path>] [tcp:127.0.0.1:<port>]`; the host prefers streamlocal and falls back to TCP |
+| Shim handshake | `__DSH_PTC_READY__ <token> [unix:<path>] [tcp:127.0.0.1:<port>]`; short private Unix socket path first, authenticated TCP fallback |
 | Control environment marker | `DSH_SUBPROCESS_CONTROL=pipe` |
 | Host launch chain | `resolveExecutable` -> `bootstrapArgs` -> `sandbox.confine` -> `subprocess.spawn({ stdio: { control: 'pipe' } })` |
 | Default bootstrap mapping | `fs.processPathFromHostPath(fileURLToPath(new URL('./process.js', import.meta.url)))` |
 | Worker imports | Node built-ins only (birpc/acorn are bundled into the file) |
 | Minimum remote Node | 22 (the worker uses `Promise.withResolvers`) |
-| Worker upload name | `process.mjs` / `persistent-process.mjs` (ESM; never `.js` without a package.json) |
+| Worker upload name | `process.mjs` (ESM; never `.js` without a package.json) |
 
 The manifest `vendor/upstream/ptc-worker.manifest.json` records the DSH and
-package versions, hashes of `process.js`, `persistent-process.js`,
-`lib/index.js`, and `dsh-subprocess/lib/control.js`, the contract probe results,
+package versions, hashes of `process.js`, `lib/index.js`, and `dsh-subprocess/lib/control.js`, the contract probe results,
 and the minimum remote Node major.
 
 ## Which version is used

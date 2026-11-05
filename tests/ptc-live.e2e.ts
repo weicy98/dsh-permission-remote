@@ -87,7 +87,7 @@ async function harness(
   ctx.provide('sandbox', sandbox)
   ctx.provide('sandboxPolicy', {
     defaultMode: 'read-only',
-    resolve: () => ({ mode: 'read-only', workspaceRoot: remoteRoot }),
+    resolve: () => ({ mode: 'read-only', workspaceRoot: placeholder }),
   })
   await ctx.plugin(NodePtcRuntime, {
     executionMode,
@@ -153,7 +153,7 @@ test('live: official worker runs a program and the tool bridge on the SSH host',
         functions: { echo: async args => ({ value: Number((args as { value?: number }).value ?? 0) + 1 }) },
         errorClass: { name: 'ToolCallError', memberNameProperty: 'toolName' },
       }],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(result.error, undefined, JSON.stringify(result))
     assert.deepEqual(result.value, { value: { value: 42 }, cwd: remoteRoot, env: [] })
@@ -170,7 +170,7 @@ test('live: read-only denies writes and workspace-write writes only on the remot
       cwd: h.placeholder,
       timeoutMs: 20_000,
       bindings: [],
-      sandboxPolicy: { mode: 'read-only', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'read-only', workspaceRoot: h.placeholder },
     }))
     assert.equal(readOnly.error?.kind, 'exception', JSON.stringify(readOnly))
     assert.match(readOnly.error?.message ?? '', /read-only file system/i)
@@ -181,7 +181,7 @@ test('live: read-only denies writes and workspace-write writes only on the remot
       cwd: h.placeholder,
       timeoutMs: 20_000,
       bindings: [],
-      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: h.placeholder },
     }))
     assert.equal(write.error, undefined, JSON.stringify(write))
     assert.equal(write.value, 'remote')
@@ -200,11 +200,11 @@ test('live: timeout leaves no worker or shim process behind', { skip: !ready }, 
       cwd: h.placeholder,
       timeoutMs: 300,
       bindings: [],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(timed.error?.kind, 'timeout', JSON.stringify(timed))
     await new Promise(resolve => setTimeout(resolve, 500))
-    const check = await pool.exec(host, secret, 'pgrep -af "process\\.mjs|ptc-shim\\.mjs" || true', 10_000)
+    const check = await pool.exec(host, secret, 'pgrep -af "[p]rocess\\.mjs|[p]tc-shim\\.mjs" || true', 10_000)
     assert.equal(check.stdout.trim(), '')
   } finally {
     await pool.dispose()
@@ -223,7 +223,7 @@ test('live: persistent-in-memory keeps state in the SSH-host worker', { skip: !r
       timeoutMs: 30_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(first.error, undefined, JSON.stringify(first))
     assert.equal(first.value, 40)
@@ -233,7 +233,7 @@ test('live: persistent-in-memory keeps state in the SSH-host worker', { skip: !r
       timeoutMs: 30_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(second.error, undefined, JSON.stringify(second))
     assert.equal(second.value, 42)

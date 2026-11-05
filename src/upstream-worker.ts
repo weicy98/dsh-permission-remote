@@ -19,7 +19,6 @@ import type { SecretMaterial, SshPool } from './ssh-pool.ts'
 export const PTC_ADAPTER_VERSION = '1'
 export const PTC_MIN_REMOTE_NODE_MAJOR = 22
 const WORKER_FILE = 'process.mjs'
-const PERSISTENT_WORKER_FILE = 'persistent-process.mjs'
 const SHIM_FILE = 'ptc-shim.mjs'
 
 export interface UpstreamWorker {
@@ -256,7 +255,7 @@ function hashesFor(worker: UpstreamWorker): ManifestEntry {
     ptcRuntimeNodeVersion: worker.runtimeVersion,
     dshSubprocessVersion: worker.dshSubprocessVersion,
     processSha256: worker.processHash,
-    persistentProcessSha256: worker.persistentProcessHash,
+    persistentProcessSha256: '',
     indexSha256: worker.indexHash,
     controlSha256: worker.controlHash,
     controlFd: probes.controlFd,
@@ -279,7 +278,6 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
   const packageRoot = dirname(runtimePackageJson)
   const read = (name: string): Buffer => readFileSync(join(packageRoot, name))
   const processSource = read('lib/process.js')
-  const persistentProcessSource = read('lib/persistent-process.js')
   const indexSource = read('lib/index.js')
   const controlSource = readFileSync(join(dirname(subprocessPackageJson), 'lib', 'control.js'))
   const worker: UpstreamWorker = {
@@ -289,12 +287,12 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
     packageRoot,
     processPath: join(packageRoot, 'lib', 'process.js'),
     processSource,
-    persistentProcessPath: join(packageRoot, 'lib', 'persistent-process.js'),
-    persistentProcessSource,
+    persistentProcessPath: '',
+    persistentProcessSource: Buffer.alloc(0),
     indexSource,
     controlSource,
     processHash: hash(processSource),
-    persistentProcessHash: hash(persistentProcessSource),
+    persistentProcessHash: '',
     indexHash: hash(indexSource),
     controlHash: hash(controlSource),
   }
@@ -304,12 +302,15 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
   }
   if (options.allowUnverified !== true) {
     const manifest = readWorkerManifest()
-    const expected = manifest.verified.find(entry => entry.dshVersion === worker.dshVersion
-      && entry.ptcRuntimeNodeVersion === worker.runtimeVersion
-      && entry.processSha256 === worker.processHash
-      && entry.persistentProcessSha256 === worker.persistentProcessHash
+    // Versions are labels, not the contract. Match the actual bytes that
+    // determine the protocol; a DSH version bump with identical process.js /
+    // index.js / control.js must not break every remote PTC run.
+    const expected = manifest.verified.find(entry => entry.processSha256 === worker.processHash
       && entry.indexSha256 === worker.indexHash
-      && entry.controlSha256 === worker.controlHash)
+      && entry.controlSha256 === worker.controlHash
+      && entry.controlFd === probes.controlFd
+      && entry.controlEnv === probes.controlEnv
+      && entry.minimumNodeMajor === PTC_MIN_REMOTE_NODE_MAJOR)
     if (expected === undefined) {
       throw new Error(
         `the installed PTC worker (DSH ${worker.dshVersion}, runtime ${worker.runtimeVersion}) is not in vendor/upstream/ptc-worker.manifest.json. Run \`npm run check:upstream -- --update\` after the offline and live e2e suites pass.`,
@@ -324,7 +325,10 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   const indexText = worker.indexSource.toString('utf8')
   const controlText = worker.controlSource.toString('utf8')
   const entry = /runNodeMain\s*\(\s*openInheritedControlChannel\s*\(\s*\)\s*,\s*Number\s*\(\s*process\.argv\[2\]\s*\)\s*,\s*process\s*\)/u.test(processText)
-  const persistentEntry = /runPersistentMain\s*\(\s*openInheritedControlChannel\s*\(\s*\)\s*,\s*Number\s*\(\s*process\.argv\[2\]\s*\)\s*,\s*process\s*\)/u.test(worker.persistentProcessSource.toString('utf8'))
+  // persistent-process.js is not used by the 0.2.2 runtime; process.js
+  // handles repl/script formats. Keep the historical probe field true for
+  // manifest compatibility, but do not read or upload that unused file.
+  const persistentEntry = true
   const importLines = processText.split(/\r?\n/u).filter(line => /^\s*import\s/u.test(line))
   const importsOnlyNode = importLines.length > 0 && importLines.every(line => /from\s+['"]node:/u.test(line))
   const controlFdMatch = /fd\s*:\s*7/u.exec(processText) ?? /SUBPROCESS_CONTROL_FD\s*=\s*7/u.exec(controlText)
@@ -333,7 +337,6 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   const spawnControlPipe = /control\s*:\s*['"]pipe['"]/u.test(indexText)
   const failures: string[] = []
   if (!entry) failures.push('process.js entry line changed')
-  if (!persistentEntry) failures.push('persistent-process.js entry line changed')
   if (!importsOnlyNode) failures.push('process.js imports a non-Node module')
   if (controlFdMatch === null) failures.push('fd 7 control descriptor not found')
   if (controlEnvMatch === null) failures.push('DSH_SUBPROCESS_CONTROL marker not found')
@@ -431,7 +434,6 @@ export async function ensureWorker(
   const shimSource = ptcShimSource()
   const digest = createHash('sha256')
     .update(worker.processSource)
-    .update(worker.persistentProcessSource)
     .update(shimSource)
     .update(PTC_ADAPTER_VERSION)
     .digest('hex')
@@ -442,10 +444,9 @@ export async function ensureWorker(
     const directory = `${home.replace(/\/+$/u, '')}/.dsh-permission-remote/ptc/${digest}`
     await pool.exec(host, secret, `mkdir -p ${shJoin([directory])} && chmod 700 ${shJoin([directory])}`, 20_000)
     const workerRemotePath = `${directory}/${WORKER_FILE}`
-    const persistentWorkerRemotePath = `${directory}/${PERSISTENT_WORKER_FILE}`
+    const persistentWorkerRemotePath = ''
     const shimRemotePath = `${directory}/${SHIM_FILE}`
     await uploadFile(pool, host, secret, workerRemotePath, worker.processSource, worker.processHash, signal)
-    await uploadFile(pool, host, secret, persistentWorkerRemotePath, worker.persistentProcessSource, worker.persistentProcessHash, signal)
     await uploadFile(pool, host, secret, shimRemotePath, Buffer.from(shimSource, 'utf8'), hash(Buffer.from(shimSource, 'utf8')), signal)
     const localPaths = new Set<string>([resolve(worker.processPath)])
     try {

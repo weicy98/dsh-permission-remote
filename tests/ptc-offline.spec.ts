@@ -94,7 +94,7 @@ async function harness(
   })
   assert.ok(restoreWorld !== undefined)
   const deps: RemotePtcDeps = {
-    pool: {} as never,
+    pool: { sftpRealpath: async (_host: unknown, _secret: unknown, remotePath: string) => remotePath } as never,
     hostOf: id => id === 'h1' ? {
       id: 'h1', name: '', host: '127.0.0.1', port: 22, username: 'u', auth: 'key',
       privateKeyPath: '', fingerprint: '', opsPolicy: 'ask',
@@ -138,7 +138,7 @@ test('the official Node runtime executes return and logs through the shim', asyn
       cwd: h.placeholder,
       timeoutMs: 10_000,
       bindings: [],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     })
     const result = await h.runtime.run(spec)
     assert.equal(result.error, undefined, JSON.stringify(result))
@@ -149,6 +149,23 @@ test('the official Node runtime executes return and logs through the shim', asyn
   }
 })
 
+
+test('a long-running PTC program survives the handshake timeout window', async () => {
+  const h = await harness('danger-full-access')
+  try {
+    const result = await h.runtime.run(h.runtime.resolve({
+      program: 'await new Promise(resolve => setTimeout(resolve, 11_000)); return "alive"',
+      cwd: h.placeholder,
+      timeoutMs: 30_000,
+      bindings: [],
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
+    }))
+    assert.equal(result.error, undefined, JSON.stringify(result))
+    assert.equal(result.value, 'alive')
+  } finally {
+    await h.dispose()
+  }
+})
 
 test('the official runtime runs tools.* through the host binding bridge', async () => {
   const h = await harness()
@@ -162,7 +179,7 @@ test('the official runtime runs tools.* through the host binding bridge', async 
         functions: { echo: async (args) => ({ value: Number((args as { value?: number }).value ?? 0) + 1 }) },
         errorClass: { name: 'ToolCallError', memberNameProperty: 'toolName' },
       }],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     })
     const result = await h.runtime.run(spec)
     assert.equal(result.error, undefined, JSON.stringify(result))
@@ -180,7 +197,7 @@ test('the remote cwd is the session cwd and process.env is empty', async () => {
       cwd: h.placeholder,
       timeoutMs: 10_000,
       bindings: [],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     })
     const result = await h.runtime.run(spec)
     assert.equal(result.error, undefined, JSON.stringify(result))
@@ -198,7 +215,7 @@ test('workspace-write is enforced by the remote bwrap profile', async () => {
       cwd: h.placeholder,
       timeoutMs: 20_000,
       bindings: [],
-      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: h.placeholder },
     })
     const result = await h.runtime.run(spec)
     assert.equal(result.error, undefined, JSON.stringify(result))
@@ -217,7 +234,7 @@ test('timeout and abort terminate the remote shim process group', async () => {
       cwd: h.placeholder,
       timeoutMs: 150,
       bindings: [],
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     })
     const timed = await h.runtime.run(timeout)
     assert.equal(timed.error?.kind, 'timeout', JSON.stringify(timed))
@@ -229,7 +246,7 @@ test('timeout and abort terminate the remote shim process group', async () => {
       timeoutMs: 20_000,
       bindings: [],
       signal: controller.signal,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     })
     setTimeout(() => controller.abort('test cancel'), 150)
     const cancelled = await h.runtime.run(aborted)
@@ -250,7 +267,7 @@ test('persistent-in-memory retains state for one state owner', async () => {
       timeoutMs: 20_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(first.error, undefined, JSON.stringify(first))
     assert.equal(first.value, 41)
@@ -260,7 +277,7 @@ test('persistent-in-memory retains state for one state owner', async () => {
       timeoutMs: 20_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(second.error, undefined, JSON.stringify(second))
     assert.equal(second.value, 42)
@@ -281,7 +298,7 @@ test('vm-script with scriptPersistence retains state for one state owner', async
       timeoutMs: 20_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(first.error, undefined, JSON.stringify(first))
     assert.equal(first.value, 7)
@@ -291,7 +308,7 @@ test('vm-script with scriptPersistence retains state for one state owner', async
       timeoutMs: 20_000,
       bindings: [],
       stateOwner: owner,
-      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.placeholder },
     }))
     assert.equal(second.error, undefined, JSON.stringify(second))
     assert.equal(second.value, 42)

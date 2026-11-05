@@ -105,11 +105,73 @@ test('ptc-shim falls back to loopback TCP when the socket path is unusable', asy
     client.on('data', () => undefined)
     client.on('error', () => undefined)
     await once(client, 'connect')
-    client.write('tcp')
+    client.write(`__DSH_PTC_AUTH__ ${shim.token}\ntcp`)
     await new Promise(resolve => setTimeout(resolve, 100))
     client.end()
     shim.child.stdin.end()
     await once(shim.child, 'exit')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('ptc-shim cleans up and exits when stdin closes before a client connects', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ptc-shim-'))
+  try {
+    const childPath = await echoChild(dir)
+    const shim = await startShim(join(dir, 'run.sock'), [process.execPath, childPath])
+    shim.child.stdin.end()
+    const [code] = await once(shim.child, 'exit')
+    assert.equal(code, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('ptc-shim rejects a TCP client that does not present the token', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ptc-shim-'))
+  try {
+    const childPath = await echoChild(dir)
+    const shim = await startShim('-', [process.execPath, childPath])
+    const { connect } = await import('node:net')
+    const wrong = connect(shim.endpoint.port!, '127.0.0.1')
+    wrong.on('error', () => undefined)
+    await once(wrong, 'connect')
+    wrong.write('__DSH_PTC_AUTH__ wrong-token\n')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    // The bad connection must not have spawned a child; the shim stays alive
+    // for the real host connection (or exits when its stdin closes).
+    shim.child.stdin.end()
+    await once(shim.child, 'exit')
+    wrong.destroy()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('the watchdog removes a detached worker when the shim is SIGKILLed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ptc-shim-'))
+  const socketPath = join(dir, 'run.sock')
+  const pidFile = join(dir, 'worker.pid')
+  const childPath = join(dir, 'sleep-child.cjs')
+  await writeFile(childPath, `require('node:fs').writeFileSync(process.argv[2], String(process.pid)); setInterval(() => undefined, 1000)\n`)
+  try {
+    const shim = await startShim(socketPath, [process.execPath, childPath, pidFile])
+    const { connect } = await import('node:net')
+    const client = connect(socketPath)
+    client.on('error', () => undefined)
+    await once(client, 'connect')
+    for (let i = 0; i < 50 && !(await import('node:fs')).existsSync(pidFile); i += 1) await new Promise(resolve => setTimeout(resolve, 20))
+    const workerPid = Number((await import('node:fs')).readFileSync(pidFile, 'utf8'))
+    assert.ok(workerPid > 0)
+    shim.child.kill('SIGKILL')
+    await once(shim.child, 'exit')
+    await new Promise(resolve => setTimeout(resolve, 2000))
+    let alive = true
+    try { process.kill(workerPid, 0) } catch { alive = false }
+    assert.equal(alive, false, 'worker should not survive a SIGKILLed shim')
+    client.destroy()
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

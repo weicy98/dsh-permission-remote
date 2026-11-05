@@ -437,6 +437,7 @@ export class SshPool {
     let settled = false
     let resolveDone: (result: ExecResult) => void = () => undefined
     let rejectDone: (error: Error) => void = () => undefined
+    let closeTimer: ReturnType<typeof setTimeout> | undefined
     const done = new Promise<ExecResult>((resolve, reject) => {
       resolveDone = resolve
       rejectDone = reject
@@ -444,6 +445,10 @@ export class SshPool {
     const finish = (code?: number | null, signalValue?: string | null) => {
       if (settled) return
       settled = true
+      if (closeTimer !== undefined) {
+        clearTimeout(closeTimer)
+        closeTimer = undefined
+      }
       stdout.end()
       stderr.end()
       resolveDone({
@@ -471,6 +476,11 @@ export class SshPool {
       } catch {
         // Closing a finished channel is the outcome we wanted.
       }
+      // A dead SSH transport may never deliver the channel close event. Do
+      // not leave timeout/cancel callers waiting forever.
+      if (closeTimer === undefined) {
+        closeTimer = setTimeout(() => finish(null, 'KILL'), 1000)
+      }
     }
     try {
       live.client.exec(command, (error, opened) => {
@@ -484,6 +494,14 @@ export class SshPool {
           return
         }
         stream = opened as unknown as ExecStream
+        if (settled) {
+          try {
+            stream.close()
+          } catch {
+            // The channel was already closed while the open was in flight.
+          }
+          return
+        }
         stream.on('data', chunk => {
           if (!settled) stdout.write(chunk)
         })
