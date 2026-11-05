@@ -211,3 +211,17 @@ test('a volatility-updated fractional value is floored instead of trusted', () =
   assert.equal(config.transferMaxBytes, 1)
   assert.equal(config.transferTimeoutMs, 2)
 })
+
+test('a corrupt volatile limit falls back to the default, not to "no limit"', () => {
+  // `0` is the documented "no limit" sentinel, so it is the one fallback a
+  // corrupt value must not take: that would silently disable the guard. Both
+  // fields have to land on their real defaults instead.
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 })
+  const config = readConfig(resolved)
+  for (const corrupt of [-1, Number.NaN, Number.NEGATIVE_INFINITY]) {
+    updateVolatile(resolved.transferMaxBytes, createVolatile(corrupt))
+    updateVolatile(resolved.transferTimeoutMs, createVolatile(corrupt))
+    assert.equal(config.transferMaxBytes, 32 * 1024 * 1024, `maxBytes after ${corrupt}`)
+    assert.equal(config.transferTimeoutMs, 120_000, `timeoutMs after ${corrupt}`)
+  }
+})

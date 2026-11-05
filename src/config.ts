@@ -230,10 +230,15 @@ export function readConfig(raw: unknown): PluginConfig {
   const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
   const registry = (): string => String(registryRef === undefined ? registryDefault : registryRef.get() ?? '').trim()
   const root = (): string => String(rootRef === undefined ? rootDefault : rootRef.get() ?? '').trim()
-  const transferMaxBytes = (): number => normalizeTransferLimit(bytesRef === undefined ? bytesDefault : bytesRef.get())
+  // The fallback is the default, never `0`: `0` is the "no limit" sentinel, so
+  // falling back to it would turn a corrupt value into an unguarded transfer.
+  const transferMaxBytes = (): number => normalizeTransferLimit(
+    bytesRef === undefined ? bytesDefault : bytesRef.get(),
+    TRANSFER_MAX_BYTES_DEFAULT,
+  )
   const transferTimeoutMs = (): number => Math.min(
     TRANSFER_TIMEOUT_MS_MAX,
-    normalizeTransferLimit(timeoutRef === undefined ? timeoutDefault : timeoutRef.get()),
+    normalizeTransferLimit(timeoutRef === undefined ? timeoutDefault : timeoutRef.get(), TRANSFER_TIMEOUT_MS_DEFAULT),
   )
   const ref = hostRef ?? parsed.hosts
   // `Config()` returns volatile wrappers for volatile fields even when the

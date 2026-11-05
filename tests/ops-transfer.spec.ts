@@ -13,7 +13,10 @@ import {
   runSshUpload,
   type OpsTransferLimits,
 } from '../src/ops.ts'
-import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
+import { SFTP_STATUS, SshFailure, type ExecResult, type SshPool } from '../src/ssh-pool.ts'
+
+/** `SSH_FX_PERMISSION_DENIED`; the numeric status wins over the message. */
+const SFTP_PERMISSION_DENIED: number = SFTP_STATUS.PERMISSION_DENIED
 
 function host(overrides: Partial<HostConfig> = {}): HostConfig {
   return {
@@ -431,6 +434,45 @@ test('download refuses a missing remote file, a directory, a symlink, and a spec
         new RegExp(`remote path is not a regular file \\(${type}\\)`),
       )
       assert.deepEqual(download.reads, [])
+    }
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+/* ---------- transport faults are not "missing" ---------- */
+
+test('a transport fault is reported as itself, never as "no file"', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abc')
+    // A dropped connection, a refused permission, and a protocol fault all must
+    // survive: turning one into "no file at remote path" would send the model
+    // hunting for a path that exists on a host it cannot reach.
+    const faults: Array<{ label: string, error: Error }> = [
+      { label: 'dropped connection', error: new SshFailure('Connection lost', 'sftp-lstat') },
+      { label: 'permission denied', error: new SshFailure('Permission denied', 'sftp-lstat', SFTP_PERMISSION_DENIED) },
+      // Wording that a naive message match would misclassify as missing.
+      { label: 'missing-looking message', error: new SshFailure('channel closed before the file could be found', 'sftp-lstat') },
+    ]
+    for (const fault of faults) {
+      const failing = () => { throw fault.error }
+      const upload = api({ attrs: () => failing() as never })
+      await assert.rejects(
+        () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, LIMITS),
+        (error: Error) => error.message === fault.error.message,
+        `upload should surface ${fault.label} unchanged`,
+      )
+      assert.equal(upload.commands.length, 0, `${fault.label}: no remote write`)
+
+      const download = api({ attrs: () => failing() as never })
+      await assert.rejects(
+        () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: join(local, 'b.bin') }, {}, LIMITS),
+        (error: Error) => error.message === fault.error.message && !/no file at remote path/.test(error.message),
+        `download should surface ${fault.label} unchanged`,
+      )
+      assert.deepEqual(download.reads, [], `${fault.label}: no bytes pulled`)
     }
   } finally {
     await rm(local, { recursive: true, force: true })

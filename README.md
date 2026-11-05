@@ -52,15 +52,15 @@ dsh plugin --profile web add dsh-permission-remote
 
 ### 远程调用审批（默认「每次询问」）
 
-控制其他工作区里的会话用 `ssh_exec` / `ssh_write` 操作这台主机时放不放行：
+控制其他工作区里的会话用 `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` 操作这台主机时放不放行：
 
 | 选项 | 行为 |
 |---|---|
-| 每次询问 | 执行命令和写文件各要一次 `danger-full-access` 审批（默认） |
+| 每次询问 | 执行命令、写文件和传文件各要一次 `danger-full-access` 审批（默认） |
 | 不再询问 | 直接执行，不弹卡。卡片上显示琥珀色标签「远程调用免审批」 |
 | 禁止调用 | 这台主机拒绝所有远程命令和写入。卡片上显示灰色标签「远程调用已禁止」 |
 
-读取远端文件不受这个设置影响。
+读取远端文件（`ssh_read`）不受这个设置影响。下载算写入：它会在运行 DSH 的机器上落盘，所以和其它写入一起走这道闸门，而不是随读取放行。
 
 ### 环境变量来源（默认「SSH 登录环境」）
 
@@ -137,7 +137,7 @@ dsh plugin --profile web add dsh-permission-remote
 
 `ssh_exec`、`ssh_write`、`ssh_upload`、`ssh_download` 和 `ssh_workspace` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
 
-下载按**写入**处理：它对远端只是读，但会在运行 DSH 的机器上落盘，所以和 `ssh_write` 同一道闸门——只读会话不能借下载绕过本机沙箱。纯文本读取仍用 `ssh_read`，它只受「禁止」限制。
+下载按**写入**处理：它对远端只是读，但会在运行 DSH 的机器上落盘，所以和 `ssh_write` 同一道闸门。注意这道闸门只约束「询问」策略下的主机：切到「信任」后，下载和 `ssh_write` 一样不再看当前会话的档位，也不弹审批，只读会话同样能写本机文件。纯文本读取仍用 `ssh_read`，它只受「禁止」限制。
 
 **单文件，不递归。** 两个工具都不传目录，也不做断点续传。最终组件是符号链接时两端都拒绝（远端用 `lstat`，本机也用 `lstat`，再加 `O_NOFOLLOW`），因为 `mv -f` 会替换链接本身而 `realpath` 会把有效链接解析到目标，两种语义都容易写出意外结果；中间目录是链接则按普通路径处理。FIFO、设备、socket 一律拒绝，不会被当成文件读取。
 
@@ -242,15 +242,15 @@ Both settings live in the **edit dialog**. The card normally shows only actions;
 
 ### Remote call approval (default: ask each time)
 
-Controls whether a session in another workspace may use `ssh_exec` / `ssh_write` against this host:
+Controls whether a session in another workspace may use `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` against this host:
 
 | Option | Behaviour |
 |---|---|
-| Ask each time | Each command and each write needs one `danger-full-access` approval (default) |
+| Ask each time | Each command, write, and transfer needs one `danger-full-access` approval (default) |
 | Do not ask | Runs directly with no prompt. The card shows an amber label: remote calls need no approval |
 | Block calls | This host refuses every remote command and write. The card shows a grey label: remote calls blocked |
 
-Reading remote files is not affected by this setting.
+Reading remote files (`ssh_read`) is not affected by this setting. A download counts as a write: it creates a file on the machine running DSH, so it follows the write gate rather than the read one.
 
 ### Environment source (default: SSH login environment)
 
@@ -317,7 +317,7 @@ Each host has a **Remote ops** policy in Settings:
 
 Ops commands, writes, uploads, downloads, and workspace registration are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
 
-A download is gated like a **write**: it only reads on the remote side, but it creates a file on the machine running DSH, so a read-only session cannot use it to bypass the local sandbox. Plain text reads still use `ssh_read`, which Deny alone limits.
+A download is gated like a **write**: it only reads on the remote side, but it creates a file on the machine running DSH, so it uses `ssh_write`'s gate. That gate only constrains an **Ask** host: under **Trust**, a download — like `ssh_write` — stops consulting the session's mode and shows no prompt, so even a read-only session can write a local file. Plain text reads still use `ssh_read`, which Deny alone limits.
 
 **One file, no recursion.** Neither tool accepts a directory or resumes a partial transfer. When the final component is a symbolic link both ends refuse it (the remote with `lstat`, the local side with `lstat` plus `O_NOFOLLOW`): `mv -f` would replace the link itself while `realpath` would resolve a live link to its target, and either behavior silently writes somewhere the caller did not name. Linked intermediate directories are ordinary path components. FIFOs, devices, and sockets are refused rather than read as files.
 
