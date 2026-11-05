@@ -111,7 +111,12 @@ interface HostContext {
 }
 
 interface PromptToolsAssembly {
-  tools: ReadonlyArray<{ name: string }>
+  /**
+   * Present up to 0.2.1, where the assembly carried the schema list. 0.2.2
+   * moved declarations to providers and merges them after this waterfall, so
+   * the object a listener receives may not have the field at all.
+   */
+  tools?: ReadonlyArray<{ name: string }>
 }
 
 interface PromptAssembleContext {
@@ -2245,11 +2250,21 @@ function installRemoteShellSurface(
     // assembly must not be filtered by this session's directory.
     if (context.scope !== undefined && context.scope !== agent) return assembled
     if (!remoteNow()) return assembled
-    return { ...assembled, tools: withoutWindowsShells(assembled.tools, true) }
+    // Hosts up to 0.2.1 carry the tool schemas in the assembly, so Windows
+    // shells can be filtered here. 0.2.2 moved declarations to providers and
+    // merges them after this waterfall, so there is nothing to filter and the
+    // assembly must pass through untouched — reading `tools` there throws, and
+    // a throw inside the waterfall rejects the whole prompt assembly. Hiding
+    // on that host belongs to `tools.restrict({ deny })` in applyDynamic.
+    const declared = (assembled as { tools?: unknown }).tools
+    if (!Array.isArray(declared)) return assembled
+    return { ...assembled, tools: withoutWindowsShells(declared as ReadonlyArray<{ name: string }>, true) }
   }))
   // Official `tool:bash` stays. This section is empty on a local cwd, so
   // renderPrompt drops it. `complete: true` personas replace sections after
-  // the waterfall; the schema filter above still runs on `assembly.tools`.
+  // the waterfall; on hosts that still ship schemas in the assembly the filter
+  // above runs on `assembly.tools`, and on 0.2.2 the executor's tool list is
+  // already restricted by `applyDynamic`.
   disposers.push(agent.ctx.systemPrompt.section({
     name: REMOTE_POSIX_SECTION,
     order: agent.ctx.systemPrompt.getSectionOrder('TOOL_BASH') + 5,

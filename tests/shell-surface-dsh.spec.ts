@@ -16,6 +16,19 @@ import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import { isUnknownRestrictError } from '../src/shell-surface.ts'
 
+/**
+ * 0.2.2 replaced the tools row's `mode` field with executor plugins, so the
+ * fixture picks its shape at runtime: mount the executor packages when they
+ * exist, otherwise declare the presentation on the tools row as 0.2.1 did.
+ * The specifier is a variable on purpose — the packages do not exist in an
+ * older dependency tree, and a literal import would fail to typecheck there.
+ */
+const NATIVE_EXECUTOR_MODULE = '@deepseek-ai/dsh-tool-executor-native'
+const PTC_EXECUTOR_MODULE = '@deepseek-ai/dsh-tool-executor-ptc'
+
+const nativeExecutor = await import(NATIVE_EXECUTOR_MODULE).catch(() => undefined)
+const ptcExecutor = await import(PTC_EXECUTOR_MODULE).catch(() => undefined)
+
 const remoteCwd = mapRemoteToLocal('host1', '/srv/app')!
 const localCwd = '/tmp/local-project'
 const OFFICIAL_PWSH = 'Non-zero exits are reported as `[exit code: N]` markers; investigate failures before moving on. On Windows a killed process settles as `[exit code: 1]` without a signal marker; treat a bare exit 1 after an interruption as a termination, not a command failure.'
@@ -56,6 +69,23 @@ async function injected(scope: Scope): Promise<Context> {
   return ready
 }
 
+/**
+ * Select the PTC presentation for one agent's scope.
+ *
+ * 0.2.2 selects it by mounting the executor on that scope; 0.2.1 declared it
+ * with `tools.presentAs('ptc')`. The cast keeps this file typechecking against
+ * either dependency tree.
+ */
+async function presentPtc(agent: HostAgent): Promise<void> {
+  if (ptcExecutor !== undefined) {
+    await agent.ctx.plugin(ptcExecutor)
+    return
+  }
+  const tools = agent.ctx.tools as unknown as { presentAs?(mode: string): void }
+  if (typeof tools.presentAs !== 'function') throw new Error('no PTC presentation available on this host')
+  tools.presentAs('ptc')
+}
+
 async function boot() {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt, {
@@ -64,7 +94,12 @@ async function boot() {
     personaPrefix: '',
     personaSuffix: '',
   })
-  await ctx.plugin(ToolRuntime, { mode: 'native' })
+  // The tools service registers the prompt's tool provider, and that provider
+  // resolves through the scope's executor. 0.2.2 removed the row-level `mode`
+  // (its schema is `z.never()`), so the executor plugin is required there;
+  // 0.2.1 defaults to `native` and has no executor package to mount.
+  await ctx.plugin(ToolRuntime)
+  if (nativeExecutor !== undefined) await ctx.plugin(nativeExecutor)
   ctx.provide('ptcRuntime', { language: 'typescript', programFormat: 'function-body' })
   ctx.provide('settings', { configure: () => () => undefined, describe: () => [], update: async () => undefined })
   ctx.provide('workspaceRegistry', { list: () => [] })
@@ -223,7 +258,7 @@ test('ancestor pwsh leaves the PTC SDK and a scope-local pwsh stays in it', asyn
   try {
     host.preset.tools.register(windowsShell('pwsh'))
     const ancestor = await host.makeAgent('ancestor-ptc', remoteCwd)
-    ancestor.ctx.tools.presentAs('ptc')
+    await presentPtc(ancestor)
     await host.created(ancestor)
     const ancestorView = await host.rendered(ancestor)
     assert.deepEqual(ancestorView.tools, ['run_code'])
@@ -235,7 +270,7 @@ test('ancestor pwsh leaves the PTC SDK and a scope-local pwsh stays in it', asyn
     // cannot hide the copy registered on the agent itself.
     const overlaid = await host.makeAgent('overlaid-ptc', remoteCwd)
     overlaid.ctx.tools.register(windowsShell('pwsh'))
-    overlaid.ctx.tools.presentAs('ptc')
+    await presentPtc(overlaid)
     await host.created(overlaid)
     const overlaidView = await host.rendered(overlaid)
     assert.deepEqual(overlaidView.tools, ['run_code'])
@@ -249,7 +284,7 @@ test('ancestor pwsh leaves the PTC SDK and a scope-local pwsh stays in it', asyn
   try {
     const local = await isolated.makeAgent('local-ptc', remoteCwd)
     local.ctx.tools.register(windowsShell('pwsh'))
-    local.ctx.tools.presentAs('ptc')
+    await presentPtc(local)
     assert.equal(isUnknownRestrictError(thrownDeny(local, 'pwsh')), true)
     await isolated.created(local)
     const localView = await isolated.rendered(local)

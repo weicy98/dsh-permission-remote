@@ -198,6 +198,17 @@ function surface(options: SurfaceOptions) {
     const result = await entry.fn({ tools: toolsForModel } as never, { scope } as never, (async () => ({ tools: toolsForModel })) as never) as { tools: Array<{ name: string }> }
     return result.tools.map(tool => tool.name)
   }
+  /**
+   * Feed the listener an arbitrary assembly. Hosts that own tool declarations
+   * (0.2.2) hand the waterfall only sections, contexts, and variables, and the
+   * listener must return that object without touching a schema list.
+   */
+  const assembleRaw = async (assembly: Record<string, unknown>, scope: object = agent) => {
+    const entry = listener('system-prompt/assemble')
+    assert.ok(entry)
+    const result = await entry.fn(assembly as never, { scope } as never, (async () => assembly) as never)
+    return result as Record<string, unknown>
+  }
 
   return {
     agent,
@@ -217,6 +228,7 @@ function surface(options: SurfaceOptions) {
     emit,
     guard,
     assemble,
+    assembleRaw,
     activeGuards: () => guards.filter(entry => entry.active).length,
     toolCount: (name: string) => tools.filter(tool => tool.name === name).length,
     sectionCount: (name: string) => sections.filter(section => section.name === name).length,
@@ -249,6 +261,27 @@ test('a Windows-shaped remote install hides pwsh and registers bash without repl
   assert.deepEqual(await session.assemble(['pwsh', 'bash'], {}), ['pwsh', 'bash'])
   assert.equal(session.guard('pwsh'), WINDOWS_SHELL_DENIED)
   assert.equal(session.guard('bash'), undefined)
+})
+
+test('an assembly without a tools list passes through untouched', async () => {
+  // 0.2.2 moved tool declarations to providers and merges them after this
+  // waterfall, so the assembly a listener receives has no `tools`. Reading it
+  // there threw a TypeError and rejected every remote session's prompt
+  // assembly; the listener must hand the object back exactly as it came.
+  const session = surface({ headerCwd: remoteCwd, officialBash: false })
+  await session.created()
+  const sections = [{ name: 'tool:bash', text: OFFICIAL_BASH }]
+  assert.deepEqual(await session.assembleRaw({ sections, contexts: [], variables: {} }), { sections, contexts: [], variables: {} })
+  assert.deepEqual(await session.assembleRaw({ sections: [], contexts: [], variables: {} }), { sections: [], contexts: [], variables: {} })
+
+  // A local session never reaches the filter, and an empty assembly is not its business either.
+  const local = surface({ headerCwd: localCwd })
+  await local.created()
+  const localAssembly = { sections: [], contexts: [], variables: {} }
+  assert.deepEqual(await local.assembleRaw(localAssembly), localAssembly)
+
+  // Hosts that still carry schemas keep the Windows-shell filter.
+  assert.deepEqual(await session.assemble(['pwsh', 'powershell', 'cmd', 'bash']), ['bash'])
 })
 
 test('a scope-local pwsh is skipped by restrict, removed from the schema, and denied by the guard', async () => {
