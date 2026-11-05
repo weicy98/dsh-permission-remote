@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, writeTransferLimits, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, isPathQuery, joinPath, matchRange, mergeEditedHost, parentDir, pickCompletion, resolveUnder, splitPath, stepActive, toDraft, type Draft } from './draft.ts'
 import { importNeedsConfirm } from './import-risk.ts'
 import { rootPromptFor, type RootPrompt } from './root-prompt.ts'
@@ -10,6 +10,9 @@ import { installStyles } from './styles.ts'
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
 
 const NS = 'permission-remote'
+
+/** Mirrors the host schema cap: `AbortSignal.timeout` refuses larger delays. */
+const TRANSFER_TIMEOUT_MS_MAX = 2 ** 31 - 1
 
 /**
  * One id for the sidebar row and the main panel it selects. The sidebar
@@ -254,6 +257,10 @@ function Section(props: SectionProps): JSX.Element {
   const [openWorkspaces, setOpenWorkspaces] = useState<Record<string, boolean>>({})
   const [tagTitles, setTagTitles] = useState(true)
   const [rgRegistry, setRgRegistry] = useState('')
+  /** Transfer ceiling in bytes; empty or "0" means no ceiling. */
+  const [transferMaxDraft, setTransferMaxDraft] = useState('')
+  /** Transfer deadline in milliseconds; empty or "0" means no deadline. */
+  const [transferTimeoutDraft, setTransferTimeoutDraft] = useState('')
   const [rootInfo, setRootInfo] = useState<RemoteRootInfo | null>(null)
   const [rootDraft, setRootDraft] = useState('')
   const [rootPrompt, setRootPrompt] = useState<RootPrompt | null>(null)
@@ -275,6 +282,8 @@ function Section(props: SectionProps): JSX.Element {
     setHosts(loaded.hosts)
     setTagTitles(loaded.tagWorkspaceTitles)
     setRgRegistry(loaded.rgRegistry)
+    setTransferMaxDraft(String(loaded.transferMaxBytes))
+    setTransferTimeoutDraft(String(loaded.transferTimeoutMs))
     setRootDraft(loaded.remoteRoot)
     setRevision(loaded.revision)
     return loaded.hosts
@@ -466,6 +475,40 @@ function Section(props: SectionProps): JSX.Element {
       setRgRegistry(saved.rgRegistry)
       setRevision(saved.revision)
       note(t('registrySaved'))
+    } catch (error) {
+      await reload().catch(() => undefined)
+      fail(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Save the transfer ceiling and deadline; empty or "0" means no limit. */
+  async function saveTransferLimits(): Promise<void> {
+    const maxBytes = Number.parseInt(transferMaxDraft.trim(), 10)
+    const timeoutMs = Number.parseInt(transferTimeoutDraft.trim(), 10)
+    if (transferMaxDraft.trim().length > 0 && !Number.isFinite(maxBytes)) {
+      note(t('transferLimitsInvalid'))
+      return
+    }
+    if (transferTimeoutDraft.trim().length > 0 && !Number.isFinite(timeoutMs)) {
+      note(t('transferLimitsInvalid'))
+      return
+    }
+    // The host clamps the deadline to the 32-bit timer limit. Say so instead of
+    // silently saving a different number than the one that was typed.
+    if (Number.isFinite(timeoutMs) && timeoutMs > TRANSFER_TIMEOUT_MS_MAX) {
+      note(`${t('transferLimitsClamped')} ${TRANSFER_TIMEOUT_MS_MAX}`)
+    }
+    setBusy(true)
+    try {
+      await writeTransferLimits(ctx, Number.isFinite(maxBytes) ? maxBytes : 0, Number.isFinite(timeoutMs) ? timeoutMs : 0, revision)
+      const saved = await readHosts(ctx)
+      setTransferMaxDraft(String(saved.transferMaxBytes))
+      setTransferTimeoutDraft(String(saved.transferTimeoutMs))
+      setRevision(saved.revision)
+      // A clamped value is worth explaining; otherwise the plain confirmation.
+      note(saved.transferTimeoutMs === timeoutMs ? t('transferLimitsSaved') : `${t('transferLimitsClamped')} ${saved.transferTimeoutMs}`)
     } catch (error) {
       await reload().catch(() => undefined)
       fail(error)
@@ -1640,6 +1683,37 @@ function Section(props: SectionProps): JSX.Element {
         </label>
         <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveRegistry()}>{t('save')}</button>
         <span className="dsh-ssh-note">{t('rgRegistryHint')}</span>
+      </div>
+      {/* One ssh_upload / ssh_download: byte ceiling and abort deadline. */}
+      <div className="dsh-ssh-registry">
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-transfer-max">
+          <span className="dsh-ssh-label">{t('transferMaxBytes')}</span>
+          <input
+            id="dsh-ssh-transfer-max"
+            className="dsh-ssh-input"
+            type="text"
+            inputMode="numeric"
+            value={transferMaxDraft}
+            placeholder="33554432"
+            disabled={busy}
+            onChange={event => setTransferMaxDraft(event.target.value.replace(/[^0-9]/g, ''))}
+          />
+        </label>
+        <label className="dsh-ssh-field" htmlFor="dsh-ssh-transfer-timeout">
+          <span className="dsh-ssh-label">{t('transferTimeoutMs')}</span>
+          <input
+            id="dsh-ssh-transfer-timeout"
+            className="dsh-ssh-input"
+            type="text"
+            inputMode="numeric"
+            value={transferTimeoutDraft}
+            placeholder="120000"
+            disabled={busy}
+            onChange={event => setTransferTimeoutDraft(event.target.value.replace(/[^0-9]/g, ''))}
+          />
+        </label>
+        <button type="button" className="dsh-ssh-button" disabled={busy} onClick={() => void saveTransferLimits()}>{t('save')}</button>
+        <span className="dsh-ssh-note">{t('transferLimitsHint')}</span>
       </div>
       {/* Where the local mirror of every remote workspace lives. */}
       <div className="dsh-ssh-registry">

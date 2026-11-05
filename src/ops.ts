@@ -1,8 +1,12 @@
 import { randomBytes } from 'node:crypto'
-import { posix } from 'node:path'
+import { constants as fsConstants } from 'node:fs'
+import { lstat, open, stat } from 'node:fs/promises'
+import { dirname as dirnameLocal, isAbsolute, posix } from 'node:path'
+import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig, OpsPolicy } from './config.ts'
 import {
+  abortError,
   capturedText,
   throwIfAborted,
   withSignal,
@@ -19,6 +23,23 @@ import { isSftpMissing, type SecretMaterial } from './ssh-pool.ts'
 const READ_CAP = 1024 * 1024
 const HOME_BEGIN = '__DSH_OPS_HOME_BEGIN__'
 const HOME_END = '__DSH_OPS_HOME_END__'
+
+/** Window used when reading a local upload source; the ceiling is enforced per byte. */
+const LOCAL_READ_CHUNK = 64 * 1024
+
+/**
+ * Ceiling and deadline for one transfer, as configured on the settings page.
+ * `0` means "no limit" for both: the operator opted in explicitly, so the
+ * upload source may be held in memory and a read may run unbounded.
+ */
+export interface OpsTransferLimits {
+  /** Byte ceiling for one transfer; `0` means unlimited. */
+  readonly maxBytes: number
+  /** Abort deadline for one transfer; `0` means unlimited. */
+  readonly timeoutMs: number
+}
+
+export const NO_TRANSFER_LIMITS: OpsTransferLimits = { maxBytes: 0, timeoutMs: 0 }
 
 export interface OpsApprovalArgs {
   sandbox_permissions?: string
@@ -369,4 +390,339 @@ function parseRemoteHome(stdout: string): string | undefined {
     if (posix.isAbsolute(home)) return home
   }
   return undefined
+}
+
+/* ------------------------------------------------------------------------- *
+ * ssh_upload / ssh_download
+ *
+ * One file, either direction. Both are write-class ops: an upload replaces a
+ * remote file and a download creates a local one, so an `ask` host needs the
+ * session's danger-full-access or a one-shot approval.
+ *
+ * Symlink policy is the same on both ends: the final component must not be a
+ * symbolic link. `resolveCreatedPath` would realpath a live symlink to its
+ * target — and then `mv -f` would replace the link's referent, not the link —
+ * so upload checks with `lstat` first and never follows the last component.
+ * Intermediate directories are ordinary path components and may be links.
+ * ------------------------------------------------------------------------- */
+
+function transferCap(limits: OpsTransferLimits): number {
+  return limits.maxBytes > 0 ? limits.maxBytes : Number.MAX_SAFE_INTEGER
+}
+
+function transferDeadline(exec: ToolExec, limits: OpsTransferLimits): AbortSignal | undefined {
+  if (limits.timeoutMs <= 0) return exec.signal
+  const timeout = AbortSignal.timeout(limits.timeoutMs)
+  return exec.signal === undefined ? timeout : AbortSignal.any([exec.signal, timeout])
+}
+
+/**
+ * Name a timeout instead of forwarding a bare `AbortError`.
+ *
+ * A cancellation and this deadline both end as `AbortError`, and the model
+ * cannot tell them apart. The caller's own signal is the discriminator: if it
+ * did not abort, the deadline was the only thing that could have. A
+ * cancellation therefore keeps its own error and a deadline is renamed.
+ */
+function transferAbortError(cancelSignal: AbortSignal | undefined, limits: OpsTransferLimits, error: unknown): unknown {
+  if (limits.timeoutMs <= 0) return error
+  if (!(error instanceof Error) || error.name !== 'AbortError') return error
+  if (cancelSignal?.aborted === true) return error
+  const timedOut = new Error(`transfer timed out after ${limits.timeoutMs} ms (the deadline is the "Transfer timeout" setting; 0 means unlimited)`)
+  timedOut.name = 'TimeoutError'
+  return timedOut
+}
+
+/** A local path is platform-native: Windows accepts `C:\x`, POSIX accepts `/x`. */
+function requireLocalPath(value: unknown, field = 'local_path'): string {
+  const requested = String(value ?? '').trim()
+  if (requested.length === 0) throw new Error(`${field} is required`)
+  if (!isAbsolute(requested)) {
+    throw new Error(`${field} must be an absolute path on the machine running DSH: ${requested}`)
+  }
+  return requested
+}
+
+/**
+ * Read one local file under a ceiling.
+ *
+ * The size from `fstat` is only a pre-check: the file can grow between that
+ * call and the read, so the loop stops at `maxBytes + 1` bytes and rejects.
+ * Reading the whole file first and comparing afterwards would still allocate
+ * the grown file. `O_NOFOLLOW` refuses a symlink at the final component
+ * (ignored on Windows, where `lstat` above is the guard).
+ */
+async function readLocalCapped(path: string, maxBytes: number, signal: AbortSignal | undefined): Promise<Buffer> {
+  let info
+  try {
+    info = await lstat(path)
+  } catch (error) {
+    if (signal?.aborted === true) throw error
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw new Error(`no such local file: ${path}`)
+    }
+    throw new Error(`cannot read local file ${path}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (info.isSymbolicLink()) throw new Error(`refusing to transfer a symbolic link: ${path}`)
+  if (info.isDirectory()) throw new Error(`local path is a directory: ${path}`)
+  if (!info.isFile()) throw new Error(`local path is not a regular file: ${path}`)
+  let handle
+  try {
+    // `O_NOFOLLOW` is 0 on Windows, where it would silently do nothing; the
+    // lstat above is the only symlink guard that platform has.
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+    handle = await open(path, fsConstants.O_RDONLY | noFollow)
+  } catch (error) {
+    // ELOOP means the path became a symlink after the lstat above.
+    if ((error as NodeJS.ErrnoException)?.code === 'ELOOP') {
+      throw new Error(`refusing to transfer a symbolic link: ${path}`)
+    }
+    throw error
+  }
+  try {
+    const opened = await handle.stat()
+    if (!opened.isFile()) throw new Error(`local path is not a regular file: ${path}`)
+    if (maxBytes > 0 && opened.size > maxBytes) {
+      throw new Error(`local file is ${opened.size} bytes, over the ${maxBytes} byte transfer ceiling`)
+    }
+    const parts: Buffer[] = []
+    let total = 0
+    while (true) {
+      throwIfAborted(signal)
+      const room = maxBytes > 0 ? Math.min(LOCAL_READ_CHUNK, maxBytes + 1 - total) : LOCAL_READ_CHUNK
+      const chunk = Buffer.allocUnsafe(room)
+      const { bytesRead } = await handle.read(chunk, 0, room, null)
+      if (bytesRead === 0) break
+      total += bytesRead
+      if (maxBytes > 0 && total > maxBytes) {
+        throw new Error(`local file is over the ${maxBytes} byte transfer ceiling`)
+      }
+      parts.push(chunk.subarray(0, bytesRead))
+    }
+    return parts.length === 0 ? Buffer.alloc(0) : Buffer.concat(parts, total)
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+/**
+ * Classify the remote target without following the final component.
+ *
+ * A server that omits SSH_FILEXFER_ATTR_PERMISSIONS gets its type derived by
+ * `attrsOf` (readlink, directory probe, then the login shell), so `other`
+ * really means "FIFO/device/socket or unknowable" and must be refused. A
+ * plain `stat` cannot make that distinction: its `type` stays `undefined`.
+ */
+async function remoteTargetOf(
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  remotePath: string,
+  follow: boolean,
+  signal: AbortSignal | undefined,
+): Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number, mode?: number } | undefined> {
+  try {
+    return await withSignal(hostApi.pool.sftpAttrs(host, secret, remotePath, follow), signal)
+  } catch (error) {
+    if (signal?.aborted === true) throw error
+    if (isSftpMissing(error)) return undefined
+    throw error
+  }
+}
+
+/**
+ * Race one transfer step against the deadline.
+ *
+ * `pool.exec` returns a promise that only settles when the channel does, and a
+ * cancelled channel can still take up to two seconds to report. Racing the
+ * deadline here means a timed-out transfer rejects promptly even if the step
+ * itself never settles. A real cancellation keeps its own `AbortError`;
+ * `transferAbortError` only renames the deadline case.
+ */
+async function withTransferDeadline<T>(
+  work: Promise<T>,
+  deadline: AbortSignal | undefined,
+  cancelSignal: AbortSignal | undefined,
+  limits: OpsTransferLimits,
+): Promise<T> {
+  if (deadline === undefined || limits.timeoutMs <= 0) {
+    try {
+      return await work
+    } catch (error) {
+      throw transferAbortError(cancelSignal, limits, error)
+    }
+  }
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortError())
+    if (deadline.aborted) onAbort()
+    else deadline.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([work, aborted])
+  } catch (error) {
+    throw transferAbortError(cancelSignal, limits, error)
+  } finally {
+    if (onAbort !== undefined) deadline.removeEventListener('abort', onAbort)
+    // The losing promise must not surface as an unhandled rejection.
+    work.catch(() => undefined)
+  }
+}
+
+export async function runSshUpload(
+  hostApi: ToolHost,
+  host: HostConfig,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+  limits: OpsTransferLimits = NO_TRANSFER_LIMITS,
+): Promise<Record<string, unknown>> {
+  const localPath = requireLocalPath(args.local_path)
+  const remoteRequest = String(args.remote_path ?? '').trim()
+  if (remoteRequest.length === 0) throw new Error('remote_path is required')
+  await requireOps(
+    hostApi,
+    host,
+    exec,
+    args as OpsApprovalArgs,
+    'ssh_upload',
+    hostSubject(host, 'remote file upload'),
+    {
+      en: `upload ${clip(localPath, 120)} to ${clip(remoteRequest, 120)} on ${hostLabel(host)}`,
+      zh: `把 ${clip(localPath, 120)} 上传到 ${hostLabel(host)} 的 ${clip(remoteRequest, 120)}`,
+    },
+  )
+  throwIfAborted(exec.signal)
+  const signal = transferDeadline(exec, limits)
+  const secret = await hostApi.secretOf(host)
+  const body = await withTransferDeadline(readLocalCapped(localPath, limits.maxBytes, signal), signal, exec.signal, limits)
+  throwIfAborted(signal)
+  const remotePath = await resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path')
+  // Same refusal as the download side: `/` is never a file, and the atomic
+  // script would only report it as "remote path is a directory" after a
+  // round trip. Naming the real problem here is clearer and symmetric.
+  if (posix.normalize(remotePath) === '/') throw new Error('remote_path must name a file, not the filesystem root')
+  const existing = await remoteTargetOf(hostApi, host, secret, remotePath, false, signal)
+  if (existing !== undefined && existing.type !== 'file') {
+    throw new Error(`remote path is not a regular file (${existing.type}): ${remotePath}`)
+  }
+  const directory = posix.dirname(remotePath)
+  const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
+  const script = atomicWriteScript(directory, tmp, remotePath, existing?.mode)
+  // `timeoutMs` 0 disables the channel timer, matching the "no deadline"
+  // setting; a non-zero value aborts the write at the same instant the
+  // transfer signal does.
+  const result = await withTransferDeadline(hostApi.pool.exec(host, secret, script, limits.timeoutMs, signal, body), signal, exec.signal, limits)
+  if (result.code !== 0) throw new Error(result.stderr || 'remote upload failed')
+  return {
+    host: opsHostView(host),
+    localPath,
+    remotePath,
+    bytes: body.length,
+    operation: existing === undefined ? 'create' : 'update',
+    maxBytes: limits.maxBytes,
+    timeoutMs: limits.timeoutMs,
+  }
+}
+
+export function renderOpsUpload(value: Record<string, unknown>): string {
+  const host = value.host as OpsHostView | undefined
+  const label = host === undefined ? 'remote host' : host.name || host.address
+  const bytes = typeof value.bytes === 'number' ? value.bytes : 0
+  const action = value.operation === 'update' ? 'updated' : 'created'
+  const limits = transferLimitText(value)
+  return `uploaded ${String(value.localPath ?? '')} → ${String(value.remotePath ?? '')} on ${label} (${bytes} bytes, ${action}${limits})`
+}
+
+export async function runSshDownload(
+  hostApi: ToolHost,
+  host: HostConfig,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+  limits: OpsTransferLimits = NO_TRANSFER_LIMITS,
+): Promise<Record<string, unknown>> {
+  const localPath = requireLocalPath(args.local_path)
+  const remoteRequest = String(args.remote_path ?? '').trim()
+  if (remoteRequest.length === 0) throw new Error('remote_path is required')
+  await requireOps(
+    hostApi,
+    host,
+    exec,
+    args as OpsApprovalArgs,
+    'ssh_download',
+    hostSubject(host, 'remote file download'),
+    {
+      en: `download ${clip(remoteRequest, 120)} from ${hostLabel(host)} to ${clip(localPath, 120)}`,
+      zh: `把 ${hostLabel(host)} 的 ${clip(remoteRequest, 120)} 下载到 ${clip(localPath, 120)}`,
+    },
+  )
+  throwIfAborted(exec.signal)
+  const signal = transferDeadline(exec, limits)
+  const secret = await hostApi.secretOf(host)
+  const remotePath = await resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path')
+  if (posix.normalize(remotePath) === '/') throw new Error('remote_path must name a file, not the filesystem root')
+  // Check the destination before pulling any bytes, so a bad local path fails
+  // before a large read. It runs after the gate on purpose: a denied or
+  // unapproved call must not probe the local filesystem either.
+  await assertLocalTarget(localPath)
+  const info = await remoteTargetOf(hostApi, host, secret, remotePath, false, signal)
+  if (info === undefined) throw new Error(`no file at remote path: ${remotePath}`)
+  if (info.type !== 'file') {
+    throw new Error(`remote path is not a regular file (${info.type}): ${remotePath}`)
+  }
+  if (limits.maxBytes > 0 && info.size > limits.maxBytes) {
+    throw new Error(`remote file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
+  }
+  throwIfAborted(signal)
+  const data = await withTransferDeadline(
+    withSignal(hostApi.pool.sftpRead(host, secret, remotePath, transferCap(limits), signal), signal),
+    signal,
+    exec.signal,
+    limits,
+  )
+  throwIfAborted(signal)
+  await withTransferDeadline(
+    withSignal(writeFileAtomic(localPath, data, { mode: 0o600, dirMode: 0o700 }), signal),
+    signal,
+    exec.signal,
+    limits,
+  )
+  return {
+    host: opsHostView(host),
+    remotePath,
+    localPath,
+    bytes: data.length,
+    maxBytes: limits.maxBytes,
+    timeoutMs: limits.timeoutMs,
+  }
+}
+
+/** A download never creates a directory tree: the parent must already be one. */
+async function assertLocalTarget(localPath: string): Promise<void> {
+  const parent = dirnameLocal(localPath)
+  if (parent.length > 0 && parent !== localPath) {
+    const parentInfo = await stat(parent).catch(() => undefined)
+    if (parentInfo === undefined) throw new Error(`local parent directory does not exist: ${parent}`)
+    if (!parentInfo.isDirectory()) throw new Error(`local parent is not a directory: ${parent}`)
+  }
+  const existing = await lstat(localPath).catch(() => undefined)
+  if (existing === undefined) return
+  if (existing.isDirectory()) throw new Error(`local path is a directory: ${localPath}`)
+  if (existing.isSymbolicLink()) throw new Error(`refusing to write through a symbolic link: ${localPath}`)
+}
+
+export function renderOpsDownload(value: Record<string, unknown>): string {
+  const host = value.host as OpsHostView | undefined
+  const label = host === undefined ? 'remote host' : host.name || host.address
+  const bytes = typeof value.bytes === 'number' ? value.bytes : 0
+  const limits = transferLimitText(value)
+  return `downloaded ${String(value.remotePath ?? '')} from ${label} → ${String(value.localPath ?? '')} (${bytes} bytes${limits})`
+}
+
+/** State the ceilings that actually applied, so `0` reads as "unlimited". */
+function transferLimitText(value: Record<string, unknown>): string {
+  const maxBytes = typeof value.maxBytes === 'number' ? value.maxBytes : 0
+  const timeoutMs = typeof value.timeoutMs === 'number' ? value.timeoutMs : 0
+  const ceiling = maxBytes > 0 ? `${maxBytes} byte ceiling` : 'no byte ceiling'
+  const deadline = timeoutMs > 0 ? `${timeoutMs} ms timeout` : 'no timeout'
+  return `; ${ceiling}, ${deadline}`
 }

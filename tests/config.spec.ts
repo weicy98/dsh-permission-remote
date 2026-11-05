@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { Config, connectionKeyChanged, normalizeLoginEnv, readConfig, type HostConfig } from '../src/config.ts'
 import { migrationStatePath, readMigrationState, writeMigrationState } from '../src/migration-state.ts'
 
@@ -147,4 +148,66 @@ test('a bookkeeping file from another version is read but reported', async () =>
   } finally {
     await rm(box, { recursive: true, force: true })
   }
+})
+
+test('transfer limits are volatile, defaulted, and readable through the getter', () => {
+  assert.equal(Config.dict?.transferMaxBytes?.meta.volatile, true)
+  assert.equal(Config.dict?.transferTimeoutMs?.meta.volatile, true)
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 }) as unknown as { transferMaxBytes: unknown, transferTimeoutMs: unknown }
+  const config = readConfig(resolved)
+  assert.equal(config.transferMaxBytes, 32 * 1024 * 1024)
+  assert.equal(config.transferTimeoutMs, 120_000)
+})
+
+test('a stored zero survives: it is the "no limit" sentinel', () => {
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4, transferMaxBytes: 0, transferTimeoutMs: 0 })
+  const config = readConfig(resolved)
+  assert.equal(config.transferMaxBytes, 0)
+  assert.equal(config.transferTimeoutMs, 0)
+})
+
+test('a settings write is visible through the getter without a reload', () => {
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 })
+  const config = readConfig(resolved)
+  updateVolatile(resolved.transferMaxBytes, createVolatile(1024))
+  assert.equal(config.transferMaxBytes, 1024)
+  updateVolatile(resolved.transferTimeoutMs, createVolatile(5000))
+  assert.equal(config.transferTimeoutMs, 5000)
+})
+
+test('a plain settings object keeps its transfer limits', () => {
+  const config = readConfig({ hosts: [host('h1')], maxConnections: 2, transferMaxBytes: 2048, transferTimeoutMs: 900 })
+  assert.equal(config.transferMaxBytes, 2048)
+  assert.equal(config.transferTimeoutMs, 900)
+})
+
+test('the schema rejects a negative limit instead of disabling the guard', () => {
+  // `natural()` is non-negative, so a hand-edited config fails loudly rather
+  // than turning into an accidental "no ceiling".
+  assert.throws(() => readConfig({ hosts: [host('h1')], maxConnections: 2, transferMaxBytes: -5 }), /expected number >= 0/)
+})
+
+test('the schema rejects a fractional limit too', () => {
+  assert.throws(() => readConfig({ hosts: [host('h1')], maxConnections: 2, transferMaxBytes: 1.5 }), /multiple of 1/)
+})
+
+test('the schema caps the deadline at the 32-bit timer limit', () => {
+  assert.throws(() => readConfig({ hosts: [host('h1')], maxConnections: 2, transferTimeoutMs: 2 ** 31 }), /<= 2147483647|expected number/)
+})
+
+test('a volatile deadline above the timer limit is clamped, not passed to AbortSignal', () => {
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 })
+  const config = readConfig(resolved)
+  updateVolatile(resolved.transferTimeoutMs, createVolatile(2 ** 40))
+  assert.equal(config.transferTimeoutMs, 2 ** 31 - 1)
+})
+
+test('a volatility-updated fractional value is floored instead of trusted', () => {
+  // A volatile commit bypasses the schema, so the getter is the last guard.
+  const resolved = Config({ hosts: [host('h1')], maxConnections: 4 })
+  const config = readConfig(resolved)
+  updateVolatile(resolved.transferMaxBytes, createVolatile(1.5))
+  updateVolatile(resolved.transferTimeoutMs, createVolatile(2.9))
+  assert.equal(config.transferMaxBytes, 1)
+  assert.equal(config.transferTimeoutMs, 2)
 })

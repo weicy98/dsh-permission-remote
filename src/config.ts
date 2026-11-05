@@ -2,6 +2,20 @@ import Schema from '@deepseek-ai/schemastery'
 import { createVolatile, isVolatile, updateVolatile, type Volatile } from '@deepseek-ai/cosmokit'
 import { isValidHostId } from './router.ts'
 
+/** Default ceiling for one transfer: the same 32 MiB `present` and uploads use. */
+export const TRANSFER_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
+
+/** Default transfer deadline. Long enough for 32 MiB on a slow link. */
+export const TRANSFER_TIMEOUT_MS_DEFAULT = 120_000
+
+/**
+ * Largest accepted deadline. Node's timer clock is a signed 32-bit millisecond
+ * count: `AbortSignal.timeout` throws `ERR_OUT_OF_RANGE` above 2^32-1, and
+ * `setTimeout` above 2^31-1 silently fires after 1 ms. Capping the setting
+ * keeps both from turning a large value into a crash or an instant failure.
+ */
+export const TRANSFER_TIMEOUT_MS_MAX = 2 ** 31 - 1
+
 /**
  * `ask` gates commands and writes behind the session permission mode and an
  * approval card. `trust` runs them without a prompt. `deny` rejects every
@@ -69,6 +83,19 @@ export const Config = Schema.object({
    * The Settings action changes it and migrates the old tree there.
    */
   remoteRoot: Schema.string().default('').volatile(),
+  /**
+   * Byte ceiling for one `ssh_upload` / `ssh_download`. `0` means no ceiling:
+   * the whole file is held in memory, so the operator opts in explicitly.
+   * Volatile so the settings page can write it; a non-volatile field would be
+   * read once at load and every save would be a silent no-op.
+   */
+  transferMaxBytes: Schema.natural().default(TRANSFER_MAX_BYTES_DEFAULT).volatile(),
+  /**
+   * Abort deadline for one transfer, in milliseconds. `0` means no deadline.
+   * Applied to the remote write and the remote read; the pre-transfer `stat`
+   * cannot be cancelled mid-flight and only rejects the caller's promise.
+   */
+  transferTimeoutMs: Schema.natural().default(TRANSFER_TIMEOUT_MS_DEFAULT).max(TRANSFER_TIMEOUT_MS_MAX).volatile(),
 })
 
 export type OpsPolicy = 'ask' | 'trust' | 'deny'
@@ -128,6 +155,10 @@ export interface PluginConfig {
   readonly rgRegistry: string
   /** Operator-chosen placeholder root, or empty for the built-in default. */
   remoteRoot: string
+  /** Byte ceiling for one transfer; `0` means unlimited. */
+  readonly transferMaxBytes: number
+  /** Abort deadline for one transfer in milliseconds; `0` means unlimited. */
+  readonly transferTimeoutMs: number
 }
 
 type HostRef = Volatile<unknown>
@@ -180,6 +211,10 @@ export function readConfig(raw: unknown): PluginConfig {
   const registryDefault = typeof record.rgRegistry === 'string' ? record.rgRegistry : ''
   const rootRef = refOf(record.remoteRoot)
   const rootDefault = typeof record.remoteRoot === 'string' ? record.remoteRoot : ''
+  const bytesRef = refOf(record.transferMaxBytes)
+  const bytesDefault = typeof record.transferMaxBytes === 'number' ? record.transferMaxBytes : TRANSFER_MAX_BYTES_DEFAULT
+  const timeoutRef = refOf(record.transferTimeoutMs)
+  const timeoutDefault = typeof record.transferTimeoutMs === 'number' ? record.transferTimeoutMs : TRANSFER_TIMEOUT_MS_DEFAULT
   const parsed = Config({
     ...record,
     hosts: copyHostRows(hostRef !== undefined ? hostRef.get() : record.hosts),
@@ -188,18 +223,35 @@ export function readConfig(raw: unknown): PluginConfig {
     tagWorkspaceTitles: tagRef !== undefined ? tagRef.get() !== false : tagDefault,
     rgRegistry: registryRef !== undefined ? String(registryRef.get() ?? '') : registryDefault,
     remoteRoot: rootRef !== undefined ? String(rootRef.get() ?? '') : rootDefault,
+    transferMaxBytes: bytesRef !== undefined ? Number(bytesRef.get() ?? 0) : bytesDefault,
+    transferTimeoutMs: timeoutRef !== undefined ? Number(timeoutRef.get() ?? 0) : timeoutDefault,
   }) as unknown as { hosts?: unknown, deletedHosts?: unknown, maxConnections?: number }
   const maxConnections = parsed.maxConnections ?? 4
   const tag = tagRef === undefined ? (): boolean => tagDefault : (): boolean => tagRef.get() !== false
   const registry = (): string => String(registryRef === undefined ? registryDefault : registryRef.get() ?? '').trim()
   const root = (): string => String(rootRef === undefined ? rootDefault : rootRef.get() ?? '').trim()
+  const transferMaxBytes = (): number => normalizeTransferLimit(bytesRef === undefined ? bytesDefault : bytesRef.get())
+  const transferTimeoutMs = (): number => Math.min(
+    TRANSFER_TIMEOUT_MS_MAX,
+    normalizeTransferLimit(timeoutRef === undefined ? timeoutDefault : timeoutRef.get()),
+  )
   const ref = hostRef ?? parsed.hosts
   // `Config()` returns volatile wrappers for volatile fields even when the
   // input was a plain array, so prefer the parsed reference when present.
   const deletedRowRef = deletedRef ?? refOf(parsed.deletedHosts)
   const deletedRows = copyDeletedRows(deletedRowRef !== undefined ? deletedRowRef.get() : record.deletedHosts) ?? []
-  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, root, rootRef, deletedRowRef, deletedRows)
-  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root() }
+  if (isHostRef(ref)) return viewConfig(ref, maxConnections, tag, registry, root, rootRef, deletedRowRef, deletedRows, transferMaxBytes, transferTimeoutMs)
+  return { hosts: asHostArray(ref), deletedHosts: deletedRows, maxConnections, tagWorkspaceTitles: tagDefault, rgRegistry: registry(), remoteRoot: root(), transferMaxBytes: transferMaxBytes(), transferTimeoutMs: transferTimeoutMs() }
+}
+
+/**
+ * A transfer limit as a non-negative integer. `0` is the documented "no limit"
+ * sentinel, so it must survive; a negative, fractional, or non-numeric value
+ * falls back to the default instead of silently disabling a guard.
+ */
+export function normalizeTransferLimit(value: unknown, fallback = 0): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return fallback
+  return Math.floor(value)
 }
 
 function refOf(value: unknown): HostRef | undefined {
@@ -215,6 +267,8 @@ function viewConfig(
   rootRef: HostRef | undefined,
   deletedRef: HostRef | undefined,
   deletedRows: DeletedHost[],
+  transferMaxBytes: () => number,
+  transferTimeoutMs: () => number,
 ): PluginConfig {
   return {
     get hosts() {
@@ -243,6 +297,12 @@ function viewConfig(
     },
     get remoteRoot() {
       return remoteRoot()
+    },
+    get transferMaxBytes() {
+      return transferMaxBytes()
+    },
+    get transferTimeoutMs() {
+      return transferTimeoutMs()
     },
     set remoteRoot(value: string) {
       // A read-only config (no volatile ref) cannot persist a new root; the

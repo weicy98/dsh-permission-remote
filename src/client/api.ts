@@ -58,7 +58,15 @@ export interface RpcResult<T> {
 
 export interface SettingsNamespace {
   ns: string
-  value: { hosts?: HostView[], maxConnections?: number, tagWorkspaceTitles?: boolean, rgRegistry?: string, remoteRoot?: string }
+  value: {
+    hosts?: HostView[]
+    maxConnections?: number
+    tagWorkspaceTitles?: boolean
+    rgRegistry?: string
+    remoteRoot?: string
+    transferMaxBytes?: number
+    transferTimeoutMs?: number
+  }
   revision: number
 }
 
@@ -77,7 +85,18 @@ export interface HostSettings {
   tagWorkspaceTitles: boolean
   rgRegistry: string
   remoteRoot: string
+  transferMaxBytes: number
+  transferTimeoutMs: number
   revision: number
+}
+
+/** Defaults mirrored from the host schema for rows saved before the field existed. */
+const TRANSFER_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
+const TRANSFER_TIMEOUT_MS_DEFAULT = 120_000
+
+/** A stored transfer limit. `0` is the documented "no limit" sentinel and must survive. */
+function transferLimit(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback
 }
 
 export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
@@ -92,7 +111,9 @@ export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   const tagWorkspaceTitles = row?.value?.tagWorkspaceTitles !== false
   const rgRegistry = typeof row?.value?.rgRegistry === 'string' ? row.value.rgRegistry : ''
   const remoteRoot = typeof row?.value?.remoteRoot === 'string' ? row.value.remoteRoot : ''
-  return { hosts, tagWorkspaceTitles, rgRegistry, remoteRoot, revision: row?.revision ?? 0 }
+  const transferMaxBytes = transferLimit(row?.value?.transferMaxBytes, TRANSFER_MAX_BYTES_DEFAULT)
+  const transferTimeoutMs = transferLimit(row?.value?.transferTimeoutMs, TRANSFER_TIMEOUT_MS_DEFAULT)
+  return { hosts, tagWorkspaceTitles, rgRegistry, remoteRoot, transferMaxBytes, transferTimeoutMs, revision: row?.revision ?? 0 }
 }
 
 export async function writeTagWorkspaceTitles(ctx: ClientFace, enabled: boolean, revision: number): Promise<void> {
@@ -102,6 +123,26 @@ export async function writeTagWorkspaceTitles(ctx: ClientFace, enabled: boolean,
 /** Store the npm registry used to fetch a ripgrep binary; empty restores npmjs. */
 export async function writeRgRegistry(ctx: ClientFace, registry: string, revision: number): Promise<void> {
   await ctx.remote.settings.mutate(NS, [{ op: 'set', path: ['rgRegistry'], value: registry }], revision)
+}
+
+/**
+ * Store the transfer ceiling and deadline. `0` in either field means "no
+ * limit"; the host schema validates that they are non-negative integers.
+ */
+export async function writeTransferLimits(ctx: ClientFace, maxBytes: number, timeoutMs: number, revision: number): Promise<void> {
+  await ctx.remote.settings.mutate(NS, [
+    { op: 'set', path: ['transferMaxBytes'], value: wholeLimit(maxBytes) },
+    { op: 'set', path: ['transferTimeoutMs'], value: wholeLimit(timeoutMs) },
+  ], revision)
+}
+
+/**
+ * Clamp one limit to a non-negative whole number. `Math.max(0, Math.floor(NaN))`
+ * is `NaN`, which JSON cannot carry and the host schema would reject, so a
+ * non-finite value becomes the "no limit" sentinel instead.
+ */
+export function wholeLimit(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
 }
 
 export interface RipgrepInstall {

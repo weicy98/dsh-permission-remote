@@ -115,7 +115,7 @@ dsh plugin --profile web add dsh-permission-remote
 
 ## 远程运维
 
-普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机，用来查日志、重启服务、改配置，或者把远端目录注册成工作区。打开会话即可看到五个工具：
+普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机，用来查日志、重启服务、改配置、传文件，或者把远端目录注册成工作区。打开会话即可看到七个工具：
 
 | 工具 | 作用 |
 |---|---|
@@ -123,17 +123,29 @@ dsh plugin --profile web add dsh-permission-remote
 | `ssh_exec` | 在那台机器上执行 `bash -lc`，可选绝对路径 `workdir` 和 `timeoutMs` |
 | `ssh_read` | 读取远端文件，1 MiB 上限，按行分页；支持 `~/` |
 | `ssh_write` | 用临时文件加 `mv -f` 原子替换远端文件。已有文件保留权限位，新文件按远端 umask 创建，目录路径会被拒绝 |
+| `ssh_upload` | 把一个本机文件传到远端。本机路径必须是**运行 DSH 那台机器**上的绝对路径，远端路径是绝对路径或以 `~/` 开头。字节写在目标同目录的临时文件里再 `mv -f` 替换：断线不会截断原文件，已有文件保留权限位，新文件按远端 umask 创建 |
+| `ssh_download` | 把远端一个文件取回本机。远端路径是绝对路径或以 `~/` 开头，本机路径的上级目录必须已经存在。文件原子替换并置为 `0600` |
 | `ssh_workspace` | 给某台已有主机、以某个远端目录创建一个工作区。目录必须已经存在且是目录，不能是文件系统根 `/`。标题默认取目录名，开了标题标注时会带上服务器前缀。重复添加同一目录不会产生第二行，保留原标题，结果里会说明 |
 
 每台主机在设置里有一个**远程运维**策略：
 
-| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` / 添加工作区 `ssh_workspace` |
+| 策略 | 读取 `ssh_read` | 命令 `ssh_exec` / 写入 `ssh_write` / 上传 `ssh_upload` / 下载 `ssh_download` / 添加工作区 `ssh_workspace` |
 |---|---|---|
 | 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，模型必须带 `sandbox_permissions: "danger-full-access"` 和理由重试后弹审批卡。卡片上有主机和截断后的命令或路径，批准只放宽这一次。其它档位不会弹卡 |
 | 信任 | 允许 | 直接执行，不弹审批 |
 | 禁止 | 拒绝 | 拒绝 |
 
-`ssh_exec`、`ssh_write` 和 `ssh_workspace` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
+`ssh_exec`、`ssh_write`、`ssh_upload`、`ssh_download` 和 `ssh_workspace` 在远端不受远端工作区沙箱约束，因为运维目标通常是本机工作区之外的机器。它们要么走当前会话的 `danger-full-access`，要么走这台主机的信任策略，要么走一次审批。读取只受「禁止」限制。
+
+下载按**写入**处理：它对远端只是读，但会在运行 DSH 的机器上落盘，所以和 `ssh_write` 同一道闸门——只读会话不能借下载绕过本机沙箱。纯文本读取仍用 `ssh_read`，它只受「禁止」限制。
+
+**单文件，不递归。** 两个工具都不传目录，也不做断点续传。最终组件是符号链接时两端都拒绝（远端用 `lstat`，本机也用 `lstat`，再加 `O_NOFOLLOW`），因为 `mv -f` 会替换链接本身而 `realpath` 会把有效链接解析到目标，两种语义都容易写出意外结果；中间目录是链接则按普通路径处理。FIFO、设备、socket 一律拒绝，不会被当成文件读取。
+
+**上限与超时在设置页配置**（「设置」标签页里的「单次传输上限（字节）」和「单次传输超时（毫秒）」）：默认 32 MiB 和 120 秒，改完立即生效。填 `0` 或留空表示**不封顶 / 不限时**——不封顶时整个文件会进内存，超时只在读取和远端写入阶段真正可中止，预检的 `stat` 无法中途取消，只会让这次调用先返回。超时或取消**可能仍完成落盘**，失败也可能在远端留下同目录临时文件；已经写好的结果不回滚。超时上限是 `2147483647` 毫秒（Node 定时器的 32 位上限，再大的值会立刻触发或直接报错），超过时设置页会说明已按上限保存。超时和用户取消在上层都表现为中止，但插件会把**超时**改写成 `TimeoutError` 并在消息里写明生效的毫秒数，取消仍是 `AbortError`，模型因此能分辨是该调大设置还是别重试。
+
+上传的远端父目录由脚本 `mkdir -p` 创建，且不会改动已有目录的权限（这里没有复用 `sftpPutFile`，那个函数会把父目录 `chmod 700`）。下载**不会**自动创建本机目录树，上级目录不存在就直接报错。
+
+远端工作区里的会话也能调这两个工具，但那里的 `local_path` 指的是**运行 DSH 的机器**：模型看到的 `~/.dsh/remote/...` 占位路径在本机只是一个目录骨架，远端主机看不到它。要在远端会话内搬运文件，用那台机器上的 `bash`。
 
 `ssh_workspace` 做一次远端 `stat`，再按远端真实路径注册（符号链接记成它指向的目录，标题默认取这个真实路径的目录名）。`realpath` 失败则这次注册失败。它不改远端文件。它只在侧栏加一条工作区。打开这条工作区会在那台机器上开始一个会话，所以询问策略下仍和命令一样要审批。这次调用不让当前会话进入，结果里也不给出占位目录。要在那台机器上工作，从侧栏打开。文件系统根 `/` 不能注册，真实路径解析成 `/` 时同样拒绝：那一棵会盖住整台机器。对同一个远端真实路径重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
 
@@ -143,7 +155,7 @@ dsh plugin --profile web add dsh-permission-remote
 - `ssh_exec` 用 `bash -lc`，会读登录 shell 的 profile，这样 `PATH` 里才有 `systemctl`、`docker` 这类命令；profile 若往 stdout 打东西，会出现在命令输出里
 - `sudo` 只能走免密（`sudo -n`）。SSH 非交互执行没有 TTY，需要口令的 `sudo` 会卡住
 - 只支持直连的 Linux 或 macOS；不支持跳板机和 Windows 远端
-- 目前没有上传和下载工具
+- 上传和下载只处理单个文件：不跟目录、不续传，单次上限和超时见上面的设置项
 - 网络中断时，正在执行的远端命令会失败；已经写入的文件留在远端，不会回滚
 
 ## 侧栏终端
@@ -175,7 +187,7 @@ DSH 本身跑在 Windows 上时，远端工作区的对话只暴露远端 `bash`
 
 模型用「运行代码」时，跑的仍是你电脑上这个占位目录里的运行时，不是远端那一份。会话读取项目里的 `AGENTS.md`、`CLAUDE.md`（以及同名的 `.local`）时走文件系统接口，占位路径会读到远端那一份。`$DSH_HOME/AGENTS.md` 这种不在占位根下的全局文件仍是本机。每轮组装提示词会沿祖先目录对这些文件多做几次远端查询。提示词内容和本机那份不一样，已经缓存的前缀对不上。
 
-目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用上面的 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write` / `ssh_workspace`。
+目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用上面的 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write` / `ssh_upload` / `ssh_download` / `ssh_workspace`。
 
 Linux 上要让命令遵守当前权限，需要在那台机器上安装 bubblewrap。设置页可以代为安装，页面上也有可以自己执行的命令。
 
@@ -283,7 +295,7 @@ The right sidebar's terminal on a remote workspace connects to that host, not to
 
 ### Remote ops from an ordinary workspace
 
-A workspace whose directory is on your own computer can also act on a configured SSH host. Every session gets five tools:
+A workspace whose directory is on your own computer can also act on a configured SSH host. Every session gets seven tools:
 
 | Tool | Purpose |
 |---|---|
@@ -291,21 +303,33 @@ A workspace whose directory is on your own computer can also act on a configured
 | `ssh_exec` | Run `bash -lc` on that host, with optional absolute `workdir` and `timeoutMs` |
 | `ssh_read` | Read a remote file, capped at 1 MiB, paginated by line; `~/` is expanded |
 | `ssh_write` | Replace a remote file atomically with a temp file and `mv -f`. An existing file keeps its permission bits, a new file uses the remote umask, and a directory path is rejected |
+| `ssh_upload` | Copy one local file to the remote host. `local_path` is an absolute path on the **machine running DSH**; `remote_path` is absolute or starts with `~/`. The bytes go to a same-directory temp file and are renamed with `mv -f`: a dropped connection never truncates the original, an existing file keeps its permission bits, and a new file uses the remote umask |
+| `ssh_download` | Copy one remote file back to this machine. `remote_path` is absolute or starts with `~/`; the parent of `local_path` must already exist. The target is replaced atomically with mode `0600` |
 | `ssh_workspace` | Add a workspace for an existing host from one remote directory. The directory must already exist and be a directory, and it cannot be the filesystem root `/`. The title defaults to its name, carrying the server prefix when title tagging is on. Registering the same directory again keeps the existing row and its title, and the result says so |
 
 Each host has a **Remote ops** policy in Settings:
 
-| Policy | `ssh_read` | `ssh_exec` / `ssh_write` / `ssh_workspace` |
+| Policy | `ssh_read` | `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` / `ssh_workspace` |
 |---|---|---|
 | Ask (default) | allowed | runs only when the session is `danger-full-access`; otherwise the first call is denied and a retry must pass `sandbox_permissions: "danger-full-access"` plus a justification. The approval card names the host and the truncated command or path, and grants this one call. Any other mode does not open a card |
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops commands, writes, and workspace registration are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
+Ops commands, writes, uploads, downloads, and workspace registration are not wrapped in the remote workspace sandbox, because the target is usually a machine outside your local workspace. They need the session's `danger-full-access`, a trusted host, or a one-shot approval. Reads are only limited by Deny.
+
+A download is gated like a **write**: it only reads on the remote side, but it creates a file on the machine running DSH, so a read-only session cannot use it to bypass the local sandbox. Plain text reads still use `ssh_read`, which Deny alone limits.
+
+**One file, no recursion.** Neither tool accepts a directory or resumes a partial transfer. When the final component is a symbolic link both ends refuse it (the remote with `lstat`, the local side with `lstat` plus `O_NOFOLLOW`): `mv -f` would replace the link itself while `realpath` would resolve a live link to its target, and either behavior silently writes somewhere the caller did not name. Linked intermediate directories are ordinary path components. FIFOs, devices, and sockets are refused rather than read as files.
+
+**The ceiling and deadline live on the Settings page** ("Transfer ceiling (bytes)" and "Transfer timeout (ms)" under the Settings tab): 32 MiB and 120 seconds by default, applied to the next call. `0` or an empty field means **no ceiling / no deadline** — with no ceiling the whole file is held in memory, and the deadline can only interrupt the read and the remote write; the pre-transfer `stat` cannot be cancelled mid-flight and only rejects the caller. A timeout or cancellation **may still complete the write**, and a failure may leave a same-directory temp file on the remote; nothing already written is rolled back. The deadline is capped at `2147483647` ms, Node's 32-bit timer limit: a larger delay would fire at once (`setTimeout`) or throw (`AbortSignal.timeout`), so the settings page says it saved the capped value. Both a deadline and a cancellation abort the call, but the plugin renames the **timeout** to `TimeoutError` with the effective milliseconds in the message; a cancellation stays `AbortError`, so the model can tell whether to raise the setting or not retry.
+
+The remote parent directory is created by the upload's `mkdir -p` and keeps its existing permissions (this does not reuse `sftpPutFile`, which would `chmod 700` the parent). A download never creates a local directory tree: a missing parent is an error.
+
+A session in a remote workspace can call both tools too, but there `local_path` means the **machine running DSH**: the `~/.dsh/remote/...` placeholder path the model sees is only a directory skeleton there, and the remote host cannot see it. To move files inside that session, use `bash` on that machine.
 
 `ssh_workspace` does one remote `stat`, then registers the remote real path (a symlink is stored as its target, and the default title is that real path's directory name). A `realpath` failure fails the registration. It does not modify remote files. It only adds a sidebar workspace. Opening that workspace starts a session on that machine, which is why an ask host still requires the same approval as a command. This call does not let the current session enter, and the placeholder path is not returned. Start a session there by opening the workspace from the sidebar. The filesystem root `/` is refused, including when the real path is `/`, because that one workspace would cover the whole machine. Registering the same real path again keeps the existing row and its title, and the result says so.
 
-Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes; no upload or download tools yet. If the network drops, the running command fails and files already written stay on the remote.
+Requirements: the host fingerprint must already be trusted; `ssh_exec` runs `bash -lc`, so the login profile is sourced to get `systemctl`, `docker`, and similar commands on `PATH` (profile output lands in the command output); `sudo` works only without a password prompt (`sudo -n`) because SSH exec has no TTY; direct Linux or macOS only, with no jump hosts or Windows remotes. Transfers are single files with no recursion or resume; the ceiling and deadline are the settings described above. If the network drops, the running command fails and files already written stay on the remote.
 
 Run Code still executes in the placeholder directory on your computer. The session's `AGENTS.md`, `CLAUDE.md`, and their `.local` files are read through the filesystem service, so a placeholder path reads the remote copy. A global file outside that placeholder, such as `$DSH_HOME/AGENTS.md`, stays on your computer. Each prompt walks the ancestor directories and stats those files on the remote host. The prompt text differs from the local copy, so a previously cached prefix no longer matches.
 

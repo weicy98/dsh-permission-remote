@@ -749,7 +749,7 @@ function throwIfRgFailed(result: ExecResult, signal: AbortSignal | undefined, la
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || `${label} failed`)
 }
 
-function abortError(): Error {
+export function abortError(): Error {
   const error = new Error('tool call aborted')
   error.name = 'AbortError'
   return error
