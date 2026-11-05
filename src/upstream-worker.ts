@@ -9,6 +9,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { shJoin } from './shell-quote.ts'
@@ -87,9 +88,7 @@ interface LocateOptions {
   readonly allowUnverified?: boolean
 }
 
-let manifestCache: WorkerManifest | undefined
-
-function packageManifestPath(): string {
+export function packageManifestPath(): string {
   const here = dirname(fileURLToPath(import.meta.url))
   const candidates = [
     join(here, '..', 'vendor', 'upstream', 'ptc-worker.manifest.json'),
@@ -98,24 +97,41 @@ function packageManifestPath(): string {
   return candidates.find(candidate => existsSync(candidate)) ?? candidates[0]!
 }
 
-export function readWorkerManifest(): WorkerManifest {
-  if (manifestCache !== undefined) return manifestCache
-  try {
-    const raw = JSON.parse(readFileSync(packageManifestPath(), 'utf8')) as Partial<WorkerManifest>
-    manifestCache = {
-      contractVersion: 1,
-      verified: Array.isArray(raw.verified) ? raw.verified as ManifestEntry[] : [],
-    }
-  } catch {
-    manifestCache = { contractVersion: 1, verified: [] }
-  }
-  return manifestCache
+/** Writable per-install overlays; `adapt:upstream` uses this instead of the package manifest. */
+export function overlayManifestPath(env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.DSH_HOME?.trim() || join(homedir(), '.dsh')
+  return join(home, 'permission-remote', 'upstream-ptc.manifest.json')
 }
 
-export function writeWorkerManifest(manifest: WorkerManifest): void {
-  mkdirSync(dirname(packageManifestPath()), { recursive: true })
-  writeFileSync(packageManifestPath(), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
-  manifestCache = manifest
+function readEntries(path: string): ManifestEntry[] {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<WorkerManifest>
+    return Array.isArray(raw.verified) ? raw.verified as ManifestEntry[] : []
+  } catch {
+    return []
+  }
+}
+
+export function readWorkerManifest(): WorkerManifest {
+  // The package manifest is the release baseline; a host-local overlay records
+  // versions adapted on an already-installed host without rewriting the package.
+  // Read both on every lookup so `adapt:upstream` takes effect without a restart.
+  const merged = new Map<string, ManifestEntry>()
+  for (const entry of [...readEntries(packageManifestPath()), ...readEntries(overlayManifestPath())]) {
+    merged.set(`${entry.dshVersion}\0${entry.ptcRuntimeNodeVersion}\0${entry.processSha256}`, entry)
+  }
+  return { contractVersion: 1, verified: [...merged.values()] }
+}
+
+export function writeWorkerManifest(manifest: WorkerManifest, path: string = packageManifestPath()): void {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+}
+
+export function writeOverlayManifest(manifest: WorkerManifest, env: NodeJS.ProcessEnv = process.env): string {
+  const path = overlayManifestPath(env)
+  writeWorkerManifest(manifest, path)
+  return path
 }
 
 function isPackageRoot(path: string): boolean {

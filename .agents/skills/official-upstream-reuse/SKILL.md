@@ -50,8 +50,9 @@ npm run check:upstream -- --update
 ```
 
 `npm run adapt:upstream` is the one-command installed-host static adaptation;
-it records a manifest entry only after contract probes pass and reminds you to
-run the e2e gates. Unknown drift must fail closed.
+it writes a writable `$DSH_HOME/permission-remote/upstream-ptc.manifest.json`
+overlay only after contract probes pass, and reminds you to run the e2e gates.
+Unknown drift must fail closed.
 
 ## Remaining hand-written candidates
 

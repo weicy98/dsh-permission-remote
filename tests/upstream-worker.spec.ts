@@ -10,6 +10,8 @@ import {
   ptcShimSource,
   clearWorkerCache,
   ensureWorker,
+  readWorkerManifest,
+  writeOverlayManifest,
 } from '../src/upstream-worker.ts'
 
 async function fixture(): Promise<string> {
@@ -120,5 +122,26 @@ test('ensureWorker uploads process.mjs and the shim once per digest', async () =
     if (previous === undefined) delete process.env.DSH_INSTALL_ROOT
     else process.env.DSH_INSTALL_ROOT = previous
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+
+test('a host-local overlay manifest extends the package baseline without rebuilding', async () => {
+  const root = await fixture()
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-overlay-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const worker = locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true })
+    const entry = manifestEntryFor(worker)
+    const path = writeOverlayManifest({ contractVersion: 1, verified: [entry] })
+    assert.equal(path, join(home, 'permission-remote', 'upstream-ptc.manifest.json'))
+    const merged = readWorkerManifest()
+    assert.equal(merged.verified.some(item => item.dshVersion === entry.dshVersion && item.processSha256 === entry.processSha256), true)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(root, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
   }
 })

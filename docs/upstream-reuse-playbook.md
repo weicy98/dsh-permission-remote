@@ -31,6 +31,23 @@ manifest make the check reproducible.
    handshake. An unverified upstream version must produce an actionable error,
    never a silent fallback to a local process.
 
+## What “dynamic upstream” means
+
+The worker is the peer of the **plugin host's** `NodePtcRuntime`, not of the
+remote machine's DSH installation. The remote machine only needs Node.js; its
+DSH version is irrelevant. Pulling a 0.2.3 worker while the plugin host still
+runs the 0.2.2 runtime would be a version mismatch because the control protocol
+has no handshake. The supported adaptation is:
+
+- installed plugin host upgraded to DSH 0.2.3 and contract unchanged:
+  `npm run adapt:upstream` records the host's 0.2.3 worker in the writable
+  `$DSH_HOME/permission-remote/upstream-ptc.manifest.json` overlay; the next
+  remote run uploads that worker;
+- contract changed: update the probe/adapter and ship a plugin release that
+  declares the new entry;
+- plugin host stays 0.2.2: it keeps using its 0.2.2 worker, even if the remote
+  machine has a newer DSH package installed.
+
 ## Upstream upgrade flow
 
 ```bash

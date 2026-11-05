@@ -26,6 +26,13 @@ package versions, hashes of `process.js`, `persistent-process.js`,
 `lib/index.js`, and `dsh-subprocess/lib/control.js`, the contract probe results,
 and the minimum remote Node major.
 
+## Which version is used
+
+The worker must match the **plugin host's** NodePtcRuntime package, not the
+remote machine's DSH version. The remote host only needs Node.js; a DSH 0.2.3
+installation on the remote does not let a 0.2.2 host speak a 0.2.3 worker. The
+overlay adaptation therefore records the version installed on the plugin host.
+
 ## Upgrade runbook
 
 1. Run `npm run check:upstream`.
@@ -45,6 +52,12 @@ and the minimum remote Node major.
 
 - `DSH_INSTALL_ROOT` points the locator at a DSH install root. It is intended
   for tests and diagnostics; it is not exposed to the model.
+- `npm run adapt:upstream` is the one-command adaptation for an already-installed
+  host. It writes `$DSH_HOME/permission-remote/upstream-ptc.manifest.json`
+  (a writable overlay), not the package manifest. The plugin merges package and
+  overlay entries, so the next PTC call uses the installed host's worker without
+  rebuilding the plugin. Static probes alone are not a production approval: run
+  `npm run test:ptc` and `npm run e2e:ptc` after it.
 - The runtime locator also uses the running DSH CLI entry (`process.argv[1]`)
   and its module resolution path. It never falls back to the plugin's own dev
   dependency or to the old self-authored bootstrap.

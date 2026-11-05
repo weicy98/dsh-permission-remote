@@ -10,7 +10,7 @@
  * a directory containing node_modules/@deepseek-ai/dsh). `--dsh-root` is an
  * equivalent argument for local diagnostics.
  */
-import { locateUpstreamWorker, manifestEntryFor, probeContract, readWorkerManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
+import { locateUpstreamWorker, manifestEntryFor, probeContract, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 
 const argv = process.argv.slice(2)
 const adapt = argv.includes('--adapt')
@@ -41,8 +41,8 @@ if (update) {
     && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion
     && item.processSha256 === entry.processSha256))
   verified.push(entry)
-  writeWorkerManifest({ contractVersion: 1, verified })
-  console.log(`check:upstream: wrote manifest entry for DSH ${entry.dshVersion} / runtime ${entry.ptcRuntimeNodeVersion}`)
+  const path = adapt ? writeOverlayManifest({ contractVersion: 1, verified }) : (writeWorkerManifest({ contractVersion: 1, verified }), 'vendor/upstream/ptc-worker.manifest.json')
+  console.log(`check:upstream: wrote manifest entry for DSH ${entry.dshVersion} / runtime ${entry.ptcRuntimeNodeVersion} -> ${path}`)
   if (adapt) console.log('check:upstream: static probes passed. Run `npm run test:ptc` and `npm run e2e:ptc` before treating this host as production-verified.')
   process.exit(0)
 }
