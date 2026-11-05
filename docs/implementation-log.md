@@ -1,0 +1,16 @@
+# Implementation log
+
+One row per commit. Every row records the step, the commit subject, and the
+verification actually run. Do not mark a row complete from static inspection
+alone.
+
+| Step | Commit | Change | Verification |
+| --- | --- | --- | --- |
+| S0 | chore: 从 main 建立 PTC 上游 worker 骨架 | Worktree `ptc-upstream-worker-main`, docs, script skeleton | `git merge-base --is-ancestor main HEAD` 通过 |
+| S1 | feat: 定位宿主 PTC worker 与契约 manifest | Locator, contract probes, manifest | `npm run check:upstream` 通过（DSH 0.2.2-rc.1） |
+| S2 | feat: ptc-shim | fd7 socket shim | `tests/ptc-shim.spec.ts` 3/3 通过 |
+| S3 | feat: remote-world | confine/spawn adapter, local transport, offline e2e | `tests/ptc-offline.spec.ts` 5/5、`tests/remote-world.spec.ts` 2/2 通过 |
+| S4 | feat: 接入插件 apply 与 SSH transport | SSH transport, Node status, plugin wiring | `npm test` 664/664、`npm run typecheck` 通过 |
+| S5 | test/docs: 真机 e2e 与用户文档 | Live e2e, README/advanced docs | 代码完成；真机结果待有 SSH 环境后填写 |
+| S6 | feat: 持久模式（可选） | persistent worker | offline/live persistent test |
+| S7 | chore: 版本、lib 与发布 | version 0.14.0, build, release checks | `npm run check:upstream`、`npm test`、`npm run build` 通过 |
