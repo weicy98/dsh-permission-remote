@@ -157,8 +157,8 @@ function handleConnection(server, accepted, kind) {
     // frame may share a TCP/Unix read).
     const rest = buffer.slice(newline + 1)
     if (rest.length > 0) accepted.unshift(Buffer.from(rest))
-    // Removing the auth listener leaves the socket paused; keep it paused so
-    // bytes arriving before the worker takes fd 7 stay buffered for it.
+    // Keep the socket paused after auth so bytes arriving before the worker
+    // takes fd 7 remain buffered for the child.
     accepted.pause()
     socket = accepted
     for (const other of servers) {
