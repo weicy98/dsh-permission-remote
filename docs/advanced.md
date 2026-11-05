@@ -102,6 +102,15 @@ DSH 的 `present` 只认本机文件：它逐个 `stat` 参数里的路径，再
 
 远端工作区里的会话也能调这两个工具，但那里的 `local_path` 指的是**运行 DSH 的机器**：模型看到的 `~/.dsh/remote/...` 占位路径在本机只是一个目录骨架，远端主机看不到它。要在远端会话内搬运文件，用那台机器上的 `bash`。
 
+## 远端 run_code（PTC）
+
+远端 `run_code` / `workflow` 使用宿主同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` 的 `process.js`。插件只做四件事：定位/校验上游 worker、按 hash 上传、用 SSH 转发的 fd 7 socket 提供控制通道、把 `sandbox.confine` / `subprocess.spawn` 适配到远端。帧协议、程序运行、超时/输出上限、错误分类和工具回桥全部由官方 runtime 负责。
+
+- 远端需要 Node.js 22+；worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
+- `process.env` 为空；`cwd`/相对路径在远端；只支持 per-call function-body，`repl`/script 暂时拒绝。
+- 上游契约、manifest 与升级 runbook 见 [upstream-ptc-worker.md](upstream-ptc-worker.md)。
+- 如果远端 sshd 禁用 streamlocal，会尝试 loopback TCP；两者都不可用时明确失败，不静默回退本机。
+
 ## 远程运维细节
 
 `ssh_workspace` 做一次远端 `stat`，再按远端真实路径注册（符号链接记成它指向的目录，标题默认取这个真实路径的目录名）。`realpath` 失败则这次注册失败。它不改远端文件。它只在侧栏加一条工作区。打开这条工作区会在那台机器上开始一个会话，所以询问策略下仍和命令一样要审批。这次调用不让当前会话进入，结果里也不给出占位目录。要在那台机器上工作，从侧栏打开。文件系统根 `/` 不能注册，真实路径解析成 `/` 时同样拒绝：那一棵会盖住整台机器。对同一个远端真实路径重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
