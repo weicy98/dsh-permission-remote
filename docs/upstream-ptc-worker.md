@@ -11,7 +11,7 @@ hashes it, and uploads the exact bytes to the SSH host.
 | --- | --- |
 | Worker entry | `lib/process.js`, `runNodeMain(openInheritedControlChannel(), Number(process.argv[2]), process)` |
 | Persistent worker entry | `lib/persistent-process.js`, `runPersistentMain(...)`; uploaded as `persistent-process.mjs` |
-| Persistent mode | Built `process.js` handles `programFormat: repl|script`; `persistent-process.js` is the REPL-default legacy entry |
+| Persistent mode | Built `process.js` handles `programFormat: repl` or `script`; `persistent-process.js` is the REPL-default legacy entry |
 | Control descriptor | fd 7 |
 | Shim handshake | `__DSH_PTC_READY__ <token> [unix:<path>] [tcp:127.0.0.1:<port>]`; the host prefers streamlocal and falls back to TCP |
 | Control environment marker | `DSH_SUBPROCESS_CONTROL=pipe` |
