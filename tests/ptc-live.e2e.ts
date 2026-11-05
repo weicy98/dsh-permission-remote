@@ -51,6 +51,7 @@ interface LiveHarness {
   readonly runtime: NodePtcRuntime
   readonly status: RunnerStatus
   readonly placeholder: string
+  readonly workerRemotePath?: string
   readonly dispose: () => Promise<void>
 }
 
@@ -132,6 +133,7 @@ async function harness(
     runtime,
     status,
     placeholder,
+    get workerRemotePath() { return remoteWorkerPath.length === 0 ? undefined : remoteWorkerPath },
     dispose: async () => {
       detach()
       restoreWorld()
@@ -204,7 +206,8 @@ test('live: timeout leaves no worker or shim process behind', { skip: !ready }, 
     }))
     assert.equal(timed.error?.kind, 'timeout', JSON.stringify(timed))
     await new Promise(resolve => setTimeout(resolve, 500))
-    const check = await pool.exec(host, secret, 'pgrep -af "[p]rocess\\.mjs|[p]tc-shim\\.mjs" || true', 10_000)
+    const marker = h.workerRemotePath ?? ''
+    const check = await pool.exec(host, secret, `pgrep -af ${JSON.stringify(marker)} | grep -v 'pgrep -af' || true`, 10_000)
     assert.equal(check.stdout.trim(), '')
   } finally {
     await pool.dispose()
