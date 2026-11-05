@@ -94,6 +94,14 @@ export interface HostSettings {
 const TRANSFER_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
 const TRANSFER_TIMEOUT_MS_DEFAULT = 120_000
 
+/**
+ * Mirrors `TRANSFER_TIMEOUT_MS_MAX` in `config.ts`; the browser bundle cannot
+ * import the server module. `AbortSignal.timeout` refuses a larger delay, and
+ * `setTimeout` above this overflows its 32-bit timer, so the value is capped
+ * before it is stored rather than silently clamped only on read.
+ */
+export const TRANSFER_TIMEOUT_MS_MAX = 2 ** 31 - 1
+
 /** A stored transfer limit. `0` is the documented "no limit" sentinel and must survive. */
 function transferLimit(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback
@@ -112,7 +120,12 @@ export async function readHosts(ctx: ClientFace): Promise<HostSettings> {
   const rgRegistry = typeof row?.value?.rgRegistry === 'string' ? row.value.rgRegistry : ''
   const remoteRoot = typeof row?.value?.remoteRoot === 'string' ? row.value.remoteRoot : ''
   const transferMaxBytes = transferLimit(row?.value?.transferMaxBytes, TRANSFER_MAX_BYTES_DEFAULT)
-  const transferTimeoutMs = transferLimit(row?.value?.transferTimeoutMs, TRANSFER_TIMEOUT_MS_DEFAULT)
+  // A value saved by an older build (or edited elsewhere) may be over the
+  // timer limit. Show the value that will actually apply, not the stored one.
+  const transferTimeoutMs = Math.min(
+    transferLimit(row?.value?.transferTimeoutMs, TRANSFER_TIMEOUT_MS_DEFAULT),
+    TRANSFER_TIMEOUT_MS_MAX,
+  )
   return { hosts, tagWorkspaceTitles, rgRegistry, remoteRoot, transferMaxBytes, transferTimeoutMs, revision: row?.revision ?? 0 }
 }
 
@@ -132,7 +145,7 @@ export async function writeRgRegistry(ctx: ClientFace, registry: string, revisio
 export async function writeTransferLimits(ctx: ClientFace, maxBytes: number, timeoutMs: number, revision: number): Promise<void> {
   await ctx.remote.settings.mutate(NS, [
     { op: 'set', path: ['transferMaxBytes'], value: wholeLimit(maxBytes) },
-    { op: 'set', path: ['transferTimeoutMs'], value: wholeLimit(timeoutMs) },
+    { op: 'set', path: ['transferTimeoutMs'], value: Math.min(wholeLimit(timeoutMs), TRANSFER_TIMEOUT_MS_MAX) },
   ], revision)
 }
 

@@ -102,7 +102,7 @@
   "transferLimitsHint": "ssh_upload / ssh_download 共用的上限与超时。字节数留空或填 0 表示不封顶（整个文件会进内存）；超时留空或填 0 表示不限时。保存后立即生效。",
   "transferLimitsSaved": "传输上限与超时已保存。",
   "transferLimitsInvalid": "上限和超时只能填非负整数；留空或 0 表示不限制。",
-  "transferLimitsClamped": "超过上限，已按 2147483647 毫秒保存：",
+  "transferLimitsClamped": "已按 2147483647 毫秒上限保存（更大的超时会溢出 Node 定时器）。",
   "rgInstalled": "ripgrep 已就绪：",
   "rgStillMissing": "下载完成但远端仍不可用",
   "installOk": "bubblewrap 已可用。",

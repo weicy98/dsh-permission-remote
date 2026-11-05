@@ -569,6 +569,22 @@ async function withTransferDeadline<T>(
   }
 }
 
+/**
+ * A bare `throwIfAborted(signal)` between transfer steps cannot tell the
+ * deadline from a user cancellation: both abort the same combined signal, so a
+ * timeout would surface as `AbortError` ("tool call aborted") and the model
+ * would retry instead of raising the "Transfer timeout" setting. Every check
+ * that runs while the deadline is live goes through here.
+ */
+function throwIfTransferAborted(
+  signal: AbortSignal | undefined,
+  cancelSignal: AbortSignal | undefined,
+  limits: OpsTransferLimits,
+): void {
+  if (signal?.aborted !== true) return
+  throw transferAbortError(cancelSignal, limits, abortError())
+}
+
 export async function runSshUpload(
   hostApi: ToolHost,
   host: HostConfig,
@@ -593,15 +609,28 @@ export async function runSshUpload(
   )
   throwIfAborted(exec.signal)
   const signal = transferDeadline(exec, limits)
-  const secret = await hostApi.secretOf(host)
+  const secret = await withTransferDeadline(hostApi.secretOf(host), signal, exec.signal, limits)
   const body = await withTransferDeadline(readLocalCapped(localPath, limits.maxBytes, signal), signal, exec.signal, limits)
-  throwIfAborted(signal)
-  const remotePath = await resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path')
+  throwIfTransferAborted(signal, exec.signal, limits)
+  // `resolveOpsPath` runs the remote `$HOME` probe for `~/`; racing it here
+  // makes a slow probe obey the transfer deadline. The probe itself cannot be
+  // cancelled mid-flight, so it may finish in the background and stay cached.
+  const remotePath = await withTransferDeadline(
+    resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path'),
+    signal,
+    exec.signal,
+    limits,
+  )
   // Same refusal as the download side: `/` is never a file, and the atomic
   // script would only report it as "remote path is a directory" after a
   // round trip. Naming the real problem here is clearer and symmetric.
   if (posix.normalize(remotePath) === '/') throw new Error('remote_path must name a file, not the filesystem root')
-  const existing = await remoteTargetOf(hostApi, host, secret, remotePath, false, signal)
+  const existing = await withTransferDeadline(
+    remoteTargetOf(hostApi, host, secret, remotePath, false, signal),
+    signal,
+    exec.signal,
+    limits,
+  )
   if (existing !== undefined && existing.type !== 'file') {
     throw new Error(`remote path is not a regular file (${existing.type}): ${remotePath}`)
   }
@@ -657,14 +686,26 @@ export async function runSshDownload(
   )
   throwIfAborted(exec.signal)
   const signal = transferDeadline(exec, limits)
-  const secret = await hostApi.secretOf(host)
-  const remotePath = await resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path')
+  const secret = await withTransferDeadline(hostApi.secretOf(host), signal, exec.signal, limits)
+  // See the upload side: a `~/` home probe must not outlive the transfer
+  // deadline just because it has no signal of its own.
+  const remotePath = await withTransferDeadline(
+    resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path'),
+    signal,
+    exec.signal,
+    limits,
+  )
   if (posix.normalize(remotePath) === '/') throw new Error('remote_path must name a file, not the filesystem root')
   // Check the destination before pulling any bytes, so a bad local path fails
   // before a large read. It runs after the gate on purpose: a denied or
   // unapproved call must not probe the local filesystem either.
   await assertLocalTarget(localPath)
-  const info = await remoteTargetOf(hostApi, host, secret, remotePath, false, signal)
+  const info = await withTransferDeadline(
+    remoteTargetOf(hostApi, host, secret, remotePath, false, signal),
+    signal,
+    exec.signal,
+    limits,
+  )
   if (info === undefined) throw new Error(`no file at remote path: ${remotePath}`)
   if (info.type !== 'file') {
     throw new Error(`remote path is not a regular file (${info.type}): ${remotePath}`)
@@ -672,14 +713,14 @@ export async function runSshDownload(
   if (limits.maxBytes > 0 && info.size > limits.maxBytes) {
     throw new Error(`remote file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
   }
-  throwIfAborted(signal)
+  throwIfTransferAborted(signal, exec.signal, limits)
   const data = await withTransferDeadline(
     withSignal(hostApi.pool.sftpRead(host, secret, remotePath, transferCap(limits), signal), signal),
     signal,
     exec.signal,
     limits,
   )
-  throwIfAborted(signal)
+  throwIfTransferAborted(signal, exec.signal, limits)
   await withTransferDeadline(
     withSignal(writeFileAtomic(localPath, data, { mode: 0o600, dirMode: 0o700 }), signal),
     signal,

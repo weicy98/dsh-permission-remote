@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import en from '../../locale/en.json' with { type: 'json' }
 import zh from '../../locale/zh.json' with { type: 'json' }
-import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, writeTransferLimits, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
+import { callHost, changeRemoteRoot, exportHosts, importHosts, installRipgrep, purgeHost as purgeHostRequest, readHosts, readRemoteRootInfo, readWorkspaces, writeRgRegistry, writeTagWorkspaceTitles, writeTransferLimits, TRANSFER_TIMEOUT_MS_MAX, type ClientFace, type DeletedHostView, type HostView, type RemoteRootChange, type RemoteRootInfo, type RemoteWorkspaceView, type RunnerView } from './api.ts'
 import { blankDraft, clampActive, createTarget, draftPortValid, filterEntries, isPathQuery, joinPath, matchRange, mergeEditedHost, parentDir, pickCompletion, resolveUnder, splitPath, stepActive, toDraft, type Draft } from './draft.ts'
 import { importNeedsConfirm } from './import-risk.ts'
 import { rootPromptFor, type RootPrompt } from './root-prompt.ts'
@@ -10,9 +10,6 @@ import { installStyles } from './styles.ts'
 export const inject = ['remote', 'remote.settings', 'connection', 'slots', 'locale']
 
 const NS = 'permission-remote'
-
-/** Mirrors the host schema cap: `AbortSignal.timeout` refuses larger delays. */
-const TRANSFER_TIMEOUT_MS_MAX = 2 ** 31 - 1
 
 /**
  * One id for the sidebar row and the main panel it selects. The sidebar
@@ -495,11 +492,10 @@ function Section(props: SectionProps): JSX.Element {
       note(t('transferLimitsInvalid'))
       return
     }
-    // The host clamps the deadline to the 32-bit timer limit. Say so instead of
-    // silently saving a different number than the one that was typed.
-    if (Number.isFinite(timeoutMs) && timeoutMs > TRANSFER_TIMEOUT_MS_MAX) {
-      note(`${t('transferLimitsClamped')} ${TRANSFER_TIMEOUT_MS_MAX}`)
-    }
+    // The client API stores the capped deadline, so the value read back is the
+    // one that actually applies. Say that it was capped instead of echoing a
+    // different number than the one typed.
+    const clamped = Number.isFinite(timeoutMs) && timeoutMs > TRANSFER_TIMEOUT_MS_MAX
     setBusy(true)
     try {
       await writeTransferLimits(ctx, Number.isFinite(maxBytes) ? maxBytes : 0, Number.isFinite(timeoutMs) ? timeoutMs : 0, revision)
@@ -507,8 +503,7 @@ function Section(props: SectionProps): JSX.Element {
       setTransferMaxDraft(String(saved.transferMaxBytes))
       setTransferTimeoutDraft(String(saved.transferTimeoutMs))
       setRevision(saved.revision)
-      // A clamped value is worth explaining; otherwise the plain confirmation.
-      note(saved.transferTimeoutMs === timeoutMs ? t('transferLimitsSaved') : `${t('transferLimitsClamped')} ${saved.transferTimeoutMs}`)
+      note(clamped ? t('transferLimitsClamped') : t('transferLimitsSaved'))
     } catch (error) {
       await reload().catch(() => undefined)
       fail(error)

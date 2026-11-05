@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +7,7 @@ import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
 import type { ApprovalDetail, RunnerStatus, ToolHost } from '../src/execute.ts'
 import {
+  forgetOpsHost,
   NO_TRANSFER_LIMITS,
   renderOpsDownload,
   renderOpsUpload,
@@ -79,6 +81,9 @@ function api(options: {
   remoteBytes?: Buffer
   attrs?: (path: string, follow: boolean) => Attrs | undefined
 } = {}): TransferApi {
+  // The home probe is cached per host id across tests; every fixture starts
+  // from an unknown `$HOME`, so a hang override is actually exercised.
+  forgetOpsHost('prod1')
   const commands: string[] = []
   const bodies: Array<string | Buffer | undefined> = []
   const execs: Array<{ command: string, timeoutMs: number | undefined }> = []
@@ -96,7 +101,9 @@ function api(options: {
       _signal?: AbortSignal,
       stdin?: string | Buffer,
     ) => {
-      if (command.includes('"$HOME"')) return result({ stdout: markedHome })
+      // The override must be able to hang the home probe, so it comes before
+      // the marked-home default.
+      if (command.includes('"$HOME"')) return options.exec?.(command, stdin) ?? result({ stdout: markedHome })
       commands.push(command)
       bodies.push(stdin)
       execs.push({ command, timeoutMs })
@@ -310,6 +317,14 @@ test('upload refuses a directory, a symlink, and a special local source', async 
       () => runSshUpload(api().api, host({ opsPolicy: 'trust' }), { local_path: join(local, 'missing.bin'), remote_path: '/srv/x' }, {}, LIMITS),
       /no such local file/,
     )
+    if (process.platform !== 'win32') {
+      const fifo = join(local, 'pipe')
+      execFileSync('mkfifo', [fifo])
+      await assert.rejects(
+        () => runSshUpload(api().api, host({ opsPolicy: 'trust' }), { local_path: fifo, remote_path: '/srv/x' }, {}, LIMITS),
+        /not a regular file/,
+      )
+    }
   } finally {
     await rm(local, { recursive: true, force: true })
   }
@@ -623,6 +638,116 @@ test('a cancellation still reports as a cancellation, not a timeout', async () =
     await assert.rejects(
       () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, { signal: controller.signal }, { maxBytes: 0, timeoutMs: 60_000 }),
       (error: Error) => error.name === 'AbortError' && !/timed out/.test(error.message),
+    )
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a timeout during the remote pre-check is reported as a timeout', async () => {
+  const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abc')
+    // The SFTP lstat never settles. The deadline lives on a combined signal,
+    // so the step has to be raced through `withTransferDeadline`; otherwise
+    // this reproduces as a bare AbortError.
+    const hang = () => new Promise<never>(() => undefined) as never
+    const upload = api({ attrs: hang })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 30 }),
+      (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 30 ms/.test(error.message),
+    )
+    assert.equal(upload.commands.length, 0)
+
+    const download = api({ attrs: hang })
+    await assert.rejects(
+      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: join(local, 'b.bin') }, {}, { maxBytes: 0, timeoutMs: 30 }),
+      (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 30 ms/.test(error.message),
+    )
+    assert.deepEqual(download.reads, [])
+  } finally {
+    clearInterval(keepAlive)
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a timeout during ~ expansion is reported as a timeout', async () => {
+  const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
+  try {
+    // `$HOME` is resolved by an exec without its own signal; the call has to
+    // race it against the transfer deadline rather than wait it out.
+    const download = api({ exec: () => new Promise(() => undefined) as unknown as ExecResult })
+    await assert.rejects(
+      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '~/logs/app.log', local_path: join(local, 'app.log') }, {}, { maxBytes: 0, timeoutMs: 30 }),
+      (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 30 ms/.test(error.message),
+    )
+  } finally {
+    clearInterval(keepAlive)
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a cancellation during the remote pre-check stays a cancellation', async () => {
+  const local = await tempDir()
+  try {
+    const controller = new AbortController()
+    const download = api({ attrs: () => new Promise<never>(() => undefined) as never })
+    const pending = runSshDownload(
+      download.api,
+      host({ opsPolicy: 'trust' }),
+      { remote_path: '/srv/a.bin', local_path: join(local, 'b.bin') },
+      { signal: controller.signal },
+      { maxBytes: 0, timeoutMs: 60_000 },
+    )
+    controller.abort()
+    await assert.rejects(pending, (error: Error) => error.name === 'AbortError' && !/timed out/.test(error.message))
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('the 0-byte, exact-ceiling, and over-ceiling boundaries hold', async () => {
+  const local = await tempDir()
+  try {
+    const cap = 4
+    for (const size of [0, cap, cap + 1]) {
+      const source = join(local, `u-${size}.bin`)
+      await writeFile(source, Buffer.alloc(size, 0x61))
+      const upload = api()
+      const run = runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/x' }, {}, { maxBytes: cap, timeoutMs: 0 })
+      if (size > cap) {
+        await assert.rejects(run, /over the 4 byte transfer ceiling/)
+      } else {
+        assert.equal((await run).bytes, size)
+      }
+
+      const download = api({ attrs: () => ({ type: 'file', size }), remoteBytes: Buffer.alloc(size, 0x62) })
+      const target = join(local, `d-${size}.bin`)
+      const pulled = runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/x', local_path: target }, {}, { maxBytes: cap, timeoutMs: 0 })
+      if (size > cap) {
+        await assert.rejects(pulled, /over the 4 byte transfer ceiling/)
+      } else {
+        assert.equal((await pulled).bytes, size)
+        assert.equal((await readFile(target)).length, size)
+      }
+    }
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a remote file that grows after the pre-check is not read past the ceiling', async () => {
+  const local = await tempDir()
+  try {
+    // `attrs` says one byte, but the read returns ten: the read-side cap is
+    // what has to stop it, and the failure must not be rewritten as "missing".
+    const download = api({ attrs: () => ({ type: 'file', size: 1 }), remoteBytes: Buffer.alloc(10, 0x63) })
+    await assert.rejects(
+      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: join(local, 'b.bin') }, {}, { maxBytes: 4, timeoutMs: 0 }),
+      (error: Error) => /over the 4 byte limit/.test(error.message) && !/no file at remote path/.test(error.message),
     )
   } finally {
     await rm(local, { recursive: true, force: true })

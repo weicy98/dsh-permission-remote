@@ -102,7 +102,7 @@
   "transferLimitsHint": "Ceiling and deadline shared by ssh_upload / ssh_download. Leave the byte count empty or 0 for no ceiling (the whole file is held in memory); leave the timeout empty or 0 for no deadline. Saves take effect immediately.",
   "transferLimitsSaved": "Transfer ceiling and timeout saved.",
   "transferLimitsInvalid": "The ceiling and timeout must be non-negative integers; empty or 0 means unlimited.",
-  "transferLimitsClamped": "Over the limit, saved as 2147483647 ms:",
+  "transferLimitsClamped": "Saved at the 2147483647 ms cap; larger deadlines overflow Node's timer.",
   "rgInstalled": "ripgrep ready:",
   "rgStillMissing": "Downloaded, but the remote still reports it missing",
   "installOk": "bubblewrap is available.",
