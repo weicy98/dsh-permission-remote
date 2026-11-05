@@ -59,7 +59,6 @@ const rows = [
   ['control fd', String(entry.controlFd), String(expected?.controlFd)],
   ['control env', entry.controlEnv ?? '(missing)', expected?.controlEnv ?? '(missing)'],
   ['entry probe', String(probes.entry), String(expected?.probes.entry)],
-  ['persistent entry probe', String(probes.persistentEntry), String(expected?.probes.persistentEntry)],
   ['imports only node', String(probes.importsOnlyNode), String(expected?.probes.importsOnlyNode)],
   ['bootstrapArgs mapping', String(probes.bootstrapArgsMapsHostPath), String(expected?.probes.bootstrapArgsMapsHostPath)],
   ['spawn control pipe', String(probes.spawnControlPipe), String(expected?.probes.spawnControlPipe)],

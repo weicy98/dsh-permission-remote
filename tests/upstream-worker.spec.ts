@@ -31,12 +31,6 @@ async function fixture(): Promise<string> {
     'async function runNodeMain(stream, max, processState) { processState.chdir("/tmp") }',
     'runNodeMain(openInheritedControlChannel(), Number(process.argv[2]), process);',
   ].join('\n'))
-  await writeFile(join(runtime, 'lib', 'persistent-process.js'), [
-    'import { Socket } from "node:net";',
-    'function openInheritedControlChannel() { return new Socket({ fd: 7 }) }',
-    'async function runPersistentMain(stream, max, processState) {}',
-    'runPersistentMain(openInheritedControlChannel(), Number(process.argv[2]), process);',
-  ].join('\n'))
   await writeFile(join(runtime, 'lib', 'index.js'), [
     'const result = fs.processPathFromHostPath(path);',
     'return [mapped(fileURLToPath(new URL("./process.js", import.meta.url))), String(maxMessageBytes)];',
@@ -65,7 +59,6 @@ test('the locator reads the installed runtime and its contract', async () => {
     const entry = manifestEntryFor(worker)
     assert.equal(entry.processSha256.length, 64)
     assert.equal(entry.probes.entry, true)
-    assert.equal(entry.probes.persistentEntry, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

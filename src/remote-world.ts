@@ -36,7 +36,7 @@ import type {
 } from '@deepseek-ai/dsh-subprocess'
 import type { HostConfig } from './config.ts'
 import type { RunnerStatus } from './execute.ts'
-import { bwrapFileProfileArgs, fileWritableRoots, seatbeltProfileArgs } from './profile.ts'
+import { bwrapFileProfileArgs, bwrapProfileArgs, fileWritableRoots, seatbeltProfileArgs } from './profile.ts'
 import { shJoin } from './shell-quote.ts'
 import type { RemoteTransport, RemoteExecHandle } from './remote-transport.ts'
 import type { ExecResult, SecretMaterial } from './ssh-pool.ts'
@@ -673,14 +673,11 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
       if (!active.status.sandbox.available || active.status.sandboxTool === 'none') {
         throw new SandboxUnavailableError(policy.mode, 'remote sandbox probe failed')
       }
-      const roots = {
-        workspaceRoot: active.remoteRoot,
-        tmp: active.status.roots.tmp,
-        userTmp: active.status.roots.userTmp,
-      }
       const mapped = argv.map((value, index) => index === 0 ? remoteExecutable(active, value) : value)
       if (active.status.sandboxTool === 'bwrap') {
-        const profile = bwrapFileProfileArgs(policy.mode, roots) ?? []
+        // PTC follows the bash-style workspace profile: a private /tmp rather
+        // than the file-tool profile that bind-mounts the real temp dirs.
+        const profile = bwrapProfileArgs(policy.mode, active.remoteRoot) ?? []
         return {
           argv: ['bwrap', ...profile, '--chdir', active.remoteCwd, '--', ...mapped],
           enforcement: 'full',
@@ -688,7 +685,7 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
           runnerFailureRules: [{ fatalSignatures: ['bwrap: '] }],
         }
       }
-      const profile = seatbeltProfileArgs(policy.mode, fileWritableRoots(policy.mode, roots)) ?? []
+      const profile = seatbeltProfileArgs(policy.mode, policy.mode === 'workspace-write' ? [active.remoteRoot] : []) ?? []
       return {
         argv: ['sandbox-exec', ...profile, '--', ...mapped],
         enforcement: 'full',

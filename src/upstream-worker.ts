@@ -37,7 +37,6 @@ export interface UpstreamWorker {
 
 export interface ContractProbe {
   readonly entry: boolean
-  readonly persistentEntry: boolean
   readonly importsOnlyNode: boolean
   readonly controlFd: number | undefined
   readonly controlEnv: string | undefined
@@ -58,8 +57,7 @@ export interface ManifestEntry {
   readonly minimumNodeMajor: number
   readonly probes: {
     readonly entry: boolean
-    readonly persistentEntry: boolean
-    readonly importsOnlyNode: boolean
+      readonly importsOnlyNode: boolean
     readonly bootstrapArgsMapsHostPath: boolean
     readonly spawnControlPipe: boolean
   }
@@ -242,7 +240,6 @@ function hashesFor(worker: UpstreamWorker): ManifestEntry {
     minimumNodeMajor: PTC_MIN_REMOTE_NODE_MAJOR,
     probes: {
       entry: probes.entry,
-      persistentEntry: probes.persistentEntry,
       importsOnlyNode: probes.importsOnlyNode,
       bootstrapArgsMapsHostPath: probes.bootstrapArgsMapsHostPath,
       spawnControlPipe: probes.spawnControlPipe,
@@ -301,10 +298,6 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   const indexText = worker.indexSource.toString('utf8')
   const controlText = worker.controlSource.toString('utf8')
   const entry = /runNodeMain\s*\(\s*openInheritedControlChannel\s*\(\s*\)\s*,\s*Number\s*\(\s*process\.argv\[2\]\s*\)\s*,\s*process\s*\)/u.test(processText)
-  // persistent-process.js is not used by the 0.2.2 runtime; process.js
-  // handles repl/script formats. Keep the historical probe field true for
-  // manifest compatibility, but do not read or upload that unused file.
-  const persistentEntry = true
   const importLines = processText.split(/\r?\n/u).filter(line => /^\s*import\s/u.test(line))
   const importsOnlyNode = importLines.length > 0 && importLines.every(line => /from\s+['"]node:/u.test(line))
   const controlFdMatch = /fd\s*:\s*7/u.exec(processText) ?? /SUBPROCESS_CONTROL_FD\s*=\s*7/u.exec(controlText)
@@ -320,7 +313,6 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   if (!spawnControlPipe) failures.push('subprocess.spawn no longer requests a control pipe')
   return {
     entry,
-    persistentEntry,
     importsOnlyNode,
     controlFd: controlFdMatch === null ? undefined : 7,
     controlEnv: controlEnvMatch?.[1],
