@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
@@ -30,6 +30,7 @@
   "files": [
     "lib",
     "src",
+    "scripts",
     "locale",
     "vendor",
     "cordis.patch.yml",
@@ -52,7 +53,10 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-transform-types --test tests/*.spec.ts",
-    "test:ci": "DSH_REQUIRE_OFFICIAL_TOOLS=1 node --experimental-transform-types --test tests/*.spec.ts"
+    "test:ci": "DSH_REQUIRE_OFFICIAL_TOOLS=1 node --experimental-transform-types --test tests/*.spec.ts",
+    "test:ptc": "node --experimental-transform-types --test tests/ptc-*.spec.ts",
+    "e2e:ptc": "node --experimental-transform-types --test tests/ptc-live.e2e.ts",
+    "check:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --check"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",
@@ -79,6 +83,9 @@
     "@deepseek-ai/schemastery": "^3.19.0"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-ptc-runtime-node": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-subprocess": "0.2.2-rc.1",
     "@deepseek-ai/dsh-tool-executor-native": "^0.2.2-rc.1",
     "@deepseek-ai/dsh-tool-executor-ptc": "^0.2.2-rc.1",
     "@types/node": "^24.0.0",

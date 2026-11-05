@@ -154,5 +154,6 @@
   "hostBackupHint": "The exported JSON holds only the host list, never passwords or key passphrases. Merge updates only the fields the file contains; a changed address drops the saved password. Replace makes the file the whole list and keeps a deleted host that still has workspaces. After importing, test connections again and re-enter secrets as needed.",
   "exportedHosts": "Host configuration exported.",
   "importedHosts": "Host configuration imported (added/updated/removed):",
-  "importTrusted": "hosts set to trust (commands run without asking):"
+  "importTrusted": "hosts set to trust (commands run without asking):",
+  "node": "Node"
 }

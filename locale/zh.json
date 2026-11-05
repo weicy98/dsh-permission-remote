@@ -154,5 +154,6 @@
   "hostBackupHint": "导出的 JSON 只含主机列表，不含口令和私钥口令。合并只更新文件里写了的字段；地址变了会丢掉已保存的口令。整体替换以文件为准，并保留仍有工作区的已删除主机。导入后请重新测试连接并按需重填口令。",
   "exportedHosts": "主机配置已导出。",
   "importedHosts": "主机配置已导入（新增/更新/移除）：",
-  "importTrusted": "设为 trust 的主机（命令不再询问）："
+  "importTrusted": "设为 trust 的主机（命令不再询问）：",
+  "node": "Node"
 }

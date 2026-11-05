@@ -4,6 +4,7 @@
  */
 import { posix } from 'node:path'
 import { rgPackageName, rgPlatformOf } from './rg-fetch.ts'
+import { shQuote } from './shell-quote.ts'
 
 export interface ProbeOutcome {
   readonly available: boolean
@@ -17,6 +18,69 @@ export function probeOutcome(exitCode: number | null, timedOut: boolean, stderr 
     return { available: false, reason: 'missing' }
   }
   return { available: false, reason: 'rejected' }
+}
+
+/** PTC worker minimum: process.js uses Promise.withResolvers (Node 22+). */
+export const PTC_MIN_NODE_MAJOR = 22
+
+/** Markers keep a login-shell banner out of the node lookup. */
+export const NODE_LOOKUP_BEGIN = '__DSH_NODE_BEGIN__'
+export const NODE_LOOKUP_END = '__DSH_NODE_END__'
+
+export interface RemoteNode {
+  readonly path: string
+  readonly version: string
+  readonly major: number
+}
+
+/**
+ * `command -v node` then `node -p process.versions.node`.
+ *
+ * Plain PATH first; a failing or too-old system Node retries through an
+ * interactive bash so nvm/asdf layouts resolve. Markers keep login banners out
+ * of the parsed result.
+ */
+export function nodeProbeCommand(): string {
+  const inner = [
+    'command -v node',
+    '__dsh_rc=$?',
+    'if [ "$__dsh_rc" -eq 0 ]; then node -p process.versions.node; fi',
+    'exit $__dsh_rc',
+  ].join('; ')
+  return [
+    `printf '%s\\n' '${NODE_LOOKUP_BEGIN}'`,
+    '__dsh_ok=0',
+    'if command -v node >/dev/null 2>&1; then',
+    '  __dsh_ver=$(node -p process.versions.node 2>/dev/null)',
+    '  __dsh_rc=$?',
+    '  if [ "$__dsh_rc" -eq 0 ]; then',
+    '    command -v node',
+    `    printf '%s\\n' "$__dsh_ver"`,
+    '    case "$__dsh_ver" in',
+    '      2[2-9].*|3[0-9].*|4[0-9].*) __dsh_ok=1 ;;',
+    '    esac',
+    '  fi',
+    'fi',
+    'if [ "$__dsh_ok" -eq 0 ] && command -v bash >/dev/null 2>&1; then',
+    `  bash -ic ${shQuote(inner)} 2>/dev/null`,
+    'fi',
+    `printf '%s\\n' '${NODE_LOOKUP_END}'`,
+    'exit 0',
+  ].join('\n')
+}
+
+/** Last semantic version is the version; the last bare absolute path before it is the binary. */
+export function parseNodeProbe(stdout: string): RemoteNode | null {
+  const lines = outputBlock(stdout, NODE_LOOKUP_BEGIN, NODE_LOOKUP_END)
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+  const versionIndex = lines.findLastIndex(line => /^\d+\.\d+\.\d+/.test(line))
+  if (versionIndex < 1) return null
+  const version = lines[versionIndex] ?? ''
+  const major = Number(version.split('.')[0])
+  const nodePath = lines.slice(0, versionIndex).reverse().find(line => posix.isAbsolute(line) && !/\s/.test(line))
+  if (nodePath === undefined || !Number.isInteger(major)) return null
+  return { path: nodePath, version, major }
 }
 
 /**

@@ -28,8 +28,11 @@ import {
 } from './profile.ts'
 import {
   hostFactsCommand,
+  nodeProbeCommand,
   outputBlock,
   parseHostFacts,
+  parseNodeProbe,
+  PTC_MIN_NODE_MAJOR,
   probeOutcome,
   type HostFacts,
   ripgrepPackage,
@@ -47,6 +50,10 @@ const require = createRequire(import.meta.url)
 const READ_CAP = 1024 * 1024
 const IMAGE_CAP = 8 * 1024 * 1024
 
+export type RemoteNodeStatus =
+  | { readonly available: true, readonly path: string, readonly version: string, readonly major: number }
+  | { readonly available: false, readonly reason: 'missing' | 'old', readonly version?: string }
+
 export interface RunnerStatus {
   readonly os: 'linux' | 'darwin' | 'other'
   readonly sandbox: ProbeOutcome
@@ -54,6 +61,8 @@ export interface RunnerStatus {
   readonly ripgrep: 'uploaded' | 'system' | 'missing' | 'upload-failed'
   readonly ripgrepPath: string
   readonly roots: RemoteFileRoots
+  readonly home: string
+  readonly node?: RemoteNodeStatus
   readonly install: DistroInstall | null
 }
 
@@ -176,7 +185,18 @@ export async function probeHost(
     const release = await pool.exec(host, secret, 'cat /etc/os-release', 10_000)
     install = distroInstallFor(parseOsRelease(release.stdout))
   }
-  return { os, sandbox, sandboxTool, ripgrep, ripgrepPath, roots, install }
+  const node = await probeNode(pool, host, secret)
+  return { os, sandbox, sandboxTool, ripgrep, ripgrepPath, roots, home, node, install }
+}
+
+/** Probe remote Node without uploading anything; upload is lazy in the PTC wrapper. */
+export async function probeNode(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteNodeStatus> {
+  const probed = await pool.exec(host, secret, nodeProbeCommand(), 10_000)
+  if (probed.timedOut || probed.code !== 0) return { available: false, reason: 'missing' }
+  const parsed = parseNodeProbe(probed.stdout)
+  if (parsed === null) return { available: false, reason: 'missing' }
+  if (parsed.major < PTC_MIN_NODE_MAJOR) return { available: false, reason: 'old', version: parsed.version }
+  return { available: true, path: parsed.path, version: parsed.version, major: parsed.major }
 }
 
 export async function installBubblewrap(pool: SshPool, host: HostConfig, secret: SecretMaterial, status: RunnerStatus): Promise<ExecResult> {

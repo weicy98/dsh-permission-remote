@@ -56,6 +56,10 @@ import {
 } from './shell-surface.ts'
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
+import { attachRemotePtc } from './ptc-remote.ts'
+import { installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
+import { SshPoolTransport } from './remote-transport.ts'
+import { ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import { installRemoteFs, remoteFsInstalled } from './remote-fs.ts'
 import { installRemoteUploads } from './uploads.ts'
@@ -1755,8 +1759,11 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   let fsPatchReady = false
+  let worldReady = false
+  let ptcDisposed = false
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => async () => {
+    ptcDisposed = true
     // One agent disposer must not skip the remaining agents or the pool.
     const failure = settleDisposers([...unregisters])
     unregisters.clear()
@@ -1778,6 +1785,37 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.delete(remove)
     })
   })
+  rawCtx.inject(['sandbox', 'subprocess'], bridged => {
+    const remove = installRemoteWorld(bridged as unknown as { get(name: string): unknown }, {
+      transport: new SshPoolTransport(core.pool),
+      hostOf: id => core.listHosts().find(host => host.id === id),
+      secretOf: host => core.secret(host),
+      statusOf: host => core.statusOf(host),
+    })
+    if (remove === undefined) return
+    worldReady = true
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
+      worldReady = false
+    })
+  })
+  const detachPtc = attachRemotePtc(rawCtx as unknown as Parameters<typeof attachRemotePtc>[0], {
+    pool: core.pool,
+    hostOf: id => core.listHosts().find(host => host.id === id),
+    secretOf: host => core.secret(host),
+    statusOf: host => core.statusOf(host),
+    ensureWorker: (host, secret, status, signal) => ensureWorker(core.pool, host, secret, status.home, signal),
+    worldReady: () => worldReady,
+    fsReady: () => fsPatchReady,
+    disposed: () => ptcDisposed,
+  })
+  unregisters.add(detachPtc)
+  ctx.effect(() => () => {
+    detachPtc()
+    unregisters.delete(detachPtc)
+  })
   // Sidebar listing, office preview, and markdown images all read ctx.fs at the
   // placeholder path. Uploads are copied before that stream's first pull.
   // `fs` is not in this plugin's inject list. A get() here runs before that
@@ -1786,6 +1824,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     const ready = bridged as unknown as HostContext
     const removeFs = installRemoteFs(ready, core)
     fsPatchReady = removeFs !== undefined || remoteFsInstalled(ready)
+    // Install the worker path map before uploads: uploads' wrapper composes
+    // over the current processPathFromHostPath function and must see ours.
+    const removeWorkerPath = installWorkerPathMap(ready.get('fs'))
     const removeUploads = installRemoteUploads(ready, core)
     const unbinds: Array<() => void> = []
     if (removeFs !== undefined) {
@@ -1794,6 +1835,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unbinds.push(unbind)
       unregisters.add(unbind)
     }
+    unregisters.add(removeWorkerPath)
     if (removeUploads !== undefined) {
       unregisters.add(removeUploads)
       const unbind = core.bindRemoteTree(hostId => removeUploads.invalidateHost(hostId))
@@ -1801,11 +1843,14 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.add(unbind)
     }
     bridged.effect(() => () => {
-      removeFs?.()
+      // Remove uploads first: its wrapper was installed over ours.
       removeUploads?.()
+      removeWorkerPath()
+      removeFs?.()
       for (const unbind of unbinds) unbind()
       if (removeFs !== undefined) unregisters.delete(removeFs)
       if (removeUploads !== undefined) unregisters.delete(removeUploads)
+      unregisters.delete(removeWorkerPath)
       for (const unbind of unbinds) unregisters.delete(unbind)
     })
   })
