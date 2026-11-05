@@ -2406,19 +2406,26 @@ function sessionIsRemote(ctx: HostContext, agent: AgentLike): boolean {
   }
 }
 
+const REMOTE_TIMEOUT_DESCRIPTION = 'Timeout in milliseconds. When it expires this remote command is killed. Without a sandbox runner, child processes of the command may keep running on the remote host.'
+
+/**
+ * Point one captured schema's `timeoutMs` description at the remote host.
+ *
+ * The official tools publish `parameters` as JSON Schema (`properties.timeoutMs`),
+ * because `defineTool` compiles the declaration before registration; the older
+ * bare-field spelling is still honoured so a non-compiled fixture behaves.
+ */
 function withRemoteTimeout(definition: object): object {
   const parameters = (definition as { parameters?: Record<string, { description?: string }> }).parameters
-  if (parameters?.timeoutMs === undefined) return definition
-  return {
-    ...definition,
-    parameters: {
-      ...parameters,
-      timeoutMs: {
-        ...parameters.timeoutMs,
-        description: 'Timeout in milliseconds. When it expires this remote command is killed. Without a sandbox runner, child processes of the command may keep running on the remote host.',
-      },
-    },
+  if (parameters === undefined) return definition
+  const properties = (parameters as { properties?: Record<string, { description?: string }> }).properties
+  const timeoutField = properties?.timeoutMs ?? parameters.timeoutMs
+  if (timeoutField === undefined) return definition
+  const withDescription = { ...timeoutField, description: REMOTE_TIMEOUT_DESCRIPTION }
+  if (properties !== undefined) {
+    return { ...definition, parameters: { ...parameters, properties: { ...properties, timeoutMs: withDescription } } }
   }
+  return { ...definition, parameters: { ...parameters, timeoutMs: withDescription } }
 }
 
 function effectiveCwd(ctx: HostContext, exec: ToolExec, fallback: string | undefined): string | undefined {

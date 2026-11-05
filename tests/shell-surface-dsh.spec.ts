@@ -379,3 +379,38 @@ test('terminal_open refuses through the real registry on a remote cwd and passes
     await host.close()
   }
 })
+
+test('a remote bash schema tells the model the timeout kills the remote command', async () => {
+  // `defineTool` compiles `parameters` to JSON Schema before registration, so
+  // the captured official schema exposes `properties.timeoutMs`. The rewritten
+  // description is the only signal that a remote timeout kills the command on
+  // the SSH host rather than on this machine.
+  const host = await boot()
+  try {
+    host.preset.tools.register(defineTool({
+      name: 'bash',
+      description: 'official bash',
+      parameters: {
+        command: { type: 'string', required: true, description: 'command' },
+        description: { type: 'string', required: true, description: 'why' },
+        timeoutMs: { type: 'integer', description: 'local timeout' },
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
+        render: () => [{ type: 'text', text: '' }],
+      },
+      async execute() {
+        return { text: '' }
+      },
+    }))
+    const agent = await host.makeAgent('timeout-remote', remoteCwd)
+    await host.created(agent)
+    const assembly = await host.ctx.systemPrompt.assemble({ scope: agent })
+    const bash = assembly.tools.find(tool => tool.name === 'bash')
+    assert.ok(bash, 'the remote bash shadow is present')
+    const parameters = bash.parameters as { properties?: Record<string, { description?: string }> }
+    assert.match(parameters.properties?.timeoutMs?.description ?? '', /remote command is killed/)
+  } finally {
+    await host.close()
+  }
+})
