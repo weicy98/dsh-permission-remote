@@ -1,6 +1,6 @@
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
+import { isAbsolute, join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
 import { FsError, type FsTarget, type FsVersion } from '@deepseek-ai/dsh-fs'
@@ -39,8 +39,12 @@ import { emptyMigrationState, readMigrationState, writeMigrationState, type Migr
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
 import {
   PWSH_SECTION,
+  REMOTE_APPLY_PATCH_PROMPT,
+  REMOTE_EDITOR_PROMPT,
+  REMOTE_FILE_TOOLS_SECTION,
   REMOTE_POSIX_SECTION,
   REMOTE_WORKSPACE_CONTEXT,
+  STR_REPLACE_EDITOR_PATH_REFUSED,
   isUnknownRestrictError,
   isWindowsShell,
   remotePosixPrompt,
@@ -126,10 +130,10 @@ interface PromptAssembleContext {
 interface AgentContext {
   tools: HostContext['tools'] & {
     restrict(filter: { deny: readonly string[] }): () => void
-    guard(guard: (execution: { readonly name: string, readonly agent?: ToolExec['agent'] }) => string | undefined): () => void
+    guard(guard: (execution: { readonly name: string, readonly arguments?: unknown, readonly agent?: ToolExec['agent'] }) => string | undefined): () => void
   }
   systemPrompt: {
-    section(section: { name: string, order: number, text: string | (() => string), complete?: boolean }): () => void
+    section(section: { name: string, order: number, text: string | ((context: { scope?: object }) => string), complete?: boolean }): () => void
     getSectionOrder(name: string): number
     context(context: { name: string, order: number, text: string | ((context: unknown) => string), required?: boolean, interpolate?: boolean }): () => void
     getContextOrder(name: string): number
@@ -1549,12 +1553,16 @@ export class Core {
       return
     }
     if (event.type !== 'tool/call' || typeof event.data?.callId !== 'string') return
-    if (event.data.name !== 'write' && event.data.name !== 'edit') return
+    const name = event.data.name
+    if (name !== 'write' && name !== 'edit' && name !== 'apply_patch' && name !== 'str_replace_editor') return
     let filePath: string | undefined
-    if (typeof event.data.arguments === 'string') {
+    const rawArguments = typeof event.data.arguments === 'string' ? event.data.arguments : undefined
+    if (rawArguments !== undefined) {
       try {
-        const parsed = JSON.parse(event.data.arguments) as { file_path?: unknown }
-        if (typeof parsed.file_path === 'string') filePath = parsed.file_path
+        const parsed = JSON.parse(rawArguments) as Record<string, unknown>
+        if (name === 'str_replace_editor' && typeof parsed.path === 'string') filePath = parsed.path
+        else if (name === 'apply_patch' && typeof parsed.input === 'string') filePath = firstPatchPath(parsed.input)
+        else if (typeof parsed.file_path === 'string') filePath = parsed.file_path
       } catch {
         // A malformed/truncated argument string only loses presentation detail.
       }
@@ -1665,7 +1673,7 @@ function markRemote(service: SshApi): void {
  * commits a directory through the official service, the second stages files and
  * delegates to the official tool, so neither has a runner of its own.
  */
-const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
+const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present' | 'str_replace_editor'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
   read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
     const attachments = ctx.get('attachments') as { saveImage(input: { data: Buffer, mediaType: string, name: string }): Promise<Record<string, unknown>> } | undefined
@@ -1684,12 +1692,19 @@ const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present'>, 
   },
 }
 
+/** First path named by a Codex-style patch, for the approval card only. */
+function firstPatchPath(input: string): string | undefined {
+  const match = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$|^\*\*\* Move to:\s*(.+)$/m.exec(input)
+  const value = match?.[1] ?? match?.[2]
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
 /**
- * The official write/edit tools own their approval prompts, so the plugin
- * cannot pass host/path detail through `resolveMode` anymore. The approval
- * request event carries the call id; the matching `tool/call` event carries the
- * raw arguments. Enrich only remote write/edit prompts and leave every other
- * approval untouched.
+ * The official write/edit/apply_patch tools own their approval prompts, so the
+ * plugin cannot pass host/path detail through `resolveMode` anymore. The
+ * approval request event carries the call id; the matching `tool/call` event
+ * carries the raw arguments. Enrich only remote mutating prompts; editor has no
+ * escalation fields and never sends an approval request.
  */
 export function installRemoteApprovalDetail(ctx: AgentContext, core: Core): () => void {
   const register = ctx.on as unknown as (
@@ -1698,9 +1713,10 @@ export function installRemoteApprovalDetail(ctx: AgentContext, core: Core): () =
     options?: { prepend?: boolean },
   ) => () => void
   return register('approval/request', async (request, next) => {
-    // Non-write/edit approvals are not ours to decorate. Return their
-    // delegation exactly once; never put `next()` inside the catch below.
-    if (request.toolName !== 'write' && request.toolName !== 'edit') return next()
+    // Only the tools whose escalation runs through FsSandboxController send
+    // this request. Return their delegation exactly once; never put `next()`
+    // inside the catch below.
+    if (request.toolName !== 'write' && request.toolName !== 'edit' && request.toolName !== 'apply_patch') return next()
     try {
       const session = request.agent.session
       const cached = core.toolCallDetail(session?.id, request.callId)
@@ -1711,7 +1727,7 @@ export function installRemoteApprovalDetail(ctx: AgentContext, core: Core): () =
       const host = core.requireHost(route.hostId)
       const label = host.name || host.host || route.hostId
       const path = requested.length > 0 ? resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd) : route.remoteCwd
-      const action = request.toolName === 'write' ? 'write' : 'edit'
+      const action = request.toolName
       const currentEn = request.displayReason?.en ?? request.reason ?? ''
       const currentZh = request.displayReason?.zh ?? currentEn
       const mutable = request as { displayReason?: { en: string, [locale: string]: string } }
@@ -2036,6 +2052,46 @@ async function assertLocalWorkingDirectory(
   if (route.kind === 'remote') assertEnterableRemoteCwd(core, route, headerCwd)
 }
 
+/**
+ * Map a bare absolute path in a remote session onto the placeholder spelling
+ * of the same host. `str_replace_editor` requires absolute paths, but its
+ * official `resolveTarget` calls `ctx.fs.resolve(path, { signal })` with no
+ * cwd: without this rewrite a remote real absolute path would resolve against
+ * this computer's filesystem. Placeholder paths are already remote and pass
+ * through untouched; relative paths are rejected by the official tool itself.
+ * A mapping failure fails closed instead of handing the path back to the local
+ * provider.
+ */
+function rewriteRemoteEditorArgs(current: RemoteRoute, args: Record<string, unknown>): Record<string, unknown> {
+  const requested = args.path
+  // Both spellings matter: on a Windows host a `C:\...` path is absolute for
+  // the local provider but cannot name a file on a POSIX remote host.
+  if (typeof requested !== 'string' || !(isAbsolute(requested) || posix.isAbsolute(requested))) return args
+  if (routeByCwd(requested).kind === 'remote') return args
+  if (!posix.isAbsolute(requested)) {
+    throw new Error(`str_replace_editor: "${requested}" is not a usable absolute path in this remote workspace`)
+  }
+  const remote = normalizeRemoteDirectory(resolveRemotePath(requested, current.remoteCwd, current.placeholderCwd))
+  if (remote === null) {
+    throw new Error(`str_replace_editor: "${requested}" is not a usable absolute path in this remote workspace`)
+  }
+  const placeholder = mapRemoteToLocal(current.hostId, remote)
+  if (placeholder === null) {
+    throw new Error(`str_replace_editor: cannot map "${requested}" onto this remote host`)
+  }
+  return { ...args, path: placeholder }
+}
+
+/** Delegate to the official execute with a path that routes to the remote fs. */
+async function runRemoteStrReplaceEditor(
+  official: (args: unknown, exec: ToolExec) => Promise<unknown>,
+  current: RemoteRoute,
+  record: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  return official(rewriteRemoteEditorArgs(current, record), exec)
+}
+
 function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
@@ -2047,6 +2103,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     const plans = planShadows(name => agent.ctx.tools.get(name, agent))
     disposers.push(installRemoteApprovalDetail(agent.ctx, core))
     const hasOfficialBash = plans.some(plan => plan.name === 'bash' && plan.official !== undefined)
+    const editorShadowReady = plans.some(plan => plan.name === 'str_replace_editor' && plan.official !== undefined)
     const host = core.toolHost(agent.ctx.get('jobs') as ToolHost['jobs'])
     for (const plan of plans) {
       // A preset with no bash used to register the fallback here for the
@@ -2071,13 +2128,30 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           assertEnterableRemoteCwd(core, current, headerCwd)
           if (plan.name === 'working_directory') return commitRemoteWorkingDirectory(core, ctx, host, current, record, exec, headerCwd)
           if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec)
+          if (plan.name === 'str_replace_editor') return runRemoteStrReplaceEditor(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
           return RUNNERS[plan.name](host, current, record, exec, ctx)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
+      if (plan.name === 'str_replace_editor' && typeof base.presentCall === 'function') {
+        // The official call card is built from the model's raw arguments, not
+        // from the rewritten args we hand to execute. Rewrite there too so the
+        // diff card names the placeholder path the other file tools show.
+        // Presentation must never fail a call: a path that cannot be mapped
+        // falls back to the raw arguments and the card shows what the model sent.
+        const officialPresentCall = base.presentCall as (args: Record<string, unknown>) => unknown
+        definition.presentCall = (args: Record<string, unknown>) => {
+          try {
+            const current = routeByCwd(effectiveCwd(ctx, { agent }, headerCwd))
+            return officialPresentCall(current.kind === 'remote' ? rewriteRemoteEditorArgs(current, args) : args)
+          } catch {
+            return officialPresentCall(args)
+          }
+        }
+      }
       disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
-    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady)
+    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady, editorShadowReady)
     disposeDynamic = surface.disposeDynamic
     surface.sync(opened)
   } catch (error) {
@@ -2141,6 +2215,7 @@ function installRemoteShellSurface(
   hasOfficialBash: boolean,
   disposers: Array<() => void>,
   fsReady: () => boolean,
+  editorShadowReady: boolean,
 ): { sync(route: Route): void, disposeDynamic(): void } {
   const dynamic: Array<() => void> = []
   let applied: Route = { kind: 'local' }
@@ -2240,6 +2315,17 @@ function installRemoteShellSurface(
   disposers.push(agent.ctx.tools.guard(execution => {
     const remote = routeByCwd(effectiveCwd(ctx, execution, headerCwd)).kind === 'remote'
     if (isWindowsShell(execution.name)) return windowsShellGuardReason(remote)
+    // Guards run on the model's raw arguments, before the shadow rewrites
+    // `args.path`. Refuse a bare absolute path only when no shadow is mounted
+    // to do that rewrite; otherwise the official tool would resolve it against
+    // this computer's filesystem.
+    if (remote && execution.name === 'str_replace_editor' && !editorShadowReady) {
+      const raw = execution.arguments
+      const requested = typeof raw === 'object' && raw !== null ? (raw as { path?: unknown }).path : undefined
+      if (typeof requested === 'string' && (isAbsolute(requested) || posix.isAbsolute(requested)) && routeByCwd(requested).kind !== 'remote') {
+        return STR_REPLACE_EDITOR_PATH_REFUSED
+      }
+    }
     if (!remote || fsReady()) return undefined
     if (FS_SURFACE_TOOLS.has(execution.name)) return REMOTE_FS_UNPATCHED
     return undefined
@@ -2270,6 +2356,48 @@ function installRemoteShellSurface(
     order: agent.ctx.systemPrompt.getSectionOrder('TOOL_BASH') + 5,
     text: () => remotePosixPrompt(remoteNow()),
   }))
+  // 0.2.2 publishes apply_patch / str_replace_editor only in custom
+  // compositions. The section is empty unless one of them is actually visible,
+  // so the guidance never advertises a tool the model cannot call. Hosts that
+  // do not know the patch section order fall back to the edit section.
+  const fileToolsOrder = ((): number | undefined => {
+    for (const name of ['TOOL_APPLY_PATCH', 'TOOL_EDIT']) {
+      try {
+        const order = agent.ctx.systemPrompt.getSectionOrder(name)
+        if (typeof order === 'number' && Number.isFinite(order)) return order + 1
+      } catch {
+        // An older host does not publish this placement.
+      }
+    }
+    return undefined
+  })()
+  if (fileToolsOrder !== undefined) {
+    disposers.push(agent.ctx.systemPrompt.section({
+      name: REMOTE_FILE_TOOLS_SECTION,
+      order: fileToolsOrder,
+      text: (context?: { scope?: object }) => {
+        // A shared section must not describe this agent's remote workspace to
+        // another agent whose prompt happens to render the same section.
+        if (context?.scope !== undefined && context.scope !== agent) return ''
+        if (!remoteNow()) return ''
+        const at = context?.scope ?? agent
+        const visible = (name: string): boolean => {
+          try {
+            return agent.ctx.tools.get(name, at) !== undefined
+          } catch {
+            return false
+          }
+        }
+        // Describe only the tools this composition actually mounts: naming a
+        // tool the model cannot call wastes a prompt line and invites a call
+        // that fails as unknown.
+        return [
+          visible('apply_patch') ? REMOTE_APPLY_PATCH_PROMPT : '',
+          visible('str_replace_editor') ? REMOTE_EDITOR_PROMPT : '',
+        ].filter(text => text.length > 0).join('\n\n')
+      },
+    }))
+  }
   // A required runtime context, not a prompt section: it sits beside
   // `Current working directory` in the same per-turn snapshot, survives a
   // complete persona (which only collapses sections), and changes only the

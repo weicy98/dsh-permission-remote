@@ -37,9 +37,10 @@ import type { HostConfig } from './config.ts'
 import { composeCreatedPath } from './contain.ts'
 import type { RunnerStatus } from './execute.ts'
 import { isRemoteMissing } from './ops.ts'
+import { applyHunks, type PatchHunk } from './patch-hunks.ts'
 import { fileWriteAllowed } from './profile.ts'
 import { mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, workspaceBinding } from './router.ts'
-import { commitRemoteText, parseRemoteVersion, remoteRoots, remoteVersionEvidence, remoteVersionToken, resolveCreatedPath, type RemoteVersionEvidence } from './remote-write.ts'
+import { commitRemoteDelete, commitRemoteText, parseRemoteVersion, remoteRoots, remoteVersionEvidence, remoteVersionToken, resolveCreatedPath, type RemoteVersionEvidence } from './remote-write.ts'
 import { SFTP_STATUS, SshFailure, isSftpPermissionDenied, type ExecResult, type RemoteDirEntry, type SecretMaterial, type SftpAttrs, type SshPool } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
 
@@ -119,14 +120,15 @@ interface Originals {
   writeText(target: FsTarget, content: string, expected?: FsWriteIntent, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsWriteOutcome>
   editText(target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsEditOutcome>
   /**
-   * The remaining mutating methods of the fs service definition. They are NOT
-   * reimplemented remotely (yet), so they stay optional here and are refused
-   * for a remote target instead of falling through to the local backend. A
-   * local target still reaches the mounted provider unchanged.
+   * The remaining mutating methods of the fs service definition. DSH 0.2.2
+   * publishes them for `apply_patch`; they are reimplemented remotely when the
+   * mounted provider has them, and refused for a remote target otherwise so
+   * they never fall through to the local backend. A local target still reaches
+   * the mounted provider unchanged.
    */
-  patchText?(target: FsTarget, hunks: readonly unknown[], expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsEditOutcome>
+  patchText?(target: FsTarget, hunks: readonly PatchHunk[], expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsEditOutcome>
   deleteFile?(target: FsTarget, expected?: { version: FsVersion }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsDeleteOutcome>
-  moveFile?(source: FsTarget, destination: FsTarget, options: { hunks?: readonly unknown[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsMoveOutcome>
+  moveFile?(source: FsTarget, destination: FsTarget, options: { hunks?: readonly PatchHunk[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent }, signal?: AbortSignal, policy?: SandboxExecutionPolicy): Promise<FsMoveOutcome>
   contains(parent: FsTarget, child: FsTarget): boolean
   watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>>
 }
@@ -215,9 +217,29 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
     restorers.push(replaceMethod(surface, 'watch', (target, changed, signal) => watchRemote(runtime, target, changed, signal)))
     restorers.push(replaceMethod(surface, 'writeText', (target, content, expected, signal, policy) => writeRemoteText(runtime, target, content, expected, signal, policy)))
     restorers.push(replaceMethod(surface, 'editText', (target, edit, expected, signal, policy) => editRemoteText(runtime, target, edit, expected, signal, policy)))
-    guardRemoteMutation(surface, originals, restorers, 'patchText')
-    guardRemoteMutation(surface, originals, restorers, 'deleteFile')
-    guardRemoteMutation(surface, originals, restorers, 'moveFile')
+    // 0.2.2 added these three methods for `apply_patch`. When the mounted
+    // provider has them, route remote targets through the implementations
+    // below. Older hosts keep the refusal: a missing method must not be
+    // invented, and no official tool calls one there.
+    if (patchMutationsAvailable(originals)) {
+      restorers.push(replaceMethod(surface, 'patchText', (
+        target: FsTarget, hunks: readonly PatchHunk[], expected?: { version: FsVersion },
+        signal?: AbortSignal, policy?: SandboxExecutionPolicy,
+      ) => patchRemoteText(runtime, target, hunks, expected, signal, policy)))
+      restorers.push(replaceMethod(surface, 'deleteFile', (
+        target: FsTarget, expected?: { version: FsVersion },
+        signal?: AbortSignal, policy?: SandboxExecutionPolicy,
+      ) => deleteRemoteFile(runtime, target, expected, signal, policy)))
+      restorers.push(replaceMethod(surface, 'moveFile', (
+        source: FsTarget, destination: FsTarget,
+        options: { hunks?: readonly PatchHunk[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent },
+        signal?: AbortSignal, policy?: SandboxExecutionPolicy,
+      ) => moveRemoteFile(runtime, source, destination, options, signal, policy)))
+    } else {
+      guardRemoteMutation(surface, originals, restorers, 'patchText')
+      guardRemoteMutation(surface, originals, restorers, 'deleteFile')
+      guardRemoteMutation(surface, originals, restorers, 'moveFile')
+    }
     Object.defineProperty(fs, MARKER, { value: true, configurable: true, enumerable: false })
   } catch (error) {
     for (const restore of restorers) restore()
@@ -698,7 +720,7 @@ async function writeRemoteTextUnlocked(
   try {
     await commitRemoteText(context.pool, context.host, context.secret, context.status, context.mode, context.roots, context.targetPath, content, signal, existing?.mode, expected)
   } catch (error) {
-    throw asFs(error, signal)
+    rethrowCommitFailure(runtime, context, error, signal)
   }
   runtime.meta.forgetAttrs(context.host.id, context.targetPath, true)
   runtime.meta.forgetRealpath(context.host.id, context.targetPath)
@@ -840,7 +862,7 @@ async function editRemoteTextUnlocked(
   try {
     await commitRemoteText(context.pool, context.host, context.secret, context.status, context.mode, context.roots, context.targetPath, content, signal, existing.mode, expected === undefined ? undefined : { kind: 'replaceIfVersion', version: expected.version })
   } catch (error) {
-    throw asFs(error, signal)
+    rethrowCommitFailure(runtime, context, error, signal)
   }
   runtime.meta.forgetAttrs(context.host.id, context.targetPath, true)
   runtime.meta.forgetRealpath(context.host.id, context.targetPath)
@@ -856,6 +878,441 @@ async function editRemoteTextUnlocked(
   const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
   const afterVersion = bumpVersion(runtime, context.host.id, context.targetPath, afterInfo, evidence)
   return { version: afterVersion, before, after: edited.content }
+}
+
+/** Whether the mounted provider publishes the 0.2.2 patch mutations. */
+function patchMutationsAvailable(originals: Originals): boolean {
+  return typeof originals.patchText === 'function'
+    && typeof originals.deleteFile === 'function'
+    && typeof originals.moveFile === 'function'
+}
+
+/** Serialize a mutation that touches two paths without deadlocking. */
+async function withTargetLocks<T>(runtime: Runtime, keys: string[], action: () => Promise<T>): Promise<T> {
+  const ordered = [...new Set(keys)].sort()
+  const step = (index: number): Promise<T> => index >= ordered.length
+    ? action()
+    : withTargetLock(runtime, ordered[index]!, () => step(index + 1))
+  return step(0)
+}
+
+/**
+ * Drop the cached facts about a path after it was created, changed or removed.
+ *
+ * Only the attribute and realpath caches are invalidated, matching what
+ * `writeText` / `editText` already do. Two things are deliberately left alone:
+ *
+ * - `runtime.versions` (the per-path generation counter): `bumpVersion`
+ *   documents that it must stay monotonic for the lifetime of the patch,
+ *   because resetting it could make a later write reuse an older generation and
+ *   compare equal to a stale token.
+ * - `runtime.identity` (lexical -> realpath): `containsRemote` fails closed when
+ *   an identity is missing, so dropping it would make `ctx.fs.contains()` return
+ *   false for a path that was just written. The next `resolve` refreshes it.
+ *
+ * The version side is refreshed by the caller's own `sftpAttrs` + `bumpVersion`
+ * probe.
+ */
+function forgetTarget(runtime: Runtime, hostId: string, remotePath: string): void {
+  runtime.meta.forgetAttrs(hostId, remotePath, true)
+  runtime.meta.forgetAttrs(hostId, remotePath, false)
+  runtime.meta.forgetRealpath(hostId, remotePath)
+}
+
+/**
+ * Surface a failed remote commit, dropping any cache that could describe the
+ * pre-commit state.
+ *
+ * A remote command can fail AFTER it changed the file: `mv` may have run and a
+ * later `chmod` failed, or the transport may drop after the rename. The
+ * official `apply_patch` tells `failed` from `unknown` by re-`stat`ing the
+ * target and comparing versions (`unchanged`), and `statRemote` serves a cached
+ * attribute for up to 5 seconds. Keeping that cache would report the old version
+ * and turn a possibly-applied operation into `failed`. `FS_IO_ERROR` and
+ * `FS_ABORTED` are exactly the two codes whose effect is uncertain; the guard
+ * codes (stale/sandbox/not-observed) are decided before the rename, so their
+ * cache stays valid.
+ */
+function rethrowCommitFailure(
+  runtime: Runtime,
+  context: MutationContext,
+  error: unknown,
+  signal: AbortSignal | undefined,
+): never {
+  const failure = asFs(error, signal)
+  // Any commit failure can be ambiguous: the rename may already have happened
+  // and a later step or the transport failed. Dropping the cache costs one
+  // re-probe and removes a whole class of "reported failed but actually
+  // applied" misjudgements, whatever code the failure mapped to.
+  forgetTarget(runtime, context.host.id, context.targetPath)
+  throw failure
+}
+
+interface RemoteSourceState {
+  readonly context: MutationContext
+  readonly info: SftpAttrs
+  readonly version: FsVersion
+}
+
+/**
+ * Common pre-check for patch/delete/move sources.
+ *
+ * The lstat on the lexical spelling is what keeps a delete or move from
+ * following a final symlink and removing its target. `currentRemoteAttrs`
+ * supplies the version evidence used by the compare-and-swap guard and by the
+ * remote shell script; both see the same realpath-resolved target.
+ */
+async function requireRemoteFile(
+  runtime: Runtime,
+  target: FsTarget,
+  expected: { version: FsVersion } | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+  signal: AbortSignal | undefined,
+  verb: 'patch' | 'delete' | 'move',
+  rejectFinalSymlink: boolean,
+): Promise<RemoteSourceState> {
+  let context: MutationContext | undefined
+  try {
+    context = await mutationContext(runtime, target, policy, signal)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (context === undefined) {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": not a remote target`, 'FS_IO_ERROR')
+  }
+  throwIfFsAborted(signal)
+  const route = routeByCwd(String(target.targetKey))
+  if (route.kind !== 'remote') {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": not a remote target`, 'FS_IO_ERROR')
+  }
+  let info: SftpAttrs | undefined
+  try {
+    info = await uncachedAttrs(runtime, context.host, context.secret, route.remoteCwd, false, signal)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (info === undefined) {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+  }
+  // A delete or move must never follow a final symlink: `rm` on the resolved
+  // target would remove a different file than the one the patch named. The
+  // official apply_patch preflight refuses those too (PATCH_SYMLINK_SOURCE).
+  // `patchText` is different: the official tool resolves the path first and the
+  // local backend patches through a symlink, so refusing here would be a remote
+  // only divergence. Its target still has to be a regular file after following.
+  if (info.type === 'symlink' && rejectFinalSymlink) {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": not a regular file`, 'FS_PERMISSION_DENIED')
+  }
+  if (info.type !== 'file' && info.type !== 'symlink') {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  let version: FsVersion | undefined
+  let followed: SftpAttrs | undefined
+  try {
+    const current = await currentRemoteAttrs(runtime, context, signal)
+    version = current.version
+    followed = current.info
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (followed !== undefined && followed.type !== 'file') {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  if (version === undefined) {
+    throw new FsError(`cannot ${verb} "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+  }
+  if (expected !== undefined) {
+    const comparison = compareRemoteVersion(expected.version, version)
+    if (comparison === 'unavailable') {
+      throw new FsError(`cannot verify "${target.displayPath}" before ${verb}: remote version evidence is unavailable`, 'FS_IO_ERROR')
+    }
+    if (comparison !== 'match') {
+      throw new FsError(`cannot ${verb} "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+    }
+  }
+  // Return the *followed* attributes, not the lstat ones. A final symlink's
+  // lstat mode carries S_IFLNK (for example 0o120777); passing `mode & 0o7777`
+  // to the atomic write would chmod the target file 0777. The callers use
+  // `info.mode` to preserve the file's permission bits on commit, so it must be
+  // the target file's mode. `followed` is undefined only when the follow-stat
+  // found nothing, which the version check above already rejects.
+  return { context, info: followed ?? info, version }
+}
+
+/** Read one remote UTF-8 file, keeping its line-ending style for the commit. */
+async function readRemoteSourceText(
+  runtime: Runtime,
+  context: MutationContext,
+  target: FsTarget,
+  signal?: AbortSignal,
+): Promise<{ before: string, lineEndings: 'LF' | 'CRLF' }> {
+  let raw: Buffer
+  try {
+    raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, TEXT_CAP, signal)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  throwIfFsAborted(signal)
+  if (raw.includes(0)) throw new FsError(`cannot edit "${target.displayPath}": binary file`, 'FS_NOT_TEXT')
+  let decoded: string
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(raw)
+  } catch {
+    throw new FsError(`cannot edit "${target.displayPath}": not UTF-8 text`, 'FS_NOT_TEXT')
+  }
+  return { before: normalizeLineEndings(decoded), lineEndings: detectLineEndings(decoded) }
+}
+
+/** Bounded LF-normalized content for a diff card; unavailable basis is null. */
+async function boundedRemoteBefore(runtime: Runtime, context: MutationContext, signal?: AbortSignal): Promise<string | null> {
+  try {
+    const raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, DIFF_BASIS_MAX_BYTES, signal)
+    throwIfFsAborted(signal)
+    if (raw.includes(0)) return null
+    return normalizeLineEndings(new TextDecoder('utf-8', { fatal: true }).decode(raw))
+  } catch (error) {
+    if (error instanceof FsError) throw error
+    return null
+  }
+}
+
+/** Post-write verification shared by patch and move. */
+async function versionAfterRemoteWrite(
+  runtime: Runtime,
+  context: MutationContext,
+  target: FsTarget,
+  signal?: AbortSignal,
+): Promise<FsVersion> {
+  forgetTarget(runtime, context.host.id, context.targetPath)
+  let afterInfo: SftpAttrs | undefined
+  try {
+    afterInfo = await runtime.access.pool.sftpAttrs(context.host, context.secret, context.targetPath, true)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (afterInfo === undefined) {
+    throw new FsError(`"${target.displayPath}" disappeared while its write was being verified`, 'FS_IO_ERROR')
+  }
+  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
+  return bumpVersion(runtime, context.host.id, context.targetPath, afterInfo, evidence)
+}
+
+function patchFailureError(target: FsTarget, failure: { hunkLineNumber: number, stage: string }): FsError {
+  return new FsError(
+    `cannot patch "${target.displayPath}": hunk at patch line ${failure.hunkLineNumber} (${failure.stage}) does not match`,
+    'FS_PATCH_MISMATCH',
+  )
+}
+
+async function patchRemoteText(
+  runtime: Runtime,
+  target: FsTarget,
+  hunks: readonly PatchHunk[],
+  expected: { version: FsVersion } | undefined,
+  signal: AbortSignal | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+): Promise<FsEditOutcome> {
+  const route = routeByCwd(String(target.targetKey))
+  if (route.kind !== 'remote') return runtime.originals.patchText!(target, hunks, expected, signal, policy)
+  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () =>
+    patchRemoteTextUnlocked(runtime, target, hunks, expected, signal, policy))
+}
+
+async function patchRemoteTextUnlocked(
+  runtime: Runtime,
+  target: FsTarget,
+  hunks: readonly PatchHunk[],
+  expected: { version: FsVersion } | undefined,
+  signal: AbortSignal | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+): Promise<FsEditOutcome> {
+  const { context, info } = await requireRemoteFile(runtime, target, expected, policy, signal, 'patch', false)
+  // `requireRemoteFile` already hashed the file to obtain version evidence; this
+  // second read produces the text itself. The two are kept separate because the
+  // hash must exist even when the file turns out to be binary, and merging them
+  // would couple the version-evidence path to the text-decode path.
+  const { before, lineEndings } = await readRemoteSourceText(runtime, context, target, signal)
+  const result = applyHunks(before, hunks)
+  if (!result.ok) throw patchFailureError(target, result.failure)
+  const after = result.after
+  try {
+    await commitRemoteText(
+      context.pool, context.host, context.secret, context.status, context.mode, context.roots,
+      context.targetPath, restoreLineEndings(after, lineEndings), signal, info.mode,
+      expected === undefined ? undefined : { kind: 'replaceIfVersion', version: expected.version },
+    )
+  } catch (error) {
+    rethrowCommitFailure(runtime, context, error, signal)
+  }
+  const version = await versionAfterRemoteWrite(runtime, context, target, signal)
+  return { version, before, after }
+}
+
+async function deleteRemoteFile(
+  runtime: Runtime,
+  target: FsTarget,
+  expected: { version: FsVersion } | undefined,
+  signal: AbortSignal | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+): Promise<FsDeleteOutcome> {
+  const route = routeByCwd(String(target.targetKey))
+  if (route.kind !== 'remote') return runtime.originals.deleteFile!(target, expected, signal, policy)
+  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () =>
+    deleteRemoteFileUnlocked(runtime, target, expected, signal, policy))
+}
+
+async function deleteRemoteFileUnlocked(
+  runtime: Runtime,
+  target: FsTarget,
+  expected: { version: FsVersion } | undefined,
+  signal: AbortSignal | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+): Promise<FsDeleteOutcome> {
+  const { context } = await requireRemoteFile(runtime, target, expected, policy, signal, 'delete', true)
+  const before = await boundedRemoteBefore(runtime, context, signal)
+  try {
+    await commitRemoteDelete(
+      context.pool, context.host, context.secret, context.status, context.mode, context.roots,
+      context.targetPath, signal, expected,
+    )
+  } catch (error) {
+    rethrowCommitFailure(runtime, context, error, signal)
+  }
+  forgetTarget(runtime, context.host.id, context.targetPath)
+  return { before }
+}
+
+async function moveRemoteFile(
+  runtime: Runtime,
+  source: FsTarget,
+  destination: FsTarget,
+  options: { hunks?: readonly PatchHunk[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent } = {},
+  signal: AbortSignal | undefined = undefined,
+  policy: SandboxExecutionPolicy | undefined = undefined,
+): Promise<FsMoveOutcome> {
+  const sourceRoute = routeByCwd(String(source.targetKey))
+  const destinationRoute = routeByCwd(String(destination.targetKey))
+  if (sourceRoute.kind !== 'remote' && destinationRoute.kind !== 'remote') {
+    return runtime.originals.moveFile!(source, destination, options, signal, policy)
+  }
+  if (sourceRoute.kind !== 'remote' || destinationRoute.kind !== 'remote' || sourceRoute.hostId !== destinationRoute.hostId) {
+    throw new FsError('cannot move between a remote workspace and this computer', 'FS_SANDBOX_DENIED')
+  }
+  if (String(source.targetKey) === String(destination.targetKey)) {
+    throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
+  }
+  return withTargetLocks(runtime, [
+    `${sourceRoute.hostId}\0${String(source.targetKey)}`,
+    `${destinationRoute.hostId}\0${String(destination.targetKey)}`,
+  ], () => moveRemoteFileUnlocked(runtime, source, destination, options, signal, policy))
+}
+
+async function moveRemoteFileUnlocked(
+  runtime: Runtime,
+  source: FsTarget,
+  destination: FsTarget,
+  options: { hunks?: readonly PatchHunk[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent },
+  signal: AbortSignal | undefined,
+  policy: SandboxExecutionPolicy | undefined,
+): Promise<FsMoveOutcome> {
+  const { context: sourceContext, info: sourceInfo } = await requireRemoteFile(runtime, source, options.expectedSource, policy, signal, 'move', true)
+  let destinationContext: MutationContext | undefined
+  try {
+    destinationContext = await mutationContext(runtime, destination, policy, signal)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (destinationContext === undefined) {
+    throw new FsError(`cannot move "${source.displayPath}" to a non-remote destination`, 'FS_SANDBOX_DENIED')
+  }
+  // One remote file has two placeholder spellings: the whole path encoded in
+  // one segment, or the workspace root encoded plus a relative suffix. They are
+  // different `targetKey`s but the same file, so the string comparison above
+  // cannot see it. Publishing the destination and then deleting the source
+  // would destroy that file, so compare the realpath-resolved targets and
+  // refuse a same-file move as FS_SAME_TARGET, like the local backend.
+  if (sourceContext.targetPath === destinationContext.targetPath) {
+    throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
+  }
+  let existing: SftpAttrs | undefined
+  let existingVersion: FsVersion | undefined
+  try {
+    const current = await currentRemoteAttrs(runtime, destinationContext, signal)
+    existing = current.info
+    existingVersion = current.version
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+  if (existing !== undefined && existing.type !== 'file') {
+    throw new FsError(`cannot write "${destination.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  const intent = options.expectedDestination
+  if (intent?.kind === 'createIfAbsent' && existing !== undefined) {
+    throw new FsError(`cannot overwrite existing "${destination.displayPath}" without reading it first`, 'FS_NOT_OBSERVED')
+  }
+  if (intent?.kind === 'replaceIfVersion') {
+    if (existing === undefined || existingVersion === undefined) {
+      throw new FsError(`cannot write "${destination.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+    }
+    const comparison = compareRemoteVersion(intent.version, existingVersion)
+    if (comparison === 'unavailable') {
+      throw new FsError(`cannot verify "${destination.displayPath}" before writing: remote version evidence is unavailable`, 'FS_IO_ERROR')
+    }
+    if (comparison !== 'match') {
+      throw new FsError(`cannot write "${destination.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+    }
+  }
+  const { before: sourceText, lineEndings } = await readRemoteSourceText(runtime, sourceContext, source, signal)
+  let after = sourceText
+  if (options.hunks !== undefined) {
+    const result = applyHunks(sourceText, options.hunks)
+    if (!result.ok) throw patchFailureError(source, result.failure)
+    after = result.after
+  }
+  const content = restoreLineEndings(after, lineEndings)
+  // Match the local backend's bounded diffs: `sourceBefore` is judged on the
+  // source text it returns, the destination basis on the content being written.
+  const sourceBefore = Buffer.byteLength(sourceText, 'utf8') < DIFF_BASIS_MAX_BYTES ? sourceText : null
+  const destinationBefore = existing !== undefined && Buffer.byteLength(content, 'utf8') < DIFF_BASIS_MAX_BYTES
+    ? await boundedRemoteBefore(runtime, destinationContext, signal)
+    : null
+  try {
+    await commitRemoteText(
+      destinationContext.pool, destinationContext.host, destinationContext.secret,
+      destinationContext.status, destinationContext.mode, destinationContext.roots,
+      destinationContext.targetPath, content, signal, sourceInfo.mode, intent,
+    )
+  } catch (error) {
+    rethrowCommitFailure(runtime, destinationContext, error, signal)
+  }
+  const destinationOutcome: FsWriteOutcome = {
+    operation: existing === undefined ? 'create' : 'update',
+    version: await versionAfterRemoteWrite(runtime, destinationContext, destination, signal),
+    before: destinationBefore,
+    after,
+  }
+  // The destination is already published. A failed source removal is reported,
+  // not rolled back: this is the same contract as the local backend.
+  try {
+    await commitRemoteDelete(
+      sourceContext.pool, sourceContext.host, sourceContext.secret,
+      sourceContext.status, sourceContext.mode, sourceContext.roots,
+      sourceContext.targetPath, signal, options.expectedSource,
+    )
+  } catch (error) {
+    const failure = asFs(error, signal)
+    if (failure.code === 'FS_IO_ERROR' || failure.code === 'FS_ABORTED') {
+      forgetTarget(runtime, sourceContext.host.id, sourceContext.targetPath)
+    }
+    return {
+      sourceBefore,
+      destination: destinationOutcome,
+      sourceDeleted: false,
+      sourceFailure: { code: failure.code, message: failure.message },
+    }
+  }
+  forgetTarget(runtime, sourceContext.host.id, sourceContext.targetPath)
+  return { sourceBefore, destination: destinationOutcome, sourceDeleted: true }
 }
 
 /**
@@ -1436,8 +1893,9 @@ function bindOptionalMutations(fs: FsSurface, originals: Originals): Originals {
 /**
  * Refuse a mutating fs method this backend does not implement remotely.
  *
- * `writeText` and `editText` are reimplemented; `patchText`, `deleteFile`, and
- * `moveFile` are not. Leaving them on the mounted provider would run the
+ * `writeText`, `editText`, and (on 0.2.2) `patchText`, `deleteFile` and
+ * `moveFile` are reimplemented remotely. On an older provider that lacks the
+ * patch mutations, leaving them on the mounted provider would run the
  * provider's own local implementation against the placeholder spelling, which
  * really is a path on this computer: `apply_patch` would then edit a local file
  * that only looks like the remote one, and `present`/uploads may already have

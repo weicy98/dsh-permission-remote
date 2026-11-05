@@ -4,11 +4,15 @@
  * Presets register their tools on an ancestor scope. A registration on the
  * root context does not cover them. The wrapper must close over the official
  * execute captured BEFORE register: a later get() returns the wrapper and
- * recurses. `read`, `write`, and `edit` are deliberately absent: the remote
- * filesystem backend serves them through the official tools.
+ * recurses. `read`, `write`, `edit` and `apply_patch` are deliberately absent:
+ * the remote filesystem backend serves them through the official tools.
+ * `str_replace_editor` is the exception: its official `resolveTarget` calls
+ * `ctx.fs.resolve(path, { signal })` without a cwd, so a remote real absolute
+ * path would fall through to the local provider. Its shadow only rewrites
+ * `args.path` and delegates to the official execute; the schema stays official.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'] as const
+export const ROUTED_TOOLS = ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
 
 /**

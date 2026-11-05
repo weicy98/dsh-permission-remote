@@ -1,12 +1,12 @@
 # dsh-permission-remote
 
-把一台 Linux 或 macOS 机器上的目录做成 DeepSeek Harness（DSH）工作区。标准会话里的 `bash`、`read`、`write`、`edit`、`read_image`、`glob`、`grep` 在那台机器上执行。只读、工作区可写、完全放开，以及一次放宽，仍用这个会话现有的 Permissions 和审批卡片。
+把一台 Linux 或 macOS 机器上的目录做成 DeepSeek Harness（DSH）工作区。标准会话里的 `bash`、`read`、`write`、`edit`、`read_image`、`glob`、`grep` 在那台机器上执行。在 DSH 0.2.2 上，如果组合里启用了可选的 `apply_patch` 和 `str_replace_editor`，它们同样在那台机器上执行。只读、工作区可写、完全放开，以及一次放宽，仍用这个会话现有的 Permissions 和审批卡片。
 
 [English](#english).
 
 ## 安装
 
-前置：DSH `>=0.2.1-rc.3 <0.3.0`、`web` profile、Node `>= 22.5`。仓库：[weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote)。
+前置：DSH `>=0.2.2-rc.1 <0.3.0`、`web` profile、Node `>= 22.5`。仓库：[weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote)。
 
 从 GitHub 安装：
 
@@ -191,22 +191,36 @@ DSH 本身跑在 Windows 上时，远端工作区的对话只暴露远端 `bash`
 
 Linux 上要让命令遵守当前权限，需要在那台机器上安装 bubblewrap。设置页可以代为安装，页面上也有可以自己执行的命令。
 
+### 可选的 `apply_patch` 与 `str_replace_editor`（DSH 0.2.2）
+
+DSH 0.2.2 还有两个可选的文件工具，在远端工作区里同样落在这台机器上。两者默认都关着，插件不会替你启用，要在预设或组合里自己打开：把 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 设为 `true` 才注册 `apply_patch`（所有官方预设都默认 `false`）；`@deepseek-ai/dsh-tool-str-replace-editor` 是独立包，只在自定义组合里挂载，官方预设不带它。
+
+路径写法：
+
+- `apply_patch` 的路径按会话工作目录（本机占位目录）解析，也可以直接给绝对占位路径。
+- `str_replace_editor` 只收绝对路径，把 `read` 或右侧栏文件树返回的占位路径原样传回去就好。若给了它一个远端真实绝对路径（例如 `/home/me/project/a.ts`），插件会把它改写成同一台主机对应的占位路径，绝不会在本机按这个名字读写文件；若该工具的转发层没有挂载，这类调用会被直接拒绝，同样不会碰本机文件。远端真实绝对路径只用于 `bash` 命令。
+
+行为：`apply_patch` 的新增、更新、删除、移动，和编辑器的 `view`、`create`、`str_replace`、`insert`，都在远端执行，并遵守会话的 Permissions 档位、审批卡片和远端沙箱，删除与移动也不例外。整个补丁先整体预检，再按顺序逐条提交；中途失败不会回滚，已提交的操作留在远端。一次「移动」若已发布目标、却删不掉源文件，目标保留，调用只报告这一步失败。
+
+限制：只处理 UTF-8 文本，不支持二进制；没有回滚。`str_replace_editor` 没有一次性的 `sandbox_permissions` / `justification` 提权，请用会话里已经设好的常驻 Permissions 档位。移动涉及两个路径，不是原子操作；删除只涉及一个路径。
+
 ## 开发
 
 ```sh
 npm install
 npm test
+npm run test:ci   # 官方工具探针缺失时直接失败，CI 用这个
 npm run typecheck
 npm run build
 ```
 
-`lib/` 是安装入口，改完源码需要重新构建。
+`lib/` 是安装入口，改完源码需要重新构建。`npm run test:ci` 需要本机装有 DSH 0.2.2；`npm test` 在找不到时会把官方工具集成用例跳过。
 
 ## English
 
-SSH remote workspaces for the DSH web GUI. On a workspace created from **Settings → SSH hosts**, the standard tools `bash`, `read`, `write`, `edit`, `read_image`, `glob`, and `grep` run on that Linux or macOS host. The session keeps its existing Permissions selector and approval card.
+SSH remote workspaces for the DSH web GUI. On a workspace created from **Settings → SSH hosts**, the standard tools `bash`, `read`, `write`, `edit`, `read_image`, `glob`, and `grep` run on that Linux or macOS host. On DSH 0.2.2, the optional `apply_patch` and `str_replace_editor` tools, when enabled in the composition, run on that host too. The session keeps its existing Permissions selector and approval card.
 
-Requires DSH `>=0.2.1-rc.3 <0.3.0`, the `web` profile, and Node `>= 22.5`. Source: [weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote).
+Requires DSH `>=0.2.2-rc.1 <0.3.0`, the `web` profile, and Node `>= 22.5`. Source: [weicy98/dsh-permission-remote](https://github.com/weicy98/dsh-permission-remote).
 
 From GitHub:
 
@@ -345,3 +359,16 @@ A few consequences:
 You can connect directly to one Linux or macOS machine. Jump hosts and Windows remotes are not supported. If the network drops, the operation in progress fails. Files already written on the remote stay there: reconnecting does not write them again and does not undo them.
 
 On Linux, install bubblewrap on that machine if commands should follow the current permission mode. The settings page can install it, and it also shows the command you can run yourself.
+
+### Optional `apply_patch` and `str_replace_editor` (DSH 0.2.2)
+
+DSH 0.2.2 brings two optional file tools that, in a remote workspace, also act on the remote host. Both are off by default and the plugin does not enable them for you; you opt in through the preset or composition. Setting `applyPatch: true` on `@deepseek-ai/dsh-tool-fs` registers `apply_patch` (every official preset leaves it `false`), while `@deepseek-ai/dsh-tool-str-replace-editor` is a standalone package mounted only in custom compositions and absent from the default presets.
+
+Paths:
+
+- `apply_patch` paths are resolved against the session working directory (the local placeholder directory), or given as absolute placeholder paths.
+- `str_replace_editor` requires absolute paths, so pass back the placeholder paths that `read` or the file tree returned. A real remote absolute path such as `/home/me/project/a.ts` is rewritten by the plugin to that same host's placeholder path, so it never reads or writes a local file by that name; when the tool's rewriting shadow is not mounted, such a call is refused instead, still without touching a local file. Real remote absolute paths belong in `bash` commands only.
+
+Behaviour: `apply_patch` add / update / delete / move and the editor's view / create / str_replace / insert all run on the remote host and obey the session Permissions selector, approval cards, and the remote sandbox, delete and move included. A whole patch is preflighted first, then its operations commit in order and are not rolled back on failure. A move that has published its destination but cannot delete the source keeps that destination and reports the failure.
+
+Limits: UTF-8 text only, no binary files, and no rollback. `str_replace_editor` has no one-shot `sandbox_permissions` / `justification` escalation, so use the session's standing Permissions mode. Move spans two paths and is not atomic; delete touches a single path.

@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.11.0",
+  "version": "0.13.0",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
@@ -37,7 +37,7 @@
   ],
   "engines": {
     "node": ">=22.5",
-    "dsh": ">=0.2.1-rc.3 <0.3.0"
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
   },
   "dsh": {
     "bundle": {
@@ -51,7 +51,8 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --test tests/*.spec.ts"
+    "test": "node --experimental-transform-types --test tests/*.spec.ts",
+    "test:ci": "DSH_REQUIRE_OFFICIAL_TOOLS=1 node --experimental-transform-types --test tests/*.spec.ts"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",
@@ -65,19 +66,21 @@
     "@vscode/ripgrep-linux-x64": "^1.15.11"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis": "^4.1.0",
     "@deepseek-ai/cosmokit": "^1.8.6",
-    "@deepseek-ai/dsh-atomic-write": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-credentials": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-fs": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-home-paths": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-sandbox": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-settings": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/dsh-typert-protocol": ">=0.2.1-rc.3 <0.3.0",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/dsh-atomic-write": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-fs": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-sandbox": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-settings": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.19.0"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-tool-executor-native": "^0.2.2-rc.1",
+    "@deepseek-ai/dsh-tool-executor-ptc": "^0.2.2-rc.1",
     "@types/node": "^24.0.0",
     "@types/react": "~18.3.1",
     "@types/semver": "^7.8.0",

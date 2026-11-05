@@ -1267,15 +1267,16 @@ test('a write to another workspace on the same host is refused', async () => {
   assert.equal(writes, 0)
 })
 
-test('a mutating fs method the backend does not implement remotely refuses only a remote target', async () => {
+test('the 0.2.2 patch mutations are routed remotely and never reach the local provider', async () => {
   const { backend } = createHarness()
   const remote = await backend.resolve(placeholder('a.ts'))
   const remoteB = await backend.resolve(placeholder('b.ts'))
   const local: FsTarget = { targetKey: FsTargetKey('/tmp/local'), displayPath: '/tmp/local' }
 
-  // `apply_patch` reaches `patchText`, and a delete/move reaches its own method.
-  // None of them has a remote implementation, so each must be refused instead
-  // of running the provider's local code against the placeholder spelling.
+  // `apply_patch` reaches `patchText`, and a delete/move reaches its own
+  // method. All three are now remote implementations: without a sandbox policy
+  // they fail closed instead of running the provider's local code against the
+  // placeholder spelling.
   for (const [label, run] of [
     ['patchText', () => backend.patchText(remote)],
     ['deleteFile', () => backend.deleteFile(remote)],
@@ -1283,7 +1284,6 @@ test('a mutating fs method the backend does not implement remotely refuses only 
   ] as const) {
     await assert.rejects(run, (error: unknown) => {
       assert.equal(codeOf(error), 'FS_SANDBOX_DENIED', `${label} must be refused, not run locally`)
-      assert.match((error as Error).message, /cannot be changed by this operation/)
       return true
     }, label)
   }

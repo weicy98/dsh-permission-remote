@@ -50,9 +50,11 @@ test('present is routed so a remote session can deliver a file', () => {
   assert.ok(present!.official, 'the official execute is captured for delegation')
 })
 
-test('official read, write, and edit tools stay outside the shadow plan', () => {
+test('official read, write, edit and apply_patch tools stay outside the shadow plan', () => {
   const plans = planShadows(name => ({ execute: async () => name }))
   const names = plans.map(plan => String(plan.name))
-  assert.deepEqual(names, ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present'])
-  assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit'), false)
+  // str_replace_editor is the exception: its official resolveTarget omits cwd,
+  // so a thin path-rewriting shadow is required (see shell-install.spec.ts).
+  assert.deepEqual(names, ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'])
+  assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit' || name === 'apply_patch'), false)
 })

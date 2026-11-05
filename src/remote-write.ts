@@ -21,7 +21,7 @@ import {
   type RemoteFileRoots,
 } from './profile.ts'
 import { shJoin } from './shell-quote.ts'
-import { isSftpMissing, type SshPool, type SecretMaterial } from './ssh-pool.ts'
+import { isSftpMissing, type ExecResult, type SshPool, type SecretMaterial } from './ssh-pool.ts'
 import type { RunnerStatus } from './execute.ts'
 
 /** Resolve a possibly-not-yet-existing remote path through its nearest real ancestor. */
@@ -219,6 +219,45 @@ function lockScript(target: string, lockRoot: string): string {
   return `if command -v flock >/dev/null 2>&1; then exec 9>${lockQuoted}; flock -x 9; else count=0; while ! mkdir ${lockDirQuoted} 2>/dev/null; do count=$((count + 1)); if [ "$count" -gt 200 ]; then echo 'remote write lock timeout' >&2; exit 75; fi; sleep 0.05; done; trap 'rmdir ${lockDirQuoted} 2>/dev/null || true' EXIT; fi`
 }
 
+/**
+ * Map a failed remote commit command to the typed filesystem error the local
+ * backend would raise.
+ *
+ * Both `commitRemoteText` and `commitRemoteDelete` run under the same guard
+ * script and the same sandbox wrapper, so their exit codes mean the same
+ * thing. Keeping one mapper here stops the two call sites from drifting when a
+ * new code is added. Codes 23/26/27 are only emitted by one of them, and an
+ * unused branch is harmless for the other.
+ */
+function mapRemoteCommitFailure(result: ExecResult, mode: SandboxMode, action: 'write' | 'delete'): never {
+  const stderr = result.stderr.trim()
+  if (sandboxDenied(result.code, result.stderr)) {
+    throw new FsError(`[sandbox: ${mode}] remote ${action} denied: ${stderr || 'sandbox denied'}`, 'FS_SANDBOX_DENIED')
+  }
+  // Distinct exit codes let a race that happens after the local pre-check
+  // surface as the same typed error as the equivalent local backend.
+  if (result.code === 23 || /remote target already exists/i.test(stderr)) {
+    throw new FsError(stderr || 'remote target already exists', 'FS_NOT_OBSERVED')
+  }
+  if (result.code === 24 || /remote file version changed/i.test(stderr)) {
+    throw new FsError(stderr || 'remote file version changed', 'FS_STALE_VERSION')
+  }
+  if (result.code === 25 || /requires strong or hash version evidence/i.test(stderr)) {
+    throw new FsError(stderr || `remote ${action} requires strong or hash version evidence`, 'FS_IO_ERROR')
+  }
+  // A vanished delete target is an error, not a silent success (no `rm -f`).
+  if (result.code === 26 || /disappeared or is not a regular file/i.test(stderr)) {
+    throw new FsError(stderr || 'remote delete target disappeared', 'FS_IO_ERROR')
+  }
+  if (result.code === 27 || /is a directory/i.test(stderr)) {
+    throw new FsError(stderr || 'remote delete target is a directory', 'FS_NOT_REGULAR_FILE')
+  }
+  if (/permission denied/i.test(stderr)) {
+    throw new FsError(stderr || `remote ${action} permission denied`, 'FS_PERMISSION_DENIED')
+  }
+  throw new Error(stderr || `remote ${action} failed`)
+}
+
 /** Atomically write UTF-8 content through a temp file in the target directory. */
 export async function commitRemoteText(
   pool: SshPool,
@@ -246,26 +285,50 @@ export async function commitRemoteText(
     ? script
     : fileCommand(status, mode, roots, script)
   const result = await pool.exec(host, secret, wrapped, 20_000, signal, content)
-  if (result.code !== 0) {
-    const stderr = result.stderr.trim()
-    if (sandboxDenied(result.code, result.stderr)) {
-      throw new FsError(`[sandbox: ${mode}] remote write denied: ${stderr || 'sandbox denied'}`, 'FS_SANDBOX_DENIED')
-    }
-    // The remote guard and the no-clobber publication use distinct exit codes
-    // so a race that happens after the local pre-check still surfaces as the
-    // same typed filesystem error as the equivalent local backend.
-    if (result.code === 23 || /remote target already exists/i.test(stderr)) {
-      throw new FsError(stderr || 'remote target already exists', 'FS_NOT_OBSERVED')
-    }
-    if (result.code === 24 || /remote file version changed/i.test(stderr)) {
-      throw new FsError(stderr || 'remote file version changed', 'FS_STALE_VERSION')
-    }
-    if (result.code === 25 || /requires strong or hash version evidence/i.test(stderr)) {
-      throw new FsError(stderr || 'remote write requires strong or hash version evidence', 'FS_IO_ERROR')
-    }
-    if (/permission denied/i.test(stderr)) {
-      throw new FsError(stderr || 'remote write permission denied', 'FS_PERMISSION_DENIED')
-    }
-    throw new Error(stderr || 'remote write failed')
+  if (result.code !== 0) mapRemoteCommitFailure(result, mode, 'write')
+}
+
+/**
+ * Remove one remote UTF-8 file without following a final symlink.
+ *
+ * `rm` (never `rm -f`) is deliberate: a target that disappeared between the
+ * lstat pre-check and this command must surface as FS_IO_ERROR, exactly like
+ * the local backend's `removeFile`. The type check, the version guard and the
+ * removal all run under one cooperative lock, so a concurrent writer cannot
+ * slip a different file in between them. Delete uses the same sandbox fence as
+ * a write, so it obeys the session's Permissions mode and workspace roots.
+ */
+export async function commitRemoteDelete(
+  pool: SshPool,
+  host: HostConfig,
+  secret: SecretMaterial,
+  status: RunnerStatus,
+  mode: SandboxMode,
+  roots: RemoteFileRoots,
+  target: string,
+  signal?: AbortSignal,
+  expected?: { version: FsVersion },
+): Promise<void> {
+  if (signal?.aborted === true) throw new FsError('aborted', 'FS_ABORTED')
+  if (mode !== 'danger-full-access' && !status.sandbox.available) {
+    throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
+  const quoted = shJoin([target])
+  const intent: FsWriteIntent | undefined = expected === undefined
+    ? undefined
+    : { kind: 'replaceIfVersion', version: expected.version }
+  const lockRoot = status.roots.userTmp || status.roots.tmp || posix.dirname(target)
+  const script = [
+    'set -e',
+    lockScript(target, lockRoot),
+    writeGuardScript(target, intent),
+    `if [ -d ${quoted} ]; then echo 'remote delete target is a directory' >&2; exit 27; fi`,
+    `if [ -L ${quoted} ] || [ ! -f ${quoted} ]; then echo 'remote delete target disappeared or is not a regular file' >&2; exit 26; fi`,
+    `rm -- ${quoted}`,
+  ].filter(line => line.length > 0).join('\n')
+  const wrapped = mode === 'danger-full-access'
+    ? script
+    : fileCommand(status, mode, roots, script)
+  const result = await pool.exec(host, secret, wrapped, 20_000, signal)
+  if (result.code !== 0) mapRemoteCommitFailure(result, mode, 'delete')
 }

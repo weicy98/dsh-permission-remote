@@ -19,6 +19,21 @@ export const PWSH_SECTION = 'tool:pwsh'
 /** Separate from `tool:bash`, whose official text is only the exit-code sentence. */
 export const REMOTE_POSIX_SECTION = 'remote-posix-shell'
 
+/** Extra guidance for the optional DSH 0.2.2 patch / editor file tools. */
+export const REMOTE_FILE_TOOLS_SECTION = 'remote-file-tools'
+
+/**
+ * Returned when a `str_replace_editor` call in a remote session names a bare
+ * absolute path that is not a remote placeholder AND its path-rewriting shadow
+ * is not mounted. Without the shadow the official tool resolves that path with
+ * the local filesystem, so refusing is the only safe answer.
+ */
+export const STR_REPLACE_EDITOR_PATH_REFUSED = 'str_replace_editor is not safe on this remote workspace right now: this absolute path is not a remote placeholder path and no path-rewriting shadow is mounted. Pass the placeholder path returned by read or the file tree.'
+
+export const REMOTE_APPLY_PATCH_PROMPT = 'The optional apply_patch tool runs on this remote host. It accepts paths relative to the session working directory, absolute placeholder paths, and bare remote absolute paths: /srv/app/a.ts is resolved against the remote host, not this computer.'
+
+export const REMOTE_EDITOR_PROMPT = 'The optional str_replace_editor tool runs on this remote host. It requires absolute paths: pass back the placeholder paths returned by read or the file tree. A bare remote absolute path is rewritten by the plugin to that placeholder spelling and never reaches this computer; remote real absolute paths belong in bash commands only.'
+
 /**
  * Returned to the model when a Windows shell would run on the control host.
  * Fixed text: the guard does not invent a translated command.

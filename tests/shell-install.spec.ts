@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
-import { mapRemoteToLocal } from '../src/router.ts'
-import { PWSH_SECTION, REMOTE_POSIX_SECTION, REMOTE_WORKSPACE_CONTEXT, WINDOWS_SHELL_DENIED } from '../src/shell-surface.ts'
+import { mapRemoteToLocal, routeByCwd } from '../src/router.ts'
+import { PWSH_SECTION, REMOTE_FILE_TOOLS_SECTION, REMOTE_POSIX_SECTION, REMOTE_WORKSPACE_CONTEXT, WINDOWS_SHELL_DENIED } from '../src/shell-surface.ts'
 
 const remoteCwd = mapRemoteToLocal('host1', '/srv/app')!
 const localCwd = '/tmp/local-project'
@@ -46,6 +48,14 @@ interface SurfaceOptions {
   failSectionDispose?: boolean
   /** Simulate a host whose systemPrompt predates the runtime-context API. */
   noContextApi?: boolean
+  /** Provide a minimal fs service so the remote fs patch counts as mounted. */
+  fsReady?: boolean
+  /** Publish a TOOL_APPLY_PATCH placement for the optional file-tools section. */
+  fileToolsOrder?: number
+  /** Make apply_patch and str_replace_editor visible to planShadows / sections. */
+  officialPatchTools?: boolean
+  /** Restrict the visible patch tools to this subset (used to check the prompt split). */
+  visiblePatchTools?: readonly string[]
 }
 
 function surface(options: SurfaceOptions) {
@@ -64,6 +74,28 @@ function surface(options: SurfaceOptions) {
   } else if (options.directory !== 'missing') {
     ctx.provide('workingDirectory', { get: () => live.current })
   }
+  if (options.fsReady === true) {
+    const noop = async () => undefined
+    ctx.provide('fs', {
+      async resolve(requested: string) { return { targetKey: requested, displayPath: requested } },
+      processPath: (target: { targetKey: unknown }) => String(target.targetKey),
+      processPathFromHostPath: (hostPath: string) => hostPath,
+      async lstat() { return undefined },
+      async stat() { return undefined },
+      async listDir() { return [] },
+      async readText() { return '' },
+      async streamText() { return (async function* () {})() },
+      async readBytes() { return new Uint8Array() },
+      async readByteRange() { return new Uint8Array() },
+      async writeText() { return 'local-write' },
+      async editText() { return 'local-edit' },
+      async patchText() { return 'local-patch' },
+      async deleteFile() { return 'local-delete' },
+      async moveFile() { return 'local-move' },
+      contains: () => true,
+      watch: noop,
+    })
+  }
   const pluginDisposers: Array<() => void> = []
   const writable = ctx as unknown as { effect(execute: () => unknown): unknown }
   const originalEffect = writable.effect.bind(ctx)
@@ -79,12 +111,14 @@ function surface(options: SurfaceOptions) {
   const contexts: RegisteredContext[] = []
   const denies: string[] = []
   const restrictCalls: string[] = []
-  const guards: Array<{ active: boolean, fn: (execution: { name: string, agent?: object }) => string | undefined }> = []
+  const guards: Array<{ active: boolean, fn: (execution: { name: string, arguments?: unknown, agent?: object }) => string | undefined }> = []
   const listeners: Array<{ event: string, active: boolean, fn: (...args: unknown[]) => unknown }> = []
   const cleanups: Array<() => void> = []
   let sectionDisposeFailures = options.failSectionDispose === true ? 1 : 0
   const restrictable = options.restrictable ?? new Set(['pwsh', 'powershell', 'cmd'])
   const officialCalls: string[] = []
+  const officialArgs: Array<{ name: string, args: unknown }> = []
+  const localReads: string[] = []
   const header = { cwd: options.headerCwd }
   const agent = {
     session: { header },
@@ -92,10 +126,18 @@ function surface(options: SurfaceOptions) {
       tools: {
         get: (name: string) => {
           if (name === 'bash' && options.officialBash !== true) return undefined
-          if (!['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open'].includes(name)) return undefined
+          const official = ['bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open']
+          if (options.officialPatchTools === true) official.push('apply_patch', 'str_replace_editor')
+          if (options.visiblePatchTools !== undefined) official.push(...options.visiblePatchTools)
+          if (!official.includes(name)) return undefined
           return {
-            execute: async () => {
+            execute: async (args: unknown) => {
               officialCalls.push(name)
+              officialArgs.push({ name, args })
+              if (name === 'str_replace_editor') {
+                const requested = (args as { path?: unknown }).path
+                if (typeof requested === 'string') localReads.push(requested)
+              }
               return 'official'
             },
           }
@@ -118,7 +160,7 @@ function surface(options: SurfaceOptions) {
             if (index >= 0) denies.splice(index, 1)
           }
         },
-        guard: (fn: (execution: { name: string, agent?: object }) => string | undefined) => {
+        guard: (fn: (execution: { name: string, arguments?: unknown, agent?: object }) => string | undefined) => {
           const entry = { active: true, fn }
           guards.push(entry)
           return () => { entry.active = false }
@@ -142,6 +184,7 @@ function surface(options: SurfaceOptions) {
         getSectionOrder: (name: string) => {
           if (name === 'TOOL_PWSH') return 1010
           if (name === 'TOOL_BASH') return 1000
+          if (name === 'TOOL_APPLY_PATCH' && options.fileToolsOrder !== undefined) return options.fileToolsOrder
           throw new Error(`unknown section order ${name}`)
         },
         ...options.noContextApi === true ? {} : {
@@ -186,10 +229,10 @@ function surface(options: SurfaceOptions) {
     assert.ok(sessionListener)
     sessionListener.fn(agent.session as never, { type, data: cwd === undefined ? {} : { cwd } } as never)
   }
-  const guard = (name: string) => {
+  const guard = (name: string, args?: unknown) => {
     const entry = guards.find(item => item.active)
     assert.ok(entry)
-    return entry.fn({ name, agent })
+    return entry.fn({ name, arguments: args, agent })
   }
   const assemble = async (names: string[], scope: object = agent) => {
     const entry = listener('system-prompt/assemble')
@@ -215,6 +258,8 @@ function surface(options: SurfaceOptions) {
     header,
     live,
     officialCalls,
+    officialArgs,
+    localReads,
     restrictCalls,
     denies,
     warnings,
@@ -322,6 +367,95 @@ test('the fs guard does not fire on a local session', async () => {
   await session.created()
   assert.equal(session.guard('write'), undefined)
   assert.equal(session.guard('apply_patch'), undefined)
+})
+
+test('file tools pass the guard once the remote fs patch is mounted', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true })
+  await session.created()
+  assert.equal(session.guard('read'), undefined)
+  assert.equal(session.guard('write'), undefined)
+  assert.equal(session.guard('apply_patch'), undefined)
+  assert.equal(session.guard('str_replace_editor', { path: `${remoteCwd}/a.ts` }), undefined)
+})
+
+test('a bare absolute editor path is refused when no rewriting shadow is mounted', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true })
+  await session.created()
+  // The fixture does not mount the official editor tool, so no shadow exists.
+  assert.match(session.guard('str_replace_editor', { path: '/srv/app/a.ts' }) ?? '', /no path-rewriting shadow/)
+  assert.equal(session.guard('str_replace_editor', { path: 'a.ts' }), undefined)
+  assert.equal(session.guard('str_replace_editor', { path: `${remoteCwd}/a.ts` }), undefined)
+  // A local session keeps the official behaviour.
+  const local = surface({ headerCwd: localCwd, officialBash: false, fsReady: true })
+  await local.created()
+  assert.equal(local.guard('str_replace_editor', { path: '/srv/app/a.ts' }), undefined)
+})
+
+test('the editor shadow maps a bare absolute path onto the same host placeholder', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, officialPatchTools: true })
+  await session.created()
+  const shadow = session.activeTools('str_replace_editor')[0]
+  assert.ok(shadow)
+  // With the shadow mounted, the guard leaves the raw call alone and the
+  // wrapper rewrites the path before delegating to the official execute.
+  assert.equal(session.guard('str_replace_editor', { path: '/srv/app/a.ts' }), undefined)
+  await shadow.execute({ command: 'view', path: '/srv/app/a.ts' }, { agent: session.agent })
+  const call = session.officialArgs.find(entry => entry.name === 'str_replace_editor')
+  assert.ok(call)
+  assert.equal((call.args as { path: string }).path, mapRemoteToLocal('host1', '/srv/app/a.ts'))
+  // A placeholder path is already remote and passes through untouched.
+  await shadow.execute({ command: 'view', path: `${remoteCwd}/a.ts` }, { agent: session.agent })
+  const second = session.officialArgs.filter(entry => entry.name === 'str_replace_editor').at(-1)
+  assert.equal((second?.args as { path: string }).path, `${remoteCwd}/a.ts`)
+})
+
+test('the file-tools prompt names only the tools the composition mounts', async () => {
+  const onlyEditor = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, fileToolsOrder: 1020, visiblePatchTools: ['str_replace_editor'] })
+  await onlyEditor.created()
+  const editorText = onlyEditor.render()
+  assert.match(editorText, /str_replace_editor tool runs on this remote host/)
+  assert.doesNotMatch(editorText, /apply_patch tool runs/)
+  const onlyPatch = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, fileToolsOrder: 1020, visiblePatchTools: ['apply_patch'] })
+  await onlyPatch.created()
+  const patchText = onlyPatch.render()
+  assert.match(patchText, /apply_patch tool runs on this remote host/)
+  assert.doesNotMatch(patchText, /str_replace_editor tool runs/)
+})
+
+test('a local decoy file is never named to the official editor tool', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'dsh-editor-decoy-'))
+  const decoy = path.join(directory, 'a.ts')
+  writeFileSync(decoy, 'LOCAL DECOY')
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, officialPatchTools: true })
+  await session.created()
+  const shadow = session.activeTools('str_replace_editor')[0]
+  assert.ok(shadow)
+  // This bare absolute path really exists on this computer. Without the
+  // path-rewriting shadow the official resolveTarget (no cwd) would hand it
+  // to the local filesystem and read/overwrite the decoy.
+  await shadow.execute({ command: 'view', path: decoy }, { agent: session.agent })
+  const call = session.officialArgs.find(entry => entry.name === 'str_replace_editor')
+  assert.ok(call)
+  const passed = (call.args as { path: string }).path
+  assert.notEqual(passed, decoy, 'the bare local path must never reach the official tool')
+  assert.equal(routeByCwd(passed).kind, 'remote')
+  assert.equal(session.localReads.includes(decoy), false)
+  assert.equal(readFileSync(decoy, 'utf8'), 'LOCAL DECOY', 'the local file is untouched')
+})
+
+test('the optional file-tools section appears only when a patch tool is visible', async () => {
+  const session = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, fileToolsOrder: 1020, officialPatchTools: true })
+  await session.created()
+  assert.equal(session.activeSections(REMOTE_FILE_TOOLS_SECTION).length, 1)
+  assert.match(session.render(), /apply_patch tool runs on this remote host/)
+  assert.match(session.render(), /bare remote absolute paths/)
+  assert.match(session.render(), /str_replace_editor tool runs on this remote host/)
+  const without = surface({ headerCwd: remoteCwd, officialBash: false, fsReady: true, fileToolsOrder: 1020 })
+  await without.created()
+  const empty = without.activeSections(REMOTE_FILE_TOOLS_SECTION)
+  assert.equal(empty.length, 1)
+  const text = empty[0]?.text
+  assert.equal(typeof text === 'function' ? text() : text, '')
 })
 
 test('a non-unknown restrict error fails remote agent creation, drops both registration sets, and refuses every tool', async () => {
