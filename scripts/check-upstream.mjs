@@ -13,7 +13,8 @@
 import { locateUpstreamWorker, manifestEntryFor, probeContract, readWorkerManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 
 const argv = process.argv.slice(2)
-const update = argv.includes('--update')
+const adapt = argv.includes('--adapt')
+const update = argv.includes('--update') || adapt
 const check = argv.includes('--check') || !update
 const rootIndex = argv.findIndex(value => value === '--dsh-root')
 if (rootIndex !== -1) {
@@ -42,6 +43,7 @@ if (update) {
   verified.push(entry)
   writeWorkerManifest({ contractVersion: 1, verified })
   console.log(`check:upstream: wrote manifest entry for DSH ${entry.dshVersion} / runtime ${entry.ptcRuntimeNodeVersion}`)
+  if (adapt) console.log('check:upstream: static probes passed. Run `npm run test:ptc` and `npm run e2e:ptc` before treating this host as production-verified.')
   process.exit(0)
 }
 

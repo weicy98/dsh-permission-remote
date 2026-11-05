@@ -56,7 +56,8 @@
     "test:ci": "DSH_REQUIRE_OFFICIAL_TOOLS=1 node --experimental-transform-types --test tests/*.spec.ts",
     "test:ptc": "node --experimental-transform-types --test tests/ptc-*.spec.ts",
     "e2e:ptc": "node --experimental-transform-types --test tests/ptc-live.e2e.ts",
-    "check:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --check"
+    "check:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --check",
+    "adapt:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --adapt"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",
