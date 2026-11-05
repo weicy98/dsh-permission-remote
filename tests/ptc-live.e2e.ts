@@ -54,7 +54,10 @@ interface LiveHarness {
   readonly dispose: () => Promise<void>
 }
 
-async function harness(): Promise<LiveHarness> {
+async function harness(
+  executionMode: 'per-call' | 'persistent-in-memory' | 'vm-script' = 'per-call',
+  scriptPersistence = false,
+): Promise<LiveHarness> {
   const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-live-home-'))
   const env = { DSH_HOME: home }
   const placeholder = mapRemoteToLocal(host.id, remoteRoot, env)!
@@ -87,8 +90,8 @@ async function harness(): Promise<LiveHarness> {
     resolve: () => ({ mode: 'read-only', workspaceRoot: remoteRoot }),
   })
   await ctx.plugin(NodePtcRuntime, {
-    executionMode: 'per-call',
-    scriptPersistence: false,
+    executionMode,
+    scriptPersistence,
     timeoutMs: 120_000,
     maxTimeoutMs: 600_000,
     maxOutputBytes: 1_000_000,
@@ -204,6 +207,37 @@ test('live: timeout leaves no worker or shim process behind', { skip: !ready }, 
     assert.equal(check.stdout.trim(), '')
   } finally {
     await pool.dispose()
+    await h.dispose()
+  }
+})
+
+
+test('live: persistent-in-memory keeps state in the SSH-host worker', { skip: !ready }, async () => {
+  const h = await harness('persistent-in-memory')
+  const owner = {}
+  try {
+    const first = await h.runtime.run(h.runtime.resolve({
+      program: 'var retained = 40\nretained',
+      cwd: h.placeholder,
+      timeoutMs: 30_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+    }))
+    assert.equal(first.error, undefined, JSON.stringify(first))
+    assert.equal(first.value, 40)
+    const second = await h.runtime.run(h.runtime.resolve({
+      program: 'retained + 2',
+      cwd: h.placeholder,
+      timeoutMs: 30_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: remoteRoot },
+    }))
+    assert.equal(second.error, undefined, JSON.stringify(second))
+    assert.equal(second.value, 42)
+  } finally {
+    await h.runtime.release(owner)
     await h.dispose()
   }
 })
