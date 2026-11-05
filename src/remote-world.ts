@@ -238,9 +238,18 @@ class RemotePtcHandle implements SubprocessHandle {
       )
       this.handshakeTimer = setTimeout(() => this.fail(new Error('PTC shim did not print a control-channel handshake')), 10_000)
       const endpoint = await this.waitForHandshake()
-      const forward = endpoint.kind === 'unix'
-        ? await this.transport.forwardOutStreamLocal(this.world.host, this.world.secret, endpoint.path, this.spec.signal)
-        : await this.transport.forwardOutTcp(this.world.host, this.world.secret, '127.0.0.1', endpoint.port, this.spec.signal)
+      let forward: Duplex | undefined
+      if (endpoint.unixPath !== undefined) {
+        try {
+          forward = await this.transport.forwardOutStreamLocal(this.world.host, this.world.secret, endpoint.unixPath, this.spec.signal)
+        } catch (error) {
+          if (endpoint.tcpPort === undefined) throw error
+        }
+      }
+      if (forward === undefined && endpoint.tcpPort !== undefined) {
+        forward = await this.transport.forwardOutTcp(this.world.host, this.world.secret, '127.0.0.1', endpoint.tcpPort, this.spec.signal)
+      }
+      if (forward === undefined) throw new Error('PTC shim reported no usable forwarding endpoint')
       this.forward = forward
       if (this.settled) {
         forward.destroy()
@@ -265,18 +274,22 @@ class RemotePtcHandle implements SubprocessHandle {
     while (newline !== -1) {
       const line = this.stderrBuffer.slice(0, newline).replace(/\r$/u, '')
       this.stderrBuffer = this.stderrBuffer.slice(newline + 1)
-      const match = /^__DSH_PTC_READY__\s+(\S+)\s+(unix:(.+)|tcp:([^:]+):(\d+))\s*$/u.exec(line)
-      if (!this.ready && match !== null) {
-        this.ready = true
-        this.handshake = {
-          kind: match[3] !== undefined ? 'unix' : 'tcp',
-          path: match[3] ?? '',
-          hostname: match[4] ?? '127.0.0.1',
-          port: Number(match[5] ?? 0),
-          token: match[1] ?? '',
+      const parts = line.trim().split(/\s+/u)
+      if (!this.ready && parts[0] === '__DSH_PTC_READY__' && parts[1] !== undefined) {
+        const unix = parts.slice(2).find(value => value.startsWith('unix:'))
+        const tcp = parts.slice(2).find(value => value.startsWith('tcp:'))
+        if (unix !== undefined || tcp !== undefined) {
+          this.ready = true
+          this.handshake = {
+            token: parts[1],
+            ...(unix === undefined ? {} : { unixPath: unix.slice(5) }),
+            ...(tcp === undefined ? {} : { tcpPort: Number(tcp.slice(4).split(':').at(-1)) }),
+          }
+          this.resolveHandshake?.()
+          this.resolveHandshake = undefined
+        } else {
+          this.stderr.write(`${line}\n`)
         }
-        this.resolveHandshake?.()
-        this.resolveHandshake = undefined
       } else {
         this.stderr.write(`${line}\n`)
       }
@@ -284,11 +297,11 @@ class RemotePtcHandle implements SubprocessHandle {
     }
   }
 
-  private handshake: { kind: 'unix', path: string, hostname?: string, port?: number, token: string } | { kind: 'tcp', path?: string, hostname: string, port: number, token: string } | undefined
+  private handshake: { token: string, unixPath?: string, tcpPort?: number } | undefined
   private resolveHandshake: (() => void) | undefined
   private rejectHandshake: ((error: Error) => void) | undefined
 
-  private async waitForHandshake(): Promise<{ kind: 'unix', path: string } | { kind: 'tcp', port: number }> {
+  private async waitForHandshake(): Promise<{ unixPath?: string, tcpPort?: number }> {
     if (this.handshake === undefined) {
       await new Promise<void>((resolve, reject) => {
         this.resolveHandshake = resolve
@@ -297,17 +310,13 @@ class RemotePtcHandle implements SubprocessHandle {
     }
     if (this.handshake === undefined) throw new Error('PTC shim handshake disappeared')
     if (this.handshake.token !== this.token) throw new Error('PTC shim handshake token did not match')
-    return this.handshake.kind === 'unix'
-      ? { kind: 'unix' as const, path: this.handshake.path }
-      : { kind: 'tcp' as const, port: Number(this.handshake.port) }
-  }
-
-  private async handshakeResult(): Promise<{ kind: 'unix', path: string } | { kind: 'tcp', port: number }> {
-    if (this.handshake === undefined) throw new Error('PTC shim handshake disappeared')
-    if (this.handshake.token !== this.token) throw new Error('PTC shim handshake token did not match')
-    return this.handshake.kind === 'unix'
-      ? { kind: 'unix' as const, path: this.handshake.path }
-      : { kind: 'tcp' as const, port: Number(this.handshake.port) }
+    if (this.handshake.unixPath === undefined && this.handshake.tcpPort === undefined) {
+      throw new Error('PTC shim handshake had no forwarding endpoint')
+    }
+    return {
+      ...(this.handshake.unixPath === undefined ? {} : { unixPath: this.handshake.unixPath }),
+      ...(this.handshake.tcpPort === undefined ? {} : { tcpPort: this.handshake.tcpPort }),
+    }
   }
 
   terminate(): void {

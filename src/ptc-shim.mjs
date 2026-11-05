@@ -6,10 +6,10 @@
  *   node ptc-shim.mjs <socketPath|-> <remoteCwd> -- <argv...>
  *
  * The host writes a token as the first line of stdin. The shim listens on a
- * Unix socket (or a loopback TCP port when Unix sockets are unavailable) and
- * prints exactly one handshake line on stderr:
+ * Unix socket and a loopback TCP port (either may be unavailable) and prints
+ * one handshake line on stderr:
  *
- *   __DSH_PTC_READY__ <token> <unix:/path|tcp:127.0.0.1:port>
+ *   __DSH_PTC_READY__ <token> [unix:/path] [tcp:127.0.0.1:port]
  *
  * It accepts one connection, passes it to the worker as fd 7, and otherwise
  * stays out of the control stream. stdout/stderr remain the program's raw
@@ -37,7 +37,7 @@ if (childArgv.length === 0) {
 let token = ''
 let child
 let socket
-let server
+const servers = new Set()
 let groupKilled = false
 let cleaned = false
 let exiting = false
@@ -45,11 +45,14 @@ let exiting = false
 function cleanup() {
   if (cleaned) return
   cleaned = true
-  try {
-    server?.close()
-  } catch {
-    // Already closed.
+  for (const server of servers) {
+    try {
+      server.close()
+    } catch {
+      // Already closed.
+    }
   }
+  servers.clear()
   try {
     socket?.destroy()
   } catch {
@@ -120,21 +123,49 @@ function readFirstLine() {
   })
 }
 
+function handleConnection(server, accepted) {
+  if (socket !== undefined) {
+    accepted.destroy()
+    return
+  }
+  socket = accepted
+  for (const other of servers) {
+    if (other === server) continue
+    try {
+      other.close()
+    } catch {
+      // Already closed.
+    }
+  }
+  // The socket directory is private to the remote user and the host verifies
+  // the token in the handshake before it uses the forwarded stream.
+  spawnWorker(accepted)
+}
+
 function listenUnix(path) {
   return new Promise((resolve, reject) => {
-    server = createServer()
+    const server = createServer()
+    servers.add(server)
     server.once('error', error => {
-      server?.close()
+      servers.delete(server)
+      try { server.close() } catch {}
       reject(error)
     })
+    server.on('connection', accepted => handleConnection(server, accepted))
     server.listen(path, () => resolve({ kind: 'unix', path }))
   })
 }
 
 function listenTcp() {
   return new Promise((resolve, reject) => {
-    server = createServer()
-    server.once('error', reject)
+    const server = createServer()
+    servers.add(server)
+    server.once('error', error => {
+      servers.delete(server)
+      try { server.close() } catch {}
+      reject(error)
+    })
+    server.on('connection', accepted => handleConnection(server, accepted))
     server.listen(0, '127.0.0.1', () => {
       const address = server.address()
       if (typeof address !== 'object' || address === null) {
@@ -185,39 +216,27 @@ async function main() {
     process.stderr.write('ptc-shim: empty token\n')
     process.exit(2)
   }
-  let endpoint
+  const endpoints = []
   if (socketArgument !== '-') {
     try {
-      try {
-        const info = statSync(socketArgument)
-        if (info.isSocket()) rmSync(socketArgument, { force: true })
-      } catch {
-        // The socket does not exist yet.
-      }
-      endpoint = await listenUnix(socketArgument)
+      const info = statSync(socketArgument)
+      if (info.isSocket()) rmSync(socketArgument, { force: true })
     } catch {
-      endpoint = await listenTcp()
+      // The socket does not exist yet.
     }
-  } else {
-    endpoint = await listenTcp()
-  }
-
-  server.on('connection', accepted => {
-    if (socket !== undefined) {
-      accepted.destroy()
-      return
-    }
-    socket = accepted
     try {
-      server.close()
+      endpoints.push(await listenUnix(socketArgument))
     } catch {
-      // Already closed.
+      // TCP below is the fallback.
     }
-    // The socket directory is private to the remote user and the host verifies
-    // the token in the handshake before it uses the forwarded stream.
-    spawnWorker(accepted)
-  })
-  process.stderr.write(`${HANDSHAKE} ${token} ${handshakeValue(endpoint)}\n`)
+  }
+  try {
+    endpoints.push(await listenTcp())
+  } catch {
+    // A Unix endpoint may still work.
+  }
+  if (endpoints.length === 0) throw new Error('could not bind a Unix socket or a loopback TCP port')
+  process.stderr.write(`${HANDSHAKE} ${token} ${endpoints.map(handshakeValue).join(' ')}\n`)
 
   process.stdin.on('end', killGroup)
   process.stdin.on('close', killGroup)

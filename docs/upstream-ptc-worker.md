@@ -12,6 +12,7 @@ hashes it, and uploads the exact bytes to the SSH host.
 | Worker entry | `lib/process.js`, `runNodeMain(openInheritedControlChannel(), Number(process.argv[2]), process)` |
 | Persistent worker entry | `lib/persistent-process.js`, `runPersistentMain(...)` |
 | Control descriptor | fd 7 |
+| Shim handshake | `__DSH_PTC_READY__ <token> [unix:<path>] [tcp:127.0.0.1:<port>]`; the host prefers streamlocal and falls back to TCP |
 | Control environment marker | `DSH_SUBPROCESS_CONTROL=pipe` |
 | Host launch chain | `resolveExecutable` -> `bootstrapArgs` -> `sandbox.confine` -> `subprocess.spawn({ stdio: { control: 'pipe' } })` |
 | Default bootstrap mapping | `fs.processPathFromHostPath(fileURLToPath(new URL('./process.js', import.meta.url)))` |
