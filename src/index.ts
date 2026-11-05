@@ -56,7 +56,7 @@ import { attachRemotePtc } from './ptc-remote.ts'
 import { installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
 import { installRemoteShell } from './remote-shell.ts'
 import { SshPoolTransport } from './remote-transport.ts'
-import { ensureWorker } from './upstream-worker.ts'
+import { clearWorkerCache, ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import { installRemoteFs, remoteFsInstalled } from './remote-fs.ts'
 import { installRemoteUploads } from './uploads.ts'
@@ -1815,6 +1815,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     // them, so this is the only safe moment to remove them. The disposer is
     // async so Cordis waits for the files to disappear before the pool closes.
     await clearStagedPresentFiles()
+    clearWorkerCache()
     await core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
@@ -1899,6 +1900,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.add(unbind)
     }
     bridged.effect(() => () => {
+      // A later remote run must not see a stale ready flag after the fs
+      // service itself is reloaded.
+      fsPatchReady = false
       // Remove uploads first: its wrapper was installed over ours.
       removeUploads?.()
       removeWorkerPath()
