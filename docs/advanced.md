@@ -107,7 +107,7 @@ DSH 的 `present` 只认本机文件：它逐个 `stat` 参数里的路径，再
 远端 `run_code` / `workflow` 使用宿主同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` 的 `process.js`。插件只做四件事：定位/校验上游 worker、按 hash 上传、用 SSH 转发的 fd 7 socket 提供控制通道、把 `sandbox.confine` / `subprocess.spawn` 适配到远端。帧协议、程序运行、超时/输出上限、错误分类和工具回桥全部由官方 runtime 负责。
 
 - 远端需要 Node.js 22+；worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
-- `process.env` 为空；`cwd`/相对路径在远端；只支持 per-call function-body，`repl`/script 暂时拒绝。
+- `process.env` 为空；`cwd`/相对路径在远端。支持 per-call function-body、persistent-in-memory REPL 和 vm-script（scriptPersistence）；保留状态按 state owner 留在远端进程，沙箱模式变化时由官方 runtime invalidate。
 - 上游契约、manifest 与升级 runbook 见 [upstream-ptc-worker.md](upstream-ptc-worker.md)。
 - 如果远端 sshd 禁用 streamlocal，会尝试 loopback TCP；两者都不可用时明确失败，不静默回退本机。
 

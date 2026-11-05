@@ -15,7 +15,7 @@ import type { SecretMaterial, SshPool } from './ssh-pool.ts'
 import type { UploadedWorker } from './upstream-worker.ts'
 
 const MARK = Symbol.for('dsh-permission-remote.ptc-remote-wrap')
-const REMOTE_NOTE = ' When the working directory is a remote workspace, the program runs on that SSH host and relative paths resolve there. Its process.env starts empty, exactly like local PTC; only per-call function-body programs are supported remotely.'
+const REMOTE_NOTE = ' When the working directory is a remote workspace, the program runs on that SSH host and relative paths resolve there. Its process.env starts empty, exactly like local PTC. Per-call and retained modes use the host\'s official runtime; retained state remains on that SSH host.'
 
 export type PtcFailureKind =
   | 'exception'
@@ -38,6 +38,7 @@ export interface PtcRunSpec {
   readonly cwd: string
   readonly timeoutMs: number | null
   readonly bindings?: readonly PtcBinding[]
+  readonly stateOwner?: unknown
   readonly sandboxPolicy?: {
     readonly mode?: string
     readonly workspaceRoot?: string
@@ -178,12 +179,6 @@ async function dispatch(
   }
   if (deps.disposed?.() === true) return failure('abort', 'the SSH workspace plugin was unloaded, so the remote run_code was not started')
 
-  if (runtime.programFormat === 'repl') {
-    return failure('exception', 'Remote workspaces do not retain run_code memory across calls. This deployment uses persistent-in-memory execution, which would stay on the local runtime, so the program was refused. Switch the PTC runtime to per-call mode or use a local workspace.')
-  }
-  if (runtime.programFormat === 'script') {
-    return failure('exception', 'This deployment uses a vm-script PTC runtime. Remote workspaces only support per-call function-body programs, so the program was refused instead of running on this computer. Switch the PTC runtime to per-call mode or use a local workspace.')
-  }
   const launch = runtime.config?.launch
   if (launch === undefined || (launch.kind !== undefined && launch.kind !== 'node-script')) {
     return failure('exception', 'Remote run_code requires the official Node PTC runtime with a node-script launch; the configured PTC runtime cannot be uploaded to the SSH host')

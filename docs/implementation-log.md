@@ -12,5 +12,5 @@ alone.
 | S3 | feat: remote-world | confine/spawn adapter, local transport, offline e2e | `tests/ptc-offline.spec.ts` 5/5、`tests/remote-world.spec.ts` 2/2 通过 |
 | S4 | feat: 接入插件 apply 与 SSH transport | SSH transport, Node status, plugin wiring | `npm test` 664/664、`npm run typecheck` 通过 |
 | S5 | test/docs: 真机 e2e 与用户文档 | Live e2e, README/advanced docs | 代码完成；真机结果待有 SSH 环境后填写 |
-| S6 | feat: 持久模式（可选） | persistent worker | offline/live persistent test |
+| S6 | feat: 持久模式（可选） | official runtime persistent-in-memory / vm-script; persistent worker uploaded | `tests/ptc-offline.spec.ts` persistent 2/2 通过 |
 | S7 | chore: 版本、lib 与发布 | version 0.14.0, build, release checks | `npm run check:upstream`、`npm test`、`npm run build` 通过 |

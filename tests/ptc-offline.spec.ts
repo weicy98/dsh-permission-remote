@@ -26,7 +26,11 @@ interface Harness {
   readonly status: RunnerStatus
 }
 
-async function harness(mode: 'danger-full-access' | 'workspace-write' = 'danger-full-access'): Promise<Harness> {
+async function harness(
+  mode: 'danger-full-access' | 'workspace-write' = 'danger-full-access',
+  executionMode: 'per-call' | 'persistent-in-memory' | 'vm-script' = 'per-call',
+  scriptPersistence = false,
+): Promise<Harness> {
   const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-home-'))
   const remoteRoot = await mkdtemp(join(tmpdir(), 'dsh-ptc-root-'))
   const workerRemote = join(remoteRoot, 'process.mjs')
@@ -65,8 +69,8 @@ async function harness(mode: 'danger-full-access' | 'workspace-write' = 'danger-
     resolve: () => ({ mode: 'workspace-write', workspaceRoot: remoteRoot }),
   })
   await ctx.plugin(NodePtcRuntime, {
-    executionMode: 'per-call',
-    scriptPersistence: false,
+    executionMode,
+    scriptPersistence,
     timeoutMs: 120_000,
     maxTimeoutMs: 600_000,
     maxOutputBytes: 1_000_000,
@@ -230,6 +234,68 @@ test('timeout and abort terminate the remote shim process group', async () => {
     const cancelled = await h.runtime.run(aborted)
     assert.equal(cancelled.error?.kind, 'abort', JSON.stringify(cancelled))
   } finally {
+    await h.dispose()
+  }
+})
+
+
+test('persistent-in-memory retains state for one state owner', async () => {
+  const h = await harness('danger-full-access', 'persistent-in-memory')
+  const owner = {}
+  try {
+    const first = await h.runtime.run(h.runtime.resolve({
+      program: 'var retained = 41\nretained',
+      cwd: h.placeholder,
+      timeoutMs: 20_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+    }))
+    assert.equal(first.error, undefined, JSON.stringify(first))
+    assert.equal(first.value, 41)
+    const second = await h.runtime.run(h.runtime.resolve({
+      program: 'retained + 1',
+      cwd: h.placeholder,
+      timeoutMs: 20_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+    }))
+    assert.equal(second.error, undefined, JSON.stringify(second))
+    assert.equal(second.value, 42)
+  } finally {
+    await h.runtime.release(owner)
+    await h.dispose()
+  }
+})
+
+
+test('vm-script with scriptPersistence retains state for one state owner', async () => {
+  const h = await harness('danger-full-access', 'vm-script', true)
+  const owner = {}
+  try {
+    const first = await h.runtime.run(h.runtime.resolve({
+      program: 'var retained = 7\nretained',
+      cwd: h.placeholder,
+      timeoutMs: 20_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+    }))
+    assert.equal(first.error, undefined, JSON.stringify(first))
+    assert.equal(first.value, 7)
+    const second = await h.runtime.run(h.runtime.resolve({
+      program: 'retained * 6',
+      cwd: h.placeholder,
+      timeoutMs: 20_000,
+      bindings: [],
+      stateOwner: owner,
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: h.remoteRoot },
+    }))
+    assert.equal(second.error, undefined, JSON.stringify(second))
+    assert.equal(second.value, 42)
+  } finally {
+    await h.runtime.release(owner)
     await h.dispose()
   }
 })
