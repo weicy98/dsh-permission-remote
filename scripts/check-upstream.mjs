@@ -76,7 +76,6 @@ const changed = expected === undefined
   || entry.controlFd !== expected.controlFd
   || entry.controlEnv !== expected.controlEnv
   || entry.probes.entry !== expected.probes.entry
-  || entry.probes.persistentEntry !== expected.probes.persistentEntry
   || entry.probes.importsOnlyNode !== expected.probes.importsOnlyNode
   || entry.probes.bootstrapArgsMapsHostPath !== expected.probes.bootstrapArgsMapsHostPath
   || entry.probes.spawnControlPipe !== expected.probes.spawnControlPipe
