@@ -26,6 +26,7 @@ const world: RemoteWorld = {
   remoteCwd: '/srv/app/sub',
   remoteRoot: '/srv/app',
   remoteNodePath: '/usr/bin/node',
+  remoteRipgrepPath: '/usr/bin/rg',
   workerLocalPaths: ['/host/dsh/lib/process.js'],
   workerRemotePath: '/home/dev/.dsh-permission-remote/ptc/hash/process.mjs',
   shimRemotePath: '/home/dev/.dsh-permission-remote/ptc/hash/ptc-shim.mjs',
@@ -55,6 +56,7 @@ test('confine produces the remote bwrap profile and maps the node path', async (
     hostOf: () => world.host,
     secretOf: async () => ({}),
     statusOf: async () => status,
+    routeByCwd: cwd => cwd === world.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
   })
   assert.ok(restore !== undefined)
   try {

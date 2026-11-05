@@ -19,10 +19,7 @@ import {
   remoteFacts,
   probeHost,
   runBash,
-  runGlob,
-  runGrep,
   runWorkingDirectory,
-  runReadImage,
   clearStagedPresentFiles,
   stagePresentFiles,
   throwIfAborted,
@@ -31,7 +28,6 @@ import {
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
-import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
@@ -58,6 +54,7 @@ import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
 import { attachRemotePtc } from './ptc-remote.ts'
 import { installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
+import { installRemoteShell } from './remote-shell.ts'
 import { SshPoolTransport } from './remote-transport.ts'
 import { ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
@@ -1677,17 +1674,43 @@ function markRemote(service: SshApi): void {
  * commits a directory through the official service, the second stages files and
  * delegates to the official tool, so neither has a runner of its own.
  */
-const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present' | 'str_replace_editor'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
+/** Delegate official bash after mapping its raw `workdir` into the remote placeholder. */
+export async function runOfficialBash(
+  official: ((args: unknown, exec: ToolExec) => Promise<unknown>) | ((args: unknown, exec: ToolExec) => unknown),
+  route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  if (typeof args.workdir === 'string' && args.workdir.length > 0) {
+    const resolved = routeByCwd(args.workdir)
+    const remote = resolved.kind === 'remote'
+      ? resolved.remoteCwd
+      : resolveRemotePath(args.workdir, route.remoteCwd, route.placeholderCwd)
+    const placeholder = mapRemoteToLocal(route.hostId, remote)
+    if (placeholder !== null) return official({ ...args, workdir: placeholder }, exec)
+  }
+  return official(args, exec)
+}
+
+/** Delegate official glob/grep after mapping placeholder paths to remote paths. */
+export async function runOfficialSearch(
+  official: (args: unknown, exec: ToolExec) => Promise<unknown> | unknown,
+  route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  if (typeof args.path === 'string' && args.path.length > 0) {
+    const resolved = routeByCwd(args.path)
+    const remote = resolved.kind === 'remote'
+      ? resolved.remoteCwd
+      : resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
+    return official({ ...args, path: remote }, exec)
+  }
+  return official(args, exec)
+}
+
+const RUNNERS: Record<'bash' | 'terminal_open', (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
-  read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
-    const attachments = ctx.get('attachments') as { saveImage(input: { data: Buffer, mediaType: string, name: string }): Promise<Record<string, unknown>> } | undefined
-    if (attachments === undefined) throw new Error('no attachment service is mounted')
-    const mediaType = sniffImage(data)
-    if (mediaType === undefined) throw new Error(`cannot read "${fileName}": the file content is not a PNG, JPEG, WebP, or GIF`)
-    return attachments.saveImage({ data, mediaType, name: fileName })
-  }, exec),
-  glob: (host, route, args, exec) => runGlob(host, route, args, exec),
-  grep: (host, route, args, exec) => runGrep(host, route, args, exec),
   // A local PTY backend would open a shell inside the placeholder directory
   // while the sidebar terminal is already on the server. Refuse instead of
   // handing the model a prompt that is not where the Session is.
@@ -1791,6 +1814,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       hostOf: id => core.listHosts().find(host => host.id === id),
       secretOf: host => core.secret(host),
       statusOf: host => core.statusOf(host),
+      routeByCwd: cwd => routeByCwd(cwd),
     })
     if (remove === undefined) return
     worldReady = true
@@ -1799,6 +1823,20 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       remove()
       unregisters.delete(remove)
       worldReady = false
+    })
+  })
+  rawCtx.inject(['shell'], bridged => {
+    const hostApi = core.toolHost(undefined)
+    const remove = installRemoteShell(bridged as unknown as { get(name: string): unknown }, {
+      routeByCwd: cwd => routeByCwd(cwd),
+      hostOf: id => core.listHosts().find(host => host.id === id),
+      loginEnvOf: (host, signal) => hostApi.loginEnvOf?.(host, signal) ?? Promise.resolve(''),
+    })
+    if (remove === undefined) return
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
     })
   })
   const detachPtc = attachRemotePtc(rawCtx as unknown as Parameters<typeof attachRemotePtc>[0], {
@@ -2172,9 +2210,16 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           }
           assertEnterableRemoteCwd(core, current, headerCwd)
           if (plan.name === 'working_directory') return commitRemoteWorkingDirectory(core, ctx, host, current, record, exec, headerCwd)
+          if (plan.name === 'bash') {
+            core.requireHost(current.hostId)
+            return runOfficialBash(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
+          }
+          if (plan.name === 'glob' || plan.name === 'grep') {
+            return runOfficialSearch(official as (value: unknown, execution: ToolExec) => Promise<unknown> | unknown, current, record, exec)
+          }
           if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec)
           if (plan.name === 'str_replace_editor') return runRemoteStrReplaceEditor(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
-          return RUNNERS[plan.name](host, current, record, exec, ctx)
+          return RUNNERS[plan.name as 'bash' | 'terminal_open'](host, current, record, exec, ctx)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)

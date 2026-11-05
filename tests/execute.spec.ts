@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
-import { clearStagedPresentFiles, finishBackground, runBash, runGlob, runWorkingDirectory, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { clearStagedPresentFiles, finishBackground, runBash, runWorkingDirectory, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
 import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -71,63 +71,6 @@ test('a killed background job reports cancelled', () => {
   const outcome = finishBackground(killed(), '', () => undefined)
   assert.equal(outcome.status, 'killed')
   assert.equal(outcome.detail, 'cancelled')
-})
-
-test('a cancelled glob is an abort, not a command failure', async () => {
-  const controller = new AbortController()
-  controller.abort()
-  const api = {
-    pool: { exec: async () => killed() } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'read-only' as const,
-  } satisfies ToolHost
-  await assert.rejects(
-    () => runGlob(api, route, { pattern: '*.ts' }, { signal: controller.signal }),
-    (error: unknown) => error instanceof Error && error.name === 'AbortError',
-  )
-})
-
-test('a login banner before the search block is not a glob path', async () => {
-  let command = ''
-  const api = {
-    pool: {
-      exec: async (_host: HostConfig, _secret: unknown, argv: string) => {
-        command = argv
-        return {
-          ...killed(),
-          code: 0,
-          signal: null,
-          stdout: ['Welcome to Ubuntu 24.04', '__DSH_SEARCH_BEGIN__', 'src/main.ts', '__DSH_SEARCH_END__', ''].join('\n'),
-        }
-      },
-    } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'read-only' as const,
-  } satisfies ToolHost
-  const result = await runGlob(api, route, { pattern: '*.ts' }, {})
-  assert.match(command, /__DSH_SEARCH_BEGIN__/)
-  assert.match(command, /exit \$status/)
-  assert.deepEqual(result.paths, [`${route.placeholderCwd}/src/main.ts`])
-})
-
-test('a glob that exits 2 is still a command failure', async () => {
-  const api = {
-    pool: {
-      exec: async () => ({ ...killed(), code: 2, signal: null, stderr: 'rg exploded' }),
-    } as unknown as SshPool,
-    hostOf: () => host,
-    secretOf: async () => ({}),
-    statusOf: async () => status,
-    resolveMode: async () => 'read-only' as const,
-  } satisfies ToolHost
-  await assert.rejects(
-    () => runGlob(api, route, { pattern: '*.ts' }, {}),
-    (error: unknown) => error instanceof Error && error.name === 'Error' && error.message === 'rg exploded',
-  )
 })
 
 test('a foreground bash result survives a JSON round trip', async () => {

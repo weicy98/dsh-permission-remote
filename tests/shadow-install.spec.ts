@@ -214,7 +214,7 @@ test('a session already on the host may walk outside its workspace', async () =>
   const bash = tools.find(tool => tool.name === 'bash')
   // Navigation on the same host is not the escalation the guard blocks; the
   // next failure is the deliberately missing host configuration.
-  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /not configured/)
+  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /unknown SSH host|not configured/)
 })
 
 test('working_directory refuses to commit an unregistered placeholder', async () => {

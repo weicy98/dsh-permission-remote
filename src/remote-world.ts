@@ -1,5 +1,6 @@
 /**
- * Remote execution-world adapters for the official PTC runtime.
+ * Remote execution-world adapters for the official PTC runtime and ordinary
+ * official tools.
  *
  * The official `NodePtcRuntime` knows nothing about SSH. This module supplies
  * the three seams it consumes:
@@ -11,13 +12,15 @@
  * - `subprocess.spawn`: starts the remote shim and exposes the official
  *   control channel as fd 7.
  *
- * The adapters are scoped by AsyncLocalStorage and by the presence of the
- * current run's worker path. Local calls, bash and the search tools keep using
- * the original services untouched.
+ * The same `spawn`/`confine` seams also route ordinary official subprocesses
+ * (bash and fs-search) by their placeholder cwd / policy root. Local calls
+ * always fall through to the original services.
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomBytes } from 'node:crypto'
-import { posix, resolve as resolvePath } from 'node:path'
+import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join, posix, resolve as resolvePath } from 'node:path'
 import { Duplex, PassThrough, type Readable, type Writable } from 'node:stream'
 import { symbols } from '@deepseek-ai/cordis'
 import {
@@ -45,6 +48,7 @@ export interface RemoteWorld {
   readonly remoteCwd: string
   readonly remoteRoot: string
   readonly remoteNodePath: string
+  readonly remoteRipgrepPath: string
   readonly workerLocalPaths: readonly string[]
   readonly workerRemotePath: string
   readonly shimRemotePath: string
@@ -59,6 +63,7 @@ export interface RemoteWorldDeps {
   readonly hostOf: (hostId: string) => HostConfig | undefined
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
+  readonly routeByCwd: (cwd: string | undefined) => { kind: 'remote', hostId: string, remoteCwd: string, placeholderCwd: string } | { kind: 'local' }
 }
 
 interface MutableService {
@@ -330,7 +335,245 @@ class RemotePtcHandle implements SubprocessHandle {
   }
 }
 
-/** Install the PTC-only patches on the deployment's sandbox/subprocess services. */
+
+/** A bounded, offset-readable collect stream. */
+class CollectedStream {
+  private text = ''
+  private seenBytes = 0
+  private readonly maxBytes: number
+  private readonly spillMax: number | undefined
+  private spillPath: string | undefined
+  private spillBytes = 0
+
+  constructor(maxBytes: number, spill?: { maxBytes: number }) {
+    this.maxBytes = Math.max(1, maxBytes)
+    this.spillMax = spill === undefined ? undefined : Math.max(1, spill.maxBytes)
+    if (this.spillMax !== undefined) {
+      this.spillPath = join(mkdtempSync(join(tmpdir(), 'dsh-remote-spill-')), 'stream')
+    }
+  }
+
+  push(value: string): void {
+    if (this.spillPath !== undefined) {
+      try {
+        appendFileSync(this.spillPath, value, 'utf8')
+        this.spillBytes += Buffer.byteLength(value, 'utf8')
+        if (this.spillMax !== undefined && this.spillBytes > this.spillMax) {
+          rmSync(this.spillPath, { force: true })
+          this.spillPath = undefined
+        }
+      } catch {
+        this.spillPath = undefined
+      }
+    }
+    this.text += value
+    const bytes = Buffer.byteLength(this.text, 'utf8')
+    this.seenBytes += Buffer.byteLength(value, 'utf8')
+    if (bytes <= this.maxBytes) return
+    let cut = 0
+    let retained = bytes
+    while (retained > this.maxBytes && cut < this.text.length) {
+      const next = this.text.charCodeAt(cut)
+      cut += 1
+      // Approximate UTF-8 bytes; only the retained tail matters for display.
+      retained -= next < 0x80 ? 1 : next < 0x800 ? 2 : 3
+    }
+    this.text = this.text.slice(cut)
+  }
+
+  readFrom(fromByte: number): { text: string, nextOffset: number, lossy: boolean } {
+    const retainedStart = this.seenBytes - Buffer.byteLength(this.text, 'utf8')
+    const lossy = fromByte < retainedStart
+    const buffer = Buffer.from(this.text, 'utf8')
+    const start = Math.max(0, Math.min(buffer.length, fromByte - retainedStart))
+    return {
+      text: buffer.subarray(start).toString('utf8'),
+      nextOffset: this.seenBytes,
+      lossy,
+      ...(this.spillPath === undefined ? {} : { spillPath: this.spillPath }),
+    }
+  }
+}
+
+function collectMode(value: unknown): value is { maxBytes: number, spill?: { maxBytes: number } } {
+  return typeof value === 'object' && value !== null && typeof (value as { maxBytes?: unknown }).maxBytes === 'number'
+}
+
+function collectReader(value: unknown): CollectedStream | undefined {
+  return collectMode(value) ? new CollectedStream(value.maxBytes, value.spill) : undefined
+}
+
+function remoteProgram(world: RemoteWorld, value: string): string {
+  const name = basename(value)
+  if ((name === 'rg' || name === 'rg.exe') && world.remoteRipgrepPath.length > 0) return world.remoteRipgrepPath
+  if (world.remoteNodePath.length > 0
+    && (value === world.resolvedLocalExecutable || value === world.launchExecutable || value === process.execPath)) {
+    return world.remoteNodePath
+  }
+  return value
+}
+
+function remoteProcessCommand(spec: SubprocessSpawnSpec, world: RemoteWorld): string {
+  const argv = spec.argv.map((value, index) => index === 0 ? remoteProgram(world, value) : value)
+  const env = spec.env ?? {}
+  const values: string[] = []
+  const removals: string[] = []
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) removals.push(name)
+    else values.push(`${name}=${value}`)
+  }
+  const prefix = values.length > 0 || removals.length > 0
+    ? shJoin(['env', ...removals.flatMap(name => ['-u', name]), ...values])
+    : ''
+  const command = shJoin(argv)
+  return `cd ${shJoin([world.remoteCwd])} && ${prefix.length > 0 ? `${prefix} ` : ''}${command}`
+}
+
+function worldForRoute(route: { hostId: string, remoteCwd: string }, host: HostConfig, secret: SecretMaterial, status: RunnerStatus): RemoteWorld {
+  return {
+    host,
+    secret,
+    status,
+    remoteCwd: route.remoteCwd,
+    remoteRoot: route.remoteCwd,
+    remoteNodePath: status.node?.available === true ? status.node.path : '',
+    remoteRipgrepPath: status.ripgrepPath,
+    workerLocalPaths: [],
+    workerRemotePath: '',
+    shimRemotePath: '',
+    launchExecutable: '',
+  }
+}
+
+/** One ordinary remote process: streaming or collected stdout/stderr, optional stdin. */
+class RemoteProcessHandle implements SubprocessHandle {
+  readonly stdin: Writable | undefined
+  readonly stdout: PassThrough | undefined
+  readonly stderr: PassThrough | undefined
+  readonly control: Duplex | undefined = undefined
+  readonly collected: SubprocessCollectedOutputs
+  readonly done: Promise<SubprocessOutcome>
+  private readonly route: { hostId: string, remoteCwd: string, placeholderCwd: string }
+  private readonly spec: SubprocessSpawnSpec
+  private readonly transport: RemoteTransport
+  private readonly deps: RemoteWorldDeps
+  private readonly outCollector: CollectedStream | undefined
+  private readonly errCollector: CollectedStream | undefined
+  private exec: RemoteExecHandle | undefined
+  private readonly pendingInput: Buffer[] = []
+  private inputEnded = false
+  private settled = false
+  private terminated = false
+  private resolveDone: (value: SubprocessOutcome) => void = () => undefined
+  private rejectDone: (error: Error) => void = () => undefined
+
+  constructor(
+    route: { hostId: string, remoteCwd: string, placeholderCwd: string },
+    spec: SubprocessSpawnSpec,
+    transport: RemoteTransport,
+    deps: RemoteWorldDeps,
+  ) {
+    this.route = route
+    this.spec = spec
+    this.transport = transport
+    this.deps = deps
+    this.outCollector = collectReader(spec.stdio.stdout)
+    this.errCollector = collectReader(spec.stdio.stderr)
+    this.collected = {
+      ...(this.outCollector === undefined ? {} : { stdout: { readFrom: offset => this.outCollector!.readFrom(offset) } }),
+      ...(this.errCollector === undefined ? {} : { stderr: { readFrom: offset => this.errCollector!.readFrom(offset) } }),
+    } as SubprocessCollectedOutputs
+    this.stdout = spec.stdio.stdout === 'pipe' ? new PassThrough() : undefined
+    this.stderr = spec.stdio.stderr === 'pipe' ? new PassThrough() : undefined
+    if (spec.stdio.stdin === 'pipe') {
+      const input = new PassThrough()
+      input.on('data', chunk => {
+        if (this.exec === undefined) this.pendingInput.push(Buffer.from(chunk))
+        else this.exec.write(chunk)
+      })
+      input.on('end', () => {
+        this.inputEnded = true
+        this.exec?.end()
+      })
+      this.stdin = input
+    } else {
+      this.stdin = undefined
+    }
+    this.done = new Promise<SubprocessOutcome>((resolve, reject) => {
+      this.resolveDone = resolve
+      this.rejectDone = reject
+    })
+    void this.start()
+  }
+
+  private async start(): Promise<void> {
+    try {
+      const host = this.deps.hostOf(this.route.hostId)
+      if (host === undefined) throw new Error(`no configured SSH host for ${this.route.hostId}`)
+      const secret = await this.deps.secretOf(host)
+      const status = await this.deps.statusOf(host)
+      if (this.terminated) return
+      const world = worldForRoute(this.route, host, secret, status)
+      const command = remoteProcessCommand(this.spec, world)
+      const exec = await this.transport.exec(host, secret, command, this.spec.signal)
+      this.exec = exec
+      if (this.terminated) {
+        exec.close()
+        return
+      }
+      for (const chunk of this.pendingInput.splice(0)) exec.write(chunk)
+      if (this.inputEnded) exec.end()
+      if (this.stdout !== undefined) exec.stdout.on('data', chunk => this.stdout!.write(chunk))
+      if (this.stderr !== undefined) exec.stderr.on('data', chunk => this.stderr!.write(chunk))
+      if (this.outCollector !== undefined) exec.stdout.on('data', chunk => this.outCollector!.push(chunk.toString('utf8')))
+      if (this.errCollector !== undefined) exec.stderr.on('data', chunk => this.errCollector!.push(chunk.toString('utf8')))
+      if (this.spec.stdio.stdin !== 'pipe' && typeof this.spec.stdio.stdin === 'object' && 'data' in this.spec.stdio.stdin) {
+        exec.write(this.spec.stdio.stdin.data)
+        exec.end()
+      } else if (this.spec.stdio.stdin === 'pipe') {
+        // stdin was created in the constructor; its listeners queue locally.
+      } else {
+        exec.end()
+      }
+      exec.done.then(result => this.finish(result), error => this.fail(error))
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  private finish(result: ExecResult): void {
+    if (this.settled) return
+    this.settled = true
+    this.stdout?.end()
+    this.stderr?.end()
+    this.resolveDone({ exitCode: result.code, signal: result.signal as NodeJS.Signals | null })
+  }
+
+  private fail(error: Error): void {
+    if (this.settled) return
+    this.settled = true
+    this.stdout?.destroy(error)
+    this.stderr?.destroy(error)
+    this.rejectDone(error)
+  }
+
+  terminate(): void {
+    this.terminated = true
+    this.exec?.close()
+  }
+
+  waitForExit(signal?: AbortSignal): Promise<boolean> {
+    if (signal === undefined) return this.done.then(() => true, () => false)
+    if (signal.aborted) return Promise.resolve(false)
+    return new Promise<boolean>(resolve => {
+      const abort = () => resolve(false)
+      signal.addEventListener('abort', abort, { once: true })
+      this.done.then(() => resolve(true), () => resolve(false)).finally(() => signal.removeEventListener('abort', abort))
+    })
+  }
+}
+
+/** Install remote-world patches on the deployment's sandbox/subprocess services. */
 export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: RemoteWorldDeps): (() => void) | undefined {
   const subprocess = unwrap(ctx.get('subprocess'))
   const sandbox = unwrap(ctx.get('sandbox'))
@@ -349,8 +592,10 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
 
   subprocess.spawn = ((spec: SubprocessSpawnSpec) => {
     const world = remoteWorldContext.getStore()
-    if (world === undefined || spec.stdio?.control !== 'pipe') return originalSpawn.call(subprocess, spec)
-    return new RemotePtcHandle(world, spec, deps.transport)
+    if (world !== undefined && spec.stdio?.control === 'pipe') return new RemotePtcHandle(world, spec, deps.transport)
+    const route = deps.routeByCwd(spec.cwd)
+    if (route.kind !== 'remote') return originalSpawn.call(subprocess, spec)
+    return new RemoteProcessHandle(route, spec, deps.transport, deps)
   }) as never
 
   subprocess.resolveExecutable = (async (command: string, env?: Readonly<Record<string, string>>, signal?: AbortSignal) => {
@@ -363,24 +608,54 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
   }) as never
 
   sandbox.confine = (async (argv: readonly string[], policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> => {
-    const world = remoteWorldContext.getStore()
-    if (world === undefined || !argv.includes(world.workerRemotePath)) {
-      return originalConfine.call(sandbox, argv, policy, signal)
+    const active = remoteWorldContext.getStore()
+    if (active !== undefined && argv.includes(active.workerRemotePath)) {
+      signal?.throwIfAborted()
+      if (!active.status.sandbox.available || active.status.sandboxTool === 'none') {
+        throw new SandboxUnavailableError(policy.mode, 'remote sandbox probe failed')
+      }
+      const roots = {
+        workspaceRoot: active.remoteRoot,
+        tmp: active.status.roots.tmp,
+        userTmp: active.status.roots.userTmp,
+      }
+      const mapped = argv.map((value, index) => index === 0 ? remoteExecutable(active, value) : value)
+      if (active.status.sandboxTool === 'bwrap') {
+        const profile = bwrapFileProfileArgs(policy.mode, roots) ?? []
+        return {
+          argv: ['bwrap', ...profile, '--chdir', active.remoteCwd, '--', ...mapped],
+          enforcement: 'full',
+          denialSignatures: ['read-only file system'],
+          runnerFailureRules: [{ fatalSignatures: ['bwrap: '] }],
+        }
+      }
+      const profile = seatbeltProfileArgs(policy.mode, fileWritableRoots(policy.mode, roots)) ?? []
+      return {
+        argv: ['sandbox-exec', ...profile, '--', ...mapped],
+        enforcement: 'full',
+        denialSignatures: ['operation not permitted'],
+        runnerFailureRules: [{ fatalSignatures: ['sandbox-exec: '] }],
+      }
     }
+    const route = deps.routeByCwd(policy.workspaceRoot)
+    if (route.kind !== 'remote') return originalConfine.call(sandbox, argv, policy, signal)
     signal?.throwIfAborted()
-    if (!world.status.sandbox.available || world.status.sandboxTool === 'none') {
+    const host = deps.hostOf(route.hostId)
+    if (host === undefined) throw new SandboxUnavailableError(policy.mode, 'remote host not configured')
+    const status = await deps.statusOf(host)
+    if (!status.sandbox.available || status.sandboxTool === 'none') {
       throw new SandboxUnavailableError(policy.mode, 'remote sandbox probe failed')
     }
     const roots = {
-      workspaceRoot: world.remoteRoot,
-      tmp: world.status.roots.tmp,
-      userTmp: world.status.roots.userTmp,
+      workspaceRoot: route.remoteCwd,
+      tmp: status.roots.tmp,
+      userTmp: status.roots.userTmp,
     }
-    const mapped = argv.map((value, index) => index === 0 ? remoteExecutable(world, value) : value)
-    if (world.status.sandboxTool === 'bwrap') {
+    const mapped = argv.map((value, index) => index === 0 ? remoteProgramForStatus(status, value) : value)
+    if (status.sandboxTool === 'bwrap') {
       const profile = bwrapFileProfileArgs(policy.mode, roots) ?? []
       return {
-        argv: ['bwrap', ...profile, '--chdir', world.remoteCwd, '--', ...mapped],
+        argv: ['bwrap', ...profile, '--', ...mapped],
         enforcement: 'full',
         denialSignatures: ['read-only file system'],
         runnerFailureRules: [{ fatalSignatures: ['bwrap: '] }],
@@ -405,6 +680,12 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     else delete sandbox.confine
     delete (subprocess as { [WORLD_MARK]?: boolean })[WORLD_MARK]
   }
+}
+
+function remoteProgramForStatus(status: RunnerStatus, value: string): string {
+  const name = basename(value)
+  if ((name === 'rg' || name === 'rg.exe') && status.ripgrepPath.length > 0) return status.ripgrepPath
+  return value
 }
 
 function remoteExecutable(world: RemoteWorld, value: string): string {

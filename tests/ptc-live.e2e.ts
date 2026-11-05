@@ -107,6 +107,7 @@ async function harness(
     hostOf: id => id === host.id ? host : undefined,
     secretOf: async () => secret,
     statusOf: async () => status,
+    routeByCwd: cwd => cwd === placeholder ? { kind: 'remote', hostId: 'h1', remoteCwd: remoteRoot, placeholderCwd: placeholder } : { kind: 'local' },
   })
   assert.ok(restoreWorld !== undefined)
   const deps: RemotePtcDeps = {

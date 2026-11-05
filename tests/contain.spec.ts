@@ -2,8 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { composeCreatedPath } from '../src/contain.ts'
 import { claimPending } from '../src/pool-claim.ts'
-import { fileWriteAllowed, globArgv, grepArgv, sandboxDenied } from '../src/profile.ts'
-import { sniffImage } from '../src/image.ts'
+import { fileWriteAllowed, sandboxDenied } from '../src/profile.ts'
 
 test('a symlink parent is judged at its real path, so link → /etc cannot create evil', () => {
   const target = composeCreatedPath('/etc', ['evil'])
@@ -23,22 +22,6 @@ test('ordinary permission denied is not a sandbox denial', () => {
   assert.equal(sandboxDenied(1, 'Read-only file system'), true)
   assert.equal(sandboxDenied(1, 'Operation not permitted'), true)
   assert.equal(sandboxDenied(0, 'Read-only file system'), false)
-})
-
-test('search argv disables ripgrep config before any path', () => {
-  assert.equal(grepArgv('/opt/rg', 'foo', '/srv/app', '*.ts')[1], '--no-config')
-  assert.equal(globArgv('/opt/rg', '**/*.ts')[1], '--no-config')
-  // The pattern is bound with -e and the path is behind --: a pattern starting
-  // with `-` must not become a ripgrep option.
-  const grep = grepArgv('/opt/rg', '--pre=/bin/sh', '/srv/app', '*.ts')
-  assert.equal(grep[grep.indexOf('-e') + 1], '--pre=/bin/sh')
-  assert.equal(grep.includes('--'), true)
-  assert.equal(grep.at(-1), '/srv/app')
-})
-
-test('image sniff rejects an unrecognized payload', () => {
-  assert.equal(sniffImage(Buffer.from('not an image')), undefined)
-  assert.equal(sniffImage(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0])), 'image/png')
 })
 
 test('concurrent claims share one pending connection', async () => {

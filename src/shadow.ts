@@ -12,7 +12,7 @@
  * `args.path` and delegates to the official execute; the schema stays official.
  */
 
-export const ROUTED_TOOLS = ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'] as const
+export const ROUTED_TOOLS = ['bash', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'] as const
 export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
 
 /**

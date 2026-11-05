@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
@@ -81,7 +81,8 @@
     "@deepseek-ai/dsh-settings": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-typert-protocol": ">=0.2.2-rc.1 <0.3.0",
-    "@deepseek-ai/schemastery": "^3.19.0"
+    "@deepseek-ai/schemastery": "^3.19.0",
+    "@deepseek-ai/dsh-fs-patch": ">=0.2.2-rc.1 <0.3.0"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.1",
@@ -95,6 +96,7 @@
     "@types/ssh2": "^1.15.5",
     "esbuild": "^0.25.9",
     "semver": "^7.8.5",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "@deepseek-ai/dsh-fs-patch": "0.2.2-rc.1"
   }
 }

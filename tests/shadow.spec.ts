@@ -10,8 +10,8 @@ test('shadow plans close over the official execute captured before register', as
       return 'local'
     },
   }
-  const plans = planShadows(name => name === 'read_image' || name === 'bash' ? official : undefined)
-  assert.deepEqual(plans.map(plan => plan.name), ['bash', 'read_image'])
+  const plans = planShadows(name => name === 'glob' || name === 'bash' ? official : undefined)
+  assert.deepEqual(plans.map(plan => plan.name), ['bash', 'glob'])
   const bash = plans[0]!
   const result = await dispatchShadow(bash.official, false, async () => {
     calls.push('remote')
@@ -55,6 +55,6 @@ test('official read, write, edit and apply_patch tools stay outside the shadow p
   const names = plans.map(plan => String(plan.name))
   // str_replace_editor is the exception: its official resolveTarget omits cwd,
   // so a thin path-rewriting shadow is required (see shell-install.spec.ts).
-  assert.deepEqual(names, ['bash', 'read_image', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'])
+  assert.deepEqual(names, ['bash', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'])
   assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit' || name === 'apply_patch'), false)
 })
