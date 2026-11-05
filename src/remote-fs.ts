@@ -66,6 +66,16 @@ export interface RemoteAccess {
   statusOf?: (host: HostConfig) => Promise<RunnerStatus>
   /** Whether the session that supplied the policy was opened on this host. */
   allowsRemoteSession?: (sessionId: string | undefined, hostId: string) => boolean
+  /**
+   * Remote workspace roots registered on one host.
+   *
+   * A session's workspace root cannot be recovered from a placeholder path:
+   * `<root>/<host>/<encoded>` names the whole remote path, while
+   * `<root>/<host>/<encoded workspace root>/suffix` names the root plus a
+   * relative suffix. Both spellings route to the same file, so containment has
+   * to be decided against the registered root, never against the target itself.
+   */
+  workspaceRootsOf?: (hostId: string) => readonly string[]
   pool: {
     exec?: (host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer) => Promise<ExecResult>
     sftpRealpath(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string>
@@ -537,11 +547,15 @@ async function mutationContext(
   throwIfFsAborted(signal)
   if (policy === undefined) throw new FsError('remote write requires a sandbox policy', 'FS_SANDBOX_DENIED')
   if (policy.mode === 'read-only') throw new FsError('remote write is not allowed by the current sandbox mode', 'FS_SANDBOX_DENIED')
+  // The session's workspace root is the one source of containment. It cannot
+  // come from the target: `workspaceBinding(key)` decodes the *second*
+  // placeholder segment, which is the whole remote path for an absolute
+  // spelling but only the workspace root for a relative one, so comparing the
+  // two would reject every write that names a remote absolute path. Following
+  // the link below then checks the realpath-resolved target against this root.
   const binding = workspaceBinding(policy.workspaceRoot)
-  const targetBinding = workspaceBinding(key)
-  if (binding === null || targetBinding === null || binding.hostId !== route.hostId
-    || targetBinding.hostId !== binding.hostId || targetBinding.remotePath !== binding.remotePath) {
-    throw new FsError(`"${target.displayPath}" is outside the session workspace`, 'FS_SANDBOX_DENIED')
+  if (binding === null || binding.hostId !== route.hostId) {
+    throw new FsError(`"${target.displayPath}" is outside the session's remote host`, 'FS_SANDBOX_DENIED')
   }
   if (runtime.access.allowsRemoteSession === undefined) {
     throw new FsError('this session cannot prove its remote workspace boundary', 'FS_SANDBOX_DENIED')
@@ -1049,8 +1063,11 @@ async function verifiedPlace(
     const real = normalizeRemoteDirectory(await runtime.access.pool.sftpRealpath(host, secret, lexical))
     throwIfFsAborted(signal)
     if (real === null) throw new FsError(`remote path is not absolute: ${lexical}`, 'FS_IO_ERROR')
-    const binding = workspaceBinding(key)
-    if (binding === null || !remotePathInside(binding.remotePath, real)) {
+    // `workspaceBinding(key)` cannot answer this: for an absolute-remote
+    // spelling its `remotePath` is the whole path, so comparing it with the
+    // link's target would refuse a link that points inside the same workspace.
+    // The registered roots are spelling-independent, so ask for those.
+    if (!remotePathInsideAnyWorkspace(runtime, route.hostId, real)) {
       throw new FsError(`"${target.displayPath}" points outside its workspace`, 'FS_PERMISSION_DENIED')
     }
     effective = real
@@ -1071,6 +1088,16 @@ async function verifiedPlace(
   }
   runtime.meta.rememberAttrs(host.id, lexical, true, info)
   return { host, remote: effective }
+}
+
+/** Whether a remote path is inside one of the roots registered for this host. */
+function remotePathInsideAnyWorkspace(runtime: Runtime, hostId: string, remotePath: string): boolean {
+  const roots = runtime.access.workspaceRootsOf?.(hostId)
+  // No registry means containment cannot be proved. Fail closed: the caller is
+  // following a link, and guessing a root from the link itself is what the
+  // relative/absolute spelling inconsistency was.
+  if (roots === undefined || roots.length === 0) return false
+  return roots.some(root => remotePathInside(root, remotePath))
 }
 
 function hostOf(runtime: Runtime, hostId: string): HostConfig {

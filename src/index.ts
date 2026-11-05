@@ -411,6 +411,24 @@ export class Core {
     return remoteWorkspaces(this.workspaces.list())
   }
 
+  /**
+   * Remote roots registered for one host, normalised and de-duplicated.
+   *
+   * `remote-fs` needs these to decide whether a followed symlink stays inside a
+   * workspace. It cannot derive the root from the placeholder spelling: the
+   * encoded segment is the whole remote path for an absolute spelling and the
+   * workspace root for a relative one.
+   */
+  workspaceRootsOf(hostId: string): readonly string[] {
+    const roots = new Set<string>()
+    for (const item of this.listWorkspaces()) {
+      if (item.hostId !== hostId) continue
+      const normalized = normalizeRemoteDirectory(item.remotePath)
+      if (normalized !== null) roots.add(normalized)
+    }
+    return [...roots]
+  }
+
   /** Whether workspace titles carry the server name. */
   get taggingEnabled(): boolean {
     return this.config.tagWorkspaceTitles

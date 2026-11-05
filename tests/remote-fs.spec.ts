@@ -7,7 +7,7 @@ import { FsError, FsTargetKey, type FsDirEntry, type FsTarget } from '@deepseek-
 import type { HostConfig } from '../src/config.ts'
 import { installRemoteFs, type RemoteAccess } from '../src/remote-fs.ts'
 import { parseRemoteVersion, remoteVersionToken } from '../src/remote-write.ts'
-import { addSupersededRoot, clearSupersededRoots, encodeRemotePath, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
+import { addSupersededRoot, clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 import { listingType, probeOpenDir, readOpenChunks, readOpenRange, SshFailure, type RemoteDirEntry, type SftpAttrs } from '../src/ssh-pool.ts'
 
 const root = mkdtempSync(path.join(tmpdir(), 'dsh-remote-fs-'))
@@ -70,7 +70,7 @@ function createHarness(warnings: string[] = [], options?: { now?: () => number, 
     localLstat: (requested?: string) => Promise<{ type: string, version?: string, size?: number } | undefined> = async () => undefined
     async stat(target?: FsTarget, _signal?: AbortSignal): Promise<{ type: string, version?: string, size?: number } | undefined> { return this.localStat(target) }
     async lstat(requested?: string, _opts?: { cwd?: string }, _signal?: AbortSignal): Promise<{ type: string, version?: string, size?: number } | undefined> { return this.localLstat(requested) }
-    async readText(): Promise<string> { return '' }
+    async readText(_target?: FsTarget, _signal?: AbortSignal): Promise<string> { return '' }
     async streamText(_target?: FsTarget, _signal?: AbortSignal): Promise<AsyncIterable<string>> { return empty() }
     async readBytes(_target?: FsTarget, _signal?: AbortSignal, _maxBytes?: number): Promise<Uint8Array> { return new Uint8Array() }
     async readByteRange(_target?: FsTarget, _range?: { offset: number, length: number }, _signal?: AbortSignal): Promise<Uint8Array> { return new Uint8Array() }
@@ -93,6 +93,7 @@ function createHarness(warnings: string[] = [], options?: { now?: () => number, 
     requireHost: () => host,
     async secret() { return {} },
     allowsRemoteSession: () => true,
+    workspaceRootsOf: () => [REMOTE],
     pool: {
       sftpRealpath: (_host, _secret, remotePath) => pool.realpath(remotePath),
       sftpAttrs: (_host, _secret, remotePath, follow) => pool.attrs(remotePath, follow),
@@ -216,7 +217,7 @@ test('readByteRange reads one window, an oversize file is FS_TOO_LARGE, and a NU
     return true
   })
 
-  pool.chunks = async function* () { yield Buffer.from([0x68, 0x00]) }
+  pool.chunks = async function* (_remotePath: string) { yield Buffer.from([0x68, 0x00]) }
   const stream = await backend.streamText(file)
   await assert.rejects(async () => {
     for await (const chunk of stream) void chunk
@@ -970,7 +971,37 @@ test('a remote target outside the policy workspace is refused before any remote 
     writes += 1
     return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
   }
+  // The write gate now proves containment with `fileWriteAllowed()` against the
+  // realpath-resolved target, so it needs a probe before it can refuse. Without
+  // one the call fails closed as FS_IO_ERROR; with one it is a sandbox denial.
+  // Either way no remote write happens.
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
   const outside = await backend.resolve('../../../../etc/passwd', { cwd: placeholder() })
+  await assert.rejects(
+    () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+  assert.equal(writes, 0)
+})
+
+test('a target outside the workspace is refused even with a probe available', async () => {
+  const { backend, access } = createHarness()
+  let writes = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+    writes += 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  // A remote absolute spelling that is outside the registered workspace: it
+  // must not slip through just because `workspaceBinding` decoded the whole
+  // path rather than the workspace root.
+  const outside = await backend.resolve('/etc/passwd', { cwd: placeholder() })
   await assert.rejects(
     () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
     (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
@@ -1084,4 +1115,123 @@ test('lstat is a metadata-only fast path and does not spawn a shell stat', async
   const info = await backend.lstat(placeholder('a.ts'))
   assert.equal(info?.type, 'file')
   assert.equal(execs, 0)
+})
+
+
+test('a remote absolute path inside the workspace can be written', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'old'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/sub/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_h: unknown, _s: unknown, _c: string, _t: number, _sig?: AbortSignal, stdin?: string | Buffer) => {
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const target = await backend.resolve(`${REMOTE}/sub/a.ts`, { cwd: placeholder() })
+  const written = await backend.writeText(target, 'new', undefined, undefined, {
+    mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never,
+  })
+  assert.equal(written.after, 'new')
+  assert.equal(content, 'new')
+})
+
+test('a symlink inside the workspace is followed for both placeholder and absolute spellings', async () => {
+  const { backend, pool } = createHarness()
+  // `/sub/link -> /sub/real`, with `real` inside the workspace.
+  const seen: string[] = []
+  pool.attrs = async (remotePath, follow) => {
+    seen.push(`${follow ? 'follow' : 'lstat'}:${remotePath}`)
+    if (remotePath === `${REMOTE}/sub/link` && !follow) return { type: 'symlink', size: 0, mtime: 2 }
+    if (remotePath === `${REMOTE}/sub/real`) return { type: 'file', size: 4, mtime: 3 }
+    if (remotePath === `${REMOTE}/sub` || remotePath === REMOTE) return { type: 'directory', size: 0, mtime: 1 }
+    return { type: 'directory', size: 0, mtime: 1 }
+  }
+
+  // `resolve` realpaths the target; keep the link visible so `verifiedPlace`
+  // still has to follow it deliberately (that is the path under test).
+  pool.realpath = async remotePath => remotePath === `${REMOTE}/sub/link` ? `${REMOTE}/sub/real` : remotePath
+  pool.chunks = async function* (_remotePath: string) { yield Buffer.from('body') }
+
+  const spellings = {
+    relative: path.join(placeholder(), 'sub', 'link'),
+    absolute: mapRemoteToLocal('lo', `${REMOTE}/sub/link`)!,
+  }
+  for (const [name, key] of Object.entries(spellings)) {
+    const target = await backend.resolve(key)
+    const text = await backend.readText(target)
+    assert.equal(text, 'body', `${name} spelling must follow the inside-workspace link`)
+  }
+  // The follow actually went through the lstat branch at least once.
+  assert.ok(seen.some(entry => entry.startsWith('lstat:')), 'verifiedPlace must lstat the final component')
+})
+
+test('a symlink leaving the workspace is refused for both spellings', async () => {
+  const { backend, pool } = createHarness()
+  pool.attrs = async (remotePath, follow) => {
+    if (remotePath === `${REMOTE}/sub/link` && !follow) return { type: 'symlink', size: 0, mtime: 2 }
+    if (remotePath === '/etc/passwd') return { type: 'file', size: 4, mtime: 3 }
+    return { type: 'directory', size: 0, mtime: 1 }
+  }
+  pool.realpath = async remotePath => remotePath === `${REMOTE}/sub/link` ? '/etc/passwd' : remotePath
+  pool.read = async () => Buffer.from('root:x')
+
+  const spellings = {
+    relative: path.join(placeholder(), 'sub', 'link'),
+    absolute: mapRemoteToLocal('lo', `${REMOTE}/sub/link`)!,
+  }
+  for (const [name, key] of Object.entries(spellings)) {
+    const target = await backend.resolve(key)
+    await assert.rejects(
+      () => backend.readText(target),
+      (error: unknown) => codeOf(error) === 'FS_PERMISSION_DENIED',
+      `${name} spelling must refuse a link that leaves the workspace`,
+    )
+  }
+})
+
+test('a followed symlink fails closed when no workspace root is registered', async () => {
+  const { backend, pool, access } = createHarness()
+  ;(access as unknown as { workspaceRootsOf: unknown }).workspaceRootsOf = () => []
+  pool.attrs = async (remotePath, follow) => {
+    if (remotePath === `${REMOTE}/sub/link` && !follow) return { type: 'symlink', size: 0, mtime: 2 }
+    if (remotePath === `${REMOTE}/sub/real`) return { type: 'file', size: 4, mtime: 3 }
+    return { type: 'directory', size: 0, mtime: 1 }
+  }
+  pool.realpath = async remotePath => remotePath
+  const target = await backend.resolve(path.join(placeholder(), 'sub', 'link'))
+  await assert.rejects(
+    () => backend.readText(target),
+    (error: unknown) => codeOf(error) === 'FS_PERMISSION_DENIED',
+  )
+})
+
+test('a write to another workspace on the same host is refused', async () => {
+  const { backend, pool, access } = createHarness()
+  let writes = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+    writes += 1
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  // Two workspaces on one host: the session is pinned to the first.
+  ;(access as unknown as { workspaceRootsOf: unknown }).workspaceRootsOf = () => [REMOTE, '/home/me/other']
+  pool.attrs = async remotePath => remotePath === '/home/me/other/a.ts'
+    ? { type: 'file', size: 3, mtime: 1 }
+    : { type: 'directory', size: 0, mtime: 1 }
+  const target = await backend.resolve('/home/me/other/a.ts', { cwd: placeholder() })
+  await assert.rejects(
+    () => backend.writeText(target, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+  )
+  assert.equal(writes, 0)
 })
