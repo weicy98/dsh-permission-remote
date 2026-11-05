@@ -126,7 +126,7 @@ test('a cd-to-root cwd still pins the sandbox root to the session workspace', as
     }),
     ensureWorker: async () => ({
       workerLocalPaths: ['/host/process.js'], workerRemotePath: '/home/dev/process.mjs',
-      persistentWorkerRemotePath: '/home/dev/persistent-process.mjs', shimRemotePath: '/home/dev/ptc-shim.mjs', digest: 'x',
+shimRemotePath: '/home/dev/ptc-shim.mjs', digest: 'x',
     }),
   }
   const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, custom)

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
 import test from 'node:test'
 import { runOfficialBash, runOfficialSearch } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
@@ -129,4 +130,18 @@ test('official bash workdir arguments are normalized back to the remote placehol
   assert.equal(calls.length, 1)
   const expected = mapRemoteToLocal('h1', '/srv/app/src')
   assert.equal(calls[0]!.workdir, expected)
+})
+
+
+test('official search result paths are mapped back to placeholder paths', async () => {
+  const result = await runOfficialSearch(() => ({
+    root: '/srv/app',
+    paths: ['/srv/app/a.ts', 'src/b.ts'],
+    matches: [{ path: '/srv/app/c.ts', lineNumber: 1, line: 'x' }],
+  }), route, { pattern: '*.ts' }, {})
+  assert.deepEqual(result, {
+    root: placeholder,
+    paths: [join(placeholder, 'a.ts'), 'src/b.ts'],
+    matches: [{ path: join(placeholder, 'c.ts'), lineNumber: 1, line: 'x' }],
+  })
 })

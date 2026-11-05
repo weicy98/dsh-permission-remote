@@ -165,3 +165,17 @@ test('a manifest entry matches by worker bytes, not the DSH version label', asyn
     await rm(home, { recursive: true, force: true })
   }
 })
+
+
+test('a DSH root without the runtime package does not fall back to the plugin dev dependency', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-ptc-empty-'))
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.0.0-fixture' }))
+  try {
+    assert.throws(
+      () => locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true }),
+      /does not contain @deepseek-ai\/dsh-ptc-runtime-node/u,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

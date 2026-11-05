@@ -258,6 +258,7 @@ class RemotePtcHandle implements SubprocessHandle {
         error => this.fail(error instanceof Error ? error : new Error(String(error))),
       )
       const endpoint = await this.waitForHandshake()
+      if (this.terminated || this.settled) return
       // The timeout covers the shim handshake only. A long-running PTC
       // program legitimately keeps the control channel open for minutes.
       this.clearHandshakeTimer()
@@ -277,7 +278,7 @@ class RemotePtcHandle implements SubprocessHandle {
       }
       if (forward === undefined) throw new Error('PTC shim reported no usable forwarding endpoint')
       this.forward = forward
-      if (this.settled) {
+      if (this.terminated || this.settled) {
         forward.destroy()
         return
       }
@@ -332,6 +333,7 @@ class RemotePtcHandle implements SubprocessHandle {
 
   private async waitForHandshake(): Promise<{ unixPath?: string, tcpPort?: number }> {
     if (this.handshake === undefined) {
+      if (this.settled) throw new Error('PTC worker exited before the control-channel handshake')
       await new Promise<void>((resolve, reject) => {
         this.resolveHandshake = resolve
         this.rejectHandshake = reject
@@ -351,9 +353,23 @@ class RemotePtcHandle implements SubprocessHandle {
   terminate(): void {
     if (this.settled) return
     this.terminated = true
-    if (this.exec !== undefined) this.exec.close()
-    else this.fail(new Error('PTC worker terminated before the SSH channel was opened'))
-    this.forward?.destroy()
+    if (this.exec !== undefined) {
+      this.exec.close()
+      this.forward?.destroy()
+      return
+    }
+    // Cancellation can arrive while transport.exec() is still pending. Settle
+    // the handle as killed instead of rejecting a `done` promise whose caller
+    // may not have attached a handler yet.
+    this.settled = true
+    this.clearHandshakeTimer()
+    const error = new Error('PTC worker terminated before the SSH channel was opened')
+    this.rejectHandshake?.(error)
+    this.rejectHandshake = undefined
+    this.stdout.end()
+    this.stderr.end()
+    this.control.fail(error)
+    this.resolveDone({ exitCode: null, signal: 'SIGKILL' })
   }
 
   waitForExit(): Promise<boolean> {
@@ -408,7 +424,8 @@ class CollectedStream {
   }
 
   readFrom(fromByte: number): { text: string, nextOffset: number, lossy: boolean } {
-    const retainedStart = this.seenBytes - Buffer.byteLength(this.text, 'utf8')
+    const retainedBytes = Buffer.byteLength(this.text, 'utf8')
+    const retainedStart = this.seenBytes - retainedBytes
     const lossy = fromByte < retainedStart
     const buffer = Buffer.from(this.text, 'utf8')
     const start = Math.max(0, Math.min(buffer.length, fromByte - retainedStart))
@@ -416,7 +433,8 @@ class CollectedStream {
       text: buffer.subarray(start).toString('utf8'),
       nextOffset: this.seenBytes,
       lossy,
-      ...(this.spillPath === undefined ? {} : { spillPath: this.spillPath }),
+      // A spill path is useful only when the stream actually overflowed.
+      ...(this.spillPath === undefined || this.seenBytes <= retainedBytes ? {} : { spillPath: this.spillPath }),
     }
   }
 }
@@ -538,7 +556,11 @@ class RemoteProcessHandle implements SubprocessHandle {
       if (host === undefined) throw new Error(`no configured SSH host for ${this.route.hostId}`)
       const secret = await this.deps.secretOf(host)
       const status = await this.deps.statusOf(host)
-      if (this.terminated) return
+      if (this.terminated) {
+        this.settled = true
+        this.resolveDone({ exitCode: null, signal: 'SIGKILL' })
+        return
+      }
       const world = worldForRoute(this.route, host, secret, status)
       const command = remoteProcessCommand(this.spec, world)
       const exec = await this.transport.exec(host, secret, command, this.spec.signal)
@@ -584,8 +606,19 @@ class RemoteProcessHandle implements SubprocessHandle {
   }
 
   terminate(): void {
+    if (this.settled) return
     this.terminated = true
-    this.exec?.close()
+    if (this.exec === undefined) {
+      // No transport was opened yet. Resolve as a killed process instead of
+      // rejecting `done`, which may not have a listener until the caller's
+      // next microtask.
+      this.settled = true
+      this.stdout?.destroy()
+      this.stderr?.destroy()
+      this.resolveDone({ exitCode: null, signal: 'SIGKILL' })
+      return
+    }
+    this.exec.close()
   }
 
   waitForExit(signal?: AbortSignal): Promise<boolean> {

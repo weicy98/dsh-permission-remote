@@ -29,7 +29,7 @@ import {
   type ToolHost,
 } from './execute.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
-import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, toModelPath, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
@@ -1687,7 +1687,8 @@ export async function runOfficialBash(
       ? resolved.remoteCwd
       : resolveRemotePath(args.workdir, route.remoteCwd, route.placeholderCwd)
     const placeholder = mapRemoteToLocal(route.hostId, remote)
-    if (placeholder !== null) return official({ ...args, workdir: placeholder }, exec)
+    if (placeholder === null) throw new Error(`cannot map remote workdir ${remote} back to the SSH workspace placeholder`)
+    return official({ ...args, workdir: placeholder }, exec)
   }
   return official(args, exec)
 }
@@ -1699,14 +1700,27 @@ export async function runOfficialSearch(
   args: Record<string, unknown>,
   exec: ToolExec,
 ): Promise<unknown> {
-  if (typeof args.path === 'string' && args.path.length > 0) {
-    const resolved = routeByCwd(args.path)
-    const remote = resolved.kind === 'remote'
-      ? resolved.remoteCwd
-      : resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
-    return official({ ...args, path: remote }, exec)
+  const normalized = typeof args.path === 'string' && args.path.length > 0
+    ? (() => {
+        const resolved = routeByCwd(args.path)
+        return resolved.kind === 'remote'
+          ? { ...args, path: resolved.remoteCwd }
+          : { ...args, path: resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd) }
+      })()
+    : args
+  const value = await official(normalized, exec)
+  if (typeof value !== 'object' || value === null) return value
+  const result = { ...(value as Record<string, unknown>) }
+  const display = (path: unknown): unknown => typeof path === 'string' && posix.isAbsolute(path) ? toModelPath(path, route) : path
+  if (Array.isArray(result.paths)) result.paths = result.paths.map(display)
+  if (result.root !== undefined) result.root = display(result.root)
+  if (Array.isArray(result.matches)) {
+    result.matches = result.matches.map(match => {
+      if (typeof match !== 'object' || match === null) return match
+      return { ...(match as Record<string, unknown>), path: display((match as Record<string, unknown>).path) }
+    })
   }
-  return official(args, exec)
+  return result
 }
 
 const RUNNERS: Record<'bash' | 'terminal_open', (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {

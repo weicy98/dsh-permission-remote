@@ -121,3 +121,15 @@ test('generic remote spawn terminates on abort', async () => {
     await h.close()
   }
 })
+
+test('terminating before the SSH channel opens settles the handle instead of hanging', async () => {
+  const h = await harness()
+  try {
+    const pending = h.spawn(spec(h.placeholder))
+    pending.terminate()
+    const result = await pending.done
+    assert.equal(result.exitCode === null || result.signal !== null, true)
+  } finally {
+    await h.close()
+  }
+})

@@ -28,12 +28,9 @@ export interface UpstreamWorker {
   readonly packageRoot: string
   readonly processPath: string
   readonly processSource: Buffer
-  readonly persistentProcessPath: string
-  readonly persistentProcessSource: Buffer
   readonly indexSource: Buffer
   readonly controlSource: Buffer
   readonly processHash: string
-  readonly persistentProcessHash: string
   readonly indexHash: string
   readonly controlHash: string
 }
@@ -54,7 +51,6 @@ export interface ManifestEntry {
   readonly ptcRuntimeNodeVersion: string
   readonly dshSubprocessVersion: string
   readonly processSha256: string
-  readonly persistentProcessSha256: string
   readonly indexSha256: string
   readonly controlSha256: string
   readonly controlFd: number | undefined
@@ -77,7 +73,6 @@ export interface WorkerManifest {
 export interface UploadedWorker {
   readonly workerLocalPaths: readonly string[]
   readonly workerRemotePath: string
-  readonly persistentWorkerRemotePath: string
   readonly shimRemotePath: string
   readonly digest: string
 }
@@ -197,19 +192,6 @@ function findDshRoot(env: NodeJS.ProcessEnv): { root: string, version: string } 
       // Try the next candidate.
     }
   }
-  // Development fallback: the plugin's own install tree may contain the
-  // runtime package as a dev dependency. This is never used for the worker
-  // bytes when a real DSH root was found above.
-  const dev = resolvePackageJson('@deepseek-ai/dsh/package.json', dirname(fileURLToPath(import.meta.url)))
-  if (dev !== undefined) {
-    const root = dirname(dev)
-    try {
-      const version = (JSON.parse(readFileSync(dev, 'utf8')) as { version?: unknown }).version
-      return { root, version: typeof version === 'string' ? version : 'unknown' }
-    } catch {
-      // Fall through to the diagnostic below.
-    }
-  }
   throw new Error(
     `cannot locate the installed @deepseek-ai/dsh package; set DSH_INSTALL_ROOT to the DSH package root. Tried: ${candidateDshRoots(env).join(', ') || '(none)'}`,
   )
@@ -220,8 +202,6 @@ function locateRuntimePackage(dshRoot: string): string {
   if (existsSync(direct)) return direct
   const resolved = resolvePackageJson('@deepseek-ai/dsh-ptc-runtime-node/package.json', dshRoot)
   if (resolved !== undefined) return resolved
-  const dev = resolvePackageJson('@deepseek-ai/dsh-ptc-runtime-node/package.json', dirname(fileURLToPath(import.meta.url)))
-  if (dev !== undefined) return dev
   throw new Error(
     `the installed DSH at ${dshRoot} does not contain @deepseek-ai/dsh-ptc-runtime-node; remote run_code requires that package. Install a DSH build with Node PTC support.`,
   )
@@ -255,7 +235,6 @@ function hashesFor(worker: UpstreamWorker): ManifestEntry {
     ptcRuntimeNodeVersion: worker.runtimeVersion,
     dshSubprocessVersion: worker.dshSubprocessVersion,
     processSha256: worker.processHash,
-    persistentProcessSha256: '',
     indexSha256: worker.indexHash,
     controlSha256: worker.controlHash,
     controlFd: probes.controlFd,
@@ -287,12 +266,9 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
     packageRoot,
     processPath: join(packageRoot, 'lib', 'process.js'),
     processSource,
-    persistentProcessPath: '',
-    persistentProcessSource: Buffer.alloc(0),
     indexSource,
     controlSource,
     processHash: hash(processSource),
-    persistentProcessHash: '',
     indexHash: hash(indexSource),
     controlHash: hash(controlSource),
   }
@@ -444,7 +420,6 @@ export async function ensureWorker(
     const directory = `${home.replace(/\/+$/u, '')}/.dsh-permission-remote/ptc/${digest}`
     await pool.exec(host, secret, `mkdir -p ${shJoin([directory])} && chmod 700 ${shJoin([directory])}`, 20_000)
     const workerRemotePath = `${directory}/${WORKER_FILE}`
-    const persistentWorkerRemotePath = ''
     const shimRemotePath = `${directory}/${SHIM_FILE}`
     await uploadFile(pool, host, secret, workerRemotePath, worker.processSource, worker.processHash, signal)
     await uploadFile(pool, host, secret, shimRemotePath, Buffer.from(shimSource, 'utf8'), hash(Buffer.from(shimSource, 'utf8')), signal)
@@ -457,7 +432,6 @@ export async function ensureWorker(
     return {
       workerLocalPaths: [...localPaths],
       workerRemotePath,
-      persistentWorkerRemotePath,
       shimRemotePath,
       digest,
     }

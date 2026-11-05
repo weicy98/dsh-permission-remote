@@ -10,7 +10,7 @@
 import { symbols } from '@deepseek-ai/cordis'
 import type { HostConfig } from './config.ts'
 import { loginEnvApply } from './login-env.ts'
-import { resolveRemotePath, type RemoteRoute } from './router.ts'
+import type { RemoteRoute } from './router.ts'
 
 interface MutableService {
   [key: string]: unknown
@@ -49,10 +49,7 @@ export function installRemoteShell(ctx: { get(name: string): unknown }, deps: Re
     if (host?.loginEnv !== true) return original(spec)
     const snapshot = await deps.loginEnvOf(host, spec.signal)
     if (snapshot.length === 0) return original(spec)
-    const resolvedRoute = deps.routeByCwd(spec.workdir)
-    const remoteWorkdir = resolvedRoute.kind === 'remote'
-      ? resolvedRoute.remoteCwd
-      : resolveRemotePath(spec.workdir, route.remoteCwd, route.placeholderCwd)
+    const remoteWorkdir = route.remoteCwd
     return original({
       ...spec,
       command: loginEnvApply(snapshot, spec.command, remoteWorkdir),

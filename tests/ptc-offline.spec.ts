@@ -104,7 +104,6 @@ async function harness(
     ensureWorker: async () => ({
       workerLocalPaths: [HOST_PROCESS_JS],
       workerRemotePath: workerRemote,
-      persistentWorkerRemotePath: join(remoteRoot, 'persistent-process.mjs'),
       shimRemotePath: SHIM,
       digest: 'test',
     }),
