@@ -129,6 +129,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 - **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用，手动刷新后属性可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`。
 - **`present` 可用。** 插件先把远端文件复制到对应占位路径，再调用官方 `present`，所以卡片和预览拿到的是本机副本；远端原文件不动，超过 32 MiB 或任一文件失败会整次拒绝。细节见[详细说明](docs/advanced.md#交付文件present)。
+- **文件工具已经是官方 `dsh-tool-fs` 的工具层。** `read`、`write`、`edit`、`read_image`、`apply_patch` 的 schema、校验和审批由 DSH 提供；插件只实现远端 `ctx.fs` 的 `writeText`/`editText`/`patchText` 等后端方法，不会把文件写到本机 placeholder。
 - **可选的 `apply_patch` / `str_replace_editor`。** 两者默认都关着，由组合配置决定是否启用了 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 或挂载 `@deepseek-ai/dsh-tool-str-replace-editor`；启用后在远端执行，遵守同一套 Permissions、审批和沙箱，整补丁先预检、失败不回滚。细节见[详细说明](docs/advanced.md#可选的-apply_patch--str_replace_editor)。
 - **DSH 跑在 Windows 上时**，远端工作区只暴露远端 `bash`；`pwsh`、`powershell`、`cmd` 会被工具过滤和守卫挡住。`minimal` 这类完整 persona 不会被改写。
 - **项目说明文件**：会话读取 `AGENTS.md` / `CLAUDE.md` 及其 `.local` 时走文件系统接口，占位路径读到远端那份；`$DSH_HOME` 下的全局文件仍是本机。
@@ -243,6 +244,7 @@ The right sidebar's terminal on a remote workspace connects to that host: the sh
 
 - **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh (manual refresh can lag ~5 s). Non-image uploads are copied to `~/.dsh-permission-remote/uploads/`.
 - **`present` works** by copying the remote file to the placeholder path first and then calling the official tool; over 32 MiB or any bad file refuses the whole call. Details: [detailed notes](docs/advanced.md#交付文件present).
+- **File tools already use the official `dsh-tool-fs` surface.** `read`, `write`, `edit`, `read_image`, and `apply_patch` keep DSH schemas, validation, and approvals; the plugin only implements the remote `ctx.fs` backend methods such as `writeText`/`editText`/`patchText`, never a local write to the placeholder.
 - **Optional `apply_patch` / `str_replace_editor`** are off unless the composition enables `applyPatch` or mounts the editor package. They then run remotely under the same Permissions, approval, and sandbox; a patch is preflighted first and is not rolled back on failure. Details: [detailed notes](docs/advanced.md#可选的-apply_patch--str_replace_editor).
 - **Windows-hosted DSH** exposes only the remote `bash` in a remote workspace; `pwsh` / `powershell` / `cmd` are filtered and guarded. A `complete: true` persona is not rewritten.
 - **Project instruction files** (`AGENTS.md`, `CLAUDE.md`, and `.local`) are read through the filesystem service, so placeholder paths read the remote copy; global files under `$DSH_HOME` stay local.

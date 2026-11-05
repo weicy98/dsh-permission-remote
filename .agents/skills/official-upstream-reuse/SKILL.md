@@ -54,11 +54,12 @@ it writes a writable `$DSH_HOME/permission-remote/upstream-ptc.manifest.json`
 overlay only after contract probes pass, and reminds you to run the e2e gates.
 Unknown drift must fail closed.
 
-## Remaining hand-written candidates
+## Current migration status
 
-See `docs/upstream-reuse-playbook.md`. Highest value: `read_image` (try the
-official tool over remote `fs.readBytes`), `bash` (official `dsh-tool-bash` with
-a full remote `SubprocessRuntime`), `grep`/`glob` (official
-`dsh-tool-fs-search` builders plus a path adapter), and the vendored
-`@deepseek-ai/dsh-fs-patch` copy. Keep remote `fs`, `ssh-pool`, uploads, ops,
-login-env, and present staging.
+See `docs/upstream-reuse-playbook.md`. The official surface for
+`read`/`write`/`edit`/`apply_patch` is already used; `read_image` is now the
+official `dsh-tool-fs` tool over remote `fs.readBytes`. `bash` delegates to
+`dsh-tool-bash` with a thin `workdir` + login-env adapter; `grep`/`glob` delegate
+to `dsh-tool-fs-search` with a thin `args.path` adapter; the vendored
+`@deepseek-ai/dsh-fs-patch` copy is gone. Keep remote `fs`, `ssh-pool`, uploads,
+ops, login-env, and present staging.

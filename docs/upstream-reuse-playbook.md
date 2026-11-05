@@ -62,30 +62,29 @@ probes and records the host version. It is intentionally **not** a substitute
 for the test gates; the command prints that reminder. If a probe fails, fix the
 probe/adapter or refuse remote execution in `docs/upstream-ptc-worker.md`.
 
-## Remaining hand-written tools and the fastest route
+## Current migration status
 
-| Current implementation | Official source | Route |
+| Current implementation | Official source | State |
 | --- | --- | --- |
-| `runReadImage` in `src/execute.ts` | `@deepseek-ai/dsh-tool-fs` `read_image` | Try removing the shadow first: official `read_image` uses `ctx.fs.readBytes` and attachments, which the remote fs already provides. |
-| `runBash` / `commandArgv` | `dsh-tool-bash` + `dsh-bash-local` / `dsh-bash-sandbox` | Implement the full remote `SubprocessRuntime` contract (`collect`/`spill`, stdin, env, signal), then delete the custom bash runner. |
-| `runGlob` / `runGrep` | `@deepseek-ai/dsh-tool-fs-search` | Reuse exported `buildGlobCommand` / `buildGrepCommand` / `runRipgrep`; keep a thin remote path-normalization adapter because the official display assumes a local workdir. |
-| `patch-hunks.ts` + `vendor/fs-patch` | `@deepseek-ai/dsh-fs-patch` | Direct import; delete the vendored copy. |
-| `str_replace_editor` shadow | `@deepseek-ai/dsh-tool-str-replace-editor` | Keep a small path-rewrite adapter, or teach `remote-fs.resolve` remote absolute paths without a cwd. |
-| `working_directory` shadow | `@deepseek-ai/dsh-tool-working-directory` | Keep only remote validation; the official service commit already does the work. |
+| `read` / `write` / `edit` / `apply_patch` tool surface | `@deepseek-ai/dsh-tool-fs` | Official tools already call `ctx.fs`; remote-fs supplies `writeText` / `editText` / `patchText` and is covered by the official-tools integration test. |
+| `read_image` shadow | `@deepseek-ai/dsh-tool-fs` `read_image` | Removed; the official tool reads through `ctx.fs.readBytes` and the attachment store. |
+| `runGlob` / `runGrep` runners | `@deepseek-ai/dsh-tool-fs-search` | Removed. A thin `runOfficialSearch` shadow rewrites `args.path` from placeholder/relative to the remote path, then delegates the official tool. |
+| `runBash` / `commandArgv` | `dsh-tool-bash` + `dsh-bash-sandbox` | Default path delegates to official `dsh-tool-bash`; a thin `runOfficialBash` maps `workdir` and `installRemoteShell` injects the login snapshot. The old runner remains only as a fallback for compositions without official bash. |
+| `patch-hunks.ts` + `vendor/fs-patch` | `@deepseek-ai/dsh-fs-patch` | Replaced with the official package; vendored copy deleted. |
+| `str_replace_editor` shadow | `@deepseek-ai/dsh-tool-str-replace-editor` | Keep the small path-rewrite adapter; official `resolveTarget` has no cwd. |
+| `working_directory` shadow | `@deepseek-ai/dsh-tool-working-directory` | Keep only remote validation; the official service commit does the work. |
 | `present` staging | `@deepseek-ai/dsh-tool-present` | Cannot be replaced: the official card opens a local path, so staging is required. |
 | `terminal_open` / sidebar PTY | `@deepseek-ai/dsh-tool-terminal` / `dsh-terminal-bash` | Separate remote `spawnTerminal`/TerminalBackend work; not the PTC seam. |
 
 Do **not** replace `remote-fs.ts`, `remote-write.ts`, `ssh-pool.ts`, `uploads.ts`,
 `ops.ts`, `login-env.ts`, or `rg-fetch.ts`: they are remote transport or
-cross-platform packaging, not duplicated DSH logic. `profile.ts` is a copied
-subset of `dsh-sandbox-local` internals; keep one copy and add its source to the
-upstream probe list.
+cross-platform packaging, not duplicated DSH logic. In particular,
+`writeText` / `editText` / `patchText` are `ctx.fs` backend methods; delegating
+them to `dsh-fs-local` would write to the local placeholder, not the SSH host.
 
 ## Suggested next order
 
-1. Replace the vendored `fs-patch` (smallest, pure library).
-2. Try deleting `read_image` shadow against remote fs.
-3. Generalize the PTC transport into `remote-execution-world.ts` with the full
-   `SubprocessSpawnSpec`; migrate `bash` next.
-4. Migrate `grep`/`glob` with the official builders and a path adapter.
-5. Leave `present` and the remote PTY for separate designs.
+1. Keep the official file tools on `ctx.fs`; no tool-surface rewrite is needed.
+2. Generalize `RemoteProcessHandle` to full spill/collect semantics and use it
+   for any remaining official process-based tool.
+3. Leave `present` and the remote PTY for separate designs.

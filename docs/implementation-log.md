@@ -14,3 +14,4 @@ alone.
 | S5 | test/docs: 真机 e2e 与用户文档 | Live e2e, README/advanced docs | `DSH_PTC_LIVE=1 ... npm run e2e:ptc` 4/4 通过（local host `h680183c9af9ceca4`） |
 | S6 | feat: 持久模式（可选） | official runtime persistent-in-memory / vm-script; persistent worker uploaded | 离线 persistent 2/2、真机 persistent 1/1 通过 |
 | S7 | chore: 版本、lib 与发布 | version 0.14.0, build, release checks | `npm run check:upstream`、`npm test` 667/667、`npm run build` 通过 |
+| S8 | feat: 复用官方文件工具与通用远端执行世界 | official `dsh-fs-patch` + `read_image`, generic `RemoteProcessHandle`, official bash/search adapters | `npm test` 675/675、`npm run test:ptc` 11/11、local host PTC e2e 4/4 通过 |
