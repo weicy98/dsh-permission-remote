@@ -126,20 +126,6 @@ export function sandboxDenied(exitCode: number | null, stderr: string): boolean 
   return /read-only file system|operation not permitted/i.test(stderr)
 }
 
-export function grepArgv(rg: string, pattern: string, base: string, include?: string): string[] {
-  // `-e` binds the pattern, and `--` ends option parsing: a pattern that starts
-  // with `-` (e.g. `--pre=/bin/sh`) is searched for instead of becoming a
-  // ripgrep option that runs a program.
-  const argv = [rg, '--no-config', '--json', '-n', '--heading', '-e', pattern]
-  if (include !== undefined && include.length > 0) argv.push('--glob', include)
-  argv.push('--', base)
-  return argv
-}
-
-export function globArgv(rg: string, pattern: string): string[] {
-  return [rg, '--no-config', '--files', '--hidden', '--iglob', pattern, '--glob', '!.git/**', '--sort', 'modified']
-}
-
 /**
  * Write stdin to a same-directory temp file, then rename it onto the target.
  * `mv` on one filesystem replaces the destination atomically. A dropped

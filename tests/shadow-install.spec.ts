@@ -214,7 +214,7 @@ test('a session already on the host may walk outside its workspace', async () =>
   const bash = tools.find(tool => tool.name === 'bash')
   // Navigation on the same host is not the escalation the guard blocks; the
   // next failure is the deliberately missing host configuration.
-  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /not configured/)
+  await assert.rejects(() => bash!.execute({ command: 'id' }, { agent }), /unknown SSH host|not configured/)
 })
 
 test('working_directory refuses to commit an unregistered placeholder', async () => {
@@ -480,6 +480,38 @@ test('a later successful install removes the deny guard', async () => {
   await created(ctx, agent)
   assert.equal(registered.includes('bash'), true)
   assert.equal(guards.some(guard => /did not mount/.test(guard({ name: 'bash' }) ?? '')), false)
+})
+
+test('a renamed workflow tool is still refused in a remote workspace without the PTC world', async () => {
+  // The official `workflow` tool takes its name from config (`toolName`), so a
+  // deployment can rename it. The refuse guard must recognise it by its
+  // declared `script` + `meta` contract, not by the literal `workflow` name.
+  const ctx = plugin()
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
+  const { agent } = agentFor(remoteCwd, () => () => undefined)
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => {
+      const index = guards.indexOf(guard)
+      if (index >= 0) guards.splice(index, 1)
+    }
+  }
+  const definitions: Record<string, { parameters?: { required?: string[] } }> = {
+    fan_out: { parameters: { required: ['script', 'meta'] } },
+    run_code: { parameters: { required: ['code', 'description'] } },
+    read: { parameters: { required: ['path'] } },
+  }
+  agent.ctx.tools.get = ((name: string) => definitions[name]) as typeof agent.ctx.tools.get
+  ctx.provide('agents', { list: () => [agent] })
+  apply(ctx, { hosts: [], maxConnections: 4 })
+  // No `ptcRuntime` service is loaded, so the PTC world never installs and the
+  // remote session must refuse rather than run these tools on this computer.
+  await created(ctx, agent)
+  assert.ok(guards.length > 0, 'a successful shadow install must install the refuse guard')
+  const refuses = (name: string): boolean => guards.some(guard => /remote PTC runtime is not installed/.test(guard({ name }) ?? ''))
+  assert.equal(refuses('fan_out'), true, 'a renamed workflow tool must still be refused')
+  assert.equal(refuses('run_code'), true)
+  assert.equal(refuses('read'), false, 'an ordinary file tool keeps its own guard')
 })
 
 test('working_directory output carries the remote directory as an optional field', async () => {

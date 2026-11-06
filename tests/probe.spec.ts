@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { FACT_BEGIN, FACT_END, RG_LOOKUP_BEGIN, RG_LOOKUP_END, hostFactsCommand, parseHostFacts, systemRipgrepCommand, systemRipgrepPath } from '../src/probe.ts'
+import { FACT_BEGIN, FACT_END, NODE_LOOKUP_BEGIN, NODE_LOOKUP_END, RG_LOOKUP_BEGIN, RG_LOOKUP_END, hostFactsCommand, nodeProbeCommand, parseHostFacts, parseNodeProbe, systemRipgrepCommand, systemRipgrepPath } from '../src/probe.ts'
 
 function block(lines: readonly string[]): string {
   return [FACT_BEGIN, ...lines, FACT_END].join('\n')
@@ -68,4 +68,16 @@ test('a login banner is not the system ripgrep path', () => {
   // A function body can hold an absolute command; that line is not the binary.
   assert.equal(systemRipgrepPath([RG_LOOKUP_BEGIN, 'rg () ', '{ ', '  /usr/local/bin/rg "$@"', '}', RG_LOOKUP_END].join('\n')), '')
   assert.equal(systemRipgrepPath(['Welcome to Ubuntu', '/usr/bin/rg'].join('\n')), '/usr/bin/rg')
+})
+
+
+test('the node probe extracts an absolute path and version across a banner', () => {
+  const stdout = ['banner line', NODE_LOOKUP_BEGIN, '/usr/local/bin/node', '22.20.0', NODE_LOOKUP_END, ''].join('\n')
+  assert.deepEqual(parseNodeProbe(stdout), { path: '/usr/local/bin/node', version: '22.20.0', major: 22 })
+  assert.match(nodeProbeCommand(), /command -v node/)
+})
+
+test('the node probe rejects output without an absolute binary', () => {
+  const stdout = [NODE_LOOKUP_BEGIN, '22.20.0', NODE_LOOKUP_END].join('\n')
+  assert.equal(parseNodeProbe(stdout), null)
 })

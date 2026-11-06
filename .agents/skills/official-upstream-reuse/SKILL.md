@@ -1,0 +1,84 @@
+---
+name: official-upstream-reuse
+description: Use when replacing a plugin's hand-written tool, protocol, worker, or runner with the installed DeepSeek Harness upstream package. Covers locating the host install, contract probes, hash manifests, worker uploads, fd 7 control shims, seam adapters, offline/live gates, and the remaining hand-written-tool candidates in dsh-permission-remote.
+---
+
+# Official upstream reuse
+
+## Rule
+
+The installed DSH package is the source of truth. Resolve it, hash it, probe
+its contract, and run a real smoke test. Never vendor a copy and never silently
+fall back to a plugin-authored implementation.
+
+## Worker/process recipe
+
+1. Locate `@deepseek-ai/dsh-ptc-runtime-node` from `DSH_INSTALL_ROOT` or the DSH
+   CLI entry (`process.argv[1]`), not from the plugin's own dev tree.
+2. Read `lib/process.js`, `lib/index.js`, and
+   `@deepseek-ai/dsh-subprocess/lib/control.js`. `process.js` serves
+   `function-body`, `repl`, and `script`; `persistent-process.js` is only a
+   legacy REPL-default entry and is neither read nor uploaded.
+3. Probe: entry line, `fd: 7`, `DSH_SUBPROCESS_CONTROL`, Node-builtins-only
+   imports, `bootstrapArgs` mapping, `stdio.control: 'pipe'`.
+4. Upload `lib/process.js` as `process.mjs`; never `.js` without a
+   `package.json` with `"type":"module"`.
+5. Shim: full argv, fd 7 socket, `DSH_SUBPROCESS_CONTROL=pipe`, PATH/TEMP/TMP,
+   detached process group, Unix + loopback TCP handshake, token validation.
+6. Translate the control-frame cwd in a thin runtime wrapper; keep an
+   AsyncLocalStorage world for the seams. Do not parse or rewrite frames.
+7. Verify with `tests/ptc-offline.spec.ts` and `tests/ptc-live.e2e.ts`; record
+   the version in `vendor/upstream/ptc-worker.manifest.json`.
+
+## Service/tool recipe
+
+- Keep the official tool definition and patch the execution seams beneath it:
+  `ctx.fs`, `ctx.sandbox.confine`, `ctx.subprocess.spawn`,
+  `ctx.subprocess.resolveExecutable`, and `ctx.workingDirectory`.
+- A generic remote world must implement the full `SubprocessSpawnSpec`:
+  `stdin: ignore|pipe|{data}`, `stdout/stderr: pipe|collect{maxBytes,spill}`,
+  `collected` readers, `control`, `signal`, `graceMs`, `terminate`,
+  `waitForExit`.
+- Route by session cwd / policy root; never route local calls. Clear the
+  AsyncLocalStorage world for nested local runs.
+
+## Upgrade gates
+
+```bash
+npm run check:upstream
+npm run test:ptc
+DSH_PTC_LIVE=1 ... npm run e2e:ptc
+npm run check:upstream -- --update
+```
+
+`npm run adapt:upstream` is the one-command installed-host static adaptation;
+it writes a writable `$DSH_HOME/permission-remote/upstream-ptc.manifest.json`
+overlay only after contract probes pass, and reminds you to run the e2e gates.
+The plugin merges package and overlay entries on every remote run, so an
+adaptation applies to the next PTC call without a rebuild or restart.
+Unknown drift must fail closed.
+
+Scope of `scripts/check-upstream.mjs`:
+
+- Does: locate the host install (`DSH_INSTALL_ROOT` or the running DSH entry),
+  hash `process.js` / `lib/index.js` / `dsh-subprocess` control.js, run the six
+  static probes, diff against the manifest, and with `--update`/`--adapt` record
+  the entry in `vendor/upstream/ptc-worker.manifest.json` or the `$DSH_HOME`
+  overlay.
+- Does not: run the test gates, bump version ranges, `engines`, docs, or release
+  notes, verify the remote Node major, or adapt automatically at startup. A
+  failed probe needs a code change to the probe/adapter first.
+- The runtime gate and `--check` match on worker bytes (hashes + control
+  fd/env); version labels are metadata, so a DSH version bump with identical
+  bytes is already usable. A drift report means the worker contract changed,
+  not merely that the release label changed.
+
+## Current migration status
+
+See `docs/upstream-reuse-playbook.md`. The official surface for
+`read`/`write`/`edit`/`apply_patch` is already used; `read_image` is now the
+official `dsh-tool-fs` tool over remote `fs.readBytes`. `bash` delegates to
+`dsh-tool-bash` with a thin `workdir` + login-env adapter; `grep`/`glob` delegate
+to `dsh-tool-fs-search` with a thin `args.path` adapter; the vendored
+`@deepseek-ai/dsh-fs-patch` copy is gone. Keep remote `fs`, `ssh-pool`, uploads,
+ops, login-env, and present staging.

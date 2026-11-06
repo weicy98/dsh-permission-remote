@@ -74,6 +74,16 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 模型带 `sandbox_permissions` 和一句话理由重试时，仍走现有审批。批准只放宽这一次调用。`workspace-write` 的文件写入在远端沙箱进程里完成：内容先进入同目录的临时文件，再 `mv -f` 换成目标文件；中途断开留下的是临时文件，原来的内容还在。
 
+## 远端 run_code（PTC）
+
+远端工作区里的 `run_code` / `workflow` 会在 SSH 主机上执行，使用的是宿主机安装的同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` worker（`process.js`），不是插件自研的运行器。
+
+- 程序里的 `process.env` 与本地 PTC 一样为空；相对路径和 `process.cwd()` 都在远端工作区。
+- 支持 per-call `function-body`、`persistent-in-memory` 的 REPL，以及 `vm-script`（`scriptPersistence` 开启时保留状态）；保留状态按 state owner 留在 SSH 主机进程内。
+- 远端需要 Node.js 22+。插件把官方 worker 按 hash 上传到 `~/.dsh-permission-remote/ptc/<hash>/`，不因升级而重复上传。
+- 远端 SSH 需要允许 streamlocal 转发；不支持时回退 loopback TCP，两者都不可用会给出明确错误。
+- 上游 worker 契约和升级流程见 [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md)。
+
 ## 远程运维
 
 普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机。可用工具：`ssh_hosts`、`ssh_exec`、`ssh_read`、`ssh_write`、`ssh_upload`、`ssh_download`、`ssh_workspace`。
@@ -119,10 +129,11 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 - **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用，手动刷新后属性可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`。
 - **`present` 可用。** 插件先把远端文件复制到对应占位路径，再调用官方 `present`，所以卡片和预览拿到的是本机副本；远端原文件不动，超过 32 MiB 或任一文件失败会整次拒绝。细节见[详细说明](docs/advanced.md#交付文件present)。
+- **文件工具已经是官方 `dsh-tool-fs` 的工具层。** `read`、`write`、`edit`、`read_image`、`apply_patch` 的 schema、校验和审批由 DSH 提供；插件只实现远端 `ctx.fs` 的 `writeText`/`editText`/`patchText` 等后端方法，不会把文件写到本机 placeholder。
 - **可选的 `apply_patch` / `str_replace_editor`。** 两者默认都关着，由组合配置决定是否启用了 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 或挂载 `@deepseek-ai/dsh-tool-str-replace-editor`；启用后在远端执行，遵守同一套 Permissions、审批和沙箱，整补丁先预检、失败不回滚。细节见[详细说明](docs/advanced.md#可选的-apply_patch--str_replace_editor)。
 - **DSH 跑在 Windows 上时**，远端工作区只暴露远端 `bash`；`pwsh`、`powershell`、`cmd` 会被工具过滤和守卫挡住。`minimal` 这类完整 persona 不会被改写。
 - **项目说明文件**：会话读取 `AGENTS.md` / `CLAUDE.md` 及其 `.local` 时走文件系统接口，占位路径读到远端那份；`$DSH_HOME` 下的全局文件仍是本机。
-- **「运行代码」仍在本机。** 它跑的是你电脑上这个占位目录里的运行时，不是远端那一份。
+- **「运行代码」在远端工作区里跑在 SSH 主机上。** 它使用宿主同版本官方 PTC worker；`process.env` 为空，支持 per-call、persistent-in-memory 和 vm-script（scriptPersistence）。
 - 只支持直连的 Linux 或 macOS；不支持跳板机和 Windows 远端。网络中断时正在进行的操作会失败，已写入远端的文件不会回滚。
 
 ## 开发
@@ -198,6 +209,16 @@ Reads `/etc/profile`, the first of `~/.bash_profile` / `~/.bash_login` / `~/.pro
 
 A model retry carrying `sandbox_permissions` plus a justification still goes through the normal approval and widens only that call.
 
+### Remote run_code (PTC)
+
+In a remote workspace, `run_code` / `workflow` executes on the SSH host using the host's exact official `@deepseek-ai/dsh-ptc-runtime-node` worker (`process.js`), not a plugin-authored runner.
+
+- Program `process.env` is empty, exactly like local PTC; relative paths and `process.cwd()` are on the remote workspace.
+- Per-call `function-body`, `persistent-in-memory` REPL, and `vm-script` with `scriptPersistence` are supported; retained state stays in the SSH host process keyed by state owner.
+- The remote host needs Node.js 22+. The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
+- The SSH server must allow streamlocal forwarding; otherwise the plugin falls back to loopback TCP and reports a clear error if both fail.
+- Upstream contract and upgrade steps: [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md).
+
 ### Remote ops
 
 An ordinary local workspace can operate a configured SSH host with `ssh_hosts`, `ssh_exec`, `ssh_read`, `ssh_write`, `ssh_upload`, `ssh_download`, and `ssh_workspace`. Each host has an ops policy:
@@ -223,10 +244,11 @@ The right sidebar's terminal on a remote workspace connects to that host: the sh
 
 - **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh (manual refresh can lag ~5 s). Non-image uploads are copied to `~/.dsh-permission-remote/uploads/`.
 - **`present` works** by copying the remote file to the placeholder path first and then calling the official tool; over 32 MiB or any bad file refuses the whole call. Details: [detailed notes](docs/advanced.md#交付文件present).
+- **File tools already use the official `dsh-tool-fs` surface.** `read`, `write`, `edit`, `read_image`, and `apply_patch` keep DSH schemas, validation, and approvals; the plugin only implements the remote `ctx.fs` backend methods such as `writeText`/`editText`/`patchText`, never a local write to the placeholder.
 - **Optional `apply_patch` / `str_replace_editor`** are off unless the composition enables `applyPatch` or mounts the editor package. They then run remotely under the same Permissions, approval, and sandbox; a patch is preflighted first and is not rolled back on failure. Details: [detailed notes](docs/advanced.md#可选的-apply_patch--str_replace_editor).
 - **Windows-hosted DSH** exposes only the remote `bash` in a remote workspace; `pwsh` / `powershell` / `cmd` are filtered and guarded. A `complete: true` persona is not rewritten.
 - **Project instruction files** (`AGENTS.md`, `CLAUDE.md`, and `.local`) are read through the filesystem service, so placeholder paths read the remote copy; global files under `$DSH_HOME` stay local.
-- **Run Code stays local.** It executes the runtime in the placeholder directory on your computer, not on the remote host.
+- **Run Code runs on the SSH host in a remote workspace.** It uses the host's exact official PTC worker; `process.env` is empty and per-call, persistent-in-memory, and vm-script modes are supported.
 - Direct Linux or macOS only; no jump hosts or Windows remotes. A dropped connection fails the running operation and files already written stay on the remote.
 
 ### Development

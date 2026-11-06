@@ -3,12 +3,20 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, posix } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { PassThrough, type Duplex } from 'node:stream'
 import { Client, type ConnectConfig } from './ssh2-client.ts'
 import type { HostConfig } from './config.ts'
 import { claimPending } from './pool-claim.ts'
 import { shJoin } from './shell-quote.ts'
 
 const OUTPUT_CAP = 1024 * 1024
+const FORWARD_OPEN_TIMEOUT_MS = 10_000
+
+function abortError(): Error {
+  const error = new Error('SSH operation aborted')
+  error.name = 'AbortError'
+  return error
+}
 
 /** Decode one SSH chunk. Incomplete UTF-8 stays in `decoder` until the next chunk or `end()`. */
 export function takeChannelText(decoder: StringDecoder, chunk: Buffer): string {
@@ -35,6 +43,16 @@ export interface ExecResult {
 /** One remote command on its own SSH channel. `close` kills that channel only. */
 export interface RemoteCommand {
   readonly done: Promise<ExecResult>
+  close(): void
+}
+
+/** A live exec channel with raw stdout/stderr streams for the PTC transport. */
+export interface PtcExecHandle {
+  readonly stdout: PassThrough
+  readonly stderr: PassThrough
+  readonly done: Promise<ExecResult>
+  write(data: Buffer | string): void
+  end(): void
   close(): void
 }
 
@@ -277,11 +295,22 @@ function expandTildePath(input: string): string {
 export class SshPool {
   private readonly live = new Map<string, Promise<Live>>()
   private readonly waiters: Array<() => void> = []
+  private readonly forwards = new Set<Duplex>()
   private active = 0
+  private disposed = false
 
   constructor(private readonly maxConnections: number) {}
 
   async dispose(): Promise<void> {
+    this.disposed = true
+    for (const channel of this.forwards) {
+      try {
+        channel.destroy()
+      } catch {
+        // Already gone.
+      }
+    }
+    this.forwards.clear()
     const pending = [...this.live.values()]
     this.live.clear()
     // A queued caller is waiting for a slot that `closeLive` will never hand
@@ -300,6 +329,9 @@ export class SshPool {
         // A failed connect released its slot in `acquire`.
       }
     }
+    // `dispose()` is also used as a test/harness reset between phases; only
+    // block callers that race the disposal itself.
+    this.disposed = false
   }
 
   invalidate(hostId: string): void {
@@ -393,6 +425,250 @@ export class SshPool {
       settleThen(commandHandle.done, () => signal.removeEventListener('abort', abort))
     }
     return commandHandle
+  }
+
+  /**
+   * Open one raw exec channel with live stdout/stderr streams. This is the
+   * transport used by the PTC shim; unlike {@link open}, it does not buffer
+   * output and it keeps the child descriptor open for the control channel.
+   */
+  async openPtcExec(host: HostConfig, secret: SecretMaterial, command: string, signal?: AbortSignal): Promise<PtcExecHandle> {
+    const live = await this.acquire(host, secret, true)
+    if (signal?.aborted === true) throw abortError()
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const queued: Buffer[] = []
+    let ending = false
+    let stream: ExecStream | undefined
+    let settled = false
+    let resolveDone: (result: ExecResult) => void = () => undefined
+    let rejectDone: (error: Error) => void = () => undefined
+    let closeTimer: ReturnType<typeof setTimeout> | undefined
+    const done = new Promise<ExecResult>((resolve, reject) => {
+      resolveDone = resolve
+      rejectDone = reject
+    })
+    const finish = (code?: number | null, signalValue?: string | null) => {
+      if (settled) return
+      settled = true
+      if (closeTimer !== undefined) {
+        clearTimeout(closeTimer)
+        closeTimer = undefined
+      }
+      stdout.end()
+      stderr.end()
+      resolveDone({
+        ...exitFields('exit', code, signalValue),
+        stdout: '',
+        stderr: '',
+        timedOut: false,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      })
+    }
+    const close = () => {
+      if (settled) return
+      if (stream === undefined) {
+        finish(null, 'KILL')
+        return
+      }
+      try {
+        stream.signal?.('KILL', () => undefined)
+      } catch {
+        // The channel may already be gone.
+      }
+      try {
+        stream.close()
+      } catch {
+        // Closing a finished channel is the outcome we wanted.
+      }
+      // A dead SSH transport may never deliver the channel close event. Do
+      // not leave timeout/cancel callers waiting forever.
+      if (closeTimer === undefined) {
+        closeTimer = setTimeout(() => finish(null, 'KILL'), 1000)
+      }
+    }
+    try {
+      live.client.exec(command, (error, opened) => {
+        if (error) {
+          if (!settled) {
+            settled = true
+            stdout.end()
+            stderr.end()
+            rejectDone(new SshFailure(error.message, 'exec'))
+          }
+          return
+        }
+        stream = opened as unknown as ExecStream
+        if (settled) {
+          try {
+            stream.close()
+          } catch {
+            // The channel was already closed while the open was in flight.
+          }
+          return
+        }
+        stream.on('data', chunk => {
+          if (!settled) stdout.write(chunk)
+        })
+        stream.stderr.on('data', chunk => {
+          if (!settled) stderr.write(chunk)
+        })
+        stream.on('close', (code, signalValue) => finish(code, signalValue))
+        for (const chunk of queued) stream.write(chunk)
+        queued.length = 0
+        if (ending) stream.end()
+        if (signal?.aborted === true) close()
+      })
+    } catch (error) {
+      if (!settled) {
+        settled = true
+        stdout.end()
+        stderr.end()
+        rejectDone(error instanceof Error ? error : new SshFailure(String(error), 'exec'))
+      }
+    }
+    if (signal !== undefined) {
+      const abort = () => close()
+      signal.addEventListener('abort', abort, { once: true })
+      settleThen(done, () => signal.removeEventListener('abort', abort))
+    }
+    return {
+      stdout,
+      stderr,
+      done,
+      write: (data: Buffer | string) => {
+        if (settled) return
+        if (stream === undefined) {
+          queued.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+          return
+        }
+        try {
+          stream.write(data)
+        } catch {
+          // The close path reports the transport failure.
+        }
+      },
+      end: () => {
+        if (settled) return
+        ending = true
+        if (stream === undefined) return
+        try {
+          stream.end()
+        } catch {
+          // Already closed.
+        }
+      },
+      close,
+    }
+  }
+
+  /** Open one direct-streamlocal channel for the PTC control socket. */
+  async forwardOutStreamLocal(host: HostConfig, secret: SecretMaterial, socketPath: string, signal?: AbortSignal): Promise<Duplex> {
+    const live = await this.acquire(host, secret, true)
+    if (signal?.aborted === true) throw abortError()
+    const client = live.client as unknown as {
+      openssh_forwardOutStreamLocal(path: string, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
+    }
+    return await new Promise<Duplex>((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => finish(abortError())
+      const finish = (error?: Error, channel?: Duplex): void => {
+        if (settled) {
+          channel?.destroy()
+          return
+        }
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (error !== undefined) {
+          channel?.destroy()
+          reject(error)
+          return
+        }
+        this.forwards.add(channel!)
+        channel!.once('close', () => this.forwards.delete(channel!))
+        resolve(channel!)
+      }
+      timer = setTimeout(() => finish(new SshFailure('streamlocal forward timed out', 'forward-streamlocal')), FORWARD_OPEN_TIMEOUT_MS)
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          finish(abortError())
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      try {
+        client.openssh_forwardOutStreamLocal(socketPath, (error, channel) => {
+          if (error !== undefined || channel === undefined) {
+            finish(new SshFailure(error?.message ?? 'streamlocal forward returned no channel', 'forward-streamlocal'))
+            return
+          }
+          if (signal?.aborted === true) {
+            finish(abortError(), channel)
+            return
+          }
+          finish(undefined, channel)
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new SshFailure(String(error), 'forward-streamlocal'))
+      }
+    })
+  }
+
+  /** Open one direct-tcpip channel for the PTC control socket fallback. */
+  async forwardOutTcp(host: HostConfig, secret: SecretMaterial, hostname: string, port: number, signal?: AbortSignal): Promise<Duplex> {
+    const live = await this.acquire(host, secret, true)
+    if (signal?.aborted === true) throw abortError()
+    const client = live.client as unknown as {
+      forwardOut(srcIP: string, srcPort: number, dstIP: string, dstPort: number, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
+    }
+    return await new Promise<Duplex>((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => finish(abortError())
+      const finish = (error?: Error, channel?: Duplex): void => {
+        if (settled) {
+          channel?.destroy()
+          return
+        }
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (error !== undefined) {
+          channel?.destroy()
+          reject(error)
+          return
+        }
+        this.forwards.add(channel!)
+        channel!.once('close', () => this.forwards.delete(channel!))
+        resolve(channel!)
+      }
+      timer = setTimeout(() => finish(new SshFailure('tcp forward timed out', 'forward-tcp')), FORWARD_OPEN_TIMEOUT_MS)
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          finish(abortError())
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      try {
+        client.forwardOut('127.0.0.1', 0, hostname, port, (error, channel) => {
+          if (error !== undefined || channel === undefined) {
+            finish(new SshFailure(error?.message ?? 'tcp forward returned no channel', 'forward-tcp'))
+            return
+          }
+          if (signal?.aborted === true) {
+            finish(abortError(), channel)
+            return
+          }
+          finish(undefined, channel)
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new SshFailure(String(error), 'forward-tcp'))
+      }
+    })
   }
 
   /** Connect far enough to read the host key. Does not persist trust. */
@@ -623,6 +899,7 @@ export class SshPool {
   }
 
   private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
+    if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     return claimPending(this.live, host.id, async () => {
       await this.reserve()
       try {
@@ -630,6 +907,11 @@ export class SshPool {
           if (!requireTrust) return true
           return fingerprintMatches(host.fingerprint, key)
         })
+        if (this.disposed) {
+          client.end()
+          this.release()
+          throw new SshFailure('SSH pool is disposed', 'connect')
+        }
         const live: Live = {
           client,
           hostId: host.id,
@@ -657,6 +939,7 @@ export class SshPool {
   }
 
   private reserve(): Promise<void> {
+    if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     if (this.active < this.maxConnections) {
       this.active += 1
       return Promise.resolve()

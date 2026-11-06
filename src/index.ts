@@ -19,10 +19,7 @@ import {
   remoteFacts,
   probeHost,
   runBash,
-  runGlob,
-  runGrep,
   runWorkingDirectory,
-  runReadImage,
   clearStagedPresentFiles,
   stagePresentFiles,
   throwIfAborted,
@@ -31,9 +28,8 @@ import {
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
-import { sniffImage } from './image.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
-import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, toModelPath, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
@@ -56,6 +52,11 @@ import {
 } from './shell-surface.ts'
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
+import { attachRemotePtc } from './ptc-remote.ts'
+import { installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
+import { installRemoteShell } from './remote-shell.ts'
+import { SshPoolTransport } from './remote-transport.ts'
+import { clearWorkerCache, ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import { installRemoteFs, remoteFsInstalled } from './remote-fs.ts'
 import { installRemoteUploads } from './uploads.ts'
@@ -1673,17 +1674,57 @@ function markRemote(service: SshApi): void {
  * commits a directory through the official service, the second stages files and
  * delegates to the official tool, so neither has a runner of its own.
  */
-const RUNNERS: Record<Exclude<RoutedToolName, 'working_directory' | 'present' | 'str_replace_editor'>, (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
+/** Delegate official bash after mapping its raw `workdir` into the remote placeholder. */
+export async function runOfficialBash(
+  official: ((args: unknown, exec: ToolExec) => Promise<unknown>) | ((args: unknown, exec: ToolExec) => unknown),
+  route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  if (typeof args.workdir === 'string' && args.workdir.length > 0) {
+    const resolved = routeByCwd(args.workdir)
+    const remote = resolved.kind === 'remote'
+      ? resolved.remoteCwd
+      : resolveRemotePath(args.workdir, route.remoteCwd, route.placeholderCwd)
+    const placeholder = mapRemoteToLocal(route.hostId, remote)
+    if (placeholder === null) throw new Error(`cannot map remote workdir ${remote} back to the SSH workspace placeholder`)
+    return official({ ...args, workdir: placeholder }, exec)
+  }
+  return official(args, exec)
+}
+
+/** Delegate official glob/grep after mapping placeholder paths to remote paths. */
+export async function runOfficialSearch(
+  official: (args: unknown, exec: ToolExec) => Promise<unknown> | unknown,
+  route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  const normalized = typeof args.path === 'string' && args.path.length > 0
+    ? (() => {
+        const resolved = routeByCwd(args.path)
+        return resolved.kind === 'remote'
+          ? { ...args, path: resolved.remoteCwd }
+          : { ...args, path: resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd) }
+      })()
+    : args
+  const value = await official(normalized, exec)
+  if (typeof value !== 'object' || value === null) return value
+  const result = { ...(value as Record<string, unknown>) }
+  const display = (path: unknown): unknown => typeof path === 'string' && posix.isAbsolute(path) ? toModelPath(path, route) : path
+  if (Array.isArray(result.paths)) result.paths = result.paths.map(display)
+  if (result.root !== undefined) result.root = display(result.root)
+  if (Array.isArray(result.matches)) {
+    result.matches = result.matches.map(match => {
+      if (typeof match !== 'object' || match === null) return match
+      return { ...(match as Record<string, unknown>), path: display((match as Record<string, unknown>).path) }
+    })
+  }
+  return result
+}
+
+const RUNNERS: Record<'bash' | 'terminal_open', (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
   bash: (host, route, args, exec) => runBash(host, route, args, exec),
-  read_image: (host, route, args, exec, ctx) => runReadImage(host, route, args, async (data, fileName) => {
-    const attachments = ctx.get('attachments') as { saveImage(input: { data: Buffer, mediaType: string, name: string }): Promise<Record<string, unknown>> } | undefined
-    if (attachments === undefined) throw new Error('no attachment service is mounted')
-    const mediaType = sniffImage(data)
-    if (mediaType === undefined) throw new Error(`cannot read "${fileName}": the file content is not a PNG, JPEG, WebP, or GIF`)
-    return attachments.saveImage({ data, mediaType, name: fileName })
-  }, exec),
-  glob: (host, route, args, exec) => runGlob(host, route, args, exec),
-  grep: (host, route, args, exec) => runGrep(host, route, args, exec),
   // A local PTY backend would open a shell inside the placeholder directory
   // while the sidebar terminal is already on the server. Refuse instead of
   // handing the model a prompt that is not where the Session is.
@@ -1755,8 +1796,15 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   let fsPatchReady = false
+  let worldReady = false
+  let ptcDisposed = false
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => async () => {
+    ptcDisposed = true
+    // The fs/subprocess patches are removed below; a later run must not see
+    // a stale "ready" flag and route through a half-unloaded world.
+    fsPatchReady = false
+    worldReady = false
     // One agent disposer must not skip the remaining agents or the pool.
     const failure = settleDisposers([...unregisters])
     unregisters.clear()
@@ -1767,6 +1815,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     // them, so this is the only safe moment to remove them. The disposer is
     // async so Cordis waits for the files to disappear before the pool closes.
     await clearStagedPresentFiles()
+    clearWorkerCache()
     await core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
@@ -1778,6 +1827,52 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.delete(remove)
     })
   })
+  rawCtx.inject(['sandbox', 'subprocess'], bridged => {
+    const remove = installRemoteWorld(bridged as unknown as { get(name: string): unknown }, {
+      transport: new SshPoolTransport(core.pool),
+      hostOf: id => core.listHosts().find(host => host.id === id),
+      secretOf: host => core.secret(host),
+      statusOf: host => core.statusOf(host),
+      routeByCwd: cwd => routeByCwd(cwd),
+    })
+    if (remove === undefined) return
+    worldReady = true
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
+      worldReady = false
+    })
+  })
+  rawCtx.inject(['shell'], bridged => {
+    const hostApi = core.toolHost(undefined)
+    const remove = installRemoteShell(bridged as unknown as { get(name: string): unknown }, {
+      routeByCwd: cwd => routeByCwd(cwd),
+      hostOf: id => core.listHosts().find(host => host.id === id),
+      loginEnvOf: (host, signal) => hostApi.loginEnvOf?.(host, signal) ?? Promise.resolve(''),
+    })
+    if (remove === undefined) return
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
+    })
+  })
+  const detachPtc = attachRemotePtc(rawCtx as unknown as Parameters<typeof attachRemotePtc>[0], {
+    pool: core.pool,
+    hostOf: id => core.listHosts().find(host => host.id === id),
+    secretOf: host => core.secret(host),
+    statusOf: host => core.statusOf(host),
+    ensureWorker: (host, secret, status, signal) => ensureWorker(core.pool, host, secret, status.home, signal),
+    worldReady: () => worldReady,
+    fsReady: () => fsPatchReady,
+    disposed: () => ptcDisposed,
+  })
+  unregisters.add(detachPtc)
+  ctx.effect(() => () => {
+    detachPtc()
+    unregisters.delete(detachPtc)
+  })
   // Sidebar listing, office preview, and markdown images all read ctx.fs at the
   // placeholder path. Uploads are copied before that stream's first pull.
   // `fs` is not in this plugin's inject list. A get() here runs before that
@@ -1786,6 +1881,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     const ready = bridged as unknown as HostContext
     const removeFs = installRemoteFs(ready, core)
     fsPatchReady = removeFs !== undefined || remoteFsInstalled(ready)
+    // Install the worker path map before uploads: uploads' wrapper composes
+    // over the current processPathFromHostPath function and must see ours.
+    const removeWorkerPath = installWorkerPathMap(ready.get('fs'))
     const removeUploads = installRemoteUploads(ready, core)
     const unbinds: Array<() => void> = []
     if (removeFs !== undefined) {
@@ -1794,6 +1892,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unbinds.push(unbind)
       unregisters.add(unbind)
     }
+    unregisters.add(removeWorkerPath)
     if (removeUploads !== undefined) {
       unregisters.add(removeUploads)
       const unbind = core.bindRemoteTree(hostId => removeUploads.invalidateHost(hostId))
@@ -1801,11 +1900,17 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.add(unbind)
     }
     bridged.effect(() => () => {
-      removeFs?.()
+      // A later remote run must not see a stale ready flag after the fs
+      // service itself is reloaded.
+      fsPatchReady = false
+      // Remove uploads first: its wrapper was installed over ours.
       removeUploads?.()
+      removeWorkerPath()
+      removeFs?.()
       for (const unbind of unbinds) unbind()
       if (removeFs !== undefined) unregisters.delete(removeFs)
       if (removeUploads !== undefined) unregisters.delete(removeUploads)
+      unregisters.delete(removeWorkerPath)
       for (const unbind of unbinds) unregisters.delete(unbind)
     })
   })
@@ -1854,7 +1959,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     seen.add(agent)
     let installed = false
     try {
-      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady)
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed)
     } catch (error) {
       // Shadows did not register. A remote session would otherwise keep the
       // official tools and run them in the placeholder directory.
@@ -2092,7 +2197,7 @@ async function runRemoteStrReplaceEditor(
   return official(rewriteRemoteEditorArgs(current, record), exec)
 }
 
-function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean): boolean {
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean, ptcReady: () => boolean): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
   // original project in `header.cwd`, decides the first shell surface.
@@ -2127,9 +2232,16 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           }
           assertEnterableRemoteCwd(core, current, headerCwd)
           if (plan.name === 'working_directory') return commitRemoteWorkingDirectory(core, ctx, host, current, record, exec, headerCwd)
+          if (plan.name === 'bash') {
+            core.requireHost(current.hostId)
+            return runOfficialBash(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
+          }
+          if (plan.name === 'glob' || plan.name === 'grep') {
+            return runOfficialSearch(official as (value: unknown, execution: ToolExec) => Promise<unknown> | unknown, current, record, exec)
+          }
           if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec)
           if (plan.name === 'str_replace_editor') return runRemoteStrReplaceEditor(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
-          return RUNNERS[plan.name](host, current, record, exec, ctx)
+          return RUNNERS[plan.name as 'bash' | 'terminal_open'](host, current, record, exec, ctx)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
@@ -2151,7 +2263,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
       }
       disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
-    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady, editorShadowReady)
+    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady, ptcReady, editorShadowReady)
     disposeDynamic = surface.disposeDynamic
     surface.sync(opened)
   } catch (error) {
@@ -2215,6 +2327,7 @@ function installRemoteShellSurface(
   hasOfficialBash: boolean,
   disposers: Array<() => void>,
   fsReady: () => boolean,
+  ptcReady: () => boolean,
   editorShadowReady: boolean,
 ): { sync(route: Route): void, disposeDynamic(): void } {
   const dynamic: Array<() => void> = []
@@ -2326,6 +2439,7 @@ function installRemoteShellSurface(
         return STR_REPLACE_EDITOR_PATH_REFUSED
       }
     }
+    if (remote && !ptcReady() && isPtcSurfaceTool(agent.ctx.tools, agent, execution.name)) return REMOTE_PTC_UNPATCHED
     if (!remote || fsReady()) return undefined
     if (FS_SURFACE_TOOLS.has(execution.name)) return REMOTE_FS_UNPATCHED
     return undefined
@@ -2521,6 +2635,25 @@ const REMOTE_FS_UNPATCHED = 'the remote filesystem patch is unavailable, so file
 const FS_SURFACE_TOOLS: ReadonlySet<string> = new Set([
   'read', 'read_image', 'write', 'edit', 'apply_patch', 'str_replace_editor',
 ])
+
+/** PTC tools must never fall back to a local runtime in a remote workspace. */
+const RUN_CODE_TOOL = 'run_code'
+/**
+ * The official `workflow` tool takes its name from config (`toolName`,
+ * defaulting to `workflow`), so a deployment that renames it would leave a
+ * remote session executing workflows on this computer. Recognise the tool by
+ * its declared argument contract instead of one literal name: `script` plus
+ * `meta` are required by every workflow registration.
+ */
+function isPtcSurfaceTool(tools: HostContext['tools'], agent: object, name: string): boolean {
+  // `run_code` is reserved by the tool registry and cannot be shadowed or renamed.
+  if (name === RUN_CODE_TOOL) return true
+  const definition = tools.get(name, agent) as { parameters?: { required?: unknown } } | undefined
+  const required = definition?.parameters?.required
+  return Array.isArray(required) && required.includes('script') && required.includes('meta')
+}
+
+const REMOTE_PTC_UNPATCHED = 'the remote PTC runtime is not installed, so run_code/workflow are refused instead of running on the local machine'
 
 function agentLabel(agent: AgentLike): string {
   return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'

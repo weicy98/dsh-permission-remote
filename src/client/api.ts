@@ -21,6 +21,7 @@ export interface RunnerView {
   /** `upload-failed`: the binary exists here but the remote refused it. */
   ripgrep: 'uploaded' | 'system' | 'missing' | 'upload-failed'
   ripgrepPath: string
+  node?: { available: boolean, path?: string, version?: string, reason?: 'missing' | 'old' }
   install: { id: string, title: string, auto: string, manual: string } | null
 }
 

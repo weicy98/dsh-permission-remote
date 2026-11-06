@@ -1611,6 +1611,13 @@ function Section(props: SectionProps): JSX.Element {
                           ? <button type="button" className="dsh-ssh-link" disabled={busy} onClick={() => void installRg(host.id)}>{t('installRipgrep')}</button>
                           : null}
                       </div>
+                      {status.runner.node !== undefined ? (
+                        <div className="dsh-ssh-host-meta">
+                          {t('node')}: {status.runner.node.available
+                            ? `${status.runner.node.version ?? ''} (${status.runner.node.path ?? ''})`
+                            : `${t('unavailable')} (${status.runner.node.reason ?? 'missing'})`}
+                        </div>
+                      ) : null}
                     </div>
                     {status.runner.os === 'linux' && !status.runner.sandbox.available
                       ? <button type="button" className="dsh-ssh-button" disabled={busy || status.runner.install === null} onClick={() => void install(host.id)}>{t('install')}</button>

@@ -19,8 +19,6 @@ import {
   bwrapProfileArgs,
   bwrapProbeArgv,
   fileWritableRoots,
-  globArgv,
-  grepArgv,
   sandboxDenied,
   seatbeltBashCommand,
   seatbeltProbeArgv,
@@ -28,8 +26,10 @@ import {
 } from './profile.ts'
 import {
   hostFactsCommand,
-  outputBlock,
+  nodeProbeCommand,
   parseHostFacts,
+  parseNodeProbe,
+  PTC_MIN_NODE_MAJOR,
   probeOutcome,
   type HostFacts,
   ripgrepPackage,
@@ -45,7 +45,10 @@ import { SshPool, isSftpMissing, type ExecResult, type SecretMaterial } from './
 
 const require = createRequire(import.meta.url)
 const READ_CAP = 1024 * 1024
-const IMAGE_CAP = 8 * 1024 * 1024
+
+export type RemoteNodeStatus =
+  | { readonly available: true, readonly path: string, readonly version: string, readonly major: number }
+  | { readonly available: false, readonly reason: 'missing' | 'old', readonly version?: string }
 
 export interface RunnerStatus {
   readonly os: 'linux' | 'darwin' | 'other'
@@ -54,6 +57,8 @@ export interface RunnerStatus {
   readonly ripgrep: 'uploaded' | 'system' | 'missing' | 'upload-failed'
   readonly ripgrepPath: string
   readonly roots: RemoteFileRoots
+  readonly home: string
+  readonly node?: RemoteNodeStatus
   readonly install: DistroInstall | null
 }
 
@@ -176,7 +181,18 @@ export async function probeHost(
     const release = await pool.exec(host, secret, 'cat /etc/os-release', 10_000)
     install = distroInstallFor(parseOsRelease(release.stdout))
   }
-  return { os, sandbox, sandboxTool, ripgrep, ripgrepPath, roots, install }
+  const node = await probeNode(pool, host, secret)
+  return { os, sandbox, sandboxTool, ripgrep, ripgrepPath, roots, home, node, install }
+}
+
+/** Probe remote Node without uploading anything; upload is lazy in the PTC wrapper. */
+export async function probeNode(pool: SshPool, host: HostConfig, secret: SecretMaterial): Promise<RemoteNodeStatus> {
+  const probed = await pool.exec(host, secret, nodeProbeCommand(), 10_000)
+  if (probed.timedOut || probed.code !== 0) return { available: false, reason: 'missing' }
+  const parsed = parseNodeProbe(probed.stdout)
+  if (parsed === null) return { available: false, reason: 'missing' }
+  if (parsed.major < PTC_MIN_NODE_MAJOR) return { available: false, reason: 'old', version: parsed.version }
+  return { available: true, path: parsed.path, version: parsed.version, major: parsed.major }
 }
 
 export async function installBubblewrap(pool: SshPool, host: HostConfig, secret: SecretMaterial, status: RunnerStatus): Promise<ExecResult> {
@@ -476,21 +492,6 @@ async function startBackground(
   return { kind: 'background', jobId: id, cwd }
 }
 
-export async function runReadImage(
-  hostApi: ToolHost,
-  route: RemoteRoute,
-  args: Record<string, unknown>,
-  save: (data: Buffer, name: string) => Promise<Record<string, unknown>>,
-  exec?: ToolExec,
-): Promise<Record<string, unknown>> {
-  throwIfAborted(exec?.signal)
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const remotePath = resolveRemotePath(String(args.file_path ?? ''), route.remoteCwd, route.placeholderCwd)
-  const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, IMAGE_CAP, exec?.signal), exec?.signal)
-  const image = await save(data, posix.basename(remotePath))
-  return { path: toModelPath(remotePath, route), image }
-}
 
 /**
  * One remote file copied to its placeholder path, for a tool that can
@@ -647,58 +648,6 @@ export async function stagePresentFiles(
   return staged
 }
 
-export async function runGlob(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
-  throwIfAborted(exec?.signal)
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const status = await hostApi.statusOf(host)
-  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host; click "Install ripgrep" on its host row in the SSH settings, or install ripgrep on the remote so rg is on PATH')
-  const base = typeof args.path === 'string'
-    ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
-    : route.remoteCwd
-  const pattern = String(args.pattern ?? '')
-  const command = withSearchMarkers(`cd ${shJoin([base])} && ${shJoin(globArgv(status.ripgrepPath, pattern))}`)
-  const result = await hostApi.pool.exec(host, secret, command, 30_000, exec?.signal)
-  throwIfRgFailed(result, exec?.signal, 'glob')
-  const paths = searchOutputLines(result.stdout).map(line => {
-    const absolute = posix.isAbsolute(line) ? line : posix.join(base, line)
-    return toModelPath(absolute, route)
-  })
-  return { root: toModelPath(base, route), paths }
-}
-
-export async function runGrep(hostApi: ToolHost, route: RemoteRoute, args: Record<string, unknown>, exec?: ToolExec): Promise<Record<string, unknown>> {
-  throwIfAborted(exec?.signal)
-  const host = requireHost(hostApi, route.hostId)
-  const secret = await hostApi.secretOf(host)
-  const status = await hostApi.statusOf(host)
-  if (status.ripgrepPath.length === 0) throw new Error('ripgrep is not available on this remote host; click "Install ripgrep" on its host row in the SSH settings, or install ripgrep on the remote so rg is on PATH')
-  const base = typeof args.path === 'string'
-    ? resolveRemotePath(args.path, route.remoteCwd, route.placeholderCwd)
-    : route.remoteCwd
-  const argv = grepArgv(status.ripgrepPath, String(args.pattern ?? ''), base, typeof args.include === 'string' ? args.include : undefined)
-  const result = await hostApi.pool.exec(host, secret, shJoin(argv), 30_000, exec?.signal)
-  throwIfRgFailed(result, exec?.signal, 'grep')
-  const matches: Array<{ path: string, lineNumber: number, line: string }> = []
-  for (const row of result.stdout.split('\n')) {
-    if (row.trim().length === 0) continue
-    let parsed: { type?: string, data?: { path?: { text?: string }, line_number?: number, lines?: { text?: string } } }
-    try {
-      parsed = JSON.parse(row) as typeof parsed
-    } catch {
-      continue
-    }
-    if (parsed.type !== 'match') continue
-    const absolute = parsed.data?.path?.text ?? ''
-    matches.push({
-      path: toModelPath(absolute, route),
-      lineNumber: parsed.data?.line_number ?? 0,
-      line: (parsed.data?.lines?.text ?? '').replace(/\n$/, ''),
-    })
-  }
-  return { matches }
-}
-
 export async function runWorkingDirectory(
   hostApi: ToolHost,
   route: RemoteRoute,
@@ -730,23 +679,6 @@ export async function runWorkingDirectory(
 
 export function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw abortError()
-}
-
-/** Login-shell noise around `rg --files` is outside this block. */
-const SEARCH_BEGIN = '__DSH_SEARCH_BEGIN__'
-const SEARCH_END = '__DSH_SEARCH_END__'
-
-function withSearchMarkers(body: string): string {
-  return `printf '%s\\n' '${SEARCH_BEGIN}'; ${body}; status=$?; printf '%s\\n' '${SEARCH_END}'; exit $status`
-}
-
-function searchOutputLines(stdout: string): string[] {
-  return outputBlock(stdout, SEARCH_BEGIN, SEARCH_END).map(line => line.trim()).filter(line => line.length > 0)
-}
-
-function throwIfRgFailed(result: ExecResult, signal: AbortSignal | undefined, label: string): void {
-  if (signal?.aborted === true) throw abortError()
-  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || `${label} failed`)
 }
 
 export function abortError(): Error {

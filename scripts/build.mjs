@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
@@ -78,5 +78,7 @@ ${clientBundled}
 await mkdir(resolve(root, 'lib'), { recursive: true })
 await writeFile(resolve(root, 'lib/index.js'), hostText)
 await writeFile(resolve(root, 'lib/client.js'), clientText)
+// Keep the worker shim self-contained in lib; src/ remains the source of truth.
+await copyFile(resolve(root, 'src', 'ptc-shim.mjs'), resolve(root, 'lib', 'ptc-shim.mjs'))
 console.log(`wrote lib/index.js (${hostText.length} bytes)`)
 console.log(`wrote lib/client.js (${clientText.length} bytes)`)

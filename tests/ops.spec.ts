@@ -27,6 +27,7 @@ const status: RunnerStatus = {
   ripgrep: 'system',
   ripgrepPath: '/usr/bin/rg',
   roots: { workspaceRoot: '/', tmp: '/tmp', userTmp: '/tmp' },
+  home: '/home/dev',
   install: null,
 }
 

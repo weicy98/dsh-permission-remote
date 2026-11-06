@@ -102,6 +102,15 @@ DSH 的 `present` 只认本机文件：它逐个 `stat` 参数里的路径，再
 
 远端工作区里的会话也能调这两个工具，但那里的 `local_path` 指的是**运行 DSH 的机器**：模型看到的 `~/.dsh/remote/...` 占位路径在本机只是一个目录骨架，远端主机看不到它。要在远端会话内搬运文件，用那台机器上的 `bash`。
 
+## 远端 run_code（PTC）
+
+远端 `run_code` / `workflow` 使用宿主同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` 的 `process.js`。插件只做四件事：定位/校验上游 worker、按 hash 上传、用 SSH 转发的 fd 7 socket 提供控制通道、把 `sandbox.confine` / `subprocess.spawn` 适配到远端。帧协议、程序运行、超时/输出上限、错误分类和工具回桥全部由官方 runtime 负责。
+
+- 远端需要 Node.js 22+；worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
+- `process.env` 为空；`cwd`/相对路径在远端。支持 per-call function-body、persistent-in-memory REPL 和 vm-script（scriptPersistence）；保留状态按 state owner 留在远端进程，沙箱模式变化时由官方 runtime invalidate。
+- 上游契约、manifest 与升级 runbook 见 [upstream-ptc-worker.md](upstream-ptc-worker.md)。
+- 如果远端 sshd 禁用 streamlocal，会尝试 loopback TCP；两者都不可用时明确失败，不静默回退本机。
+
 ## 远程运维细节
 
 `ssh_workspace` 做一次远端 `stat`，再按远端真实路径注册（符号链接记成它指向的目录，标题默认取这个真实路径的目录名）。`realpath` 失败则这次注册失败。它不改远端文件。它只在侧栏加一条工作区。打开这条工作区会在那台机器上开始一个会话，所以询问策略下仍和命令一样要审批。这次调用不让当前会话进入，结果里也不给出占位目录。要在那台机器上工作，从侧栏打开。文件系统根 `/` 不能注册，真实路径解析成 `/` 时同样拒绝：那一棵会盖住整台机器。对同一个远端真实路径重复添加不会产生第二行，保留已有的标题，结果里会说明它已经注册过。
@@ -143,7 +152,7 @@ DSH 0.2.2 还有两个可选的文件工具，在远端工作区里同样落在�
 
 **Windows 上的 DSH。** DSH 本身跑在 Windows 上时，远端工作区的对话只暴露远端 `bash`。`pwsh`、`powershell`、`cmd` 不会出现在原生工具列表里，官方那段 Windows 进程结束说明（`tool:pwsh`）在停在这个工作区时也会被盖住。回到本机目录后，这些 Windows 工具和原来的说明恢复。`minimal` 这类把提示词写成完整 persona 的预设不会被改写；挡住 Windows shell 的是工具列表过滤和执行守卫。内置预设的 `pwsh` 在祖先层，进入远端时会被从原生工具列表和 `ptc` SDK 正文里去掉。注册在 agent 本层的 `pwsh` 去不掉：SDK 正文仍可能列出它，原生列表会被滤掉，调用会被拒绝。文件工具的参数继续用工具返回的占位路径。
 
-**运行代码与项目说明文件。** 模型用「运行代码」时，跑的仍是你电脑上这个占位目录里的运行时，不是远端那一份。会话读取项目里的 `AGENTS.md`、`CLAUDE.md`（以及同名的 `.local`）时走文件系统接口，占位路径会读到远端那一份。`$DSH_HOME/AGENTS.md` 这种不在占位根下的全局文件仍是本机。每轮组装提示词会沿祖先目录对这些文件多做几次远端查询。提示词内容和本机那份不一样，已经缓存的前缀对不上。
+**运行代码与项目说明文件。** 模型用「运行代码」时，如果会话的工作目录是远端占位目录，程序由 SSH 主机上的官方 PTC worker 执行，不是本机那份；本地会话仍然在本机执行。会话读取项目里的 `AGENTS.md`、`CLAUDE.md`（以及同名的 `.local`）时走文件系统接口，占位路径会读到远端那一份。`$DSH_HOME/AGENTS.md` 这种不在占位根下的全局文件仍是本机。每轮组装提示词会沿祖先目录对这些文件多做几次远端查询。提示词内容和本机那份不一样，已经缓存的前缀对不上。
 
 **连接边界。** 目前只能直接连接一台 Linux 或 macOS。不能经跳板机连接，也不能把 Windows 当作远端。网络中断时，正在进行的操作会失败。已经写到远端的文件会留在那里：重新连上之后不会再写一遍，也不会自动撤回。远程工作区里的 `bash`、`read`、`write`、`edit` 只能操作那台机器；要在当前本地工作区操作另一台主机，用 `ssh_hosts` / `ssh_exec` / `ssh_read` / `ssh_write` / `ssh_upload` / `ssh_download` / `ssh_workspace`。
 

@@ -88,7 +88,7 @@ const SKIP: false | string = official
 const SYS_CONFIG = { includeHarnessIdentity: false, includeRuntimeContext: false, personaPrefix: '', personaSuffix: '' }
 // Only `apply_patch` is needed; disabling read/write/edit keeps the composition small.
 const FS_CONFIG = {
-  read: false, readImage: false, write: false, edit: false, applyPatch: true,
+  read: true, readImage: true, write: true, edit: true, applyPatch: true,
   readLimit: 2000, readMaxLineLength: 2000, readMaxBytes: 50 * 1024, readStreamMinSize: 64 * 1024,
 }
 const EDITOR_CONFIG = { maxOutputChars: 16_000, description: 'view/create/edit files over the Harness filesystem seam' }
@@ -181,6 +181,26 @@ async function boot(opts: { official?: boolean } = {}): Promise<Host> {
   ctx.provide('credentials', { readRecord: async () => undefined, modifyRecord: async () => undefined })
   ctx.provide('workspaceRegistry', { list: () => [] })
   ctx.provide('approval', {})
+  ctx.provide('attachments', {
+    imageLimits: {
+      mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+      maxImageBytes: 8 * 1024 * 1024,
+      maxMessageImageBytes: 8 * 1024 * 1024,
+      maxImageDimension: 8192,
+      maxImagePixels: 16_000_000,
+    },
+    saveImage: async (input: { data: Uint8Array, mediaType: string, name: string }) => ({
+      attachmentId: 'image-1',
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+      name: input.name,
+    }),
+  })
+  ctx.provide('llm', {
+    resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
+  })
 
   // Mount the plugin FIRST. Its `inject(['fs'])` install sees the marker our
   // harness already set and no-ops, so our fake SFTP pool stays authoritative.
@@ -194,7 +214,10 @@ async function boot(opts: { official?: boolean } = {}): Promise<Host> {
 
   const scopes: any[] = []
   async function addAgent(id: string, cwd: string): Promise<any> {
-    const agent: any = { session: { id, header: { cwd } } }
+    const agent: any = {
+      session: { id, header: { cwd }, requestHeader: () => ({ config: { provider: 'test', model: 'vision' } }) },
+      options: { provider: 'test', model: 'vision' },
+    }
     const s = o.scope.createScope(ctx, agent)
     scopes.push(s)
     let child: any
@@ -376,6 +399,53 @@ test('a commit failure in the shipped two-copy layout surfaces a typed error and
     const after = await host.h.fs.stat(await host.h.fs.resolve('/srv/app/keep.ts', { cwd: remoteCwd }))
     assert.ok(after)
     assert.notEqual(after.version, before?.version, 'the stat cache must not hide the applied change')
+  } finally {
+    await host.close()
+  }
+})
+
+test('official write and edit run through the remote filesystem backend', { skip: SKIP }, async () => {
+  const host = await boot()
+  try {
+    const agent = await host.addAgent('session-1', remoteCwd)
+    await host.created(agent)
+    const target = placeholder('write-edit.ts')
+    host.h.reset()
+
+    const written = await host.call(agent, 'write', { file_path: target, content: 'alpha\nbeta\n' })
+    assert.equal((written as { path?: string }).path, target)
+    assert.ok(host.h.writes.some(w => (w.stdin ?? '').includes('alpha')), 'official write publishes to the remote pool')
+
+    host.h.setFile('/srv/app/write-edit.ts', 'alpha\nbeta\n')
+    host.h.reset()
+    const edited = await host.call(agent, 'edit', { file_path: target, old_string: 'beta', new_string: 'BETA' })
+    assert.equal((edited as { path?: string }).path, target)
+    assert.ok(host.h.writes.some(w => (w.stdin ?? '').includes('BETA')), 'official edit publishes the replacement')
+    assert.equal(host.h.decoyWrites(), 0)
+    assert.equal(readFileSync(host.h.decoyFile, 'utf8'), host.h.decoyContent)
+  } finally {
+    await host.close()
+  }
+})
+
+test('official read_image uses the remote readBytes backend and attachment store', { skip: SKIP }, async () => {
+  const host = await boot()
+  try {
+    const agent = await host.addAgent('session-1', remoteCwd)
+    await host.created(agent)
+    const target = placeholder('pixel.png')
+    host.h.setFile('/srv/app/pixel.png', 'not-used')
+    const originalReadBytes = host.h.fs.readBytes
+    host.h.fs.readBytes = async () => new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    try {
+      const result: any = await host.call(agent, 'read_image', { file_path: target })
+      assert.equal(result.path, target)
+      assert.equal(result.image.mediaType, 'image/png')
+      assert.equal(result.image.name, 'pixel.png')
+    } finally {
+      host.h.fs.readBytes = originalReadBytes
+    }
+    assert.equal(host.h.decoyReads(), 0)
   } finally {
     await host.close()
   }

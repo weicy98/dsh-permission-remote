@@ -187,6 +187,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
         sandbox: { available: true, reason: 'ok' },
         sandboxTool: 'bwrap',
         roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+        home: '/home/dev',
         os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
       }
     },

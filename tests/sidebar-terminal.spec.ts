@@ -678,7 +678,7 @@ test('apply installs the bridge when the terminal services appear', async () => 
   assert.equal(Object.hasOwn(terminal, 'shells'), true)
   assert.equal(Object.hasOwn(terminal, 'create'), true)
 
-  const live = ctx.get('subprocess') as LocalSpawn
+  const live = ctx.get('subprocess') as unknown as LocalSpawn
   await assert.rejects(() => live.spawnTerminal(sidebarSpec(remotePlaceholder('/remote/src', 'gone'))), /unknown SSH host gone/)
   assert.equal(subprocess.calls.length, 0)
   const local = await live.spawnTerminal(sidebarSpec('/tmp/project'))
