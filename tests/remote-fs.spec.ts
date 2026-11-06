@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -55,7 +56,12 @@ function createHarness(warnings: string[] = [], options?: {
       pool.readAts.push({ offset, length })
       return Buffer.from('hi')
     },
-    async *chunks() { yield Buffer.from('ok') },
+    // Production serves `read` and `chunks` from one file, and the version
+    // probe may hash either source. Delegating keeps a test that overrides one
+    // reader consistent instead of modelling a file that changes mid-call.
+    async *chunks(remotePath) {
+      yield await pool.read(remotePath)
+    },
   }
   class Backend {
     delegated = false
@@ -208,6 +214,28 @@ test('a placeholder subdirectory and a superseded root both list the remote dire
     clearSupersededRoots()
   }
 })
+
+test('a capped read is FS_TOO_LARGE even when its message has no size wording', async () => {
+  // `asFs` has a string fallback for providers that do not use SshFailure.
+  // This exercises the structured path alone: the message deliberately has no
+  // "over the ... byte limit" text, so removing `isByteLimitExceeded` turns the
+  // result into FS_IO_ERROR and this test fails.
+  const { backend, pool } = createHarness()
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: 9, mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => { throw new SshFailure('read stopped at the byte cap', 'sftp-read', undefined, true) }
+  const file = await backend.resolve(placeholder('a.ts'))
+  await assert.rejects(
+    () => backend.readBytes(file, undefined, 4),
+    (error: unknown) => {
+      assert.equal(codeOf(error), 'FS_TOO_LARGE')
+      return true
+    },
+  )
+})
+
 
 test('readByteRange reads one window, an oversize file is FS_TOO_LARGE, and a NUL byte is FS_NOT_TEXT', async () => {
   const { backend, pool } = createHarness()
@@ -978,6 +1006,268 @@ test('seconds-only stat falls back to a content digest that still guards writes'
   const written = await backend.writeText(target, 'next', { kind: 'replaceIfVersion', version: before.version }, undefined, policy)
   assert.equal(written.after, 'next')
   assert.equal(content, 'next')
+})
+
+
+test('writeText reuses the version probe bytes for its diff basis', async () => {
+  // write is the most-used file tool. On a host whose stat has no nanosecond
+  // precision the version probe reads the whole file to hash it; the diff basis
+  // must come from that same transfer instead of a second read.
+  const { backend, pool, access } = createHarness()
+  let content = 'old text'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => {
+    pool.reads += 1
+    return Buffer.from(content)
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (command.includes('stat -c')) {
+      // Seconds only: no strong evidence, so the version probe must hash.
+      return { code: 0, signal: null, stdout: '12:34:5:1700000000\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  pool.reads = 0
+  const written = await backend.writeText(target, 'new text', undefined, undefined, policy)
+  assert.equal(written.before, 'old text', 'the diff basis must still be available')
+  // Only the pre-write capture remains: the post-write version reuses the
+  // bytes that were just committed instead of hashing the file a second time.
+  assert.equal(pool.reads, 1, `write made ${pool.reads} full reads; expected just the reused capture`)
+  assert.equal(content, 'new text')
+})
+
+
+test('two spellings of one remote path really take the same lock', async () => {
+  // `FsTargetKey` preserves a trailing slash, while `path.join` in the routing
+  // layer normalizes `..` and `.`. A trailing slash is therefore the spelling
+  // that genuinely differs at `targetKey` but resolves to the same remote file.
+  // The earlier test used `sub/../a.ts`, which `path.join` had already folded
+  // into the same string; it would have passed with either key scheme.
+  const { backend, pool, access } = createHarness()
+  let content = 'one'
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  let active = 0
+  let peak = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, _command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    active += 1
+    peak = Math.max(peak, active)
+    // Yield so two concurrent writes would overlap here.
+    await new Promise(resolve => setImmediate(resolve))
+    active -= 1
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  // One remote file has two genuinely different placeholder spellings: the
+  // whole remote path encoded into one segment, or the workspace root encoded
+  // plus a relative suffix (see the same-file note in moveRemoteFileUnlocked).
+  // `path.join` cannot fold these into one string, so this is the case that
+  // actually distinguishes a normalized lock key from a raw `targetKey` one.
+  const whole = await backend.resolve(path.join(root, 'lo', encodeRemotePath(`${REMOTE}/a.ts`)))
+  const suffix = await backend.resolve(placeholder('a.ts'))
+  assert.notEqual(String(whole.targetKey), String(suffix.targetKey), 'the two spellings must differ before locking')
+  const wholeRoute = routeByCwd(String(whole.targetKey))
+  const suffixRoute = routeByCwd(String(suffix.targetKey))
+  assert.equal(wholeRoute.kind, 'remote')
+  assert.equal(suffixRoute.kind, 'remote')
+  if (wholeRoute.kind === 'remote' && suffixRoute.kind === 'remote') {
+    assert.equal(wholeRoute.remoteCwd, suffixRoute.remoteCwd, 'both spellings must name one remote file')
+  }
+  await Promise.all([
+    backend.writeText(whole, 'first', undefined, undefined, policy),
+    backend.writeText(suffix, 'second', undefined, undefined, policy),
+  ])
+  assert.equal(peak, 1, `two writes overlapped (peak ${peak}); the normalized lock key did not serialize them`)
+  assert.equal(content, 'second')
+})
+
+
+/** A weak-stat host whose exec pool can publish the stdin it receives. */
+function weakStatWriteHarness(initial: string) {
+  const { backend, pool, access } = createHarness()
+  let content = initial
+  let chunkReads = 0
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => {
+    pool.reads += 1
+    return Buffer.from(content)
+  }
+  pool.chunks = async function* () {
+    chunkReads += 1
+    yield Buffer.from(content)
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (command.includes('stat -c')) {
+      // Seconds only: no strong evidence, so the version probe must hash.
+      return { code: 0, signal: null, stdout: '12:34:5:1700000000\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  return { backend, pool, policy, chunks: () => chunkReads, content: () => content, reset: () => { pool.reads = 0; chunkReads = 0 } }
+}
+
+
+test('the post-write version hashes the committed CRLF bytes, not the LF after', async () => {
+  const h = weakStatWriteHarness('old\r\ntext\r\n')
+  const target = await h.backend.resolve(placeholder('a.ts'))
+  h.reset()
+  const written = await h.backend.writeText(target, 'a\r\nB\r\n', undefined, undefined, h.policy)
+  const hash = parseRemoteVersion(written.version)?.hash
+  assert.equal(hash, createHash('sha256').update(Buffer.from('a\r\nB\r\n')).digest('hex'))
+  // Hashing the LF-normalized `after` would silently mismatch the remote
+  // sha256sum and make the next guarded write fail with FS_STALE_VERSION.
+  assert.notEqual(hash, createHash('sha256').update(Buffer.from('a\nB\n')).digest('hex'))
+  const second = await h.backend.writeText(target, 'a\r\nC\r\n', { kind: 'replaceIfVersion', version: written.version }, undefined, h.policy)
+  assert.equal(second.after, 'a\nC\n')
+  assert.equal(h.content(), 'a\r\nC\r\n')
+})
+
+
+test('the post-write version probe does not re-read the file on a weak-stat host', async () => {
+  const h = weakStatWriteHarness('old text')
+  const target = await h.backend.resolve(placeholder('a.ts'))
+  h.reset()
+  const written = await h.backend.writeText(target, 'new text', undefined, undefined, h.policy)
+  assert.ok(parseRemoteVersion(written.version)?.hash, 'the token must still carry content evidence')
+  assert.equal(h.pool.reads, 1, 'only the pre-write capture should read the file')
+  assert.equal(h.chunks(), 0, 'no sftpReadChunks may run after the commit')
+})
+
+
+test('the lexical identity cache is bounded after many distinct remote paths', async () => {
+  const { backend, pool } = createHarness()
+  pool.realpath = async remotePath => remotePath
+  const parent = await backend.resolve(placeholder())
+  const first = await backend.resolve(placeholder('p0'))
+  for (let i = 1; i < 600; i += 1) await backend.resolve(placeholder(`p${i}`))
+  const last = await backend.resolve(placeholder('p599'))
+  // Re-resolve the parent so its identity is the most recent entry.
+  await backend.resolve(placeholder())
+  assert.equal(backend.contains(parent, first), false, 'the oldest identity must be evicted once the cap is exceeded')
+  assert.equal(backend.contains(parent, last), true, 'a recently resolved identity must still be usable')
+})
+
+
+test('contains touches both identities so a long-lived root survives unrelated resolves', async () => {
+  const { backend, pool } = createHarness()
+  pool.realpath = async remotePath => remotePath
+  const parent = await backend.resolve(placeholder())
+  const child = await backend.resolve(placeholder('c0'))
+  // Four rounds of 300 distinct resolves: 1200 > META_CAP. Without the LRU
+  // touch in `containsRemote`, the root and child would be evicted during the
+  // second round and this would return a spurious `false`.
+  for (let round = 0; round < 4; round += 1) {
+    for (let i = 0; i < 300; i += 1) await backend.resolve(placeholder(`r${round}-${i}`))
+    assert.equal(backend.contains(parent, child), true, `round ${round} must still contain the child`)
+  }
+})
+
+test('a symlink alias of one remote file takes the same local lock', async () => {
+  const { backend, pool, access } = createHarness()
+  let content = 'one'
+  // A final-component symlink: the two lexical spellings realpath to one file.
+  pool.realpath = async remotePath => remotePath === `${REMOTE}/alias.ts` ? `${REMOTE}/a.ts` : remotePath
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async () => Buffer.from(content)
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  let active = 0
+  let peak = 0
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, _command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    active += 1
+    peak = Math.max(peak, active)
+    await new Promise(resolve => setImmediate(resolve))
+    active -= 1
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const real = await backend.resolve(placeholder('a.ts'))
+  const alias = await backend.resolve(placeholder('alias.ts'))
+  assert.notEqual(String(real.targetKey), String(alias.targetKey))
+  await Promise.all([
+    backend.writeText(real, 'first', undefined, undefined, policy),
+    backend.writeText(alias, 'second', undefined, undefined, policy),
+  ])
+  assert.equal(peak, 1, `two aliases overlapped (peak ${peak}); the lock key did not converge on the resolved path`)
+  assert.equal(content, 'second')
+})
+
+
+test('an oversized old file takes only two pre-write transfer attempts', async () => {
+  const { backend, pool, access } = createHarness()
+  const big = 'x'.repeat(10 * 1024 * 1024 + 1)
+  let content = big
+  let reads = 0
+  let readsAtCommit = -1
+  pool.attrs = async remotePath =>
+    remotePath === `${REMOTE}/a.ts`
+      ? { type: 'file', size: Buffer.byteLength(content), mtime: 1 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  pool.read = async (_remotePath, maxBytes) => {
+    reads += 1
+    if (maxBytes !== undefined && Buffer.byteLength(content) > maxBytes) {
+      throw new SshFailure(`file is ${Buffer.byteLength(content)} bytes, over the ${maxBytes} byte limit`, 'sftp-read', undefined, true)
+    }
+    return Buffer.from(content)
+  }
+  pool.chunks = async function* () {
+    reads += 1
+    yield Buffer.from(content)
+  }
+  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+  })
+  ;(access.pool as unknown as { exec: unknown }).exec = async (_host: unknown, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer) => {
+    if (command.includes('stat -c')) {
+      return { code: 0, signal: null, stdout: '12:34:5:1700000000\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    readsAtCommit = reads
+    if (stdin !== undefined) content = Buffer.isBuffer(stdin) ? stdin.toString('utf8') : stdin
+    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const policy = { mode: 'workspace-write' as const, workspaceRoot: placeholder(), sessionId: 'session-1' as never }
+  const target = await backend.resolve(placeholder('a.ts'))
+  reads = 0
+  const written = await backend.writeText(target, 'new text', undefined, undefined, policy)
+  assert.equal(written.before, null, 'the oversized diff basis is presentation data only')
+  // Failed capped capture (1) + full hash read (1). The old code retried the
+  // same doomed capped read for the diff basis, making three attempts.
+  assert.equal(readsAtCommit, 2, `expected 2 pre-write transfer attempts, got ${readsAtCommit}`)
+  assert.equal(reads, 2, 'the post-write probe must not add another read')
 })
 
 

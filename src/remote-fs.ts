@@ -41,7 +41,7 @@ import { applyHunks, type PatchHunk } from './patch-hunks.ts'
 import { fileWriteAllowed } from './profile.ts'
 import { mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, workspaceBinding } from './router.ts'
 import { commitRemoteDelete, commitRemoteText, parseRemoteVersion, remoteRoots, remoteVersionEvidence, remoteVersionToken, resolveCreatedPath, type RemoteVersionEvidence } from './remote-write.ts'
-import { SFTP_STATUS, SshFailure, isSftpPermissionDenied, type ExecResult, type RemoteDirEntry, type SecretMaterial, type SftpAttrs, type SshPool } from './ssh-pool.ts'
+import { SFTP_STATUS, SshFailure, isByteLimitExceeded, isSftpPermissionDenied, type ExecResult, type RemoteDirEntry, type SecretMaterial, type SftpAttrs, type SshPool } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
 
 /** Same ceiling `present` uses before it will copy a remote file. */
@@ -291,7 +291,7 @@ async function resolveRemote(runtime: Runtime, requested: string, opts?: { cwd?:
     const secret = await runtime.access.secret(host)
     throwIfFsAborted(opts?.signal)
     const remoteReal = await realRemote(runtime, host, secret, route.remoteCwd, opts?.signal)
-    runtime.identity.set(lexical, { hostId: route.hostId, remoteReal, at: runtime.now() })
+    rememberIdentity(runtime, lexical, { hostId: route.hostId, remoteReal, at: runtime.now() })
     return { targetKey: FsTargetKey(lexical), displayPath: lexical }
   } catch (error) {
     throwIfFsAborted(opts?.signal)
@@ -302,7 +302,7 @@ async function resolveRemote(runtime: Runtime, requested: string, opts?: { cwd?:
     // placeholder spelling is enough for the following stat to decide.
     const stale = runtime.meta.realpath(host.id, route.remoteCwd, true)
     if (stale !== undefined) {
-      runtime.identity.set(lexical, { hostId: route.hostId, remoteReal: stale, at: runtime.now() })
+      rememberIdentity(runtime, lexical, { hostId: route.hostId, remoteReal: stale, at: runtime.now() })
     }
     return { targetKey: FsTargetKey(lexical), displayPath: lexical }
   }
@@ -619,6 +619,77 @@ async function mutationContext(
   return { host, secret, pool, status, mode, roots, targetPath }
 }
 
+/**
+ * Move one identity to the most-recently-used end without changing its
+ * timestamp. The `at` field is realpath freshness evidence, not LRU state; a
+ * touch must never make a stale realpath look fresh.
+ */
+function touchIdentity(runtime: Runtime, key: string): void {
+  const record = runtime.identity.get(key)
+  if (record === undefined) return
+  runtime.identity.delete(key)
+  runtime.identity.set(key, record)
+}
+
+/**
+ * Keep the lexical -> realpath identity small.
+ *
+ * `identity` is keyed by the placeholder spelling and had no size bound, so a
+ * long session that resolved many distinct remote paths grew it monotonically.
+ * This mirrors `MetaCache.write`: re-inserting a key moves it to the end and the
+ * oldest entry is dropped once the map is over `META_CAP`. Evicting an identity
+ * is safe but fail-closed: `containsRemote` returns false without one, so a
+ * caller that keeps a target across hundreds of unrelated resolves can see a
+ * spurious "outside the workspace". `containsRemote` touches both identities on
+ * every successful hit, which keeps an actively used root young. A caller that
+ * never calls `contains()` across more than `META_CAP` distinct resolves can
+ * still hit the fail-closed false; that is the safe direction, and the next
+ * `resolve` repairs it.
+ */
+function rememberIdentity(runtime: Runtime, key: string, record: RemoteIdentity): void {
+  runtime.identity.delete(key)
+  runtime.identity.set(key, record)
+  while (runtime.identity.size > META_CAP) {
+    const oldest = runtime.identity.keys().next().value
+    if (oldest === undefined) break
+    runtime.identity.delete(oldest)
+  }
+}
+
+/** Resolve a mutation context before the local lock is taken. */
+async function resolveMutationContext(
+  runtime: Runtime,
+  target: FsTarget,
+  policy: SandboxExecutionPolicy | undefined,
+  signal?: AbortSignal,
+): Promise<MutationContext | undefined> {
+  try {
+    return await mutationContext(runtime, target, policy, signal)
+  } catch (error) {
+    throw asFs(error, signal)
+  }
+}
+
+/**
+ * The local lock key for one remote target.
+ *
+ * `route.remoteCwd` is only a lexically normalized spelling: a symlink alias,
+ * or the whole-path and workspace-suffix placeholder spellings of one file, can
+ * produce different `remoteCwd` values for the same remote file. The remote
+ * `lockScript` hashes the realpath-resolved `context.targetPath`, but it only
+ * wraps the commit exec. The LOCAL lock is what covers observation, decode,
+ * diff and commit, so it must converge on the same resolved path too.
+ * `mutationContext` resolves it through `resolveCreatedPath` before the lock.
+ *
+ * Hard links are NOT unified: `realpath` returns different spellings for two
+ * names of the same inode, so they still take different local locks. The atomic
+ * `mv` in the commit script prevents torn content, but a lost update between
+ * two unguarded hard-link writers remains possible.
+ */
+function realpathLockKey(context: MutationContext): string {
+  return `${context.host.id}\0${context.targetPath}`
+}
+
 async function withTargetLock<T>(runtime: Runtime, key: string, action: () => Promise<T>): Promise<T> {
   const previous = runtime.locks.get(key) ?? Promise.resolve()
   let release!: () => void
@@ -634,10 +705,49 @@ async function withTargetLock<T>(runtime: Runtime, key: string, action: () => Pr
   }
 }
 
-async function currentRemoteAttrs(runtime: Runtime, context: MutationContext, signal?: AbortSignal): Promise<{ info: SftpAttrs | undefined, version: FsVersion | undefined }> {
+/**
+ * Stat the target and derive its version.
+ *
+ * `capture` asks for the file bytes too. When the host needs a content hash for
+ * version evidence, that hash already reads the whole file; handing the same
+ * bytes back lets a caller that needs a diff basis (write, edit, patch, delete,
+ * move) skip a second transfer. The bytes are only returned when they were
+ * read, so a caller never mistakes an unread file for an empty one. A failed
+ * capture is reported separately: the caller then knows retrying the same
+ * capped read is pointless instead of silently attempting it again.
+ */
+async function currentRemoteAttrs(
+  runtime: Runtime,
+  context: MutationContext,
+  signal?: AbortSignal,
+  capture?: { maxBytes: number },
+): Promise<{ info: SftpAttrs | undefined, version: FsVersion | undefined, content?: Buffer, captureFailed?: boolean }> {
   const info = await runtime.access.pool.sftpAttrs(context.host, context.secret, context.targetPath, true)
   throwIfFsAborted(signal)
   if (info === undefined) return { info, version: undefined }
+  let captureFailed = false
+  if (capture !== undefined && info.type === 'file') {
+    // One read serves both the hash and the caller. A file over the caller's
+    // cap still needs a version, so fall back to the hash-only path.
+    let content: Buffer | undefined
+    try {
+      content = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, capture.maxBytes, signal)
+    } catch (error) {
+      if (signal?.aborted === true) throw asFs(error, signal)
+      content = undefined
+      captureFailed = true
+    }
+    throwIfFsAborted(signal)
+    if (content !== undefined) {
+      // One read feeds both the hash and the caller's diff basis, so the
+      // version token and the text cannot disagree about what the file held.
+      // `baseVersion(info)` still comes from the stat above, exactly as on the
+      // hash-only path; the stat -> read ordering is unchanged by the reuse.
+      const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true, content })
+      rememberDescriptor(runtime, versionKey(context.host.id, context.targetPath), baseVersion(info), evidence)
+      return { info, version: versionFor(runtime, context.host.id, context.targetPath, info, evidence), content }
+    }
+  }
   const evidence = info.type === 'file'
     ? await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
     : {}
@@ -645,7 +755,11 @@ async function currentRemoteAttrs(runtime: Runtime, context: MutationContext, si
   // Keep stat() and the write check on one version source. When a probe fails,
   // the current descriptor has no content proof; a guarded write then fails
   // closed as FS_IO_ERROR instead of claiming a false stale change.
-  return { info, version: versionFor(runtime, context.host.id, context.targetPath, info, evidence) }
+  return {
+    info,
+    version: versionFor(runtime, context.host.id, context.targetPath, info, evidence),
+    ...(captureFailed ? { captureFailed: true } : {}),
+  }
 }
 
 async function writeRemoteText(
@@ -658,31 +772,34 @@ async function writeRemoteText(
 ): Promise<FsWriteOutcome> {
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.writeText(target, content, expected, signal, policy)
-  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () => writeRemoteTextUnlocked(runtime, target, content, expected, signal, policy))
+  const context = await resolveMutationContext(runtime, target, policy, signal)
+  if (context === undefined) return runtime.originals.writeText(target, content, expected, signal, policy)
+  return withTargetLock(runtime, realpathLockKey(context), () => writeRemoteTextUnlocked(runtime, context, target, content, expected, signal))
 }
 
 async function writeRemoteTextUnlocked(
   runtime: Runtime,
+  context: MutationContext,
   target: FsTarget,
   content: string,
   expected: FsWriteIntent | undefined,
   signal: AbortSignal | undefined,
-  policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsWriteOutcome> {
-  let context: MutationContext | undefined
-  try {
-    context = await mutationContext(runtime, target, policy, signal)
-  } catch (error) {
-    throw asFs(error, signal)
-  }
-  if (context === undefined) return runtime.originals.writeText(target, content, expected, signal, policy)
   throwIfFsAborted(signal)
   let existing: SftpAttrs | undefined
   let existingVersion: FsVersion | undefined
+  let basis: Buffer | undefined
+  let captureFailed = false
+  // Only capture when a diff basis is actually wanted. A write of huge content
+  // needs no basis; reading the old file just to hash it would add a transfer
+  // that the strong-stat path never made before.
+  const wantBasis = Buffer.byteLength(content, 'utf8') < DIFF_BASIS_MAX_BYTES
   try {
-    const current = await currentRemoteAttrs(runtime, context, signal)
+    const current = await currentRemoteAttrs(runtime, context, signal, wantBasis ? { maxBytes: DIFF_BASIS_MAX_BYTES } : undefined)
     existing = current.info
     existingVersion = current.version
+    basis = current.content
+    captureFailed = current.captureFailed === true
   } catch (error) {
     throw asFs(error, signal)
   }
@@ -705,9 +822,13 @@ async function writeRemoteTextUnlocked(
   }
 
   let before: string | null = null
-  if (existing !== undefined && Buffer.byteLength(content, 'utf8') < DIFF_BASIS_MAX_BYTES) {
+  // A failed capture already proved the old file is over the cap; retrying the
+  // same capped read would only add a doomed SFTP round-trip.
+  if (existing !== undefined && wantBasis && !captureFailed) {
     try {
-      const raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, DIFF_BASIS_MAX_BYTES, signal)
+      // Reuse the version probe's bytes when it captured them; only fall back to
+      // a separate read when the file was too large for that capture.
+      const raw = basis ?? await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, DIFF_BASIS_MAX_BYTES, signal)
       throwIfFsAborted(signal)
       if (!raw.includes(0)) before = normalizeLineEndings(new TextDecoder('utf-8', { fatal: true }).decode(raw))
     } catch (error) {
@@ -733,7 +854,11 @@ async function writeRemoteTextUnlocked(
   if (afterInfo === undefined) {
     throw new FsError(`"${target.displayPath}" disappeared while its write was being verified`, 'FS_IO_ERROR')
   }
-  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
+  // `content` is exactly what was written over stdin (UTF-8 bytes, no line
+  // ending rewrite inside commitRemoteText). Reuse it for the hash so a
+  // seconds-only stat host does not re-read the whole file after the commit.
+  // Strong stat evidence still wins, and the 32 MiB hash bound still applies.
+  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true, content: Buffer.from(content) })
   const version = bumpVersion(runtime, context.host.id, context.targetPath, afterInfo, evidence)
   return {
     operation: existing === undefined ? 'create' : 'update',
@@ -796,31 +921,30 @@ async function editRemoteText(
 ): Promise<FsEditOutcome> {
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.editText(target, edit, expected, signal, policy)
-  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () => editRemoteTextUnlocked(runtime, target, edit, expected, signal, policy))
+  const context = await resolveMutationContext(runtime, target, policy, signal)
+  if (context === undefined) return runtime.originals.editText(target, edit, expected, signal, policy)
+  return withTargetLock(runtime, realpathLockKey(context), () => editRemoteTextUnlocked(runtime, context, target, edit, expected, signal))
 }
 
 async function editRemoteTextUnlocked(
   runtime: Runtime,
+  context: MutationContext,
   target: FsTarget,
   edit: FsEditRequest,
   expected: { version: FsVersion } | undefined,
   signal: AbortSignal | undefined,
-  policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsEditOutcome> {
-  let context: MutationContext | undefined
-  try {
-    context = await mutationContext(runtime, target, policy, signal)
-  } catch (error) {
-    throw asFs(error, signal)
-  }
-  if (context === undefined) return runtime.originals.editText(target, edit, expected, signal, policy)
   throwIfFsAborted(signal)
   let existing: SftpAttrs | undefined
   let currentVersion: FsVersion | undefined
+  let captured: Buffer | undefined
   try {
-    const current = await currentRemoteAttrs(runtime, context, signal)
+    // The version probe may read the whole file; keep those bytes for the edit
+    // instead of transferring the same file a second time below.
+    const current = await currentRemoteAttrs(runtime, context, signal, { maxBytes: TEXT_CAP })
     existing = current.info
     currentVersion = current.version
+    captured = current.content
   } catch (error) {
     throw asFs(error, signal)
   }
@@ -843,12 +967,16 @@ async function editRemoteTextUnlocked(
     }
   }
   let raw: Buffer
-  try {
-    raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, TEXT_CAP, signal)
-  } catch (error) {
-    throw asFs(error, signal)
+  if (captured !== undefined) {
+    raw = captured
+  } else {
+    try {
+      raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, TEXT_CAP, signal)
+    } catch (error) {
+      throw asFs(error, signal)
+    }
+    throwIfFsAborted(signal)
   }
-  throwIfFsAborted(signal)
   if (raw.includes(0)) throw new FsError(`cannot edit "${target.displayPath}": binary file`, 'FS_NOT_TEXT')
   let decoded: string
   try {
@@ -875,7 +1003,9 @@ async function editRemoteTextUnlocked(
   if (afterInfo === undefined) {
     throw new FsError(`"${target.displayPath}" disappeared while its edit was being verified`, 'FS_IO_ERROR')
   }
-  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
+  // `content` is the CRLF-restored string actually sent over stdin; the
+  // returned `after` is LF-normalized and must NOT be hashed here.
+  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true, content: Buffer.from(content) })
   const afterVersion = bumpVersion(runtime, context.host.id, context.targetPath, afterInfo, evidence)
   return { version: afterVersion, before, after: edited.content }
 }
@@ -952,6 +1082,10 @@ interface RemoteSourceState {
   readonly context: MutationContext
   readonly info: SftpAttrs
   readonly version: FsVersion
+  /** The file bytes, present only when the caller asked to capture them. */
+  readonly content?: Buffer
+  /** True when the capture was attempted but the file exceeded its byte cap. */
+  readonly captureFailed?: boolean
 }
 
 /**
@@ -964,22 +1098,14 @@ interface RemoteSourceState {
  */
 async function requireRemoteFile(
   runtime: Runtime,
+  context: MutationContext,
   target: FsTarget,
   expected: { version: FsVersion } | undefined,
-  policy: SandboxExecutionPolicy | undefined,
   signal: AbortSignal | undefined,
   verb: 'patch' | 'delete' | 'move',
   rejectFinalSymlink: boolean,
+  capture?: { maxBytes: number },
 ): Promise<RemoteSourceState> {
-  let context: MutationContext | undefined
-  try {
-    context = await mutationContext(runtime, target, policy, signal)
-  } catch (error) {
-    throw asFs(error, signal)
-  }
-  if (context === undefined) {
-    throw new FsError(`cannot ${verb} "${target.displayPath}": not a remote target`, 'FS_IO_ERROR')
-  }
   throwIfFsAborted(signal)
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') {
@@ -1008,10 +1134,14 @@ async function requireRemoteFile(
   }
   let version: FsVersion | undefined
   let followed: SftpAttrs | undefined
+  let content: Buffer | undefined
+  let captureFailed: boolean | undefined
   try {
-    const current = await currentRemoteAttrs(runtime, context, signal)
+    const current = await currentRemoteAttrs(runtime, context, signal, capture)
     version = current.version
     followed = current.info
+    content = current.content
+    captureFailed = current.captureFailed
   } catch (error) {
     throw asFs(error, signal)
   }
@@ -1036,23 +1166,40 @@ async function requireRemoteFile(
   // `info.mode` to preserve the file's permission bits on commit, so it must be
   // the target file's mode. `followed` is undefined only when the follow-stat
   // found nothing, which the version check above already rejects.
-  return { context, info: followed ?? info, version }
+  return {
+    context,
+    info: followed ?? info,
+    version,
+    ...(content === undefined ? {} : { content }),
+    ...(captureFailed === true ? { captureFailed: true } : {}),
+  }
 }
 
-/** Read one remote UTF-8 file, keeping its line-ending style for the commit. */
+/**
+ * Decode one remote UTF-8 file, keeping its line-ending style for the commit.
+ *
+ * `content` skips the transfer when the caller already has the bytes: the
+ * version probe reads the whole file on hosts without nanosecond stat, and
+ * reading it again just to decode it doubles that cost.
+ */
 async function readRemoteSourceText(
   runtime: Runtime,
   context: MutationContext,
   target: FsTarget,
   signal?: AbortSignal,
+  content?: Buffer,
 ): Promise<{ before: string, lineEndings: 'LF' | 'CRLF' }> {
   let raw: Buffer
-  try {
-    raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, TEXT_CAP, signal)
-  } catch (error) {
-    throw asFs(error, signal)
+  if (content !== undefined) {
+    raw = content
+  } else {
+    try {
+      raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, TEXT_CAP, signal)
+    } catch (error) {
+      throw asFs(error, signal)
+    }
+    throwIfFsAborted(signal)
   }
-  throwIfFsAborted(signal)
   if (raw.includes(0)) throw new FsError(`cannot edit "${target.displayPath}": binary file`, 'FS_NOT_TEXT')
   let decoded: string
   try {
@@ -1064,9 +1211,21 @@ async function readRemoteSourceText(
 }
 
 /** Bounded LF-normalized content for a diff card; unavailable basis is null. */
-async function boundedRemoteBefore(runtime: Runtime, context: MutationContext, signal?: AbortSignal): Promise<string | null> {
+async function boundedRemoteBefore(
+  runtime: Runtime,
+  context: MutationContext,
+  signal?: AbortSignal,
+  content?: Buffer,
+  captureFailed = false,
+): Promise<string | null> {
+  // The version probe already tried and failed to read this file within the
+  // same cap; a second read cannot succeed. The diff basis is presentation
+  // data only, so report it as unavailable instead of repeating the transfer.
+  if (captureFailed) return null
   try {
-    const raw = await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, DIFF_BASIS_MAX_BYTES, signal)
+    // Reuse the bytes the version probe already read instead of transferring
+    // the same file a second time on hosts without nanosecond stat.
+    const raw = content ?? await runtime.access.pool.sftpRead(context.host, context.secret, context.targetPath, DIFF_BASIS_MAX_BYTES, signal)
     throwIfFsAborted(signal)
     if (raw.includes(0)) return null
     return normalizeLineEndings(new TextDecoder('utf-8', { fatal: true }).decode(raw))
@@ -1081,6 +1240,7 @@ async function versionAfterRemoteWrite(
   runtime: Runtime,
   context: MutationContext,
   target: FsTarget,
+  committedContent: string,
   signal?: AbortSignal,
 ): Promise<FsVersion> {
   forgetTarget(runtime, context.host.id, context.targetPath)
@@ -1093,7 +1253,11 @@ async function versionAfterRemoteWrite(
   if (afterInfo === undefined) {
     throw new FsError(`"${target.displayPath}" disappeared while its write was being verified`, 'FS_IO_ERROR')
   }
-  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true })
+  // `committedContent` is the exact string written over stdin, already
+  // line-ending restored. Hashing those bytes removes the post-write full read
+  // on a seconds-only stat host; strong stat evidence still wins and the
+  // 32 MiB hash bound still applies.
+  const evidence = await remoteVersionEvidence(context.pool, context.host, context.secret, context.targetPath, signal, { hash: true, content: Buffer.from(committedContent) })
   return bumpVersion(runtime, context.host.id, context.targetPath, afterInfo, evidence)
 }
 
@@ -1114,37 +1278,39 @@ async function patchRemoteText(
 ): Promise<FsEditOutcome> {
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.patchText!(target, hunks, expected, signal, policy)
-  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () =>
-    patchRemoteTextUnlocked(runtime, target, hunks, expected, signal, policy))
+  const context = await resolveMutationContext(runtime, target, policy, signal)
+  if (context === undefined) return runtime.originals.patchText!(target, hunks, expected, signal, policy)
+  return withTargetLock(runtime, realpathLockKey(context), () =>
+    patchRemoteTextUnlocked(runtime, context, target, hunks, expected, signal))
 }
 
 async function patchRemoteTextUnlocked(
   runtime: Runtime,
+  context: MutationContext,
   target: FsTarget,
   hunks: readonly PatchHunk[],
   expected: { version: FsVersion } | undefined,
   signal: AbortSignal | undefined,
-  policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsEditOutcome> {
-  const { context, info } = await requireRemoteFile(runtime, target, expected, policy, signal, 'patch', false)
-  // `requireRemoteFile` already hashed the file to obtain version evidence; this
-  // second read produces the text itself. The two are kept separate because the
-  // hash must exist even when the file turns out to be binary, and merging them
-  // would couple the version-evidence path to the text-decode path.
-  const { before, lineEndings } = await readRemoteSourceText(runtime, context, target, signal)
+  // `requireRemoteFile` hashes the file for version evidence on hosts without
+  // nanosecond stat; capturing those bytes here means the text comes from the
+  // same transfer instead of a second full read.
+  const { info, content } = await requireRemoteFile(runtime, context, target, expected, signal, 'patch', false, { maxBytes: TEXT_CAP })
+  const { before, lineEndings } = await readRemoteSourceText(runtime, context, target, signal, content)
   const result = applyHunks(before, hunks)
   if (!result.ok) throw patchFailureError(target, result.failure)
   const after = result.after
+  const committed = restoreLineEndings(after, lineEndings)
   try {
     await commitRemoteText(
       context.pool, context.host, context.secret, context.status, context.mode, context.roots,
-      context.targetPath, restoreLineEndings(after, lineEndings), signal, info.mode,
+      context.targetPath, committed, signal, info.mode,
       expected === undefined ? undefined : { kind: 'replaceIfVersion', version: expected.version },
     )
   } catch (error) {
     rethrowCommitFailure(runtime, context, error, signal)
   }
-  const version = await versionAfterRemoteWrite(runtime, context, target, signal)
+  const version = await versionAfterRemoteWrite(runtime, context, target, committed, signal)
   return { version, before, after }
 }
 
@@ -1157,19 +1323,21 @@ async function deleteRemoteFile(
 ): Promise<FsDeleteOutcome> {
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.deleteFile!(target, expected, signal, policy)
-  return withTargetLock(runtime, `${route.hostId}\0${String(target.targetKey)}`, () =>
-    deleteRemoteFileUnlocked(runtime, target, expected, signal, policy))
+  const context = await resolveMutationContext(runtime, target, policy, signal)
+  if (context === undefined) return runtime.originals.deleteFile!(target, expected, signal, policy)
+  return withTargetLock(runtime, realpathLockKey(context), () =>
+    deleteRemoteFileUnlocked(runtime, context, target, expected, signal))
 }
 
 async function deleteRemoteFileUnlocked(
   runtime: Runtime,
+  context: MutationContext,
   target: FsTarget,
   expected: { version: FsVersion } | undefined,
   signal: AbortSignal | undefined,
-  policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsDeleteOutcome> {
-  const { context } = await requireRemoteFile(runtime, target, expected, policy, signal, 'delete', true)
-  const before = await boundedRemoteBefore(runtime, context, signal)
+  const { content, captureFailed } = await requireRemoteFile(runtime, context, target, expected, signal, 'delete', true, { maxBytes: DIFF_BASIS_MAX_BYTES })
+  const before = await boundedRemoteBefore(runtime, context, signal, content, captureFailed)
   try {
     await commitRemoteDelete(
       context.pool, context.host, context.secret, context.status, context.mode, context.roots,
@@ -1201,30 +1369,30 @@ async function moveRemoteFile(
   if (String(source.targetKey) === String(destination.targetKey)) {
     throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
   }
+  // Resolve both realpaths before locking: the lock keys must agree with
+  // write/edit/patch/delete on the resolved remote path, and a move needs both
+  // keys in a stable (sorted) order to avoid deadlocking two concurrent moves.
+  const sourceContext = await resolveMutationContext(runtime, source, policy, signal)
+  const destinationContext = await resolveMutationContext(runtime, destination, policy, signal)
+  if (sourceContext === undefined || destinationContext === undefined) {
+    throw new FsError(`cannot move "${source.displayPath}" to a non-remote destination`, 'FS_SANDBOX_DENIED')
+  }
   return withTargetLocks(runtime, [
-    `${sourceRoute.hostId}\0${String(source.targetKey)}`,
-    `${destinationRoute.hostId}\0${String(destination.targetKey)}`,
-  ], () => moveRemoteFileUnlocked(runtime, source, destination, options, signal, policy))
+    realpathLockKey(sourceContext),
+    realpathLockKey(destinationContext),
+  ], () => moveRemoteFileUnlocked(runtime, sourceContext, destinationContext, source, destination, options, signal))
 }
 
 async function moveRemoteFileUnlocked(
   runtime: Runtime,
+  sourceContext: MutationContext,
+  destinationContext: MutationContext,
   source: FsTarget,
   destination: FsTarget,
   options: { hunks?: readonly PatchHunk[], expectedSource?: { version: FsVersion }, expectedDestination?: FsWriteIntent },
   signal: AbortSignal | undefined,
-  policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsMoveOutcome> {
-  const { context: sourceContext, info: sourceInfo } = await requireRemoteFile(runtime, source, options.expectedSource, policy, signal, 'move', true)
-  let destinationContext: MutationContext | undefined
-  try {
-    destinationContext = await mutationContext(runtime, destination, policy, signal)
-  } catch (error) {
-    throw asFs(error, signal)
-  }
-  if (destinationContext === undefined) {
-    throw new FsError(`cannot move "${source.displayPath}" to a non-remote destination`, 'FS_SANDBOX_DENIED')
-  }
+  const { info: sourceInfo, content: sourceContent, captureFailed: sourceCaptureFailed } = await requireRemoteFile(runtime, sourceContext, source, options.expectedSource, signal, 'move', true, { maxBytes: TEXT_CAP })
   // One remote file has two placeholder spellings: the whole path encoded in
   // one segment, or the workspace root encoded plus a relative suffix. They are
   // different `targetKey`s but the same file, so the string comparison above
@@ -1234,12 +1402,24 @@ async function moveRemoteFileUnlocked(
   if (sourceContext.targetPath === destinationContext.targetPath) {
     throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
   }
+  // Destination version/intent checks come FIRST, matching the local backend's
+  // error precedence: a stale destination is reported before a hunk mismatch.
+  // The captured source bytes are the only size information available before
+  // the source is decoded; they decide whether a destination diff basis is
+  // worth reading. `restoreLineEndings` / hunks may change the final size, so
+  // this is an estimate for presentation data, not a correctness boundary.
+  const wantDestinationBasis = sourceCaptureFailed !== true
+    && (sourceContent === undefined || sourceContent.length < DIFF_BASIS_MAX_BYTES)
   let existing: SftpAttrs | undefined
   let existingVersion: FsVersion | undefined
+  let destinationBasis: Buffer | undefined
+  let destinationCaptureFailed = false
   try {
-    const current = await currentRemoteAttrs(runtime, destinationContext, signal)
+    const current = await currentRemoteAttrs(runtime, destinationContext, signal, wantDestinationBasis ? { maxBytes: DIFF_BASIS_MAX_BYTES } : undefined)
     existing = current.info
     existingVersion = current.version
+    destinationBasis = current.content
+    destinationCaptureFailed = current.captureFailed === true
   } catch (error) {
     throw asFs(error, signal)
   }
@@ -1262,7 +1442,9 @@ async function moveRemoteFileUnlocked(
       throw new FsError(`cannot write "${destination.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
     }
   }
-  const { before: sourceText, lineEndings } = await readRemoteSourceText(runtime, sourceContext, source, signal)
+  // Decode only after the destination checks, reusing the captured source bytes
+  // so the source text still costs no second transfer.
+  const { before: sourceText, lineEndings } = await readRemoteSourceText(runtime, sourceContext, source, signal, sourceContent)
   let after = sourceText
   if (options.hunks !== undefined) {
     const result = applyHunks(sourceText, options.hunks)
@@ -1273,8 +1455,8 @@ async function moveRemoteFileUnlocked(
   // Match the local backend's bounded diffs: `sourceBefore` is judged on the
   // source text it returns, the destination basis on the content being written.
   const sourceBefore = Buffer.byteLength(sourceText, 'utf8') < DIFF_BASIS_MAX_BYTES ? sourceText : null
-  const destinationBefore = existing !== undefined && Buffer.byteLength(content, 'utf8') < DIFF_BASIS_MAX_BYTES
-    ? await boundedRemoteBefore(runtime, destinationContext, signal)
+  const destinationBefore = existing !== undefined && wantDestinationBasis
+    ? await boundedRemoteBefore(runtime, destinationContext, signal, destinationBasis, destinationCaptureFailed)
     : null
   try {
     await commitRemoteText(
@@ -1287,7 +1469,7 @@ async function moveRemoteFileUnlocked(
   }
   const destinationOutcome: FsWriteOutcome = {
     operation: existing === undefined ? 'create' : 'update',
-    version: await versionAfterRemoteWrite(runtime, destinationContext, destination, signal),
+    version: await versionAfterRemoteWrite(runtime, destinationContext, destination, content, signal),
     before: destinationBefore,
     after,
   }
@@ -1328,6 +1510,10 @@ function containsRemote(runtime: Runtime, parent: FsTarget, child: FsTarget): bo
   const left = rawLeft !== undefined && runtime.meta.isRealpathFresh(rawLeft.at) ? rawLeft : undefined
   const right = rawRight !== undefined && runtime.meta.isRealpathFresh(rawRight.at) ? rawRight : undefined
   if (left !== undefined && right !== undefined) {
+    // LRU touch: a long-lived root that is checked regularly must not age out
+    // just because unrelated paths were resolved in between.
+    touchIdentity(runtime, String(parent.targetKey))
+    touchIdentity(runtime, String(child.targetKey))
     if (left.hostId !== right.hostId) return false
     return remotePathInside(left.remoteReal, right.remoteReal)
   }
@@ -1542,7 +1728,7 @@ async function verifiedPlace(
       throw new FsError(`"${target.displayPath}" points outside its workspace`, 'FS_PERMISSION_DENIED')
     }
     effective = real
-    runtime.identity.set(key, { hostId: route.hostId, remoteReal: real, at: runtime.now() })
+    rememberIdentity(runtime, key, { hostId: route.hostId, remoteReal: real, at: runtime.now() })
     runtime.meta.rememberRealpath(host.id, lexical, real)
     runtime.meta.forgetAttrs(host.id, lexical, true)
     info = await uncachedAttrs(runtime, host, secret, real, true, signal)
@@ -1854,6 +2040,9 @@ function asFs(error: unknown, signal?: AbortSignal): FsError {
   if (error instanceof SandboxUnavailableError) return new FsError(message, 'FS_SANDBOX_DENIED')
   if (isRemoteMissing(error)) return new FsError(message, 'FS_NOT_FOUND')
   if (isSftpPermissionDenied(error)) return new FsError(message, 'FS_PERMISSION_DENIED')
+  // Structured first; the message test stays as a fallback for providers that
+  // raise their own oversize error instead of going through `SshFailure`.
+  if (isByteLimitExceeded(error)) return new FsError(message, 'FS_TOO_LARGE')
   if (/over the /i.test(message) && /byte limit/i.test(message)) return new FsError(message, 'FS_TOO_LARGE')
   return new FsError(message, 'FS_IO_ERROR')
 }

@@ -221,6 +221,9 @@ test('a failed connect releases its concurrency slot', async () => {
     })
   })
   await pool.dispose()
+  // dispose() now leaves the pool permanently disposed; tests that reuse it
+  // must opt back in explicitly.
+  pool.resetForTest()
 
   await withConnect(function (this: Client) {
     process.nextTick(() => this.emit('error', new Error('connect refused')))
@@ -254,6 +257,23 @@ test('dispose closes a connection that never finished opening', async () => {
     const pool = new SshPool(2)
     await assert.rejects(() => pool.exec(host, {}, 'echo hi', 5_000), /host unreachable/)
     await pool.dispose()
+    assert.equal(pool.hasSession(host.id), false)
+  })
+})
+
+test('dispose leaves the pool disposed so a post-unload acquire is refused', async () => {
+  // With the old `disposed = false` reset, a caller holding the pool after
+  // unload could open a brand-new connection (and so could a woken waiter).
+  const pool = new SshPool(1)
+  let connects = 0
+  await withConnect(function (this: Client) {
+    connects += 1
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await pool.dispose()
+    await assert.rejects(() => pool.exec(host, {}, 'echo hi', 1_000), /SSH pool is disposed/)
+    assert.equal(connects, 0, 'a disposed pool must not open a fresh connection')
     assert.equal(pool.hasSession(host.id), false)
   })
 })

@@ -7,7 +7,7 @@
  * test suite; an unknown version or hash is a hard error with a runbook hint.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -17,7 +17,13 @@ import { shJoin } from './shell-quote.ts'
 import type { HostConfig } from './config.ts'
 import type { SecretMaterial, SshPool } from './ssh-pool.ts'
 
-export const PTC_ADAPTER_VERSION = '1'
+/**
+ * Bump whenever the remote adapter contract (shim argv/handshake/control
+ * framing) changes. The upload digest already includes the shim bytes, so this
+ * is not what makes a new shim distinguishable; it is the human-readable marker
+ * for "the adapter moved, not the worker", and it partitions the upload cache.
+ */
+export const PTC_ADAPTER_VERSION = '2'
 export const PTC_MIN_REMOTE_NODE_MAJOR = PTC_MIN_NODE_MAJOR
 const PTC_CONTROL_ENV = 'DSH_SUBPROCESS_CONTROL'
 const WORKER_FILE = 'process.mjs'
@@ -179,6 +185,19 @@ export function writeOverlayManifest(manifest: WorkerManifest, env: NodeJS.Proce
   return path
 }
 
+/**
+ * Delete this installation's writable overlay; a missing file is not an error.
+ *
+ * Removing the file rather than writing an empty `verified` array keeps "no
+ * adaptation" indistinguishable from "never adapted", which is what every
+ * reader already assumes: `readEntries` returns `[]` for both.
+ */
+export function clearOverlayManifest(env: NodeJS.ProcessEnv = process.env): string {
+  const path = overlayManifestPath(env)
+  rmSync(path, { force: true })
+  return path
+}
+
 function isPackageRoot(path: string): boolean {
   try {
     const value = JSON.parse(readFileSync(join(path, 'package.json'), 'utf8')) as { name?: unknown }
@@ -232,7 +251,13 @@ function resolvePackageJson(specifier: string, fromDir: string, allowedRoot: str
   }
 }
 
-function findDshRoot(env: NodeJS.ProcessEnv): { root: string, version: string } {
+/**
+ * Locate the installed @deepseek-ai/dsh package.
+ *
+ * Exported for tests and diagnostics: resolving a peer package from the same
+ * installation the plugin uses keeps specs off a hard-coded machine path.
+ */
+export function locateDshRoot(env: NodeJS.ProcessEnv = process.env): { root: string, version: string } {
   const explicit = env.DSH_INSTALL_ROOT?.trim()
   const candidates = explicit !== undefined && explicit.length > 0
     ? [resolve(explicit), resolve(explicit, 'node_modules', '@deepseek-ai', 'dsh')]
@@ -304,7 +329,7 @@ function hashesFor(worker: UpstreamWorker): ManifestEntry {
 }
 
 export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, options: LocateOptions = {}): UpstreamWorker {
-  const { root: dshRoot, version: dshVersion } = findDshRoot(env)
+  const { root: dshRoot, version: dshVersion } = locateDshRoot(env)
   const runtimePackageJson = locateRuntimePackage(dshRoot)
   const subprocessPackageJson = locateSubprocessPackage(dshRoot)
   const packageRoot = dirname(runtimePackageJson)
@@ -341,8 +366,13 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
       && entry.controlEnv === probes.controlEnv
       && entry.minimumNodeMajor === PTC_MIN_REMOTE_NODE_MAJOR)
     if (expected === undefined) {
+      // The package manifest lives inside the installed plugin, which is
+      // read-only for a normal npm install, so the installed-host command comes
+      // first and the source-checkout command second.
       throw new Error(
-        `the installed PTC worker (DSH ${worker.dshVersion}, runtime ${worker.runtimeVersion}) is not in vendor/upstream/ptc-worker.manifest.json. Run \`npm run check:upstream -- --update\` after the offline and live e2e suites pass.`,
+        `the installed PTC worker (DSH ${worker.dshVersion}, runtime ${worker.runtimeVersion}) is not in the PTC worker manifest. `
+        + 'On an installed host run `npm run adapt:upstream` (writes $DSH_HOME/permission-remote/upstream-ptc.manifest.json and applies to the next remote call). '
+        + 'In a source checkout run `npm run upgrade:ptc -- --write` after the offline and live suites pass.',
       )
     }
   }

@@ -83,6 +83,10 @@ export interface RemotePtcDeps {
   worldReady(): boolean
   fsReady(): boolean
   disposed?(): boolean
+  /** Drop the cached host probe so the next run re-probes after an external install. */
+  forgetProbe?(hostId: string): void
+  /** Diagnostic sink. A broken logger must never become an uncaught exception. */
+  logger?: { warn(message: string): void }
   env?: NodeJS.ProcessEnv
 }
 
@@ -97,6 +101,53 @@ function failure(kind: PtcFailureKind, message: string): PtcRunResult {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * A wrap warning also runs inside a `queueMicrotask` callback, where an
+ * uncaught exception is process-fatal in this host. Prefer the host logger,
+ * fall back to the console, and swallow every failure of either channel.
+ */
+function warnWrapFailure(deps: RemotePtcDeps, error: unknown): void {
+  const message = `[@dsh-permission-remote] PTC runtime wrap failed; remote run_code stays refused: ${messageOf(error)}`
+  try {
+    if (typeof deps.logger?.warn === 'function') {
+      deps.logger.warn(message)
+      return
+    }
+  } catch {
+    // Fall through to the console.
+  }
+  try {
+    console.warn(message)
+  } catch {
+    // A diagnostic is never worth crashing the host process.
+  }
+}
+
+const WRITE_PROBE = Symbol('dsh-permission-remote.wrap-write-probe')
+
+/** Frozen/sealed objects and hostile Proxies must be refused before any mutation. */
+function acceptsPropertyWrites(value: object): boolean {
+  if (!Object.isExtensible(value)) return false
+  try {
+    Object.defineProperty(value, WRITE_PROBE, { value: true, configurable: true })
+    delete (value as Record<symbol, unknown>)[WRITE_PROBE]
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Locate `run` on the instance or its prototype chain without invoking a getter. */
+function runDescriptorOf(value: object): PropertyDescriptor | undefined {
+  let current: object | null = value
+  while (current !== null) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, 'run')
+    if (descriptor !== undefined) return descriptor
+    current = Object.getPrototypeOf(current)
+  }
+  return undefined
 }
 
 function isRuntime(value: unknown): value is PtcRuntimeLike {
@@ -122,27 +173,94 @@ function readInstructions(value: PtcRuntimeLike, own: PropertyDescriptor | undef
   }
 }
 
+/**
+ * Wrap one runtime instance. Every mutation is reversible: a failure anywhere
+ * (preflight, the three writes, or a hostile Proxy) rolls the object back to
+ * its exact prior shape, so a half-wrapped instance can never satisfy
+ * `isRemotePtcRuntime()` and fail the guard open to a local run.
+ */
 function installWrap(value: unknown, deps: RemotePtcDeps): (() => void) | undefined {
   if (!isRuntime(value) || value[MARK] === true) return undefined
-  const ownRun = Object.hasOwn(value, 'run')
-  const originalRun = value.run
-  const ownInstructions = Object.getOwnPropertyDescriptor(value, 'executionInstructions')
-  const inherited = ownInstructions ?? Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value), 'executionInstructions')
-  value[MARK] = true
-  value.run = spec => dispatch(value, originalRun, spec, deps)
-  Object.defineProperty(value, 'executionInstructions', {
-    configurable: true,
-    enumerable: false,
-    get() {
-      return `${readInstructions(value, ownInstructions, inherited)}${REMOTE_NOTE}`
-    },
-  })
-  return () => {
-    if (ownRun) value.run = originalRun
-    else delete (value as { run?: PtcRuntimeLike['run'] }).run
-    if (ownInstructions !== undefined) Object.defineProperty(value, 'executionInstructions', ownInstructions)
-    else delete (value as { executionInstructions?: string }).executionInstructions
-    delete value[MARK]
+  const runtime = value
+  let ownRun = false
+  let ownRunDescriptor: PropertyDescriptor | undefined
+  let originalRun: PtcRuntimeLike['run'] | undefined
+  let ownInstructions: PropertyDescriptor | undefined
+  let inherited: PropertyDescriptor | undefined
+  let markApplied = false
+  let runApplied = false
+  let instructionsApplied = false
+
+  /** Undo only the writes that succeeded, in reverse order. Never throws. */
+  const rollback = (): void => {
+    try {
+      if (instructionsApplied) {
+        if (ownInstructions !== undefined) Object.defineProperty(runtime, 'executionInstructions', ownInstructions)
+        else delete (runtime as { executionInstructions?: string }).executionInstructions
+      }
+    } catch {
+      // Best effort: the preflight already refused non-configurable shapes.
+    }
+    try {
+      if (runApplied) {
+        if (ownRun && ownRunDescriptor !== undefined) {
+          try {
+            Object.defineProperty(runtime, 'run', ownRunDescriptor)
+          } catch {
+            runtime.run = originalRun as PtcRuntimeLike['run']
+          }
+        } else if (ownRun) runtime.run = originalRun as PtcRuntimeLike['run']
+        else delete (runtime as { run?: PtcRuntimeLike['run'] }).run
+      }
+    } catch {
+      // Best effort.
+    }
+    try {
+      if (markApplied) delete runtime[MARK]
+    } catch {
+      // Best effort.
+    }
+  }
+
+  try {
+    ownRun = Object.hasOwn(runtime, 'run')
+    ownRunDescriptor = ownRun ? Object.getOwnPropertyDescriptor(runtime, 'run') : undefined
+    originalRun = runtime.run
+    ownInstructions = Object.getOwnPropertyDescriptor(runtime, 'executionInstructions')
+    inherited = ownInstructions ?? Object.getOwnPropertyDescriptor(Object.getPrototypeOf(runtime), 'executionInstructions')
+
+    // Preflight: refuse shapes whose writes cannot be fully rolled back. This
+    // covers a frozen runtime (extensibility), a getter-only or non-writable
+    // `run`, and a non-configurable `executionInstructions`.
+    if (!acceptsPropertyWrites(runtime)) throw new Error('the PTC runtime object is not writable')
+    const runShape = runDescriptorOf(runtime)
+    if (runShape !== undefined && (runShape.get !== undefined || runShape.set !== undefined)) {
+      throw new Error('the PTC runtime exposes run as an accessor, which cannot be rolled back')
+    }
+    if (runShape !== undefined && runShape.writable === false) {
+      throw new Error('the PTC runtime exposes a read-only run property')
+    }
+    if (ownInstructions !== undefined && ownInstructions.configurable === false) {
+      throw new Error('the PTC runtime exposes a non-configurable executionInstructions property')
+    }
+
+    runtime[MARK] = true
+    markApplied = true
+    runtime.run = spec => dispatch(runtime, originalRun as PtcRuntimeLike['run'], spec, deps)
+    runApplied = true
+    Object.defineProperty(runtime, 'executionInstructions', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        return `${readInstructions(runtime, ownInstructions, inherited)}${REMOTE_NOTE}`
+      },
+    })
+    instructionsApplied = true
+    return rollback
+  } catch (error) {
+    rollback()
+    warnWrapFailure(deps, error)
+    return undefined
   }
 }
 
@@ -235,9 +353,14 @@ async function dispatch(
   if (status.node?.available !== true) {
     const reason = status.node?.reason ?? 'missing'
     const version = status.node?.version === undefined ? '' : ` (found ${status.node.version})`
-    return failure('exception', `remote run_code requires Node.js 22 or newer on ${host.host}; ${reason}${version}. Install Node on the remote host and probe again.`)
+    // Node (like bwrap and ripgrep) can be installed on the remote without the
+    // plugin being told. Drop this probe so the NEXT run re-probes instead of
+    // replaying a stale "missing" verdict forever.
+    deps.forgetProbe?.(route.hostId)
+    return failure('exception', `remote run_code requires Node.js 22 or newer on ${host.host}; ${reason}${version}. Install Node on the remote host and re-probe with Test connection in Settings → SSH hosts; an install action, a host edit, or a plugin restart also refreshes the probe. The next run_code re-probes automatically.`)
   }
   if (status.home.length === 0) {
+    deps.forgetProbe?.(route.hostId)
     return failure('exception', 'the remote host did not report an absolute $HOME, so the PTC worker cannot be placed there')
   }
   if (budget !== null && remaining() !== null && remaining()! <= 0) {
@@ -277,24 +400,67 @@ async function dispatch(
     launchExecutable: launch.executable ?? process.execPath,
   }
   const timeoutMs = budget === null ? null : Math.max(1, budget - (Date.now() - startedAt))
-  return remoteWorldContext.run(world, () => originalRun.call(runtime, { ...spec, cwd: remoteCwd, timeoutMs }))
+  const result = await remoteWorldContext.run(world, () => originalRun.call(runtime, { ...spec, cwd: remoteCwd, timeoutMs }))
+  // A bwrap or ripgrep installed on the remote only shows up in a fresh probe.
+  // The official runtime reports an unusable sandbox probe as a
+  // sandbox-unavailable failure; a cached probe that still lacks a dependency
+  // is worth refreshing after any failed remote run.
+  if (result.error !== undefined && (probeDependentFailure(result.error) || probeStatusIncomplete(status))) deps.forgetProbe?.(route.hostId)
+  return result
+}
+
+/** Failures caused by a stale cached probe, not by the program itself. */
+function probeDependentFailure(error: PtcFailure): boolean {
+  return error.kind === 'sandbox-unavailable'
+    || /remote sandbox probe failed/iu.test(error.message)
+}
+
+/** A cached probe that still reports a missing sandbox tool or a broken rg. */
+function probeStatusIncomplete(status: RunnerStatus): boolean {
+  // `upload-failed` means the probe tried the ripgrep upload and the remote
+  // rejected it; a later attempt (new temp dir, fixed permissions) can succeed
+  // without a host restart, so it is as stale as `missing`.
+  return status.sandbox.available !== true
+    || status.ripgrep === 'missing'
+    || status.ripgrep === 'upload-failed'
 }
 
 /** A detach function carrying whether at least one PTC runtime was wrapped. */
+/**
+ * Whether a value is a PTC runtime this plugin has wrapped.
+ *
+ * `attachRemotePtc` wraps whatever instance the service currently holds, but a
+ * later replacement is a different object. Callers that gate remote tools on
+ * "PTC is ready" must ask about the instance in hand, not about whether any
+ * wrap ever succeeded.
+ */
+export function isRemotePtcRuntime(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && (value as PtcRuntimeLike)[MARK] === true
+}
+
 export type RemotePtcDetach = (() => void) & { readonly installed: boolean }
 
 /** Wrap every official PTC runtime instance currently loaded or loaded later. */
 export function attachRemotePtc(ctx: CordisLike, deps: RemotePtcDeps): RemotePtcDetach {
   const restores = new Map<object, () => void>()
   let stopped = false
-  let installed = false
   const wrap = (value: unknown): void => {
     if (stopped || typeof value !== 'object' || value === null) return
-    const restore = installWrap(value, deps)
-    if (restore === undefined) return
-    installed = true
-    restores.get(value)?.()
-    restores.set(value, restore)
+    // `wrap` is called both synchronously during plugin load and from a
+    // queueMicrotask callback. Nothing may escape either path: an uncaught
+    // microtask exception is process-fatal in this host.
+    try {
+      const restore = installWrap(value, deps)
+      if (restore === undefined) return
+      try {
+        restores.get(value)?.()
+      } catch (error) {
+        warnWrapFailure(deps, error)
+      }
+      restores.set(value, restore)
+    } catch (error) {
+      warnWrapFailure(deps, error)
+    }
   }
   const current = ctx.get('ptcRuntime')
   if (current !== undefined && current !== null) wrap(current)
@@ -312,7 +478,9 @@ export function attachRemotePtc(ctx: CordisLike, deps: RemotePtcDeps): RemotePtc
   }) as RemotePtcDetach
   Object.defineProperty(detach, 'installed', {
     enumerable: true,
-    get: () => installed,
+    // Derived from the live wrap set rather than a sticky flag, so the value
+    // cannot outlive the wraps it describes.
+    get: () => restores.size > 0,
   })
   return detach
 }

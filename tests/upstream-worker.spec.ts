@@ -160,6 +160,35 @@ test('a manifest entry matches by worker bytes, not the DSH version label', asyn
 })
 
 
+test('unrecorded bytes name the installed-host command and never --update', async () => {
+  const root = await fixture()
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-unrecorded-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    // An empty overlay means nothing is recorded, so the strict path must throw.
+    assert.throws(
+      () => locateUpstreamWorker({ DSH_INSTALL_ROOT: root }),
+      (error: Error) => {
+        const message = error.message
+        assert.match(message, /adapt:upstream/u, 'the installed-host command must be offered')
+        assert.match(message, /upgrade:ptc/u, 'the source-checkout command must be offered')
+        // `--update` writes inside the package, which is read-only when
+        // installed; suggesting it would be a dead end.
+        assert.doesNotMatch(message, /--update/u, 'the message must not suggest rewriting the package manifest')
+        assert.doesNotMatch(message, /vendor\/upstream/u, 'the read-only package path must not be named')
+        return true
+      },
+    )
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(root, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+
 test('a DSH root without the runtime package does not fall back to the plugin dev dependency', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-ptc-empty-'))
   await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.0.0-fixture' }))

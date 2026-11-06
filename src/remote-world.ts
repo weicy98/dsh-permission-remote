@@ -18,7 +18,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomBytes } from 'node:crypto'
-import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readdirSync, rmdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, posix, resolve as resolvePath } from 'node:path'
 import { Duplex, PassThrough, type Readable, type Writable } from 'node:stream'
@@ -472,10 +472,95 @@ class RemotePtcHandle implements SubprocessHandle {
  */
 let spillDirectory: string | undefined
 let spillCounter = 0
+let exitCleanupRegistered = false
 
-function sharedSpillDirectory(): string {
-  spillDirectory ??= mkdtempSync(join(tmpdir(), 'dsh-remote-spill-'))
+/** Internal path creator, also used by the regression test for the unload cleanup. */
+export function sharedSpillDirectory(): string {
+  if (spillDirectory === undefined) {
+    spillDirectory = mkdtempSync(join(tmpdir(), 'dsh-remote-spill-'))
+    if (!exitCleanupRegistered) {
+      exitCleanupRegistered = true
+      // Synchronous and throw-safe: rmdirSync only succeeds on an empty dir, so
+      // advertised recovery artifacts are never removed at process exit either.
+      process.once('exit', () => { disposeSpillDirectory() })
+    }
+  }
   return spillDirectory
+}
+
+/** Retain at most this many success-path spill artifacts per process. */
+export const SPILL_KEEP_FILES = 64
+/** Retain at most this many bytes of success-path spill artifacts per process. */
+export const SPILL_KEEP_BYTES = 256 * 1024 * 1024
+
+/**
+ * Best-effort retention for success-path spill artifacts.
+ *
+ * Spill files are recovery aids, not durable output: they stay readable for the
+ * caller that produced them, but a long-lived process that runs many large
+ * commands must not grow its temp directory without bound. Keep the newest
+ * `files` artifacts under `bytes`, and skip `keep` so the artifact currently
+ * being written is never deleted by its own prune.
+ */
+export function pruneSpillDirectory(
+  directory: string = sharedSpillDirectory(),
+  keep?: string,
+  limits: { files: number, bytes: number } = { files: SPILL_KEEP_FILES, bytes: SPILL_KEEP_BYTES },
+): void {
+  let names: string[]
+  try {
+    names = readdirSync(directory)
+  } catch {
+    return
+  }
+  const entries: Array<{ path: string, size: number, mtimeMs: number, keep: boolean }> = []
+  for (const name of names) {
+    if (!name.startsWith('stream-')) continue
+    try {
+      const path = join(directory, name)
+      const info = statSync(path)
+      if (info.isFile()) entries.push({ path, size: info.size, mtimeMs: info.mtimeMs, keep: path === keep })
+    } catch {
+      // Raced with another prune or the file disappeared; best effort.
+    }
+  }
+  entries.sort((left, right) => left.mtimeMs - right.mtimeMs)
+  let total = entries.reduce((sum, entry) => sum + entry.size, 0)
+  while (entries.length > limits.files || total > limits.bytes) {
+    const index = entries.findIndex(entry => !entry.keep)
+    if (index === -1) break
+    const [oldest] = entries.splice(index, 1)
+    try {
+      rmSync(oldest!.path, { force: true })
+      total -= oldest!.size
+    } catch {
+      // Best effort: a failed delete only means the directory stays larger.
+    }
+  }
+}
+
+/**
+ * Remove the process-wide spill directory ONLY when it is empty. A non-empty
+ * directory holds full-output recovery artifacts that `readFrom` still
+ * advertises, so every failure (ENOTEMPTY, ENOENT, EACCES) is swallowed.
+ */
+function removeEmptySpillDirectory(directory: string): boolean {
+  try {
+    rmdirSync(directory)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Drop the empty spill directory on plugin unload. Accepting an explicit path
+ * lets the regression test exercise the exact cleanup without a full world.
+ */
+export function disposeSpillDirectory(directory: string | undefined = spillDirectory): void {
+  if (directory === spillDirectory) spillDirectory = undefined
+  if (directory === undefined) return
+  removeEmptySpillDirectory(directory)
 }
 
 /**
@@ -536,6 +621,8 @@ class CollectedStream {
       appendFileSync(path, this.retained)
       this.spillPath = path
       this.spillBytes = this.retained.length
+      // Bounded recovery artifacts: prune older spills now that this one exists.
+      pruneSpillDirectory(sharedSpillDirectory(), path)
     } catch {
       this.discardSpill()
     }
@@ -899,6 +986,9 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     if (ownConfine) sandbox.confine = savedConfine
     else delete sandbox.confine
     delete (subprocess as { [WORLD_MARK]?: boolean })[WORLD_MARK]
+    // An empty per-process temp dir must not survive unload. Directories that
+    // still hold advertised recovery artifacts are intentionally kept.
+    disposeSpillDirectory()
   }
 }
 

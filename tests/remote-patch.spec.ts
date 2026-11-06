@@ -57,6 +57,15 @@ interface HarnessOptions {
   publishPaths?: readonly string[]
   /** Apply `publishPaths` even when the command exits non-zero (simulates mv-then-chmod failure). */
   mutateOnFailure?: boolean
+  /**
+   * Model a host whose `stat` has no nanosecond precision.
+   *
+   * The version probe then has to hash the file, which reads it; this is the
+   * case where a second read for the patch text would double the traffic.
+   */
+  weakStat?: boolean
+  /** Called on every byte-serving read so a test can count them. */
+  onRead?: (remotePath: string) => void
 }
 
 interface Harness {
@@ -150,19 +159,26 @@ function createHarness(options: HarnessOptions = {}): Harness {
     async sftpProbeDir(): Promise<void> { throw new SshFailure('Failure', 'sftp-probedir') },
     async sftpReadDir(): Promise<[]> { return [] },
     async sftpRead(_host: HostConfig, _secret: unknown, remotePath: string): Promise<Buffer> {
+      options.onRead?.(remotePath)
       const content = files.get(posix.normalize(remotePath))
       if (content === undefined) throw new SshFailure('Failure', 'sftp-read')
       return Buffer.from(content)
     },
     async sftpReadAt(): Promise<Buffer> { return Buffer.alloc(0) },
     async *sftpReadChunks(_host: HostConfig, _secret: unknown, remotePath: string): AsyncGenerator<Buffer> {
+      options.onRead?.(remotePath)
       const content = files.get(posix.normalize(remotePath))
       if (content !== undefined) yield Buffer.from(content)
     },
     async exec(_host: HostConfig, _secret: unknown, command: string, _timeout: number, _signal?: AbortSignal, stdin?: string | Buffer): Promise<ExecResult> {
       commands.push(command)
       writes.push({ command, stdin: typeof stdin === 'string' ? stdin : undefined })
-      if (command.startsWith('stat ')) return result(0, STRONG_STAT)
+      if (command.startsWith('stat ')) {
+        return options.weakStat === true
+          // Seconds only: not strong evidence, so the caller must hash.
+          ? result(0, '65024:12345:9:2026-01-01 00:00:00 +0000')
+          : result(0, STRONG_STAT)
+      }
       const outcome = options.execResult?.(command) ?? result(0)
       // Emulate the atomic publication so the post-write stat sees the file.
       // A delete script carries `rm --` and publishes nothing. `mutateOnFailure`
@@ -251,6 +267,27 @@ test('patchText keeps CRLF line endings on the remote file', async () => {
   h.remove()
 })
 
+test('patchText reuses the version probe bytes instead of reading twice', async () => {
+  // With a seconds-only stat the version evidence needs a full-content hash,
+  // which reads the file. The patch text must come from that same read.
+  let reads = 0
+  const h = createHarness({ weakStat: true, onRead: () => { reads += 1 } })
+  try {
+    h.setFile(`${REMOTE}/a.ts`, 'alpha\nbeta\n')
+    const target = await h.fs.resolve(placeholder('a.ts'))
+    reads = 0
+    const outcome = await h.fs.patchText(target, HUNKS, undefined, undefined, POLICY)
+    assert.equal(outcome.after, 'alpha\nBETA\n')
+    // One read total: the pre-write capture. The post-write version now hashes
+    // the committed bytes instead of re-reading the file.
+    assert.equal(reads, 1, `patch made ${reads} full reads; expected only the reused capture`)
+    assert.equal(h.writes.length > 0, true, 'the patch must still reach the host')
+  } finally {
+    h.remove()
+  }
+})
+
+
 test('patchText reports a hunk mismatch without writing anything', async () => {
   const h = createHarness()
   h.setFile(`${REMOTE}/a.ts`, 'alpha\nbeta\n')
@@ -333,6 +370,46 @@ test('deleteFile removes remotely with rm --, never rm -f, and returns the diff 
   assert.ok(!h.commands.some(command => command.includes('rm -f ')), 'rm -f would hide a vanished target')
   h.remove()
 })
+
+test('deleteFile reuses the version probe bytes for its diff basis', async () => {
+  // With a seconds-only stat the version probe hashes the whole file. The
+  // diff basis must come from that same read rather than a second transfer.
+  let reads = 0
+  const h = createHarness({ weakStat: true, onRead: () => { reads += 1 } })
+  try {
+    h.setFile(`${REMOTE}/a.ts`, 'alpha\nbeta\n')
+    const target = await h.fs.resolve(placeholder('a.ts'))
+    reads = 0
+    const outcome = await h.fs.deleteFile(target, undefined, undefined, POLICY)
+    assert.deepEqual(outcome.before, 'alpha\nbeta\n')
+    assert.equal(reads, 1, `delete made ${reads} full reads; expected the single version-probe capture`)
+  } finally {
+    h.remove()
+  }
+})
+
+
+test('moveFile reuses the version probe bytes for source and destination basis', async () => {
+  let reads = 0
+  const h = createHarness({ weakStat: true, onRead: () => { reads += 1 } })
+  try {
+    h.setFile(`${REMOTE}/src.ts`, 'alpha\nbeta\n')
+    h.setFile(`${REMOTE}/dst.ts`, 'old destination')
+    const source = await h.fs.resolve(placeholder('src.ts'))
+    const destination = await h.fs.resolve(placeholder('dst.ts'))
+    reads = 0
+    const outcome = await h.fs.moveFile(source, destination, {}, undefined, POLICY)
+    assert.equal(outcome.sourceBefore, 'alpha\nbeta\n')
+    assert.equal(outcome.destination.before, 'old destination')
+    // Source capture + destination capture. The post-write verification hashes
+    // the committed bytes, so it adds no read. Before the capture reuse this was
+    // four reads (two version hashes plus source text and destination basis).
+    assert.equal(reads, 2, `move made ${reads} full reads`)
+  } finally {
+    h.remove()
+  }
+})
+
 
 test('deleteFile maps a target that disappeared between check and rm to FS_IO_ERROR', async () => {
   const h = createHarness({
@@ -534,6 +611,54 @@ test('moveFile enforces both the source and the destination version guard', asyn
   )
   assert.equal(h.commands.some(command => command.includes('rm -- ')), false, 'a refused move must not delete the source')
   h.remove()
+})
+
+test('a stale destination outranks a hunk mismatch', async () => {
+  // Both failures are present: the hunk does not match the source AND the
+  // destination version is stale. The local backend reports the destination
+  // guard first, so source decode/applyHunks must not run before it.
+  const h = createHarness()
+  h.setFile(`${REMOTE}/a.ts`, 'alpha\n')
+  h.setFile(`${REMOTE}/b.ts`, 'bee\n')
+  const source = await h.fs.resolve(placeholder('a.ts'))
+  const destination = await h.fs.resolve(placeholder('b.ts'))
+  const stale = remoteVersionToken({ base: 'other', strong: 'different' })
+  const missing: readonly PatchHunk[] = [
+    { lineNumber: 1, oldLines: ['not present'], newLines: ['x'], isEndOfFile: false },
+  ]
+  await assert.rejects(
+    () => h.fs.moveFile(source, destination, {
+      hunks: missing,
+      expectedDestination: { kind: 'replaceIfVersion', version: stale },
+    }, undefined, POLICY),
+    (error: unknown) => codeOf(error) === 'FS_STALE_VERSION',
+  )
+  assert.equal(h.commands.some(command => command.includes('rm -- ')), false, 'a refused move must not delete the source')
+  h.remove()
+})
+
+test('a remote lock timeout is a typed, actionable FS_IO_ERROR', async () => {
+  // The mkdir fallback emits exit 75; a host/sandbox that normalizes the code
+  // still prints the same message, so both spellings must map to the same
+  // explicit "lock timed out / retry" error.
+  for (const outcome of [
+    result(75, '', 'remote write lock timeout'),
+    result(1, '', 'remote write lock timeout'),
+  ]) {
+    const h = createHarness({ execResult: () => outcome })
+    h.setFile(`${REMOTE}/a.ts`, 'alpha\n')
+    const target = await h.fs.resolve(placeholder('a.ts'))
+    await assert.rejects(
+      () => h.fs.writeText(target, 'gamma\n', undefined, undefined, POLICY),
+      (error: unknown) => {
+        assert.equal(codeOf(error), 'FS_IO_ERROR')
+        assert.match((error as Error).message, /lock timed out/i)
+        assert.match((error as Error).message, /retry/i)
+        return true
+      },
+    )
+    h.remove()
+  }
 })
 
 test('danger-full-access commits without a sandbox wrapper, workspace-write wraps them', async () => {

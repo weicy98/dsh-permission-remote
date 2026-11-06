@@ -98,6 +98,15 @@ export interface RemoteVersionProbeOptions {
   readonly hash?: boolean
   /** Upper bound for the hash fallback; oversize files stay unversioned and fail closed. */
   readonly maxHashBytes?: number
+  /**
+   * Bytes the caller already read, used instead of a second transfer.
+   *
+   * A caller that has just read the file for its own purposes would otherwise
+   * make the version probe re-read the whole thing. Passing those bytes keeps
+   * the evidence identical to a fresh hash while halving the traffic on the
+   * no-nanosecond-stat path.
+   */
+  readonly content?: Buffer
 }
 
 const VERSION_HASH_MAX_BYTES = 32 * 1024 * 1024
@@ -137,6 +146,13 @@ export async function remoteVersionEvidence(
   if (options.hash !== true) return {}
   const limit = options.maxHashBytes ?? VERSION_HASH_MAX_BYTES
   const digest = createHash('sha256')
+  // Reusing bytes the caller already transferred gives the same digest as a
+  // fresh read. Only trust them when they are within the same hash limit, so a
+  // huge buffer cannot silently weaken the bound a fresh read would enforce.
+  if (options.content !== undefined) {
+    if (options.content.length > limit) return {}
+    return { hash: digest.update(options.content).digest('hex') }
+  }
   let total = 0
   try {
     for await (const chunk of pool.sftpReadChunks(host, secret, remotePath, signal)) {
@@ -251,6 +267,15 @@ function mapRemoteCommitFailure(result: ExecResult, mode: SandboxMode, action: '
   }
   if (result.code === 27 || /is a directory/i.test(stderr)) {
     throw new FsError(stderr || 'remote delete target is a directory', 'FS_NOT_REGULAR_FILE')
+  }
+  // The mkdir-based lock fallback gives up after ~10s with exit 75. A host or
+  // sandbox that normalizes that code still prints the same message, so match
+  // both. There is no dedicated FS_* code for a busy lock; keep FS_IO_ERROR but
+  // make the cause actionable instead of degrading to a bare Error with a
+  // generic "remote write failed" message.
+  if (result.code === 75 || /remote write lock timeout|lock timeout/i.test(stderr)) {
+    const detail = stderr.trim() || `exit ${result.code ?? 'unknown'}`
+    throw new FsError(`remote ${action} lock timed out; retry the ${action} (${detail})`, 'FS_IO_ERROR')
   }
   if (/permission denied/i.test(stderr)) {
     throw new FsError(stderr || `remote ${action} permission denied`, 'FS_PERMISSION_DENIED')

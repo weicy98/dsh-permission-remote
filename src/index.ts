@@ -52,9 +52,10 @@ import {
 } from './shell-surface.ts'
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
 import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
-import { attachRemotePtc } from './ptc-remote.ts'
-import { installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
+import { attachRemotePtc, isRemotePtcRuntime } from './ptc-remote.ts'
+import { disposeSpillDirectory, installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
 import { installRemoteShell } from './remote-shell.ts'
+import { registerUpstreamSkill } from './skills.ts'
 import { SshPoolTransport } from './remote-transport.ts'
 import { clearWorkerCache, ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
@@ -1816,6 +1817,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     // async so Cordis waits for the files to disappear before the pool closes.
     await clearStagedPresentFiles()
     clearWorkerCache()
+    // Also drop the process-wide spill directory when it is empty; directories
+    // still holding advertised recovery artifacts are deliberately retained.
+    disposeSpillDirectory()
     await core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
@@ -1858,6 +1862,19 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       unregisters.delete(remove)
     })
   })
+  // `docs/` ships with the package, but `.agents/skills/` is only discovered
+  // from a project root or a user skill directory, so an installed plugin has
+  // to publish the upgrade runbook itself. A missing runbook just means no
+  // skill; it must not block remote workspaces.
+  rawCtx.inject(['skills'], bridged => {
+    const remove = registerUpstreamSkill(bridged as unknown as Parameters<typeof registerUpstreamSkill>[0])
+    if (remove === undefined) return
+    unregisters.add(remove)
+    bridged.effect(() => () => {
+      remove()
+      unregisters.delete(remove)
+    })
+  })
   const detachPtc = attachRemotePtc(rawCtx as unknown as Parameters<typeof attachRemotePtc>[0], {
     pool: core.pool,
     hostOf: id => core.listHosts().find(host => host.id === id),
@@ -1867,6 +1884,8 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     worldReady: () => worldReady,
     fsReady: () => fsPatchReady,
     disposed: () => ptcDisposed,
+    forgetProbe: id => core.forgetProbe(id),
+    logger: ctx.logger,
   })
   unregisters.add(detachPtc)
   ctx.effect(() => () => {
@@ -1959,7 +1978,10 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     seen.add(agent)
     let installed = false
     try {
-      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed)
+      // Ask about the instance the service holds right now: a replaced,
+      // unwrapped runtime must restore the refusal instead of inheriting an
+      // earlier successful wrap.
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed && isRemotePtcRuntime(rawCtx.get('ptcRuntime')))
     } catch (error) {
       // Shadows did not register. A remote session would otherwise keep the
       // official tools and run them in the placeholder directory.

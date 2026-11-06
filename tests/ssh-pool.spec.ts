@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
-import { SshPool, SSH_KEEPALIVE_INTERVAL_MS, exitFields, sshConnectOptions, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
+import { SshFailure, SshPool, SSH_KEEPALIVE_INTERVAL_MS, exitFields, isByteLimitExceeded, sshConnectOptions, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
 
 test('channel text keeps a character split across SSH chunks', () => {
   const decoder = new StringDecoder('utf8')
@@ -12,6 +13,16 @@ test('channel text keeps a character split across SSH chunks', () => {
   assert.equal(head + tail + decoder.end(), '中文')
   assert.equal(head.includes('\uFFFD'), false)
   assert.equal(tail.includes('\uFFFD'), false)
+})
+
+test('the permission-denied JSDoc belongs to isSftpPermissionDenied', async () => {
+  // Purely cosmetic regression: the old placement left this comment stacked on
+  // top of the byte-limit comment, describing the wrong function.
+  const source = await readFile(new URL('../src/ssh-pool.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('/** The server refused the operation on permissions.')
+  assert.notEqual(start, -1, 'the comment must still exist')
+  const declaration = source.indexOf('export function', start)
+  assert.match(source.slice(declaration, declaration + 80), /^export function isSftpPermissionDenied/u)
 })
 
 test('the truncation marker is emitted once', () => {
@@ -98,4 +109,21 @@ test('a saved host drops its cached session before the next connection', () => {
 test('the vendored SFTP client accepts mkdir(path, callback)', async () => {
   const source = await import('node:fs').then(fs => fs.readFileSync(new URL('../vendor/ssh2/lib/protocol/SFTP.js', import.meta.url), 'utf8'))
   assert.match(source, /mkdir\(path, attrs, cb\) \{\n(?:.*\n){0,6}\s+if \(typeof attrs === 'function'\) \{/)
+})
+
+test('isByteLimitExceeded reads the structured flag, not the message', () => {
+  // The whole point of the flag is that a rephrased or localised message must
+  // not silently downgrade FS_TOO_LARGE to FS_IO_ERROR.
+  assert.equal(isByteLimitExceeded(new SshFailure('read stopped at the byte cap', 'sftp-read', undefined, true)), true)
+  assert.equal(isByteLimitExceeded(new SshFailure('file is 9 bytes, over the 4 byte limit', 'sftp-read', undefined, true)), true)
+  assert.equal(isByteLimitExceeded(new SshFailure('file is over the 4 byte limit', 'sftp-read')), false)
+  assert.equal(isByteLimitExceeded(new Error('file is over the 4 byte limit')), false)
+  assert.equal(isByteLimitExceeded(undefined), false)
+})
+
+test('the limit flag survives being carried through other fields', () => {
+  const error = new SshFailure('capped', 'sftp-read', 4, true)
+  assert.equal(error.status, 4)
+  assert.equal(error.limitExceeded, true)
+  assert.equal(isByteLimitExceeded(error), true)
 })

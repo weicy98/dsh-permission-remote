@@ -217,7 +217,7 @@ In a remote workspace, `run_code` / `workflow` executes on the SSH host using th
 - Per-call `function-body`, `persistent-in-memory` REPL, and `vm-script` with `scriptPersistence` are supported; retained state stays in the SSH host process keyed by state owner.
 - The remote host needs Node.js 22+. The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
 - The SSH server must allow streamlocal forwarding; otherwise the plugin falls back to loopback TCP and reports a clear error if both fail.
-- Upstream contract and upgrade steps: [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md).
+- Upstream contract and upgrade steps: [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md). The same runbook is offered to the agent as the `upstream-ptc-upgrade` skill, and `npm run upgrade:ptc` runs the probe, offline, and (with `--live`) real-host gates before recording anything.
 
 ### Remote ops
 

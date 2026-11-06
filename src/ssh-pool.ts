@@ -182,6 +182,14 @@ export class SshFailure extends Error {
     readonly stage: string,
     /** Numeric SFTP status, when the failure came from a STATUS response. */
     readonly status?: number,
+    /**
+     * Set when the read stopped at a byte cap rather than failing.
+     *
+     * A caller that maps errors must be able to tell "too large" from "I/O
+     * failed" without matching the message text: the wording is ours today but
+     * a translation or a rephrase would silently downgrade the code.
+     */
+    readonly limitExceeded?: boolean,
   ) {
     super(message)
     this.name = 'SshFailure'
@@ -218,6 +226,11 @@ export function isSftpMissing(error: unknown): boolean {
   // message still distinguishes "no such file" for those.
   if (status !== undefined && status !== SFTP_STATUS.FAILURE) return false
   return error instanceof Error && /no such file|cannot find|not found|does not exist/i.test(error.message)
+}
+
+/** Whether a read refused to continue because the file exceeded its byte cap. */
+export function isByteLimitExceeded(error: unknown): boolean {
+  return error instanceof SshFailure && error.limitExceeded === true
 }
 
 /** The server refused the operation on permissions. Code first, message second. */
@@ -329,9 +342,23 @@ export class SshPool {
         // A failed connect released its slot in `acquire`.
       }
     }
-    // `dispose()` is also used as a test/harness reset between phases; only
-    // block callers that race the disposal itself.
+    // `disposed` stays set for good: after plugin unload no caller may open a
+    // fresh connection through this pool. Only an explicit test helper can
+    // re-arm it, so a production unload is final.
+  }
+
+  /**
+   * Re-arm a disposed pool for the next phase of a test/harness.
+   *
+   * `dispose()` deliberately leaves the pool permanently disposed; tests that
+   * reuse one pool across phases must opt back in explicitly instead of making
+   * production unload reversible by default.
+   */
+  resetForTest(): void {
     this.disposed = false
+    this.active = 0
+    this.waiters.length = 0
+    this.live.clear()
   }
 
   invalidate(hostId: string): void {
@@ -700,7 +727,7 @@ export class SshPool {
     const session = await this.sftp(host, secret)
     if (maxBytes !== undefined) {
       const size = await statSize(session, remotePath)
-      if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read')
+      if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read', undefined, true)
       // Enforce the cap on the bytes actually read too: the size above is only
       // the pre-read stat, and a file that grows afterwards must not be pulled
       // whole into memory.
@@ -1298,7 +1325,7 @@ async function readAllCapped(sftp: SftpLike, remotePath: string, maxBytes: numbe
   const parts: Buffer[] = []
   for await (const chunk of readOpenChunks(sftp, remotePath, signal)) {
     total += chunk.length
-    if (total > maxBytes) throw new SshFailure(`file is over the ${maxBytes} byte limit`, 'sftp-read')
+    if (total > maxBytes) throw new SshFailure(`file is over the ${maxBytes} byte limit`, 'sftp-read', undefined, true)
     parts.push(chunk)
   }
   return parts.length === 0 ? Buffer.alloc(0) : Buffer.concat(parts, total)
