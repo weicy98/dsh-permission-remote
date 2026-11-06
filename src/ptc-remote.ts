@@ -194,6 +194,9 @@ async function dispatch(
   if (policyBinding.hostId !== route.hostId) {
     return failure('exception', 'run_code session is opened on a different SSH host than its cwd')
   }
+  if (policyBinding.remotePath === '/') {
+    return failure('exception', 'run_code refuses a session rooted at the remote filesystem root')
+  }
   if (deps.disposed?.() === true) return failure('abort', 'the SSH workspace plugin was unloaded, so the remote run_code was not started')
 
   const launch = runtime.config?.launch
@@ -277,14 +280,19 @@ async function dispatch(
   return remoteWorldContext.run(world, () => originalRun.call(runtime, { ...spec, cwd: remoteCwd, timeoutMs }))
 }
 
+/** A detach function carrying whether at least one PTC runtime was wrapped. */
+export type RemotePtcDetach = (() => void) & { readonly installed: boolean }
+
 /** Wrap every official PTC runtime instance currently loaded or loaded later. */
-export function attachRemotePtc(ctx: CordisLike, deps: RemotePtcDeps): () => void {
+export function attachRemotePtc(ctx: CordisLike, deps: RemotePtcDeps): RemotePtcDetach {
   const restores = new Map<object, () => void>()
   let stopped = false
+  let installed = false
   const wrap = (value: unknown): void => {
     if (stopped || typeof value !== 'object' || value === null) return
     const restore = installWrap(value, deps)
     if (restore === undefined) return
+    installed = true
     restores.get(value)?.()
     restores.set(value, restore)
   }
@@ -296,10 +304,15 @@ export function attachRemotePtc(ctx: CordisLike, deps: RemotePtcDeps): () => voi
     // programFormat/config fields are assigned. Defer past that stack.
     queueMicrotask(() => wrap(value))
   }, { global: true })
-  return () => {
+  const detach = (() => {
     stopped = true
     stop()
     for (const restore of restores.values()) restore()
     restores.clear()
-  }
+  }) as RemotePtcDetach
+  Object.defineProperty(detach, 'installed', {
+    enumerable: true,
+    get: () => installed,
+  })
+  return detach
 }

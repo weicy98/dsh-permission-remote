@@ -10,6 +10,7 @@ import { claimPending } from './pool-claim.ts'
 import { shJoin } from './shell-quote.ts'
 
 const OUTPUT_CAP = 1024 * 1024
+const FORWARD_OPEN_TIMEOUT_MS = 10_000
 
 function abortError(): Error {
   const error = new Error('SSH operation aborted')
@@ -296,10 +297,12 @@ export class SshPool {
   private readonly waiters: Array<() => void> = []
   private readonly forwards = new Set<Duplex>()
   private active = 0
+  private disposed = false
 
   constructor(private readonly maxConnections: number) {}
 
   async dispose(): Promise<void> {
+    this.disposed = true
     for (const channel of this.forwards) {
       try {
         channel.destroy()
@@ -326,6 +329,9 @@ export class SshPool {
         // A failed connect released its slot in `acquire`.
       }
     }
+    // `dispose()` is also used as a test/harness reset between phases; only
+    // block callers that race the disposal itself.
+    this.disposed = false
   }
 
   invalidate(hostId: string): void {
@@ -565,20 +571,49 @@ export class SshPool {
       openssh_forwardOutStreamLocal(path: string, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
     }
     return await new Promise<Duplex>((resolve, reject) => {
-      client.openssh_forwardOutStreamLocal(socketPath, (error, channel) => {
-        if (error !== undefined || channel === undefined) {
-          reject(new SshFailure(error?.message ?? 'streamlocal forward returned no channel', 'forward-streamlocal'))
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => finish(abortError())
+      const finish = (error?: Error, channel?: Duplex): void => {
+        if (settled) {
+          channel?.destroy()
           return
         }
-        if (signal?.aborted === true) {
-          channel.destroy()
-          reject(abortError())
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (error !== undefined) {
+          channel?.destroy()
+          reject(error)
           return
         }
-        this.forwards.add(channel)
-        channel.once('close', () => this.forwards.delete(channel))
-        resolve(channel)
-      })
+        this.forwards.add(channel!)
+        channel!.once('close', () => this.forwards.delete(channel!))
+        resolve(channel!)
+      }
+      timer = setTimeout(() => finish(new SshFailure('streamlocal forward timed out', 'forward-streamlocal')), FORWARD_OPEN_TIMEOUT_MS)
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          finish(abortError())
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      try {
+        client.openssh_forwardOutStreamLocal(socketPath, (error, channel) => {
+          if (error !== undefined || channel === undefined) {
+            finish(new SshFailure(error?.message ?? 'streamlocal forward returned no channel', 'forward-streamlocal'))
+            return
+          }
+          if (signal?.aborted === true) {
+            finish(abortError(), channel)
+            return
+          }
+          finish(undefined, channel)
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new SshFailure(String(error), 'forward-streamlocal'))
+      }
     })
   }
 
@@ -590,20 +625,49 @@ export class SshPool {
       forwardOut(srcIP: string, srcPort: number, dstIP: string, dstPort: number, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
     }
     return await new Promise<Duplex>((resolve, reject) => {
-      client.forwardOut('127.0.0.1', 0, hostname, port, (error, channel) => {
-        if (error !== undefined || channel === undefined) {
-          reject(new SshFailure(error?.message ?? 'tcp forward returned no channel', 'forward-tcp'))
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => finish(abortError())
+      const finish = (error?: Error, channel?: Duplex): void => {
+        if (settled) {
+          channel?.destroy()
           return
         }
-        if (signal?.aborted === true) {
-          channel.destroy()
-          reject(abortError())
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (error !== undefined) {
+          channel?.destroy()
+          reject(error)
           return
         }
-        this.forwards.add(channel)
-        channel.once('close', () => this.forwards.delete(channel))
-        resolve(channel)
-      })
+        this.forwards.add(channel!)
+        channel!.once('close', () => this.forwards.delete(channel!))
+        resolve(channel!)
+      }
+      timer = setTimeout(() => finish(new SshFailure('tcp forward timed out', 'forward-tcp')), FORWARD_OPEN_TIMEOUT_MS)
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          finish(abortError())
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      try {
+        client.forwardOut('127.0.0.1', 0, hostname, port, (error, channel) => {
+          if (error !== undefined || channel === undefined) {
+            finish(new SshFailure(error?.message ?? 'tcp forward returned no channel', 'forward-tcp'))
+            return
+          }
+          if (signal?.aborted === true) {
+            finish(abortError(), channel)
+            return
+          }
+          finish(undefined, channel)
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new SshFailure(String(error), 'forward-tcp'))
+      }
     })
   }
 
@@ -835,6 +899,7 @@ export class SshPool {
   }
 
   private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
+    if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     return claimPending(this.live, host.id, async () => {
       await this.reserve()
       try {
@@ -842,6 +907,11 @@ export class SshPool {
           if (!requireTrust) return true
           return fingerprintMatches(host.fingerprint, key)
         })
+        if (this.disposed) {
+          client.end()
+          this.release()
+          throw new SshFailure('SSH pool is disposed', 'connect')
+        }
         const live: Live = {
           client,
           hostId: host.id,
@@ -869,6 +939,7 @@ export class SshPool {
   }
 
   private reserve(): Promise<void> {
+    if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     if (this.active < this.maxConnections) {
       this.active += 1
       return Promise.resolve()

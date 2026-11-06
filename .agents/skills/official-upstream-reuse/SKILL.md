@@ -15,11 +15,13 @@ fall back to a plugin-authored implementation.
 
 1. Locate `@deepseek-ai/dsh-ptc-runtime-node` from `DSH_INSTALL_ROOT` or the DSH
    CLI entry (`process.argv[1]`), not from the plugin's own dev tree.
-2. Read `lib/process.js`, `lib/persistent-process.js`, `lib/index.js`, and
-   `@deepseek-ai/dsh-subprocess/lib/control.js`.
+2. Read `lib/process.js`, `lib/index.js`, and
+   `@deepseek-ai/dsh-subprocess/lib/control.js`. `process.js` serves
+   `function-body`, `repl`, and `script`; `persistent-process.js` is only a
+   legacy REPL-default entry and is neither read nor uploaded.
 3. Probe: entry line, `fd: 7`, `DSH_SUBPROCESS_CONTROL`, Node-builtins-only
    imports, `bootstrapArgs` mapping, `stdio.control: 'pipe'`.
-4. Upload as `process.mjs` / `persistent-process.mjs`; never `.js` without a
+4. Upload `lib/process.js` as `process.mjs`; never `.js` without a
    `package.json` with `"type":"module"`.
 5. Shim: full argv, fd 7 socket, `DSH_SUBPROCESS_CONTROL=pipe`, PATH/TEMP/TMP,
    detached process group, Unix + loopback TCP handshake, token validation.
@@ -52,7 +54,24 @@ npm run check:upstream -- --update
 `npm run adapt:upstream` is the one-command installed-host static adaptation;
 it writes a writable `$DSH_HOME/permission-remote/upstream-ptc.manifest.json`
 overlay only after contract probes pass, and reminds you to run the e2e gates.
+The plugin merges package and overlay entries on every remote run, so an
+adaptation applies to the next PTC call without a rebuild or restart.
 Unknown drift must fail closed.
+
+Scope of `scripts/check-upstream.mjs`:
+
+- Does: locate the host install (`DSH_INSTALL_ROOT` or the running DSH entry),
+  hash `process.js` / `lib/index.js` / `dsh-subprocess` control.js, run the six
+  static probes, diff against the manifest, and with `--update`/`--adapt` record
+  the entry in `vendor/upstream/ptc-worker.manifest.json` or the `$DSH_HOME`
+  overlay.
+- Does not: run the test gates, bump version ranges, `engines`, docs, or release
+  notes, verify the remote Node major, or adapt automatically at startup. A
+  failed probe needs a code change to the probe/adapter first.
+- The runtime gate and `--check` match on worker bytes (hashes + control
+  fd/env); version labels are metadata, so a DSH version bump with identical
+  bytes is already usable. A drift report means the worker contract changed,
+  not merely that the release label changed.
 
 ## Current migration status
 

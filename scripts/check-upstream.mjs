@@ -10,7 +10,7 @@
  * a directory containing node_modules/@deepseek-ai/dsh). `--dsh-root` is an
  * equivalent argument for local diagnostics.
  */
-import { locateUpstreamWorker, manifestEntryFor, probeContract, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
+import { locateUpstreamWorker, manifestEntryFor, probeContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 
 const argv = process.argv.slice(2)
 const adapt = argv.includes('--adapt')
@@ -36,10 +36,11 @@ try {
 const probes = probeContract(worker)
 const entry = manifestEntryFor(worker)
 if (update) {
-  const manifest = readWorkerManifest()
+  // `--adapt` updates only the writable host overlay; package `--update` must
+  // never promote host-local overlay entries into the release baseline.
+  const manifest = adapt ? readOverlayManifest() : readPackageManifest()
   const verified = manifest.verified.filter(item => !(item.dshVersion === entry.dshVersion
-    && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion
-    && item.processSha256 === entry.processSha256))
+    && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion))
   verified.push(entry)
   const path = adapt ? writeOverlayManifest({ contractVersion: 1, verified }) : (writeWorkerManifest({ contractVersion: 1, verified }), 'vendor/upstream/ptc-worker.manifest.json')
   console.log(`check:upstream: wrote manifest entry for DSH ${entry.dshVersion} / runtime ${entry.ptcRuntimeNodeVersion} -> ${path}`)
@@ -48,8 +49,12 @@ if (update) {
 }
 
 const manifest = readWorkerManifest()
-const expected = manifest.verified.find(item => item.dshVersion === entry.dshVersion
-  && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion)
+const expected = manifest.verified.find(item => item.processSha256 === entry.processSha256
+  && item.indexSha256 === entry.indexSha256
+  && item.controlSha256 === entry.controlSha256
+  && item.controlFd === entry.controlFd
+  && item.controlEnv === entry.controlEnv
+  && item.minimumNodeMajor === entry.minimumNodeMajor)
 const rows = [
   ['DSH', entry.dshVersion, expected?.dshVersion === entry.dshVersion ? 'same' : 'new'],
   ['ptc-runtime-node', entry.ptcRuntimeNodeVersion, expected?.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion ? 'same' : 'new'],
@@ -58,6 +63,7 @@ const rows = [
   ['dsh-subprocess control sha256', entry.controlSha256, expected?.controlSha256 === entry.controlSha256 ? 'same' : 'changed'],
   ['control fd', String(entry.controlFd), String(expected?.controlFd)],
   ['control env', entry.controlEnv ?? '(missing)', expected?.controlEnv ?? '(missing)'],
+  ['minimum node', String(entry.minimumNodeMajor), String(expected?.minimumNodeMajor)],
   ['entry probe', String(probes.entry), String(expected?.probes.entry)],
   ['imports only node', String(probes.importsOnlyNode), String(expected?.probes.importsOnlyNode)],
   ['bootstrapArgs mapping', String(probes.bootstrapArgsMapsHostPath), String(expected?.probes.bootstrapArgsMapsHostPath)],
@@ -75,6 +81,7 @@ const changed = expected === undefined
   || entry.controlSha256 !== expected.controlSha256
   || entry.controlFd !== expected.controlFd
   || entry.controlEnv !== expected.controlEnv
+  || entry.minimumNodeMajor !== expected.minimumNodeMajor
   || entry.probes.entry !== expected.probes.entry
   || entry.probes.importsOnlyNode !== expected.probes.importsOnlyNode
   || entry.probes.bootstrapArgsMapsHostPath !== expected.probes.bootstrapArgsMapsHostPath

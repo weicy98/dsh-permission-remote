@@ -1959,7 +1959,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     seen.add(agent)
     let installed = false
     try {
-      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady)
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed)
     } catch (error) {
       // Shadows did not register. A remote session would otherwise keep the
       // official tools and run them in the placeholder directory.
@@ -2197,7 +2197,7 @@ async function runRemoteStrReplaceEditor(
   return official(rewriteRemoteEditorArgs(current, record), exec)
 }
 
-function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean): boolean {
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean, ptcReady: () => boolean): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
   // original project in `header.cwd`, decides the first shell surface.
@@ -2263,7 +2263,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
       }
       disposers.push(agent.ctx.tools.register(withRemoteTimeout(definition)))
     }
-    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady, editorShadowReady)
+    const surface = installRemoteShellSurface(ctx, core, agent, host, headerCwd, hasOfficialBash, disposers, fsReady, ptcReady, editorShadowReady)
     disposeDynamic = surface.disposeDynamic
     surface.sync(opened)
   } catch (error) {
@@ -2327,6 +2327,7 @@ function installRemoteShellSurface(
   hasOfficialBash: boolean,
   disposers: Array<() => void>,
   fsReady: () => boolean,
+  ptcReady: () => boolean,
   editorShadowReady: boolean,
 ): { sync(route: Route): void, disposeDynamic(): void } {
   const dynamic: Array<() => void> = []
@@ -2438,6 +2439,7 @@ function installRemoteShellSurface(
         return STR_REPLACE_EDITOR_PATH_REFUSED
       }
     }
+    if (remote && !ptcReady() && isPtcSurfaceTool(agent.ctx.tools, agent, execution.name)) return REMOTE_PTC_UNPATCHED
     if (!remote || fsReady()) return undefined
     if (FS_SURFACE_TOOLS.has(execution.name)) return REMOTE_FS_UNPATCHED
     return undefined
@@ -2633,6 +2635,25 @@ const REMOTE_FS_UNPATCHED = 'the remote filesystem patch is unavailable, so file
 const FS_SURFACE_TOOLS: ReadonlySet<string> = new Set([
   'read', 'read_image', 'write', 'edit', 'apply_patch', 'str_replace_editor',
 ])
+
+/** PTC tools must never fall back to a local runtime in a remote workspace. */
+const RUN_CODE_TOOL = 'run_code'
+/**
+ * The official `workflow` tool takes its name from config (`toolName`,
+ * defaulting to `workflow`), so a deployment that renames it would leave a
+ * remote session executing workflows on this computer. Recognise the tool by
+ * its declared argument contract instead of one literal name: `script` plus
+ * `meta` are required by every workflow registration.
+ */
+function isPtcSurfaceTool(tools: HostContext['tools'], agent: object, name: string): boolean {
+  // `run_code` is reserved by the tool registry and cannot be shadowed or renamed.
+  if (name === RUN_CODE_TOOL) return true
+  const definition = tools.get(name, agent) as { parameters?: { required?: unknown } } | undefined
+  const required = definition?.parameters?.required
+  return Array.isArray(required) && required.includes('script') && required.includes('meta')
+}
+
+const REMOTE_PTC_UNPATCHED = 'the remote PTC runtime is not installed, so run_code/workflow are refused instead of running on the local machine'
 
 function agentLabel(agent: AgentLike): string {
   return agent.session?.id ?? agent.session?.header?.cwd ?? 'unknown'

@@ -81,6 +81,64 @@ test('confine produces the remote bwrap profile and maps the node path', async (
   }
 })
 
+test('seatbelt confinement grants the same writable roots as the remote bash path', async () => {
+  const macStatus: RunnerStatus = {
+    os: 'darwin',
+    sandbox: { available: true, reason: 'ok' },
+    sandboxTool: 'sandbox-exec',
+    ripgrep: 'system',
+    ripgrepPath: '/usr/bin/rg',
+    roots: { workspaceRoot: '/Users/dev/app', tmp: '/private/tmp', userTmp: '/var/folders/xy/T' },
+    home: '/Users/dev',
+    node: { available: true, path: '/usr/bin/node', version: '22.20.0', major: 22 },
+    install: null,
+  }
+  const macWorld: RemoteWorld = {
+    ...world,
+    status: macStatus,
+    remoteCwd: '/Users/dev/app/sub',
+    remoteRoot: '/Users/dev/app',
+  }
+  const subprocess = {
+    spawn: (..._args: unknown[]) => ({ marker: 'original-spawn' }),
+    resolveExecutable: async (..._args: unknown[]) => '/usr/local/bin/node',
+  }
+  const sandbox = {
+    confine: async (...args: unknown[]) => ({ argv: args[0] as readonly string[], enforcement: 'full' as const, denialSignatures: [], runnerFailureRules: [] }),
+  }
+  const ctx = { get: (name: string) => name === 'subprocess' ? subprocess : name === 'sandbox' ? sandbox : undefined }
+  const restore = installRemoteWorld(ctx, {
+    transport: fakeTransport(),
+    hostOf: () => macWorld.host,
+    secretOf: async () => ({}),
+    statusOf: async () => macStatus,
+    routeByCwd: cwd => cwd === macWorld.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: macWorld.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
+  })
+  assert.ok(restore !== undefined)
+  try {
+    const confined = await remoteWorldContext.run(macWorld, () => sandbox.confine([
+      '/usr/local/bin/node', macWorld.workerRemotePath, '1000',
+    ], { mode: 'workspace-write', workspaceRoot: '/placeholder' } as never))
+    assert.equal(confined.argv[0], 'sandbox-exec')
+    const profile = confined.argv[2] ?? ''
+    // The bash path grants workspace + temp roots under workspace-write; a PTC
+    // program that can write less than bash silently breaks temp-file use.
+    for (const root of ['/Users/dev/app', '/private/tmp', '/var/folders/xy/T']) {
+      assert.equal(profile.includes(root), true, `seatbelt profile must grant ${root}: ${profile}`)
+    }
+    // read-only grants none of them.
+    const readOnly = await remoteWorldContext.run(macWorld, () => sandbox.confine([
+      '/usr/local/bin/node', macWorld.workerRemotePath, '1000',
+    ], { mode: 'read-only', workspaceRoot: '/placeholder' } as never))
+    const readOnlyProfile = readOnly.argv[2] ?? ''
+    for (const root of ['/Users/dev/app', '/private/tmp']) {
+      assert.equal(readOnlyProfile.includes(root), false, `read-only must not grant ${root}`)
+    }
+  } finally {
+    restore!()
+  }
+})
+
 test('worker path map only applies inside the PTC world', () => {
   const fs = { processPathFromHostPath: (path: string) => `original:${path}` }
   const remove = installWorkerPathMap(fs)

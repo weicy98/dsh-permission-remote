@@ -28,7 +28,7 @@ and the minimum remote Node major.
 ## Which version is used
 
 The worker must match the **plugin host's** NodePtcRuntime package, not the
-remote machine's DSH version. The remote host only needs Node.js; a DSH 0.2.3
+remote machine's DSH version. The remote host needs Node.js plus a POSIX `sha256sum` or `shasum` for upload verification; a DSH 0.2.3
 installation on the remote does not let a 0.2.2 host speak a 0.2.3 worker. The
 overlay adaptation therefore records the version installed on the plugin host.
 

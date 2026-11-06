@@ -36,7 +36,7 @@ import type {
 } from '@deepseek-ai/dsh-subprocess'
 import type { HostConfig } from './config.ts'
 import type { RunnerStatus } from './execute.ts'
-import { bwrapFileProfileArgs, bwrapProfileArgs, fileWritableRoots, seatbeltProfileArgs } from './profile.ts'
+import { bwrapProfileArgs, fileWritableRoots, seatbeltProfileArgs } from './profile.ts'
 import { shJoin } from './shell-quote.ts'
 import type { RemoteTransport, RemoteExecHandle } from './remote-transport.ts'
 import type { ExecResult, SecretMaterial } from './ssh-pool.ts'
@@ -57,6 +57,9 @@ export interface RemoteWorld {
 }
 
 export const remoteWorldContext = new AsyncLocalStorage<RemoteWorld | undefined>()
+
+const PTC_AUTH_ACK = '__DSH_PTC_AUTH_OK__'
+const PTC_AUTH_TIMEOUT_MS = 10_000
 
 export interface RemoteWorldDeps {
   readonly transport: RemoteTransport
@@ -188,7 +191,7 @@ class RemotePtcHandle implements SubprocessHandle {
     const tempRoot = world.status.roots.userTmp.length > 0
       ? world.status.roots.userTmp
       : world.status.roots.tmp.length > 0 ? world.status.roots.tmp : '/tmp'
-    this.socketPath = posix.join(tempRoot, `dsh-ptc-${randomBytes(8).toString('hex')}.sock`)
+    this.socketPath = posix.join(tempRoot, `dsh-ptc-${randomBytes(8).toString('hex')}`, 'run.sock')
     void this.start()
   }
 
@@ -199,6 +202,15 @@ class RemotePtcHandle implements SubprocessHandle {
     }
   }
 
+  private flushStderr(): void {
+    const tail = this.stderrDecoder.decode()
+    if (this.stderrBuffer.length > 0) {
+      this.stderr.write(this.stderrBuffer)
+      this.stderrBuffer = ''
+    }
+    if (tail.length > 0) this.stderr.write(tail)
+  }
+
   private fail(error: Error): void {
     if (this.settled) return
     this.settled = true
@@ -206,6 +218,7 @@ class RemotePtcHandle implements SubprocessHandle {
     this.rejectHandshake?.(error)
     this.rejectHandshake = undefined
     this.stdout.end()
+    this.flushStderr()
     this.stderr.end()
     this.control.fail(error)
     this.forward?.destroy()
@@ -222,6 +235,7 @@ class RemotePtcHandle implements SubprocessHandle {
       this.rejectHandshake = undefined
     }
     this.stdout.end()
+    this.flushStderr()
     this.stderr.end()
     this.control.destroy()
     this.forward?.destroy()
@@ -258,7 +272,10 @@ class RemotePtcHandle implements SubprocessHandle {
         error => this.fail(error instanceof Error ? error : new Error(String(error))),
       )
       const endpoint = await this.waitForHandshake()
-      if (this.terminated || this.settled) return
+      if (this.terminated || this.settled) {
+        this.clearHandshakeTimer()
+        return
+      }
       // The timeout covers the shim handshake only. A long-running PTC
       // program legitimately keeps the control channel open for minutes.
       this.clearHandshakeTimer()
@@ -284,8 +301,18 @@ class RemotePtcHandle implements SubprocessHandle {
       }
       // TCP has no Unix socket permissions; require the shim token so a local
       // user who wins the accept race cannot take over the control channel.
-      if (usedTcp) forward.write(`__DSH_PTC_AUTH__ ${this.token}\n`)
+      // Wait for the shim's acknowledgement before writing any control frame:
+      // auth bytes and a first frame must never share one TCP read.
+      if (usedTcp) {
+        forward.write(`__DSH_PTC_AUTH__ ${this.token}\n`)
+        await this.waitForAuthAck(forward)
+        if (this.terminated || this.settled) {
+          forward.destroy()
+          return
+        }
+      }
       this.control.attach(forward)
+      forward.resume()
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)))
     }
@@ -350,6 +377,63 @@ class RemotePtcHandle implements SubprocessHandle {
     }
   }
 
+  /**
+   * Wait for the shim to acknowledge the TCP auth line before the host starts
+   * writing control frames. Without this barrier a TCP read can contain the
+   * auth line and the first frame together; the shim cannot hand buffered
+   * Node.js bytes to the child's duplicated fd 7.
+   */
+  private waitForAuthAck(forward: Duplex): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let buffer = ''
+      let done = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cleanup = () => {
+        forward.off('data', onData)
+        forward.off('error', onError)
+        this.spec.signal?.removeEventListener('abort', onAbort)
+        if (timer !== undefined) clearTimeout(timer)
+      }
+      const finish = (error?: Error) => {
+        if (done) return
+        done = true
+        cleanup()
+        if (error === undefined) {
+          forward.pause()
+          resolve()
+        } else {
+          reject(error)
+        }
+      }
+      const onAbort = () => finish(new Error('PTC TCP authentication was aborted'))
+      const onError = (error: Error) => finish(error)
+      const onData = (chunk: Buffer | string) => {
+        buffer += chunk.toString()
+        const newline = buffer.indexOf('\n')
+        if (newline === -1) {
+          if (buffer.length > 4096) finish(new Error('PTC TCP authentication acknowledgement was too long'))
+          return
+        }
+        const line = buffer.slice(0, newline).replace(/\r$/u, '')
+        if (line !== PTC_AUTH_ACK) {
+          finish(new Error('PTC shim rejected the TCP authentication token'))
+          return
+        }
+        const rest = buffer.slice(newline + 1)
+        if (rest.length > 0) forward.unshift(Buffer.from(rest))
+        finish()
+      }
+      forward.on('data', onData)
+      forward.once('error', onError)
+      if (this.spec.signal?.aborted === true) {
+        onAbort()
+        return
+      }
+      this.spec.signal?.addEventListener('abort', onAbort, { once: true })
+      timer = setTimeout(() => finish(new Error('PTC shim did not acknowledge the TCP authentication token')), PTC_AUTH_TIMEOUT_MS)
+    })
+  }
+
   terminate(): void {
     if (this.settled) return
     this.terminated = true
@@ -378,63 +462,128 @@ class RemotePtcHandle implements SubprocessHandle {
 }
 
 
-/** A bounded, offset-readable collect stream. */
+/**
+ * The spill location shared by every collector in this process.
+ *
+ * One private directory per process, created lazily on the first stream that
+ * actually overflows: a per-spawn directory would leave a new temp tree behind
+ * for every large bash/search call. Files are named per collector and retained
+ * as full-output recovery artifacts, matching `@deepseek-ai/dsh-subprocess-local`.
+ */
+let spillDirectory: string | undefined
+let spillCounter = 0
+
+function sharedSpillDirectory(): string {
+  spillDirectory ??= mkdtempSync(join(tmpdir(), 'dsh-remote-spill-'))
+  return spillDirectory
+}
+
+/**
+ * A bounded, offset-readable collect stream.
+ *
+ * Offsets are RAW STREAM BYTES: `seenBytes` counts what arrived, never the
+ * re-encoded length of decoded text, so `nextOffset` stays a valid cursor even
+ * when the stream contains invalid UTF-8 (which decodes to U+FFFD and would
+ * otherwise change the byte count).
+ *
+ * The retained tail is kept as bytes and cut in the byte domain, so the cap is
+ * a real byte cap for multi-byte text and a surrogate pair is never split into
+ * two lone halves of different lengths.
+ */
 class CollectedStream {
-  private text = ''
+  private retained: Buffer = Buffer.alloc(0)
   private seenBytes = 0
   private readonly maxBytes: number
   private readonly spillMax: number | undefined
   private spillPath: string | undefined
   private spillBytes = 0
+  /**
+   * Set once the spill can no longer hold the COMPLETE stream (cap exceeded or
+   * a write failed). A spill is never reopened: re-seeding a fresh file from
+   * the already-truncated tail would advertise a partial stream as the full
+   * one, which is worse than reporting no spill path at all.
+   */
+  private spillDisabled: boolean
 
   constructor(maxBytes: number, spill?: { maxBytes: number }) {
     this.maxBytes = Math.max(1, maxBytes)
     this.spillMax = spill === undefined ? undefined : Math.max(1, spill.maxBytes)
-    if (this.spillMax !== undefined) {
-      this.spillPath = join(mkdtempSync(join(tmpdir(), 'dsh-remote-spill-')), 'stream')
-    }
+    // A spill cap at or below the inline cap can never hold the complete
+    // stream: the first overflow already exceeds it.
+    this.spillDisabled = this.spillMax === undefined || this.spillMax <= this.maxBytes
   }
 
-  push(value: string): void {
+  private discardSpill(): void {
     if (this.spillPath !== undefined) {
       try {
-        appendFileSync(this.spillPath, value, 'utf8')
-        this.spillBytes += Buffer.byteLength(value, 'utf8')
-        if (this.spillMax !== undefined && this.spillBytes > this.spillMax) {
-          rmSync(this.spillPath, { force: true })
-          this.spillPath = undefined
-        }
+        rmSync(this.spillPath, { force: true })
       } catch {
-        this.spillPath = undefined
+        // Best effort.
       }
     }
-    this.text += value
-    const bytes = Buffer.byteLength(this.text, 'utf8')
-    this.seenBytes += Buffer.byteLength(value, 'utf8')
-    if (bytes <= this.maxBytes) return
-    let cut = 0
-    let retained = bytes
-    while (retained > this.maxBytes && cut < this.text.length) {
-      const next = this.text.charCodeAt(cut)
-      cut += 1
-      // Approximate UTF-8 bytes; only the retained tail matters for display.
-      retained -= next < 0x80 ? 1 : next < 0x800 ? 2 : 3
-    }
-    this.text = this.text.slice(cut)
+    this.spillPath = undefined
+    this.spillBytes = 0
+    this.spillDisabled = true
   }
 
-  readFrom(fromByte: number): { text: string, nextOffset: number, lossy: boolean } {
-    const retainedBytes = Buffer.byteLength(this.text, 'utf8')
-    const retainedStart = this.seenBytes - retainedBytes
+  /**
+   * Open the spill file on first overflow. Every byte seen so far is still in
+   * `retained` at this point, so the file starts with the complete stream.
+   */
+  private openSpill(): void {
+    try {
+      const path = join(sharedSpillDirectory(), `stream-${process.pid}-${++spillCounter}.log`)
+      appendFileSync(path, this.retained)
+      this.spillPath = path
+      this.spillBytes = this.retained.length
+    } catch {
+      this.discardSpill()
+    }
+  }
+
+  push(chunk: Buffer | string): void {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+    if (bytes.length === 0) return
+    const overflows = this.retained.length + bytes.length > this.maxBytes
+    if (!this.spillDisabled && (overflows || this.spillPath !== undefined)) {
+      if (this.spillPath === undefined) this.openSpill()
+      if (this.spillPath !== undefined) {
+        try {
+          appendFileSync(this.spillPath, bytes)
+          this.spillBytes += bytes.length
+          if (this.spillMax !== undefined && this.spillBytes > this.spillMax) this.discardSpill()
+        } catch {
+          this.discardSpill()
+        }
+      }
+    }
+    this.seenBytes += bytes.length
+    this.retained = this.retained.length === 0 ? bytes : Buffer.concat([this.retained, bytes])
+    // Keep exactly the last `maxBytes` bytes. The cut may land inside a
+    // multi-byte character; advancing past the orphan continuation bytes makes
+    // the tail decode cleanly instead of starting with a replacement character.
+    if (this.retained.length > this.maxBytes) {
+      let start = this.retained.length - this.maxBytes
+      while (start < this.retained.length && (this.retained[start]! & 0xc0) === 0x80) start += 1
+      this.retained = this.retained.subarray(start)
+    }
+  }
+
+  /** Drop the spill file: a failed stream has no readable result to recover. */
+  dispose(): void {
+    this.discardSpill()
+  }
+
+  readFrom(fromByte: number): { text: string, nextOffset: number, lossy: boolean, spillPath?: string } {
+    const retainedStart = this.seenBytes - this.retained.length
     const lossy = fromByte < retainedStart
-    const buffer = Buffer.from(this.text, 'utf8')
-    const start = Math.max(0, Math.min(buffer.length, fromByte - retainedStart))
+    const start = Math.max(0, Math.min(this.retained.length, fromByte - retainedStart))
     return {
-      text: buffer.subarray(start).toString('utf8'),
+      text: this.retained.subarray(start).toString('utf8'),
       nextOffset: this.seenBytes,
       lossy,
-      // A spill path is useful only when the stream actually overflowed.
-      ...(this.spillPath === undefined || this.seenBytes <= retainedBytes ? {} : { spillPath: this.spillPath }),
+      // Advertise a spill path only when it holds the complete stream.
+      ...(this.spillPath === undefined ? {} : { spillPath: this.spillPath }),
     }
   }
 }
@@ -573,8 +722,8 @@ class RemoteProcessHandle implements SubprocessHandle {
       if (this.inputEnded) exec.end()
       if (this.stdout !== undefined) exec.stdout.on('data', chunk => this.stdout!.write(chunk))
       if (this.stderr !== undefined) exec.stderr.on('data', chunk => this.stderr!.write(chunk))
-      if (this.outCollector !== undefined) exec.stdout.on('data', chunk => this.outCollector!.push(chunk.toString('utf8')))
-      if (this.errCollector !== undefined) exec.stderr.on('data', chunk => this.errCollector!.push(chunk.toString('utf8')))
+      if (this.outCollector !== undefined) exec.stdout.on('data', chunk => this.outCollector!.push(chunk))
+      if (this.errCollector !== undefined) exec.stderr.on('data', chunk => this.errCollector!.push(chunk))
       if (this.spec.stdio.stdin !== 'pipe' && typeof this.spec.stdio.stdin === 'object' && 'data' in this.spec.stdio.stdin) {
         exec.write(this.spec.stdio.stdin.data)
         exec.end()
@@ -600,6 +749,9 @@ class RemoteProcessHandle implements SubprocessHandle {
   private fail(error: Error): void {
     if (this.settled) return
     this.settled = true
+    // A failed run has no readable result, so its spill file is dead weight.
+    this.outCollector?.dispose()
+    this.errCollector?.dispose()
     this.stdout?.destroy(error)
     this.stderr?.destroy(error)
     this.rejectDone(error)
@@ -685,7 +837,16 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
           runnerFailureRules: [{ fatalSignatures: ['bwrap: '] }],
         }
       }
-      const profile = seatbeltProfileArgs(policy.mode, policy.mode === 'workspace-write' ? [active.remoteRoot] : []) ?? []
+      const profile = seatbeltProfileArgs(policy.mode, policy.mode === 'workspace-write'
+        // Same write grants the bash path derives from `fileWritableRoots`:
+        // the workspace root plus the remote temp dirs. Granting only the
+        // workspace here would deny a PTC program what bash already allows.
+        ? fileWritableRoots(policy.mode, {
+          workspaceRoot: active.remoteRoot,
+          tmp: active.status.roots.tmp,
+          userTmp: active.status.roots.userTmp,
+        })
+        : []) ?? []
       return {
         argv: ['sandbox-exec', ...profile, '--', ...mapped],
         enforcement: 'full',
@@ -709,7 +870,10 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     }
     const mapped = argv.map((value, index) => index === 0 ? remoteProgramForStatus(status, value) : value)
     if (status.sandboxTool === 'bwrap') {
-      const profile = bwrapFileProfileArgs(policy.mode, roots) ?? []
+      // Ordinary shell/process execution follows the bash-style profile:
+      // workspace-write gets a private /tmp rather than the file-tool profile's
+      // real temp binds. File tools use the file profile through remote-write.
+      const profile = bwrapProfileArgs(policy.mode, roots.workspaceRoot) ?? []
       return {
         argv: ['bwrap', ...profile, '--', ...mapped],
         enforcement: 'full',

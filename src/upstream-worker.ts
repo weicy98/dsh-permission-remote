@@ -10,14 +10,16 @@ import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PTC_MIN_NODE_MAJOR } from './probe.ts'
 import { shJoin } from './shell-quote.ts'
 import type { HostConfig } from './config.ts'
 import type { SecretMaterial, SshPool } from './ssh-pool.ts'
 
 export const PTC_ADAPTER_VERSION = '1'
-export const PTC_MIN_REMOTE_NODE_MAJOR = 22
+export const PTC_MIN_REMOTE_NODE_MAJOR = PTC_MIN_NODE_MAJOR
+const PTC_CONTROL_ENV = 'DSH_SUBPROCESS_CONTROL'
 const WORKER_FILE = 'process.mjs'
 const SHIM_FILE = 'ptc-shim.mjs'
 
@@ -57,7 +59,7 @@ export interface ManifestEntry {
   readonly minimumNodeMajor: number
   readonly probes: {
     readonly entry: boolean
-      readonly importsOnlyNode: boolean
+    readonly importsOnlyNode: boolean
     readonly bootstrapArgsMapsHostPath: boolean
     readonly spawnControlPipe: boolean
   }
@@ -95,13 +97,64 @@ export function overlayManifestPath(env: NodeJS.ProcessEnv = process.env): strin
   return join(home, 'permission-remote', 'upstream-ptc.manifest.json')
 }
 
+function normalizeEntry(value: unknown): ManifestEntry | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const entry = value as Partial<ManifestEntry>
+  if (typeof entry.dshVersion !== 'string'
+    || typeof entry.ptcRuntimeNodeVersion !== 'string'
+    || typeof entry.dshSubprocessVersion !== 'string'
+    || typeof entry.processSha256 !== 'string'
+    || typeof entry.indexSha256 !== 'string'
+    || typeof entry.controlSha256 !== 'string'
+    || typeof entry.minimumNodeMajor !== 'number'
+    || typeof entry.probes !== 'object'
+    || entry.probes === null) return undefined
+  const probes = entry.probes as ManifestEntry['probes']
+  if (typeof probes.entry !== 'boolean'
+    || typeof probes.importsOnlyNode !== 'boolean'
+    || typeof probes.bootstrapArgsMapsHostPath !== 'boolean'
+    || typeof probes.spawnControlPipe !== 'boolean') return undefined
+  return {
+    dshVersion: entry.dshVersion,
+    ptcRuntimeNodeVersion: entry.ptcRuntimeNodeVersion,
+    dshSubprocessVersion: entry.dshSubprocessVersion,
+    processSha256: entry.processSha256,
+    indexSha256: entry.indexSha256,
+    controlSha256: entry.controlSha256,
+    controlFd: typeof entry.controlFd === 'number' ? entry.controlFd : undefined,
+    controlEnv: typeof entry.controlEnv === 'string' ? entry.controlEnv : undefined,
+    minimumNodeMajor: entry.minimumNodeMajor,
+    probes: {
+      entry: probes.entry,
+      importsOnlyNode: probes.importsOnlyNode,
+      bootstrapArgsMapsHostPath: probes.bootstrapArgsMapsHostPath,
+      spawnControlPipe: probes.spawnControlPipe,
+    },
+  }
+}
+
 function readEntries(path: string): ManifestEntry[] {
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<WorkerManifest>
-    return Array.isArray(raw.verified) ? raw.verified as ManifestEntry[] : []
+    if (!Array.isArray(raw.verified)) return []
+    return raw.verified.map(normalizeEntry).filter((entry): entry is ManifestEntry => entry !== undefined)
   } catch {
     return []
   }
+}
+
+function manifestKey(entry: ManifestEntry): string {
+  return `${entry.processSha256}\0${entry.indexSha256}\0${entry.controlSha256}\0${String(entry.controlFd)}\0${entry.controlEnv ?? ''}\0${entry.minimumNodeMajor}`
+}
+
+/** The package release baseline only; used by `check:upstream --update`. */
+export function readPackageManifest(): WorkerManifest {
+  return { contractVersion: 1, verified: readEntries(packageManifestPath()) }
+}
+
+/** Only this installation's writable overlay; used by `check:upstream --adapt`. */
+export function readOverlayManifest(env: NodeJS.ProcessEnv = process.env): WorkerManifest {
+  return { contractVersion: 1, verified: readEntries(overlayManifestPath(env)) }
 }
 
 export function readWorkerManifest(): WorkerManifest {
@@ -110,7 +163,7 @@ export function readWorkerManifest(): WorkerManifest {
   // Read both on every lookup so `adapt:upstream` takes effect without a restart.
   const merged = new Map<string, ManifestEntry>()
   for (const entry of [...readEntries(packageManifestPath()), ...readEntries(overlayManifestPath())]) {
-    merged.set(`${entry.dshVersion}\0${entry.ptcRuntimeNodeVersion}\0${entry.processSha256}`, entry)
+    merged.set(manifestKey(entry), entry)
   }
   return { contractVersion: 1, verified: [...merged.values()] }
 }
@@ -167,10 +220,13 @@ function candidateDshRoots(env: NodeJS.ProcessEnv): string[] {
   return [...new Set(roots)]
 }
 
-function resolvePackageJson(specifier: string, fromDir: string): string | undefined {
+function resolvePackageJson(specifier: string, fromDir: string, allowedRoot: string): string | undefined {
   try {
     const require = createRequire(join(fromDir, '__dsh_resolve__.js'))
-    return require.resolve(specifier, { paths: [fromDir] })
+    const resolved = require.resolve(specifier, { paths: [fromDir] })
+    const rel = relative(resolve(allowedRoot), resolve(resolved))
+    if (rel !== '' && (rel.startsWith('..') || isAbsolute(rel))) return undefined
+    return resolved
   } catch {
     return undefined
   }
@@ -198,7 +254,7 @@ function findDshRoot(env: NodeJS.ProcessEnv): { root: string, version: string } 
 function locateRuntimePackage(dshRoot: string): string {
   const direct = join(dshRoot, 'node_modules', '@deepseek-ai', 'dsh-ptc-runtime-node', 'package.json')
   if (existsSync(direct)) return direct
-  const resolved = resolvePackageJson('@deepseek-ai/dsh-ptc-runtime-node/package.json', dshRoot)
+  const resolved = resolvePackageJson('@deepseek-ai/dsh-ptc-runtime-node/package.json', dshRoot, dirname(dshRoot))
   if (resolved !== undefined) return resolved
   throw new Error(
     `the installed DSH at ${dshRoot} does not contain @deepseek-ai/dsh-ptc-runtime-node; remote run_code requires that package. Install a DSH build with Node PTC support.`,
@@ -208,7 +264,7 @@ function locateRuntimePackage(dshRoot: string): string {
 function locateSubprocessPackage(dshRoot: string): string {
   const direct = join(dshRoot, 'node_modules', '@deepseek-ai', 'dsh-subprocess', 'package.json')
   if (existsSync(direct)) return direct
-  const resolved = resolvePackageJson('@deepseek-ai/dsh-subprocess/package.json', dshRoot)
+  const resolved = resolvePackageJson('@deepseek-ai/dsh-subprocess/package.json', dshRoot, dirname(dshRoot))
   if (resolved !== undefined) return resolved
   throw new Error(`cannot locate @deepseek-ai/dsh-subprocess under ${dshRoot}; the PTC control-channel contract cannot be verified`)
 }
@@ -302,20 +358,22 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   const importsOnlyNode = importLines.length > 0 && importLines.every(line => /from\s+['"]node:/u.test(line))
   const controlFdMatch = /fd\s*:\s*7/u.exec(processText) ?? /SUBPROCESS_CONTROL_FD\s*=\s*7/u.exec(controlText)
   const controlEnvMatch = /SUBPROCESS_CONTROL_ENV\s*=\s*['"]([^'"]+)['"]/u.exec(processText) ?? /SUBPROCESS_CONTROL_ENV\s*=\s*['"]([^'"]+)['"]/u.exec(controlText)
+  const controlEnv = controlEnvMatch?.[1]
   const bootstrapArgsMapsHostPath = /processPathFromHostPath\s*\(/u.test(indexText) && /process\.js/u.test(indexText)
   const spawnControlPipe = /control\s*:\s*['"]pipe['"]/u.test(indexText)
   const failures: string[] = []
   if (!entry) failures.push('process.js entry line changed')
   if (!importsOnlyNode) failures.push('process.js imports a non-Node module')
   if (controlFdMatch === null) failures.push('fd 7 control descriptor not found')
-  if (controlEnvMatch === null) failures.push('DSH_SUBPROCESS_CONTROL marker not found')
+  if (controlEnv === undefined) failures.push('DSH_SUBPROCESS_CONTROL marker not found')
+  else if (controlEnv !== PTC_CONTROL_ENV) failures.push(`control environment marker changed to ${controlEnv}; the shim expects ${PTC_CONTROL_ENV}`)
   if (!bootstrapArgsMapsHostPath) failures.push('bootstrapArgs no longer maps process.js through fs.processPathFromHostPath')
   if (!spawnControlPipe) failures.push('subprocess.spawn no longer requests a control pipe')
   return {
     entry,
     importsOnlyNode,
     controlFd: controlFdMatch === null ? undefined : 7,
-    controlEnv: controlEnvMatch?.[1],
+    controlEnv,
     bootstrapArgsMapsHostPath,
     spawnControlPipe,
     failures,

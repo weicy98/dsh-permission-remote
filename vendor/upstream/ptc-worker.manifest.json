@@ -6,7 +6,6 @@
       "ptcRuntimeNodeVersion": "0.2.2-rc.1",
       "dshSubprocessVersion": "0.2.2-rc.1",
       "processSha256": "e2ceaddf4afea8f11ed3202cfe77b4606e3d03a2efc55f7239fe5d330ab1dec9",
-      "persistentProcessSha256": "676abe5aaf47548f19802e82bb090019de25d777940e5d99b21efab7575582b3",
       "indexSha256": "952ffdd55654ccaedce2a9c004b68028fdcb31085987cc969d02438076260738",
       "controlSha256": "4afd0f7d7a7054b6fc8d727ea3f76731a78c9a972ddb6d5d2eef81cac4ffee3a",
       "controlFd": 7,
@@ -14,7 +13,6 @@
       "minimumNodeMajor": 22,
       "probes": {
         "entry": true,
-        "persistentEntry": true,
         "importsOnlyNode": true,
         "bootstrapArgsMapsHostPath": true,
         "spawnControlPipe": true

@@ -16,11 +16,18 @@
  * output; the handshake is never written to stdout.
  */
 import { spawn } from 'node:child_process'
-import { chmodSync, rmSync, statSync } from 'node:fs'
-import { createServer } from 'node:net'
+import { randomBytes } from 'node:crypto'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { createServer, connect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 
 const HANDSHAKE = '__DSH_PTC_READY__'
 const AUTH = '__DSH_PTC_AUTH__'
+const AUTH_OK = '__DSH_PTC_AUTH_OK__'
+const AUTH_MAX_BYTES = 4096
+/** Exit deadline for relaying the child's last writes; a stalled reader cannot hang the shim. */
+const FLUSH_TIMEOUT_MS = 10_000
 const args = process.argv.slice(2)
 const separator = args.indexOf('--')
 if (separator < 2 || separator === args.length - 1) {
@@ -29,6 +36,9 @@ if (separator < 2 || separator === args.length - 1) {
 }
 const socketArgument = args[0]
 const remoteCwd = args[1]
+const socketDirectory = socketArgument !== '-' && socketArgument.length > 0
+  ? dirname(socketArgument)
+  : ''
 const childArgv = args.slice(separator + 1)
 if (childArgv.length === 0) {
   process.stderr.write('ptc-shim: empty argv\n')
@@ -38,10 +48,21 @@ if (childArgv.length === 0) {
 let token = ''
 let child
 let socket
+let controlBridge
 const servers = new Set()
 let groupKilled = false
 let cleaned = false
 let exiting = false
+
+function ensureSocketDirectory() {
+  if (socketDirectory.length === 0 || !basename(socketDirectory).startsWith('dsh-ptc-')) return
+  try {
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 })
+    chmodSync(socketDirectory, 0o700)
+  } catch {
+    // listenUnix reports the actual failure.
+  }
+}
 
 function cleanup() {
   if (cleaned) return
@@ -59,11 +80,23 @@ function cleanup() {
   } catch {
     // Already gone.
   }
+  if (controlBridge !== undefined) {
+    for (const stream of [controlBridge.tcp, controlBridge.internal, controlBridge.workerSide]) {
+      try { stream?.destroy() } catch {}
+    }
+  }
   if (socketArgument !== '-' && socketArgument.length > 0) {
     try {
       rmSync(socketArgument, { force: true })
     } catch {
       // Best effort.
+    }
+    if (socketDirectory.length > 0 && basename(socketDirectory).startsWith('dsh-ptc-')) {
+      try {
+        rmSync(socketDirectory, { recursive: true, force: true })
+      } catch {
+        // Best effort.
+      }
     }
   }
 }
@@ -82,13 +115,50 @@ function killGroup() {
   }
 }
 
+/**
+ * Exit once stdout/stderr have actually flushed.
+ *
+ * The child's output is relayed through this process's own pipes. Calling
+ * `process.exit()` on a timer could discard whatever is still buffered — a
+ * child that writes megabytes and exits immediately lost >90% of its output in
+ * testing. An empty write's callback fires after every earlier write on the
+ * same stream has drained, so waiting for both callbacks (bounded, so a stalled
+ * consumer cannot hang the shim) is the flush barrier.
+ */
 function finish(code, signal) {
   if (exiting) return
   exiting = true
   const exitCode = typeof code === 'number' ? code : signal === undefined || signal === null ? 1 : 128
   cleanup()
   process.exitCode = exitCode
-  setTimeout(() => process.exit(exitCode), 10)
+  let pending = 2
+  let exited = false
+  const exit = () => {
+    if (exited) return
+    exited = true
+    process.exit(exitCode)
+  }
+  const flushed = () => {
+    pending -= 1
+    if (pending === 0) exit()
+  }
+  const flush = stream => {
+    if (stream === undefined || stream.destroyed || stream.writableEnded) {
+      flushed()
+      return
+    }
+    try {
+      stream.write('', flushed)
+    } catch {
+      // A closed descriptor has nothing left to flush.
+      flushed()
+    }
+  }
+  flush(process.stdout)
+  flush(process.stderr)
+  // Bounded fallback: a consumer that stops reading must not keep the shim (and
+  // its detached worker watchdog) alive forever.
+  setTimeout(exit, FLUSH_TIMEOUT_MS).unref()
 }
 
 function readFirstLine() {
@@ -138,29 +208,55 @@ function handleConnection(server, accepted, kind) {
     spawnWorker(accepted)
     return
   }
-  let buffer = ''
+  let buffer = Buffer.alloc(0)
   const onData = chunk => {
-    buffer += chunk.toString('utf8')
-    if (buffer.length > 4096) {
+    buffer = Buffer.concat([buffer, chunk])
+    const newline = buffer.indexOf(0x0a)
+    if (newline === -1) {
+      if (buffer.length > AUTH_MAX_BYTES) accepted.destroy()
+      return
+    }
+    if (newline > AUTH_MAX_BYTES) {
       accepted.destroy()
       return
     }
-    const newline = buffer.indexOf('\n')
-    if (newline === -1) return
-    const line = buffer.slice(0, newline).replace(/\r$/u, '')
+    const line = buffer.subarray(0, newline).toString('utf8').replace(/\r$/u, '')
     if (line !== `${AUTH} ${token}`) {
       accepted.destroy()
       return
     }
+    const leftover = buffer.subarray(newline + 1)
     accepted.off('data', onData)
-    // Preserve bytes the host wrote after the auth line (the first control
-    // frame may share a TCP/Unix read).
-    const rest = buffer.slice(newline + 1)
-    if (rest.length > 0) accepted.unshift(Buffer.from(rest))
-    // Keep the socket paused after auth so bytes arriving before the worker
-    // takes fd 7 remain buffered for the child.
     accepted.pause()
+    // Claim the single control slot before the async bridge setup so a second
+    // authenticated connection cannot race us into spawning a second worker.
+    if (socket !== undefined) {
+      accepted.destroy()
+      return
+    }
     socket = accepted
+    void startTcpControl(server, accepted, leftover)
+  }
+  accepted.on('data', onData)
+}
+
+/**
+ * A TCP client shares one socket with the worker, so the shim must consume the
+ * authentication line without ever stealing control bytes. The kernel can
+ * deliver a read that was already in flight when the shim paused, and those
+ * bytes would be invisible to the child. Instead, keep reading the TCP socket
+ * in this process and bridge it to a private Unix socket pair that is handed
+ * to the worker as fd 7.
+ */
+async function startTcpControl(server, tcp, leftover) {
+  try {
+    const { workerSide, hostSide } = await createControlPair()
+    if (exiting) {
+      tcp.destroy()
+      workerSide.destroy()
+      hostSide.destroy()
+      return
+    }
     for (const other of servers) {
       if (other === server) continue
       try {
@@ -169,9 +265,93 @@ function handleConnection(server, accepted, kind) {
         // Already closed.
       }
     }
-    spawnWorker(accepted)
+    workerSide.on('error', () => {
+      try { tcp.destroy() } catch {}
+    })
+    // Bytes that followed the authentication line must reach the worker before
+    // anything the bridge forwards afterwards.
+    if (leftover.length > 0) hostSide.write(leftover)
+    controlBridge = { tcp, internal: hostSide, workerSide }
+    pipeBothWays(tcp, hostSide)
+    tcp.resume()
+    tcp.write(`${AUTH_OK}\n`)
+    spawnWorker(workerSide)
+  } catch (error) {
+    process.stderr.write(`ptc-shim: TCP control bridge failed: ${error instanceof Error ? error.message : String(error)}\n`)
+    tcp.destroy()
+    finish(1)
   }
-  accepted.on('data', onData)
+}
+
+function createControlPair() {
+  const pairDir = mkdtempSync(join(tmpdir(), 'dsh-ptc-pair-'))
+  const path = join(pairDir, 'run.sock')
+  // The worker's end stays paused for the whole life of this process: only the
+  // child may read fd 7.
+  const server = createServer({ pauseOnConnect: true })
+  return new Promise((resolve, reject) => {
+    let workerSide
+    let hostSide
+    let settled = false
+    const removePairDir = () => {
+      try { rmSync(pairDir, { recursive: true, force: true }) } catch {}
+    }
+    const fail = error => {
+      if (settled) return
+      settled = true
+      try { server.close() } catch {}
+      removePairDir()
+      workerSide?.destroy()
+      hostSide?.destroy()
+      reject(error)
+    }
+    const maybeResolve = () => {
+      if (settled || workerSide === undefined || hostSide === undefined) return
+      settled = true
+      try { server.close() } catch {}
+      removePairDir()
+      resolve({ workerSide, hostSide })
+    }
+    server.once('error', fail)
+    server.once('connection', accepted => {
+      if (settled) {
+        accepted.destroy()
+        return
+      }
+      workerSide = accepted
+      maybeResolve()
+    })
+    server.listen(path, () => {
+      try { chmodSync(path, 0o600) } catch {}
+      hostSide = connect(path)
+      hostSide.once('error', fail)
+      hostSide.once('connect', maybeResolve)
+    })
+  })
+}
+
+function pipeBothWays(tcp, internal) {
+  const forward = (from, to) => {
+    from.on('data', chunk => {
+      if (to.destroyed) return
+      if (!to.write(chunk)) from.pause()
+    })
+    to.on('drain', () => {
+      if (!from.destroyed) from.resume()
+    })
+  }
+  forward(tcp, internal)
+  forward(internal, tcp)
+  const close = () => {
+    tcp.destroy()
+    internal.destroy()
+  }
+  tcp.on('end', () => internal.end())
+  internal.on('end', () => tcp.end())
+  tcp.on('close', close)
+  internal.on('close', close)
+  tcp.on('error', close)
+  internal.on('error', close)
 }
 
 function listenUnix(path) {
@@ -259,6 +439,7 @@ function spawnWorker(accepted) {
   child.stderr?.on('data', chunk => process.stderr.write(chunk))
   child.on('error', error => {
     process.stderr.write(`ptc-shim: child error: ${error.message}\n`)
+    finish(127)
   })
   child.on('close', (code, signal) => finish(code, signal))
 }
@@ -271,6 +452,7 @@ async function main() {
   }
   const endpoints = []
   if (socketArgument !== '-') {
+    ensureSocketDirectory()
     try {
       const info = statSync(socketArgument)
       if (info.isSocket()) rmSync(socketArgument, { force: true })
