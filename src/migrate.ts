@@ -32,6 +32,7 @@
 import { constants } from 'node:fs'
 import { copyFile, lstat, mkdir, open, readdir, readlink, realpath, rmdir, stat, symlink } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { PRESENT_CACHE_DIR } from './router.ts'
 
 export type MigrationStrategy = 'auto' | 'overwrite'
 
@@ -101,10 +102,26 @@ async function isEmptyDir(target: string): Promise<boolean> {
   return (await readdir(target)).length === 0
 }
 
-async function countTree(root: string): Promise<number> {
+/**
+ * Delivery snapshots are not part of the move.
+ *
+ * They are content addressed and only reachable through a path a past card
+ * recorded, so copying them would duplicate gigabytes for no gain and counting
+ * them would inflate the report the operator approves. The old root keeps them,
+ * which is where an already-recorded card still looks.
+ *
+ * Only the top level is skipped. A subdirectory that merely shares the name is
+ * an ordinary placeholder directory and belongs to the move.
+ */
+function isSnapshotTree(name: string, depth: number): boolean {
+  return depth === 0 && name === PRESENT_CACHE_DIR
+}
+
+async function countTree(root: string, depth = 0): Promise<number> {
   let count = 0
   for (const entry of await readdir(root, { withFileTypes: true })) {
-    count += entry.isDirectory() ? await countTree(join(root, entry.name)) : 1
+    if (isSnapshotTree(entry.name, depth)) continue
+    count += entry.isDirectory() ? await countTree(join(root, entry.name), depth + 1) : 1
   }
   return count
 }
@@ -195,6 +212,8 @@ async function planMerge(
 ): Promise<void> {
   const sourceDir = rel.length === 0 ? oldRoot : join(oldRoot, rel)
   for (const entry of await readdir(sourceDir, { withFileTypes: true })) {
+    // See `isSnapshotTree`: only the root's own snapshot directory is skipped.
+    if (rel.length === 0 && entry.name === PRESENT_CACHE_DIR) continue
     const childRel = rel.length === 0 ? entry.name : `${rel}/${entry.name}`
     const source = join(oldRoot, childRel)
     const target = join(newRoot, childRel)
@@ -409,6 +428,8 @@ export async function runMigration(plan: MigrationPlan): Promise<MigrationReport
     const copied = await countTree(plan.oldRoot)
     const rootReal = await openNewRoot(plan)
     for (const name of await readdir(plan.oldRoot)) {
+      // Snapshots stay behind; see `isSnapshotTree`.
+      if (name === PRESENT_CACHE_DIR) continue
       await copyEntry(join(plan.oldRoot, name), join(plan.newRoot, name), rootReal)
     }
     return { ...plannedReport(plan), copied }

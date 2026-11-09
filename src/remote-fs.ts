@@ -39,7 +39,7 @@ import type { RunnerStatus } from './execute.ts'
 import { isRemoteMissing } from './ops.ts'
 import { applyHunks, type PatchHunk } from './patch-hunks.ts'
 import { fileWriteAllowed } from './profile.ts'
-import { mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, workspaceBinding } from './router.ts'
+import { isPresentCachePath, mapRemoteToLocal, normalizeRemoteDirectory, resolveRemotePath, routeByCwd, workspaceBinding } from './router.ts'
 import { commitRemoteDelete, commitRemoteText, parseRemoteVersion, remoteRoots, remoteVersionEvidence, remoteVersionToken, resolveCreatedPath, type RemoteVersionEvidence } from './remote-write.ts'
 import { SFTP_STATUS, SshFailure, isByteLimitExceeded, isSftpPermissionDenied, type ExecResult, type RemoteDirEntry, type SecretMaterial, type SftpAttrs, type SshPool } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
@@ -770,6 +770,7 @@ async function writeRemoteText(
   signal: AbortSignal | undefined,
   policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsWriteOutcome> {
+  refusePresentSnapshot(target, 'write to')
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.writeText(target, content, expected, signal, policy)
   const context = await resolveMutationContext(runtime, target, policy, signal)
@@ -919,6 +920,7 @@ async function editRemoteText(
   signal: AbortSignal | undefined,
   policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsEditOutcome> {
+  refusePresentSnapshot(target, 'edit')
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.editText(target, edit, expected, signal, policy)
   const context = await resolveMutationContext(runtime, target, policy, signal)
@@ -1276,6 +1278,7 @@ async function patchRemoteText(
   signal: AbortSignal | undefined,
   policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsEditOutcome> {
+  refusePresentSnapshot(target, 'patch')
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.patchText!(target, hunks, expected, signal, policy)
   const context = await resolveMutationContext(runtime, target, policy, signal)
@@ -1321,6 +1324,7 @@ async function deleteRemoteFile(
   signal: AbortSignal | undefined,
   policy: SandboxExecutionPolicy | undefined,
 ): Promise<FsDeleteOutcome> {
+  refusePresentSnapshot(target, 'delete')
   const route = routeByCwd(String(target.targetKey))
   if (route.kind !== 'remote') return runtime.originals.deleteFile!(target, expected, signal, policy)
   const context = await resolveMutationContext(runtime, target, policy, signal)
@@ -1358,6 +1362,10 @@ async function moveRemoteFile(
   signal: AbortSignal | undefined = undefined,
   policy: SandboxExecutionPolicy | undefined = undefined,
 ): Promise<FsMoveOutcome> {
+  // Either end of a move can be the snapshot: writing it as the destination
+  // would replace frozen bytes, and moving it away would break a card's path.
+  refusePresentSnapshot(source, 'move')
+  refusePresentSnapshot(destination, 'move onto')
   const sourceRoute = routeByCwd(String(source.targetKey))
   const destinationRoute = routeByCwd(String(destination.targetKey))
   if (sourceRoute.kind !== 'remote' && destinationRoute.kind !== 'remote') {
@@ -1772,6 +1780,14 @@ function lexicalPath(requested: string, cwd: string | undefined): string | undef
       // A target key or a path inside this host's placeholder tree is already
       // in the local spelling the filesystem service uses. Keep it as-is.
       const direct = path.resolve(cwd, requested)
+      // A delivery snapshot is the one absolute path under a remote cwd that is
+      // real, on this computer. Everything below reads an absolute path as a
+      // path on the SSH host and hands it to `resolveRemotePath`, which would
+      // translate this one into a placeholder on a server that has no such
+      // file. `present` and the card both call in with the session's placeholder
+      // cwd, so without this the snapshot never reaches the local backend and
+      // every delivery would fail on the official tool's `stat`.
+      if (isPresentCachePath(direct)) return direct
       const directRoute = routeByCwd(direct)
       if (directRoute.kind === 'remote' && directRoute.hostId === opened.hostId) return direct
       // Everything else is a path in the remote namespace. Resolving it with
@@ -2080,6 +2096,31 @@ function bindOptionalMutations(fs: FsSurface, originals: Originals): Originals {
 }
 
 /**
+ * Refuse a mutation aimed at a delivery snapshot.
+ *
+ * A snapshot is the one local path a remote session can name and have the local
+ * backend actually write, because it is deliberately kept out of the remote
+ * namespace (`lexicalPath` and `router.ts` explain why). That makes it the one
+ * local write the model can reach without an absolute path it was never shown —
+ * `present` reports the snapshot path to the card, so the model can read it back
+ * out of a tool result. A delivery copy is frozen by construction: editing it in
+ * place would rewrite the bytes an already-recorded card opens, which is exactly
+ * what content addressing prevents.
+ *
+ * The check reads `targetKey`, not the display path. The local backend keys a
+ * target by realpath, so a symlink pointing into the snapshot tree is caught as
+ * its target, and a superseded root is covered because `isPresentCachePath`
+ * consults every routable root.
+ */
+function refusePresentSnapshot(target: FsTarget, verb: string): void {
+  if (!isPresentCachePath(String(target.targetKey))) return
+  throw new FsError(
+    `cannot ${verb} "${target.displayPath}": it is a read-only delivery snapshot; present the remote file again to deliver updated content`,
+    'FS_PERMISSION_DENIED',
+  )
+}
+
+/**
  * Refuse a mutating fs method this backend does not implement remotely.
  *
  * `writeText`, `editText`, and (on 0.2.2) `patchText`, `deleteFile` and
@@ -2115,16 +2156,36 @@ function guardRemoteMutation(
     `remote workspace: ${displayPath} cannot be changed by this operation; use write or edit instead`,
     'FS_SANDBOX_DENIED',
   ))
+  // A delivery snapshot is local, so `routeByCwd` alone would let it through to
+  // the mounted provider — which is a real local delete/move/patch of a frozen
+  // card's bytes. This branch is only reached on a provider without the 0.2.2
+  // patch mutations, so `refusePresentSnapshot` inside the remote
+  // implementations never runs here. Check the snapshot first, in every arm.
+  // Snapshot refusals go through a rejected promise, like `refuse` above: this
+  // replacement is not `async`, so a synchronous throw would reach the caller
+  // before it had a promise to handle.
+  const refuseSnapshot = (target: FsTarget, verb: string): Promise<never> | undefined => {
+    try {
+      refusePresentSnapshot(target, verb)
+      return undefined
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
   const replacement = key === 'moveFile'
     // A move touches two paths. Either side being remote is enough to make a
     // local call wrong: the source would be copied from this computer, or the
     // destination written onto it.
     ? (source: FsTarget, destination: FsTarget, ...rest: unknown[]) => {
+      const frozen = refuseSnapshot(source, 'move') ?? refuseSnapshot(destination, 'move onto')
+      if (frozen !== undefined) return frozen
       if (routeByCwd(targetOf(source)).kind === 'remote') return refuse(String(source?.displayPath ?? 'the source'))
       if (routeByCwd(targetOf(destination)).kind === 'remote') return refuse(String(destination?.displayPath ?? 'the destination'))
       return (saved as (...args: unknown[]) => unknown).call(surface, source, destination, ...rest)
     }
     : (target: FsTarget, ...rest: unknown[]) => {
+      const frozen = refuseSnapshot(target, key === 'deleteFile' ? 'delete' : 'patch')
+      if (frozen !== undefined) return frozen
       if (routeByCwd(targetOf(target)).kind === 'remote') return refuse(String(target?.displayPath ?? 'the target'))
       return (saved as (...args: unknown[]) => unknown).call(surface, target, ...rest)
     }

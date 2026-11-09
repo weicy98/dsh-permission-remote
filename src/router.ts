@@ -44,6 +44,7 @@ const supersededRoots: string[] = []
 export function setRemoteRootOverride(root: string | null): void {
   const text = root === null ? '' : String(root).trim()
   remoteRootOverride = text.length === 0 ? null : path.resolve(text)
+  invalidateCanonicalRoots()
 }
 
 /**
@@ -58,12 +59,16 @@ export function addSupersededRoot(root: string): void {
   if (text.length === 0) return
   const resolved = path.resolve(text)
   if (resolved === remoteRoot()) return
-  if (!supersededRoots.includes(resolved)) supersededRoots.push(resolved)
+  if (!supersededRoots.includes(resolved)) {
+    supersededRoots.push(resolved)
+    invalidateCanonicalRoots()
+  }
 }
 
 /** Drop every remembered root. Tests and a fresh plugin load only. */
 export function clearSupersededRoots(): void {
   supersededRoots.length = 0
+  invalidateCanonicalRoots()
 }
 
 /**
@@ -109,6 +114,43 @@ export function canonicalRoutingRoots(env: NodeJS.ProcessEnv = process.env): str
       if (!roots.includes(spelling)) roots.push(spelling)
     }
   }
+  return roots
+}
+
+/**
+ * `canonicalRoutingRoots` memoized per root set.
+ *
+ * `pathSpellings` calls `realpathSync`, so computing this on every call means a
+ * synchronous stat per root on every path the remote filesystem resolves —
+ * `lexicalPath` then `routeByCwd` right after it paid for the same answer
+ * twice. The roots only change through {@link setRemoteRootOverride},
+ * {@link addSupersededRoot} and {@link clearSupersededRoots}, each of which
+ * bumps {@link routingRootsEpoch}; the cache is keyed on that epoch plus the
+ * environment's own root inputs, so a changed setting or a redeclared
+ * `DSH_SSH_REMOTE_ROOT` cannot serve a stale list.
+ */
+let routingRootsEpoch = 0
+let canonicalCache: { key: string, roots: string[] } | undefined
+
+/** Drop {@link canonicalRoutingRootsCached}; every root mutation calls it. */
+function invalidateCanonicalRoots(): void {
+  routingRootsEpoch += 1
+  canonicalCache = undefined
+}
+
+/**
+ * {@link canonicalRoutingRoots}, reusing the previous answer while nothing that
+ * can change it has.
+ *
+ * Only for hot callers that already hold no strong reason to recompute; the
+ * locale/migration paths keep using the uncached version so a stale answer can
+ * never outlive a test that swaps the root.
+ */
+export function canonicalRoutingRootsCached(env: NodeJS.ProcessEnv = process.env): string[] {
+  const key = `${routingRootsEpoch}\0${env.DSH_SSH_REMOTE_ROOT ?? ''}\0${env.DSH_HOME ?? ''}\0${env.HOME ?? ''}`
+  if (canonicalCache !== undefined && canonicalCache.key === key) return canonicalCache.roots
+  const roots = canonicalRoutingRoots(env)
+  canonicalCache = { key, roots }
   return roots
 }
 
@@ -162,6 +204,63 @@ export function mapRemoteToLocal(hostId: string, remotePath: string, env: NodeJS
   return path.join(remoteRoot(env), hostId, encodeRemotePath(remotePath))
 }
 
+/**
+ * Directory under every remote root that holds delivery snapshots.
+ *
+ * The leading dot is load-bearing, not cosmetic: {@link isValidHostId} accepts
+ * only lowercase letters, digits, and hyphens, so `.deliverables` can never be
+ * read as a host id. That is what lets {@link routeUnderRoot} classify a
+ * snapshot as local and hand every read to the mounted local backend, instead
+ * of the remote filesystem trying to `stat` it over SFTP.
+ *
+ * It sits *inside* the remote root so a snapshot is found again after the
+ * operator moves the root (as a superseded root) and so moving the root can
+ * skip the tree by name. See `docs/advanced.md` for the expiry behaviour.
+ */
+export const PRESENT_CACHE_DIR = '.deliverables'
+
+/** Where delivery snapshots live for the root in force right now. */
+export function presentCacheRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(remoteRoot(env), PRESENT_CACHE_DIR)
+}
+
+/**
+ * The snapshot directory of every root this process routes under.
+ *
+ * A superseded root is included on purpose: a card recorded before the operator
+ * moved the root still names a file under the old one, and the read-only guard
+ * has to keep covering it. Each root contributes both its lexical and its
+ * canonical spelling, because a snapshot path is recorded as a realpath while a
+ * session cwd may still be spelled through a symlink (`~/.dsh` is one on some
+ * installs) — the guard has to match either way.
+ */
+export function presentCacheRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  return canonicalRoutingRootsCached(env).map(root => path.join(root, PRESENT_CACHE_DIR))
+}
+
+/**
+ * Whether an absolute local path names a delivery snapshot.
+ *
+ * Callers use this for one decision only: a snapshot is on this computer, never
+ * on the SSH host, so it must bypass the remote namespace. The check is purely
+ * lexical against every candidate root — a path that does not exist yet is
+ * still classified, because a read must not first create it. `..` and absolute
+ * relatives are rejected by `path.relative`, and a path on another Windows
+ * drive resolves to an absolute relative, which is rejected too.
+ */
+export function isPresentCachePath(absolute: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (typeof absolute !== 'string' || absolute.length === 0) return false
+  if (!path.isAbsolute(absolute)) return false
+  const target = path.resolve(absolute)
+  for (const root of presentCacheRoots(env)) {
+    const rel = path.relative(path.resolve(root), target)
+    if (rel === '') return true
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue
+    return true
+  }
+  return false
+}
+
 export interface RemoteRoute {
   readonly kind: 'remote'
   readonly hostId: string
@@ -208,8 +307,9 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
   // Try the cwd as given first, then its realpath: DSH normally stores the
   // canonical spelling already, but a row saved before realpath registration
   // (or a caller holding a symlink spelling) must still route remote.
+  const roots = canonicalRoutingRootsCached(env)
   for (const spelling of pathSpellings(cwd)) {
-    for (const root of canonicalRoutingRoots(env)) {
+    for (const root of roots) {
       const route = routeUnderRoot(root, spelling)
       if (route.kind === 'remote') {
         // Keep the spelling the caller (and the model) actually uses.

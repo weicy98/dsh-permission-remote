@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
@@ -80,6 +80,22 @@ function pluginWithWorkspaces(paths: string[], liveCwd?: string): Context {
 async function created(ctx: Context, agent: object): Promise<void> {
   const dispatch = ctx as unknown as { serial(name: string, payload: { agent: object }): Promise<void> }
   await dispatch.serial('agent/created', { agent })
+}
+
+/**
+ * A filesystem service that answers a delivery probe the way the local backend
+ * answers a real snapshot: `lstat` finds a file, `resolve` returns a target
+ * whose `processPath` is the same path. That is the round trip `present` and the
+ * card both require, so this double is what puts a delivery test in snapshot
+ * mode; a double that translated the path away would (correctly) send the
+ * wrapper to the placeholder fallback instead.
+ */
+function deliveryProbeFs(): object {
+  return {
+    lstat: async () => ({ type: 'file', version: 1 }),
+    resolve: async (requested: string) => ({ targetKey: requested, displayPath: requested }),
+    processPath: (target: unknown) => String((target as { displayPath?: string }).displayPath ?? target),
+  }
 }
 
 test('a remote shadow install failure fails agent creation', async () => {
@@ -592,39 +608,102 @@ test('working_directory merges remote into the real official schema, not a repla
 })
 
 test('present runs the official tool after staging the remote bytes', async () => {
-  const ctx = pluginWithWorkspaces([remoteCwd], remoteCwd)
-  apply(ctx, { hosts: [], maxConnections: 4 })
-  const tools: Array<{ name: string, output?: { schema?: Record<string, unknown> }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
-  let seen: unknown
-  const official = {
-    name: 'present',
-    description: 'official delivery',
-    output: { schema: { type: 'object', additionalProperties: false, properties: { turn: { type: 'integer' } }, required: ['turn'] } },
-    execute: async (args: unknown) => {
-      seen = args
-      return { turn: 1, files: [] }
-    },
-  }
-  const { agent } = agentFor(remoteCwd, definition => {
-    tools.push(definition as never)
-    return () => undefined
-  })
-  agent.ctx.tools.get = ((name?: string) => name === 'present' ? official : { execute: async () => 'official' }) as typeof agent.ctx.tools.get
-  await created(ctx, agent)
-  const present = tools.find(tool => tool.name === 'present')
-  assert.ok(present, 'present must be shadowed so the remote session can deliver')
-  // The official argument and output schemas are preserved: only the path values
-  // change, never the shape the model or the log sees.
-  assert.deepEqual(present!.output?.schema, official.output.schema)
+  // A scratch remote root keeps the snapshot out of the operator's real one and
+  // makes the cache writable, which is what snapshot mode needs to engage.
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-shadow-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  const router = await import('../src/router.ts')
+  const originalStat = SshPool.prototype.sftpStat
+  const originalAttrs = SshPool.prototype.sftpAttrs
+  const originalRead = SshPool.prototype.sftpRead
+  const originalChunks = SshPool.prototype.sftpReadChunks
+  try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const ctx = pluginWithWorkspaces([cwd], cwd)
+    // The delivery probe proves the snapshot survives `present`'s round trip,
+    // so the backend has to answer the way the local one does for a real
+    // snapshot. Without this the wrapper correctly falls back to placeholder mode
+    // and the snapshot assertions below would not be exercised at all.
+    ctx.provide('fs', deliveryProbeFs())
+    apply(ctx, { hosts: [{ id: 'host1', name: 'dev', host: '10.0.0.5', port: 22, username: 'me', auth: 'key', privateKeyPath: '', fingerprint: 'SHA256:abc', opsPolicy: 'ask' }], maxConnections: 4 })
+    SshPool.prototype.sftpStat = async () => ({ isDirectory: false, size: 3 })
+    SshPool.prototype.sftpAttrs = async () => ({ type: 'file', size: 3, mtime: 1 })
+    SshPool.prototype.sftpRead = async () => Buffer.from('pdf')
+    SshPool.prototype.sftpReadChunks = async function* () { yield Buffer.from('pdf') }
+    const tools: Array<{ name: string, output?: { schema?: Record<string, unknown> }, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+    let seen: unknown
+    /**
+     * The official `present` keeps the exact array it returns in `pending` and
+     * emits that same array as `deliverables/presented`. Holding the reference
+     * is what lets this test notice an in-place rewrite of the event.
+     */
+    let pendingFiles: unknown[] | undefined
+    const official = {
+      name: 'present',
+      description: 'official delivery',
+      output: { schema: { type: 'object', additionalProperties: false, properties: { turn: { type: 'integer' } }, required: ['turn'] } },
+      execute: async (args: unknown) => {
+        seen = args
+        pendingFiles = (args as { files: unknown[] }).files
+        return { turn: 1, files: (args as { files: unknown[] }).files }
+      },
+    }
+    const { agent } = agentFor(cwd, definition => {
+      tools.push(definition as never)
+      return () => undefined
+    })
+    agent.ctx.tools.get = ((name?: string) => name === 'present' ? official : { execute: async () => 'official' }) as typeof agent.ctx.tools.get
+    try {
+      await created(ctx, agent)
+      const present = tools.find(tool => tool.name === 'present')
+      assert.ok(present, 'present must be shadowed so the remote session can deliver')
+      // The official argument and output schemas are preserved: only the path values
+      // change, never the shape the model or the log sees.
+      assert.deepEqual(present!.output?.schema, official.output.schema)
 
-  // A missing host is the signal that remote staging was reached: the wrapper
-  // refuses there, before the official execute would record a delivery for a
-  // path the local backend cannot open.
-  await assert.rejects(
-    () => present!.execute({ files: [{ path: 'out/report.pdf' }] }, { agent }),
-    /not configured/,
-  )
-  assert.equal(seen, undefined)
+      const result = await present!.execute({ files: [{ path: 'out/report.pdf', description: 'the report' }] }, { agent }) as {
+        turn: number
+        files: Array<{ path: string, description?: string }>
+      }
+      assert.ok(seen, 'the official tool runs once the bytes are staged')
+
+      // 1. What the official tool records is the immutable snapshot: a hash
+      //    directory under the cache root, never the placeholder path.
+      const recorded = pendingFiles![0] as { path: string, description?: string }
+      const cacheRoot = await realpath(router.presentCacheRoot())
+      assert.equal(recorded.path.startsWith(cacheRoot + sep), true, `${recorded.path} must sit under ${cacheRoot}`)
+      assert.match(recorded.path, /(?:^|[\\/])[0-9a-f]{64}[\\/]/)
+      assert.equal(recorded.description, 'the report', 'the description survives staging')
+
+      // 2. The model is handed the placeholder spelling it works in, the same one
+      //    the other remote file tools return.
+      const route = { kind: 'remote' as const, hostId: 'host1', remoteCwd: '/srv/app', placeholderCwd: cwd }
+      assert.equal(route.kind, 'remote')
+      assert.equal(result.files[0]!.path, router.toModelPath('/srv/app/out/report.pdf', route))
+      assert.equal(result.files[0]!.path, join(cwd, 'out', 'report.pdf'))
+      assert.equal(result.files[0]!.description, 'the report')
+      assert.equal(result.turn, 1)
+
+      // 3. The event keeps the snapshot path. The official tool emits the very
+      //    array it returned, so editing those entries would point the card at
+      //    a placeholder the remote filesystem cannot open.
+      assert.equal((pendingFiles![0] as { path: string }).path, recorded.path)
+      assert.notEqual((pendingFiles![0] as { path: string }).path, result.files[0]!.path)
+      assert.equal(await readFile(recorded.path, 'utf8'), 'pdf')
+    } finally {
+      SshPool.prototype.sftpStat = originalStat
+      SshPool.prototype.sftpAttrs = originalAttrs
+      SshPool.prototype.sftpRead = originalRead
+      SshPool.prototype.sftpReadChunks = originalChunks
+    }
+  } finally {
+    router.setRemoteRootOverride(null)
+    router.clearSupersededRoots()
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('a remote delivery leaves openable bytes at the staged path', async () => {
@@ -635,17 +714,24 @@ test('a remote delivery leaves openable bytes at the staged path', async () => {
   const root = await mkdtemp(join(process.cwd(), '.present-'))
   const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
   process.env.DSH_SSH_REMOTE_ROOT = root
-  const { setRemoteRootOverride } = await import('../src/router.ts')
+  const router = await import('../src/router.ts')
   try {
     const cwd = mapRemoteToLocal('host1', '/srv/app')!
     const ctx = pluginWithWorkspaces([cwd], cwd)
+    // Without a `fs` service the delivery probe cannot prove the snapshot is
+    // readable through the session cwd, and staging correctly falls back to the
+    // placeholder path. Answering the probe the way the local backend answers a
+    // real snapshot is what puts this test in snapshot mode.
+    ctx.provide('fs', deliveryProbeFs())
     apply(ctx, { hosts: [{ id: 'host1', name: 'dev', host: '10.0.0.5', port: 22, username: 'me', auth: 'key', privateKeyPath: '', fingerprint: 'SHA256:abc', opsPolicy: 'ask' }], maxConnections: 4 })
     const originalStat = SshPool.prototype.sftpStat
     const originalAttrs = SshPool.prototype.sftpAttrs
     const originalRead = SshPool.prototype.sftpRead
+    const originalChunks = SshPool.prototype.sftpReadChunks
     SshPool.prototype.sftpStat = async () => ({ isDirectory: false, size: 3 })
     SshPool.prototype.sftpAttrs = async () => ({ type: 'file', size: 3, mtime: 1 })
     SshPool.prototype.sftpRead = async () => Buffer.from('pdf')
+    SshPool.prototype.sftpReadChunks = async function* () { yield Buffer.from('pdf') }
     const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
     let presented: { files: Array<{ path: string, description?: string }> } | undefined
     const { agent } = agentFor(cwd, definition => {
@@ -663,14 +749,20 @@ test('a remote delivery leaves openable bytes at the staged path', async () => {
       SshPool.prototype.sftpStat = originalStat
       SshPool.prototype.sftpAttrs = originalAttrs
       SshPool.prototype.sftpRead = originalRead
+      SshPool.prototype.sftpReadChunks = originalChunks
     }
     assert.ok(presented, 'the official tool runs once the bytes are staged')
     const staged = presented!.files[0]!
-    assert.match(staged.path, /host1/)
+    // The recorded path is the snapshot, and it is a real file: that is the
+    // whole premise of handing it to the official tool and to the card.
+    const cacheRoot = await realpath(router.presentCacheRoot())
+    assert.equal(staged.path.startsWith(cacheRoot + sep), true, `${staged.path} must sit under ${cacheRoot}`)
+    assert.match(staged.path, /(?:^|[\\/])[0-9a-f]{64}[\\/]/)
     assert.equal(staged.description, 'the report', 'the description survives staging')
     assert.equal(await readFile(staged.path, 'utf8'), 'pdf')
   } finally {
-    setRemoteRootOverride(null)
+    router.setRemoteRootOverride(null)
+    router.clearSupersededRoots()
     if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
     else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
     await rm(root, { recursive: true, force: true })

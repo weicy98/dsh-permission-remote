@@ -73,7 +73,7 @@ probe/adapter or refuse remote execution in `docs/upstream-ptc-worker.md`.
 | `patch-hunks.ts` + `vendor/fs-patch` | `@deepseek-ai/dsh-fs-patch` | Replaced with the official package; vendored copy deleted. |
 | `str_replace_editor` shadow | `@deepseek-ai/dsh-tool-str-replace-editor` | Keep the small path-rewrite adapter; official `resolveTarget` has no cwd. |
 | `working_directory` shadow | `@deepseek-ai/dsh-tool-working-directory` | Keep only remote validation; the official service commit does the work. |
-| `present` staging | `@deepseek-ai/dsh-tool-present` | Cannot be replaced: the official card opens a local path, so staging is required. |
+| `present` staging | `@deepseek-ai/dsh-tool-present` | Cannot be replaced: the official card opens a local path, so staging is required. Staged bytes are a content-addressed snapshot under `<placeholder root>/.deliverables/<sha256>/`; the remote-fs patch carves that one path out so a remote session's `cwd` does not translate it back into a remote path, and the five mutating methods refuse it. `scripts/check-upstream.mjs` probes that `present` still calls `lstat`/`resolve` with the Session cwd and records `processPath(target)`. A future upstream `DeliverableResolver` would remove the copy; see `docs/present-resolver-proposal.md`. |
 | `terminal_open` / sidebar PTY | `@deepseek-ai/dsh-tool-terminal` / `dsh-terminal-bash` | Separate remote `spawnTerminal`/TerminalBackend work; not the PTC seam. |
 | bash / PTC confinement argv | `@deepseek-ai/dsh-sandbox-local` profile region | Constructors are not exported. `src/profile-contract.ts` extracts them, calls them, and refuses a different argv. The file-write profile reuses the official read-only bwrap base, then bind-mounts the remote temp dirs. |
 

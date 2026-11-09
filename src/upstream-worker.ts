@@ -523,3 +523,83 @@ export async function ensureWorker(
   return pending
 }
 
+
+/**
+ * The delivery contract `present` staging depends on.
+ *
+ * The plugin cannot replace `present`: the tool validates each path through
+ * `ctx.fs` and records what `processPath` returns, and the card that opens the
+ * result reads this computer's filesystem. So the plugin stages a local copy and
+ * hands the official tool that path. Two details of the upstream implementation
+ * make that work, and both are invisible to a mock:
+ *
+ * - `lstat` and `resolve` are called with the Session cwd. Without it a remote
+ *   session's snapshot path is classified as a local path by accident; with it,
+ *   the remote filesystem patch has to carve the snapshot out explicitly
+ *   (`lexicalPath` in `remote-fs.ts`). Drop the cwd and that carve-out becomes
+ *   dead code that silently stops being exercised.
+ * - the recorded path is `processPath(target)`, not the string the model passed.
+ *   The plugin records the same realpath for the card to verify.
+ *
+ * A probe failure here does not break every remote tool the way the PTC contract
+ * does, so it is a separate check with its own message instead of a sixth
+ * `probeContract` entry — that list is paired one-to-one with runbook rows.
+ */
+export interface PresentContractProbe {
+  /** False when the installed DSH does not ship the package at all. */
+  readonly installed: boolean
+  readonly lstatWithCwd: boolean
+  readonly resolveWithCwd: boolean
+  readonly statsResolved: boolean
+  readonly recordsProcessPath: boolean
+  readonly failures: readonly string[]
+}
+
+/**
+ * Read the installed `present` implementation and check the four calls above.
+ *
+ * `lib/index.js` is the shipped build; the TypeScript source is not part of the
+ * published package.
+ *
+ * An absent package is NOT drift: a slimmed composition may not mount `present`
+ * at all, and `runPresent` is never reached then. It is reported as
+ * `installed: false` with no failures so the caller can say "skipped". Only a
+ * package that exists with a different call shape means the seam moved.
+ */
+export function probePresentContract(dshRoot: string): PresentContractProbe {
+  let source = ''
+  try {
+    source = readFileSync(join(dshRoot, 'node_modules', '@deepseek-ai', 'dsh-tool-present', 'lib', 'index.js'), 'utf8')
+  } catch {
+    // No package is not drift: a slimmed composition may not mount `present` at
+    // all, and `runPresent` is never reached then. Reported as `installed:
+    // false` so a caller can tell "absent" from "present and different" without
+    // treating absence as a failure.
+    return { installed: false, lstatWithCwd: false, resolveWithCwd: false, statsResolved: false, recordsProcessPath: false, failures: [] }
+  }
+  // The call and its options are matched together: `lstat(path, { cwd })` is the
+  // contract, not `lstat(` on its own. `resolve` takes an options object built
+  // one line earlier, so the name of that binding is read from the source
+  // instead of assumed — `{ cwd, signal }` compiled to `options` today, and a
+  // literal argument tomorrow, must both pass.
+  const lstatWithCwd = /ctx\.fs\.lstat\([^)]*\{\s*cwd\s*\}/u.test(source)
+  const cwdOptions = /const\s+(\w+)\s*=\s*\{[^}]*\bcwd\b[^}]*\}/u.exec(source)
+  const optionsName = cwdOptions?.[1]
+  const resolveWithCwd = optionsName !== undefined
+    ? new RegExp(`ctx\\.fs\\.resolve\\([^)]*,\\s*${optionsName}\\s*[,)]`, 'u').test(source)
+    : /ctx\.fs\.resolve\([^)]*\{\s*cwd\s*[^}]*\}/u.test(source)
+  const statsResolved = /const\s+target\s*=\s*await\s+ctx\.fs\.resolve\([^)]*\)[\s\S]{0,200}?ctx\.fs\.stat\(\s*target\s*,/u.test(source)
+  const recordsProcessPath = /ctx\.fs\.processPath\(\s*target\s*\)/u.test(source)
+  // Built as a list literal rather than `push` calls on purpose: the PTC worker
+  // runbook scanner treats every `failures.push(...)` in this file as a PTC
+  // contract row and requires a matching entry in scripts/upstream-map.mjs.
+  // These four are a different contract with a different fix, and they carry
+  // their own advice in check-upstream.mjs.
+  const failures = [
+    ...lstatWithCwd ? [] : ['present no longer calls ctx.fs.lstat with the Session cwd'],
+    ...resolveWithCwd ? [] : ['present no longer calls ctx.fs.resolve with the Session cwd'],
+    ...statsResolved ? [] : ['present no longer stats the resolved target'],
+    ...recordsProcessPath ? [] : ['present no longer records ctx.fs.processPath(target)'],
+  ]
+  return { installed: true, lstatWithCwd, resolveWithCwd, statsResolved, recordsProcessPath, failures }
+}

@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { mkdir, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join, posix } from 'node:path'
@@ -39,6 +40,7 @@ import {
 } from './probe.ts'
 import { rgPlatformOf } from './rg-fetch.ts'
 import { mapRemoteToLocal, resolveRemotePath, toModelPath, workspaceBinding, type RemoteRoute } from './router.ts'
+import { HARD_MAX_BYTES, type PendingSnapshot, type PresentCache } from './present-cache.ts'
 import { loginEnvApply } from './login-env.ts'
 import { shJoin } from './shell-quote.ts'
 import { SshPool, isSftpMissing, type ExecResult, type SecretMaterial } from './ssh-pool.ts'
@@ -494,7 +496,7 @@ async function startBackground(
 
 
 /**
- * One remote file copied to its placeholder path, for a tool that can
+ * One remote file copied into the local delivery cache, for a tool that can
  * only read the local filesystem.
  *
  * `present` resolves its arguments with `ctx.fs` and `stat`s the result, then
@@ -502,21 +504,46 @@ async function startBackground(
  * inside the placeholder tree, which only holds directories, so a real
  * remote file was reported as "file not found" and no delivery ever landed.
  * The event itself carries strings only, so the honest fix is a real local copy
- * at the path the model already uses — not a rewritten path that would point
- * the card at a file nobody can open.
+ * — not a rewritten path that would point the card at a file nobody can open.
  */
 export interface StagedFile {
-  /** The placeholder path the delivery should name and the card should open. */
+  /**
+   * The path the delivery names and the card opens.
+   *
+   * A snapshot path under the delivery cache in the normal case, and the
+   * placeholder path when the caller passed no cache (or the cache could not be
+   * proven readable, which makes the caller pass none).
+   */
   readonly path: string
   /** Byte size of the copy. */
   readonly bytes: number
+  /** SHA-256 of the bytes, lowercase hex. */
+  readonly hash: string
+  /** True when these exact bytes were already staged, so nothing was rewritten. */
+  readonly reused: boolean
+  /**
+   * The remote absolute path the copy came from.
+   *
+   * The caller hands the official tool {@link path} but has to give the model
+   * the placeholder spelling the other file tools use, and only the resolved
+   * remote path can produce that.
+   */
+  readonly remotePath: string
 }
 
-/**
- * Refuse a single file above this size. A card that opens a silently truncated
- * copy is worse than saying the copy is too large.
- */
-const PRESENT_CAP = 32 * 1024 * 1024
+/** What a caller may constrain about one delivery batch. */
+export interface PresentStageOptions {
+  /**
+   * Byte ceiling for one file.
+   *
+   * `0` means the operator asked for no transfer limit. The snapshot still
+   * needs one (see {@link HARD_MAX_BYTES}): this is a model-callable write to
+   * the user's own disk with no approval gate of its own.
+   */
+  readonly maxBytes: number
+  /** Where to stage. Omitted means the placeholder path, for hosts that cannot open a snapshot. */
+  readonly cache?: PresentCache
+}
 
 /**
  * Placeholder paths this process wrote a delivery copy to.
@@ -564,88 +591,331 @@ export async function clearStagedPresentFiles(only?: readonly string[]): Promise
 }
 
 /**
- * Copy remote files into their placeholder directories so the local
- * `present` tool and the card that opens its paths find real files.
+ * Copy remote files into the local delivery cache so the `present` tool and the
+ * card that opens its paths find real files.
  *
  * Everything is checked on the remote first: a missing path, a directory, or a
- * file over {@link PRESENT_CAP} refuses the whole call and names the remote path
- * the model can act on. Bytes land through `writeFileAtomic`, so a reader never
- * observes a partial copy, and each delivery rewrites the file — the event
- * records only the path, so a later delivery of an updated file has to land
- * newest content at that same path.
+ * file over the ceiling refuses the whole call and names the remote path the
+ * model can act on. Then the bytes are streamed, not buffered — a delivery can
+ * be up to {@link HARD_MAX_BYTES} and the whole point of the cache is to stop
+ * holding that in memory.
+ *
+ * The batch is atomic in the only sense that matters to a card: nothing is
+ * published until every file has been read completely. A failure on the third
+ * file removes the two temps and leaves every already-published snapshot byte
+ * for byte as it was. Nothing here rewrites an existing snapshot, because a card
+ * recorded earlier may still be pointing at it.
+ *
+ * With no {@link PresentStageOptions.cache} the bytes land at the placeholder path
+ * and are rewritten on every delivery, which is what the plugin did before the
+ * cache existed. That path is kept for a host whose filesystem cannot resolve a
+ * snapshot back (see `runPresent`), and for older callers.
  */
 export async function stagePresentFiles(
   hostApi: ToolHost,
   route: RemoteRoute,
   files: ReadonlyArray<{ path: string }>,
   exec?: ToolExec,
+  options?: PresentStageOptions,
 ): Promise<StagedFile[]> {
   throwIfAborted(exec?.signal)
   const host = requireHost(hostApi, route.hostId)
   const secret = await hostApi.secretOf(host)
-  const staged: StagedFile[] = []
-  for (const file of files) {
-    const requested = String(file.path ?? '').trim()
-    if (requested.length === 0) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
-    const remotePath = resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
-    const ticket = stagedEpoch
-    let info: { isDirectory: boolean, size: number, type?: string }
-    try {
-      // `sftpStat` follows the final link, so it cannot tell a symlink from a
-      // real file. Use `lstat` where the pool provides it; the stat fallback is
-      // only for older test doubles.
-      if (typeof hostApi.pool.sftpAttrs === 'function') {
-        const attrs = await withSignal(hostApi.pool.sftpAttrs(host, secret, remotePath, false), exec?.signal)
-        if (attrs === undefined) throw new FsError(`no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
-        info = { isDirectory: attrs.type === 'directory', size: attrs.size, type: attrs.type }
-      } else {
-        info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
+  const cache = options?.cache
+  const ceiling = presentCeiling(options?.maxBytes ?? 0)
+  // A pending write per requested entry, in request order. The remote read
+  // happens once per distinct remote path: `present` can name one file twice
+  // through two spellings, and staging it twice would waste a transfer and,
+  // worse, write two temps for the same bytes.
+  const pending: Array<PendingSnapshot & { remotePath: string }> = []
+  const staged = new Map<string, StagedFile>()
+  /** Remote paths already read in this batch, so one file is transferred once. */
+  const seen = new Set<string>()
+  /** Fallback-mode reads, published only after the whole batch has been read. */
+  const fallback: Array<{ remotePath: string, requested: string, data: Buffer }> = []
+  // Captured before any read: an unload that starts while the bytes are in
+  // flight must invalidate the whole batch, and the write only happens later.
+  const ticket = stagedEpoch
+  // Snapshots this batch created, so a rollback removes only its own work. A
+  // reused path was already on disk and belongs to an earlier delivery.
+  const created: string[] = []
+  try {
+    for (const file of files) {
+      const requested = String(file.path ?? '').trim()
+      if (requested.length === 0) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
+      const remotePath = resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
+      // Deduplicated by the resolved remote path, not the spelling: a relative
+      // path and the absolute path it resolves to name one file, and reading it
+      // twice would waste a transfer and create two temps for the same bytes.
+      if (seen.has(remotePath)) continue
+      seen.add(remotePath)
+      const info = await presentRemoteInfo(hostApi, host, secret, remotePath, requested, exec)
+      if (info.size > ceiling.limit) throw presentTooLarge(requested, info.size, ceiling)
+      if (cache === undefined) {
+        // Buffered, not written: the batch must not leave a placeholder behind
+        // when a later file fails. The bytes are published after the loop.
+        const buffered = await readRemoteFile(hostApi, host, secret, remotePath, requested, ceiling, exec)
+        fallback.push(buffered)
+        continue
       }
-    } catch (error) {
-      if (exec?.signal?.aborted === true) throw error
-      // A missing file is the model's path to fix; a dropped connection,
-      // permission denial, or SFTP fault is not. Telling it "no file" when the
-      // host is unreachable would send it hunting for a path that exists.
-      const message = error instanceof Error ? error.message : String(error)
-      if (isSftpMissing(error)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
-      if (error instanceof FsError) throw error
-      throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
+      const snapshot = await stageIntoCache(cache, hostApi, host, secret, remotePath, requested, info.size, ceiling, exec)
+      pending.push(snapshot)
     }
-    if (info.isDirectory) {
-      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_REGULAR_FILE')
+    // Placeholder mode writes only now that every file has been read, so the
+    // all-or-nothing promise holds for it too. Each write is atomic on its own
+    // (`writeFileAtomic`), but a batch is not: the loop below can still fail
+    // halfway, and the copies it already wrote are removed by the catch.
+    for (const item of fallback) {
+      staged.set(item.remotePath, await writePlaceholder(route, item, ticket, exec))
     }
-    if (info.type !== undefined && info.type !== 'file') {
-      throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is not a regular file`, 'FS_NOT_REGULAR_FILE')
+    // Publish only after every file has been read: a card must never be able to
+    // name a snapshot from a batch that did not finish.
+    for (const item of pending) {
+      const ref = await cache!.publish(item)
+      if (!ref.reused) created.push(ref.path)
+      staged.set(item.remotePath, {
+        path: ref.path,
+        bytes: ref.bytes,
+        hash: ref.hash,
+        reused: ref.reused,
+        remotePath: item.remotePath,
+      })
     }
-    if (info.size > PRESENT_CAP) {
-      throw new FsError(`Cannot present ${requested}: the remote file is ${info.size} bytes, over the ${PRESENT_CAP} byte delivery limit`, 'FS_TOO_LARGE')
-    }
-    let data: Buffer
-    try {
-      data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, PRESENT_CAP, exec?.signal), exec?.signal)
-    } catch (error) {
-      if (exec?.signal?.aborted === true) throw error
-      const message = error instanceof Error ? error.message : String(error)
-      if (/over the .*byte limit/i.test(message)) {
-        throw new FsError(`Cannot present ${requested}: the remote file is over the ${PRESENT_CAP} byte delivery limit`, 'FS_TOO_LARGE')
-      }
-      throw error
-    }
-    // The placeholder spelling every other remote tool returns, so the model
-    // sees one path for one file whichever tool produced it.
-    const placeholder = toModelPath(remotePath, route)
-    await withSignal(writeFileAtomic(placeholder, data, { mode: 0o600, dirMode: 0o700 }), exec?.signal)
-    // Unload may have started while this file was being fetched or written.
-    // Its snapshot does not include this path, so leaving the bytes here would
-    // outlive the plugin. A path that was not written is not removed.
-    if (ticket !== stagedEpoch) {
-      await rm(placeholder, { force: true })
-      throw new Error(`Cannot present ${requested}: the plugin is unloading`)
-    }
-    stagedPlaceholders.add(placeholder)
-    staged.push({ path: placeholder, bytes: data.length })
+  } catch (error) {
+    await Promise.all(pending.map(item => cache!.discard(item.temp)))
+    // A published snapshot from this batch is new content nobody can reference
+    // yet: the event is written only after the whole call succeeds. Remove just
+    // those files; the hash directory may hold other names this batch did not
+    // create, so it is never removed as a whole.
+    await Promise.all(created.map(async path => { await rm(path, { force: true }) }))
+    // A placeholder this batch wrote is equally unreferenced. `staged` only
+    // holds entries written by the loop above, so nothing older is touched.
+    await Promise.all([...staged.values()].map(async entry => { await rm(entry.path, { force: true }) }))
+    throw error
   }
-  return staged
+  // Rebuild in request order. `staged` is keyed by remote path, so a request
+  // that named the same file twice gets the same entry twice instead of a
+  // missing slot.
+  return files.map(file => {
+    const remotePath = resolveRemotePath(String(file.path ?? '').trim(), route.remoteCwd, route.placeholderCwd)
+    const entry = staged.get(remotePath)
+    if (entry === undefined) throw new FsError('Cannot present a file: the path is empty', 'FS_NOT_FOUND')
+    return entry
+  })
+}
+
+/**
+ * The per-file byte ceiling, with where it came from.
+ *
+ * A configured transfer limit becomes the delivery limit, but only up to
+ * {@link HARD_MAX_BYTES}: the setting's `0` means "no limit" for a stream to a
+ * remote host, and this writes to the operator's own disk for a tool call that
+ * carries no approval of its own. The two messages differ because an operator
+ * who raised the setting needs to know the ceiling is not the number they set.
+ */
+function presentCeiling(configured: number): { limit: number, source: 'setting' | 'no-limit' | 'raised' } {
+  if (configured > 0 && configured <= HARD_MAX_BYTES) return { limit: configured, source: 'setting' }
+  // `0` is the operator asking for no transfer limit; a value above the ceiling
+  // is them asking for more than a delivery will ever allow. They read
+  // differently, so they are not one branch.
+  if (configured <= 0) return { limit: HARD_MAX_BYTES, source: 'no-limit' }
+  return { limit: HARD_MAX_BYTES, source: 'raised' }
+}
+
+function presentTooLarge(requested: string, size: number, ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' }): FsError {
+  const where = ceiling.source === 'setting'
+    ? `${ceiling.limit} byte delivery limit`
+    : ceiling.source === 'no-limit'
+      ? `${ceiling.limit} byte snapshot limit (the transfer setting asks for no limit)`
+      : `${ceiling.limit} byte snapshot limit (the transfer setting asks for more, which a delivery does not allow)`
+  return new FsError(`Cannot present ${requested}: the remote file is ${size} bytes, over the ${where}`, 'FS_TOO_LARGE')
+}
+
+/**
+ * The remote side of the verdict on one file.
+ *
+ * `sftpStat` follows the final link, so it cannot tell a symlink from a real
+ * file. Use `lstat` where the pool provides it; the stat fallback is only for
+ * older test doubles. A missing file is the model's path to fix; a dropped
+ * connection, permission denial, or SFTP fault is not — telling it "no file"
+ * when the host is unreachable would send it hunting for a path that exists.
+ */
+async function presentRemoteInfo(
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  remotePath: string,
+  requested: string,
+  exec: ToolExec | undefined,
+): Promise<{ isDirectory: boolean, size: number, type?: string }> {
+  let info: { isDirectory: boolean, size: number, type?: string }
+  try {
+    if (typeof hostApi.pool.sftpAttrs === 'function') {
+      const attrs = await withSignal(hostApi.pool.sftpAttrs(host, secret, remotePath, false), exec?.signal)
+      if (attrs === undefined) throw new FsError(`no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+      info = { isDirectory: attrs.type === 'directory', size: attrs.size, type: attrs.type }
+    } else {
+      info = await withSignal(hostApi.pool.sftpStat(host, secret, remotePath), exec?.signal)
+    }
+  } catch (error) {
+    if (exec?.signal?.aborted === true) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    if (isSftpMissing(error)) throw new FsError(`Cannot present ${requested}: no file at the remote path ${remotePath}`, 'FS_NOT_FOUND')
+    if (error instanceof FsError) throw error
+    throw new Error(`Cannot present ${requested}: the remote host could not stat ${remotePath}: ${message}`)
+  }
+  if (info.isDirectory) {
+    throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is a directory, not a file`, 'FS_NOT_REGULAR_FILE')
+  }
+  if (info.type !== undefined && info.type !== 'file') {
+    throw new FsError(`Cannot present ${requested}: the remote path ${remotePath} is not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  return info
+}
+
+/**
+ * Stream one remote file into a cache temp file, hashing as it goes.
+ *
+ * The byte count is enforced on the bytes actually read, not only on the size
+ * the stat reported: a file that grows between the two must not be pulled whole.
+ * A truncated read is caught by comparing the total against that stat, which is
+ * the one way to notice a file removed mid-read on a server that reports EOF
+ * rather than an error.
+ */
+async function stageIntoCache(
+  cache: PresentCache,
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  remotePath: string,
+  requested: string,
+  expected: number,
+  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' },
+  exec: ToolExec | undefined,
+): Promise<PendingSnapshot & { remotePath: string }> {
+  const limit = ceiling.limit
+  const { handle, temp } = await cache.createTemp()
+  const hash = createHash('sha256')
+  let bytes = 0
+  try {
+    const chunks = remoteChunks(hostApi, host, secret, remotePath, limit, exec?.signal)
+    for await (const chunk of chunks) {
+      throwIfAborted(exec?.signal)
+      bytes += chunk.length
+      if (bytes > limit) throw presentTooLarge(requested, bytes, ceiling)
+      hash.update(chunk)
+      await handle.write(chunk)
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    await cache.discard(temp)
+    if (exec?.signal?.aborted === true) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    // A read refused for size is reported the way the stat would have: the file
+    // grew after the stat, and "over the limit" is the actionable answer.
+    if (/over the .*byte limit/i.test(message)) throw presentTooLarge(requested, bytes, ceiling)
+    throw error
+  }
+  await handle.close()
+  if (bytes !== expected) {
+    await cache.discard(temp)
+    throw new Error(`Cannot present ${requested}: the remote file changed while it was being read (${expected} bytes reported, ${bytes} read)`)
+  }
+  const digest = hash.digest('hex')
+  return {
+    temp,
+    target: cache.targetFor(digest, posix.basename(remotePath)),
+    hash: digest,
+    bytes,
+    remotePath,
+  }
+}
+
+/**
+ * The remote bytes as chunks.
+ *
+ * `sftpReadChunks` streams; `sftpRead` is the whole-file fallback for a pool
+ * written before chunks existed (and for a few test doubles). The fallback
+ * passes the ceiling so the pool still refuses an oversized file.
+ */
+async function* remoteChunks(
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  remotePath: string,
+  limit: number,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Buffer> {
+  if (typeof hostApi.pool.sftpReadChunks === 'function') {
+    for await (const chunk of hostApi.pool.sftpReadChunks(host, secret, remotePath, signal)) yield chunk
+    return
+  }
+  const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, limit, signal), signal)
+  if (data.length > 0) yield data
+}
+
+/**
+ * The pre-snapshot behaviour: buffer the file and rewrite the placeholder path.
+ *
+ * Kept for a host whose filesystem cannot prove a snapshot survives the card's
+ * round trip, and for callers that pass no cache deliberately. `writeFileAtomic`
+ * means a reader never observes a partial copy, and the epoch check removes a
+ * copy that landed after unloading started.
+ */
+async function readRemoteFile(
+  hostApi: ToolHost,
+  host: HostConfig,
+  secret: SecretMaterial,
+  remotePath: string,
+  requested: string,
+  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' },
+  exec: ToolExec | undefined,
+): Promise<{ remotePath: string, requested: string, data: Buffer }> {
+  const limit = ceiling.limit
+  try {
+    const data = await withSignal(hostApi.pool.sftpRead(host, secret, remotePath, limit, exec?.signal), exec?.signal)
+    return { remotePath, requested, data }
+  } catch (error) {
+    if (exec?.signal?.aborted === true) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    if (/over the .*byte limit/i.test(message)) throw presentTooLarge(requested, limit, ceiling)
+    throw error
+  }
+}
+
+/**
+ * Write one already-read file at its placeholder path.
+ *
+ * Split from the read so the batch reads everything before it writes anything:
+ * a failure on the third file must not leave the first two behind. The write
+ * itself is atomic through `writeFileAtomic`, so a reader never sees a partial
+ * copy, and the epoch check removes a copy that landed after unloading started.
+ */
+async function writePlaceholder(
+  route: RemoteRoute,
+  item: { remotePath: string, requested: string, data: Buffer },
+  ticket: number,
+  exec: ToolExec | undefined,
+): Promise<StagedFile> {
+  // The placeholder spelling every other remote tool returns, so the model
+  // sees one path for one file whichever tool produced it.
+  const placeholder = toModelPath(item.remotePath, route)
+  await withSignal(writeFileAtomic(placeholder, item.data, { mode: 0o600, dirMode: 0o700 }), exec?.signal)
+  // Unload may have started while this file was being written. Its snapshot
+  // does not include this path, so leaving the bytes here would outlive the
+  // plugin. A path that was not written is not removed.
+  if (ticket !== stagedEpoch) {
+    await rm(placeholder, { force: true })
+    throw new Error(`Cannot present ${item.requested}: the plugin is unloading`)
+  }
+  stagedPlaceholders.add(placeholder)
+  return {
+    path: placeholder,
+    bytes: item.data.length,
+    hash: createHash('sha256').update(item.data).digest('hex'),
+    reused: false,
+    remotePath: item.remotePath,
+  }
 }
 
 export async function runWorkingDirectory(

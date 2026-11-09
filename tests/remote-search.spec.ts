@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { runOfficialBash, runOfficialSearch } from '../src/index.ts'
-import { mapRemoteToLocal } from '../src/router.ts'
+import { clearSupersededRoots, mapRemoteToLocal, PRESENT_CACHE_DIR, setRemoteRootOverride } from '../src/router.ts'
 
 const remoteCwd = '/srv/app'
 const placeholder = mapRemoteToLocal('h1', remoteCwd)!
@@ -132,6 +134,28 @@ test('official bash workdir arguments are normalized back to the remote placehol
   assert.equal(calls[0]!.workdir, expected)
 })
 
+
+test('official bash refuses a workdir inside a delivery snapshot', async () => {
+  // The guard has to read the model's spelling, before it is mapped onto a
+  // placeholder: `mapRemoteToLocal` always yields `<root>/<hostId>/<encoded>`,
+  // which can never equal a snapshot path, so a check after the mapping is dead.
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  const base = await mkdtemp(join(tmpdir(), 'dsh-bash-cache-'))
+  process.env.DSH_SSH_REMOTE_ROOT = base
+  setRemoteRootOverride(null)
+  clearSupersededRoots()
+  try {
+    const snapshot = join(base, PRESENT_CACHE_DIR, 'a'.repeat(64), 'report.txt')
+    await assert.rejects(
+      () => runOfficialBash(() => 'should not run', route, { command: 'pwd', workdir: snapshot }, {}),
+      /read-only delivery snapshot/u,
+    )
+  } finally {
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(base, { recursive: true, force: true })
+  }
+})
 
 test('official search result paths are mapped back to placeholder paths', async () => {
   const result = await runOfficialSearch(() => ({

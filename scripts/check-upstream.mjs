@@ -15,7 +15,7 @@
  * point, so tests can drive it without spawning a process.
  */
 import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
-import { clearOverlayManifest, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
+import { clearOverlayManifest, locateDshRoot, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, probePresentContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, CHECK_UPSTREAM_FLAGS, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, unknownFlagLines, unknownFlags, usage, withDshRoot } from './cli-common.mjs'
 
 export { isInstalledPackage }
@@ -144,6 +144,20 @@ function runCheck(options, env) {
     return { code: 1 }
   }
   log(`check:upstream: sandbox profile sha256 ${sandbox.profileSha256}`)
+
+  // `present` staging is a separate contract from the PTC worker: it only breaks
+  // remote delivery, not every remote tool. It is probed after the sandbox and
+  // worker gates so a failure there cannot hide a bigger one, and before any
+  // manifest write so a drifted contract is never recorded as verified.
+  const present = probePresentContract(locateDshRoot(env).root)
+  if (present.failures.length > 0) {
+    error(`check:upstream: present delivery contract failed: ${present.failures.join('; ')}`)
+    error('check:upstream: present staging lives in src/execute.ts stagePresentFiles and the snapshot carve-out in src/remote-fs.ts lexicalPath')
+    return { code: 1 }
+  }
+  log(present.installed
+    ? 'check:upstream: present delivery contract ok (lstat/resolve carry the Session cwd, the recorded path is processPath(target))'
+    : 'check:upstream: present delivery contract skipped: this DSH build does not ship dsh-tool-present, so nothing delegates to it')
 
   if (update && dryRun) {
     const target = adapt ? overlayManifestPath(env) : 'vendor/upstream/ptc-worker.manifest.json'

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -6,6 +7,7 @@ import { join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
 import { clearStagedPresentFiles, finishBackground, runBash, runWorkingDirectory, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
+import { createPresentCache, HARD_MAX_BYTES } from '../src/present-cache.ts'
 import { mapRemoteToLocal, type RemoteRoute } from '../src/router.ts'
 import type { ExecResult, SshPool } from '../src/ssh-pool.ts'
 
@@ -385,7 +387,7 @@ test('working_directory rejects a remote directory that does not exist', async (
   )
 })
 
-test('delivering a remote file copies it to its placeholder path', async () => {
+test('delivering a remote file streams it into a content-addressed snapshot', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-present-'))
   try {
     process.env.DSH_SSH_REMOTE_ROOT = root
@@ -394,25 +396,30 @@ test('delivering a remote file copies it to its placeholder path', async () => {
     const mapping = mapRemoteToLocal('host1', '/srv/app')!
     const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
     const exec = { signal: new AbortController().signal }
+    const cache = createPresentCache(join(root, '.deliverables'))
     const api = {
       pool: {
-        sftpStat: async () => ({ isDirectory: false, size: 5 }),
-        sftpRead: async () => Buffer.from('hello'),
+        sftpAttrs: async () => ({ type: 'file', size: 5 }),
+        async *sftpReadChunks() { yield Buffer.from('hello') },
       } as unknown as SshPool,
       hostOf: () => host,
       secretOf: async () => ({}),
       statusOf: async () => status,
       resolveMode: async () => 'read-only' as const,
     } satisfies ToolHost
-    const staged = await stagePresentFiles(api, sessionRoute, [{ path: 'out/report.txt' }], exec)
+    const staged = await stagePresentFiles(api, sessionRoute, [{ path: 'out/report.txt' }], exec, { maxBytes: 0, cache })
     assert.deepEqual(staged.map(file => file.bytes), [5])
-    const target = staged[0]!.path
-    assert.match(target, /host1/)
-    assert.equal(await readFile(target, 'utf8'), 'hello')
-    // The delivered path is the placeholder the read tool already returns, not
-    // the remote spelling, because both the official tool and the card read locally.
-    assert.equal(target, posix.join(mapping, 'out/report.txt'))
-    assert.notEqual(target, '/srv/app/out/report.txt')
+    const entry = staged[0]!
+    assert.equal(entry.hash, createHash('sha256').update('hello').digest('hex'))
+    assert.equal(entry.reused, false)
+    assert.equal(entry.remotePath, '/srv/app/out/report.txt')
+    // The path is `<cache root>/<sha256>/<name>`, not the placeholder.
+    assert.ok(entry.path.startsWith(join(root, '.deliverables')))
+    assert.equal(entry.path, join(cache.root, entry.hash, 'report.txt'))
+    assert.match(entry.path, /[0-9a-f]{64}/)
+    assert.equal(await readFile(entry.path, 'utf8'), 'hello')
+    // Nothing was written into the placeholder tree this time.
+    assert.equal(existsSync(posix.join(mapping, 'out', 'report.txt')), false)
   } finally {
     delete process.env.DSH_SSH_REMOTE_ROOT
     await rm(root, { recursive: true, force: true })
@@ -459,30 +466,295 @@ test('a remote directory is not delivered as a file', async () => {
   assert.equal(reads, 0)
 })
 
-test('a second delivery of the same path replaces the earlier copy', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-present-'))
+test('identical content reuses its snapshot and changed content gets a new one', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-snap-'))
   try {
     process.env.DSH_SSH_REMOTE_ROOT = root
     const mapping = mapRemoteToLocal('host1', '/srv/app')!
     const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
-    let body = Buffer.from('first')
+    const cache = createPresentCache(join(root, '.deliverables'))
+    let body = Buffer.from('first version')
+    const api = () => ({
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: body.length }),
+        async *sftpReadChunks() { yield body },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    }) satisfies ToolHost
+
+    const [first] = await stagePresentFiles(api(), sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    // The same bytes again: reuse, no rewrite.
+    const [again] = await stagePresentFiles(api(), sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    assert.equal(again!.path, first!.path)
+    assert.equal(again!.reused, true)
+    assert.equal(await readFile(first!.path, 'utf8'), 'first version')
+
+    // Different bytes: a different content address, and the first card's file
+    // is untouched. This is the whole reason the snapshot is immutable.
+    body = Buffer.from('second version')
+    const [second] = await stagePresentFiles(api(), sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    assert.notEqual(second!.path, first!.path)
+    assert.notEqual(second!.hash, first!.hash)
+    assert.equal(second!.reused, false)
+    assert.equal(await readFile(first!.path, 'utf8'), 'first version')
+    assert.equal(await readFile(second!.path, 'utf8'), 'second version')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a batch that fails on its second file leaves nothing behind', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-batch-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    // `good.txt` exists and reads; `bad.txt` fails mid-transfer.
     const api = {
       pool: {
-        sftpStat: async () => ({ isDirectory: false, size: body.length }),
-        sftpRead: async () => body,
+        sftpAttrs: async (_h: unknown, _s: unknown, remotePath: string) => ({ type: 'file', size: remotePath.endsWith('good.txt') ? 4 : 3 }),
+        async *sftpReadChunks(_h: unknown, _s: unknown, remotePath: string) {
+          if (remotePath.endsWith('bad.txt')) throw new Error('connection reset')
+          yield Buffer.from('good')
+        },
       } as unknown as SshPool,
       hostOf: () => host,
       secretOf: async () => ({}),
       statusOf: async () => status,
       resolveMode: async () => 'read-only' as const,
     } satisfies ToolHost
-    const [first] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {})
-    body = Buffer.from('second version')
-    const [second] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {})
-    assert.equal(first!.path, second!.path)
-    // The event records only the path, so the card shows whatever sits there:
-    // the later delivery has to overwrite the earlier bytes.
-    assert.equal(await readFile(second!.path, 'utf8'), 'second version')
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'good.txt' }, { path: 'bad.txt' }], {}, { maxBytes: 0, cache }),
+      /connection reset/,
+    )
+    // No published snapshot, and no temp left behind: the batch is all-or-nothing.
+    const hashDirs = (await readdir(cache.root)).filter(name => /^[0-9a-f]{64}$/.test(name))
+    assert.deepEqual(hashDirs, [])
+    assert.deepEqual(await readdir(join(cache.root, '.tmp')), [])
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('fallback mode leaves no copy behind when a later file fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-fb-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const api = {
+      pool: {
+        sftpAttrs: async (_h: unknown, _s: unknown, p: string) => ({ type: 'file', size: 4 }),
+        sftpRead: async (_h: unknown, _s: unknown, p: string) => {
+          if (p.endsWith('bad.txt')) throw new Error('connection reset')
+          return Buffer.from('good')
+        },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    // No `cache`: the placeholder path, which used to be written inside the read
+    // loop. The first file must not survive a failure on the second.
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'good.txt' }, { path: 'bad.txt' }], {}),
+      /connection reset/,
+    )
+    assert.equal(existsSync(posix.join(mapping, 'good.txt')), false, 'a failed batch must not leave the first copy')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the delivery ceiling follows the setting, and a hard ceiling backs up "no limit"', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-ceiling-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const api = (size: number) => ({
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size }),
+        async *sftpReadChunks() { yield Buffer.from('hello') },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    }) satisfies ToolHost
+
+    // The setting is the limit, and it says so.
+    await assert.rejects(
+      () => stagePresentFiles(api(5), sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 4, cache }),
+      /over the 4 byte delivery limit/,
+    )
+    // `0` means "no limit" for a transfer, but a delivery still has a ceiling;
+    // the message says which one applied so the operator does not go looking at
+    // the transfer setting.
+    await assert.rejects(
+      () => stagePresentFiles(api(HARD_MAX_BYTES + 1), sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache }),
+      new RegExp(`over the ${HARD_MAX_BYTES} byte snapshot limit \\(the transfer setting asks for no limit\\)`),
+    )
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a setting that equals the hard ceiling is still reported as the setting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-edgeset-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const api = {
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: HARD_MAX_BYTES + 1 }),
+        async *sftpReadChunks() { yield Buffer.from('hello') },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    // Setting exactly at the ceiling: the operator picked this number, so the
+    // message must not claim a hard ceiling they did not set. Deriving the
+    // source from `limit === HARD_MAX_BYTES` would get this wrong.
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: HARD_MAX_BYTES, cache }),
+      new RegExp(`over the ${HARD_MAX_BYTES} byte delivery limit`),
+    )
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a setting above the ceiling is reported as a raised setting, not as "no limit"', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-raised-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const api = {
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: HARD_MAX_BYTES + 1 }),
+        async *sftpReadChunks() { yield Buffer.from('x') },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    // 300 MiB is not "no limit"; telling the operator their setting says
+    // "unlimited" when it says 300 MiB sends them to the wrong place.
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: HARD_MAX_BYTES * 2, cache }),
+      new RegExp(`over the ${HARD_MAX_BYTES} byte snapshot limit \\(the transfer setting asks for more`),
+    )
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a pool without sftpReadChunks still delivers, through sftpRead', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-fallback-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    // An older pool (and a few test doubles) has no chunked read.
+    const api = {
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: 5 }),
+        sftpRead: async () => Buffer.from('hello'),
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    const [entry] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    assert.equal(entry!.bytes, 5)
+    assert.equal(await readFile(entry!.path, 'utf8'), 'hello')
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an empty remote file is a valid delivery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-empty-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const api = {
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: 0 }),
+        // An empty file yields no chunk at all; the loop must still succeed.
+        async *sftpReadChunks() { /* nothing to yield */ },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    const [entry] = await stagePresentFiles(api, sessionRoute, [{ path: 'empty.txt' }], {}, { maxBytes: 0, cache })
+    assert.equal(entry!.bytes, 0)
+    assert.equal(entry!.hash, createHash('sha256').update('').digest('hex'))
+    assert.equal((await stat(entry!.path)).size, 0)
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('one remote file named twice is transferred once', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-dedupe-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    let reads = 0
+    const api = {
+      pool: {
+        sftpAttrs: async () => ({ type: 'file', size: 5 }),
+        async *sftpReadChunks() { reads += 1; yield Buffer.from('hello') },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+    // Two spellings of the same remote file: a relative path and the absolute
+    // one it resolves to. One transfer, two results in request order.
+    const staged = await stagePresentFiles(
+      api,
+      sessionRoute,
+      [{ path: 'report.txt' }, { path: '/srv/app/report.txt' }],
+      {},
+      { maxBytes: 0, cache },
+    )
+    assert.equal(reads, 1)
+    assert.equal(staged.length, 2)
+    assert.equal(staged[0]!.path, staged[1]!.path)
+    assert.equal(staged[1]!.remotePath, '/srv/app/report.txt')
   } finally {
     delete process.env.DSH_SSH_REMOTE_ROOT
     await rm(root, { recursive: true, force: true })

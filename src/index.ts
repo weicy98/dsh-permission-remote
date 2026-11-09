@@ -1,5 +1,5 @@
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import { isAbsolute, join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
@@ -25,11 +25,12 @@ import {
   throwIfAborted,
   withSignal,
   type RunnerStatus,
+  type StagedFile,
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
 import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
-import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, toModelPath, type RemoteRoute, type Route } from './router.ts'
+import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, isPresentCachePath, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, presentCacheRoot, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, toModelPath, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
 import { planRemoteRoot, runMigration, type MigrationReport, type MigrationStrategy } from './migrate.ts'
@@ -61,6 +62,7 @@ import { clearWorkerCache, ensureWorker } from './upstream-worker.ts'
 import { SshPool, type SecretMaterial } from './ssh-pool.ts'
 import { installRemoteFs, remoteFsInstalled } from './remote-fs.ts'
 import { installRemoteUploads } from './uploads.ts'
+import { openPresentCache, type PresentCache } from './present-cache.ts'
 import {
   createdWorkspaceTitle,
   hostTag,
@@ -408,6 +410,27 @@ export class Core {
   /** tool/call args for the approval-detail bridge, bounded and per session. */
   private readonly toolCalls = new Map<string, { filePath?: string, cwd?: string }>()
   private readonly sessionCwds = new Map<string, string>()
+  /**
+   * Delivery snapshots, opened for the root that was in force when they were
+   * last used.
+   *
+   * Deliberately not memoized for the life of the process. `remoteRoot()` moves
+   * when the operator changes the setting or migrates the tree, and a cache
+   * holds a root it resolved with `realpath` at open time, so the slot records
+   * the *lexical* `presentCacheRoot()` it was opened for — the one value that
+   * changes. Comparing that instead of the cache's own `.root` avoids ever
+   * matching a realpath against a lexical spelling.
+   */
+  private presentCacheSlot: { key: string, cache: PresentCache } | undefined
+  /**
+   * Routes already proven to survive the `present` round trip.
+   *
+   * The answer follows from the installed filesystem surface and the route's
+   * cwd, not from the file being delivered, so one probe per route is enough.
+   * Keyed by cache root as well: the proof stat's a file under that root, so a
+   * moved root needs its own.
+   */
+  private readonly presentRoundTrips = new Map<string, true>()
 
   constructor(
     private readonly ctx: HostContext,
@@ -551,6 +574,99 @@ export class Core {
   /** Ceiling and deadline for one ssh_upload / ssh_download; `0` means no limit. */
   transferLimits(): OpsTransferLimits {
     return { maxBytes: this.config.transferMaxBytes, timeoutMs: this.config.transferTimeoutMs }
+  }
+
+  /**
+   * The delivery snapshot cache for the root in force right now.
+   *
+   * `openPresentCache` creates the directory and resolves it through `realpath`,
+   * so it is not cheap and not a constant: the root changes when the operator
+   * edits the setting or the tree is migrated. The slot is re-opened whenever
+   * the lexical root no longer matches, which is exactly that change. A root
+   * that cannot be created is not an error; the caller stages at the
+   * placeholder path instead, which is the behaviour before snapshots existed.
+   */
+  presentCacheFor(): Promise<PresentCache | undefined> {
+    const key = presentCacheRoot()
+    const held = this.presentCacheSlot
+    if (held !== undefined && held.key === key) return Promise.resolve(held.cache)
+    return (async () => {
+      const cache = await openPresentCache()
+      this.presentCacheSlot = cache === undefined ? undefined : { key, cache }
+      return cache
+    })()
+  }
+
+  /**
+   * The cache a delivery should stage into, or `undefined` for placeholder mode.
+   *
+   * Snapshot mode is only used once the probe has proven that a file under the
+   * cache root survives the `present` round trip for this route. Without that
+   * proof the delivery would still be recorded, but every card would name a
+   * path the card cannot open — so the placeholder copy, which the previous
+   * behaviour proved readable, is the better answer. The warning is worth
+   * logging: it means the routing carve-out for snapshots is not working.
+   */
+  async presentDeliveryCache(route: RemoteRoute): Promise<PresentCache | undefined> {
+    const cache = await this.presentCacheFor()
+    if (cache === undefined) return undefined
+    if (await this.presentSnapshotRoundTrips(route, cache)) return cache
+    this.ctx.logger?.warn('[@dsh-permission-remote] present snapshots disabled: the delivery path does not resolve back to the snapshot, falling back to placeholders')
+    return undefined
+  }
+
+  /**
+   * Prove that a snapshot path can be recorded and read back.
+   *
+   * `present` calls `fs.lstat(path, { cwd })` and `fs.resolve(path, { cwd })`
+   * with the session's *remote* cwd, and the card later requires
+   * `processPath(resolve(processPathFromHostPath(path)))` to give the recorded
+   * string back. In a remote session every absolute path that is not already
+   * inside the host's placeholder tree is read as a path on the server, so the
+   * probe has to use that same cwd. Probing without one would resolve against
+   * this computer's filesystem and pass even when the remote patch translates
+   * the snapshot away — the delivery would then only fail later, in the card.
+   *
+   * The probe file lives under the cache's temp directory: it is already
+   * excluded from pruning, and its name is per-call so two deliveries racing do
+   * not share it. It is removed whatever the outcome.
+   */
+  async presentSnapshotRoundTrips(route: RemoteRoute, cache: PresentCache): Promise<boolean> {
+    const key = `${cache.root}\0${route.hostId}\0${route.placeholderCwd}`
+    if (this.presentRoundTrips.has(key)) return true
+    const probe = await this.presentProbe(route, cache)
+    if (probe) this.presentRoundTrips.set(key, true)
+    return probe
+  }
+
+  private async presentProbe(route: RemoteRoute, cache: PresentCache): Promise<boolean> {
+    const fs = this.ctx.get('fs') as Partial<PresentProbeFs> | undefined
+    // Checked before the write so a backend that cannot read the snapshot does
+    // not leave a probe file behind for nothing.
+    if (typeof fs?.lstat !== 'function' || typeof fs.resolve !== 'function' || typeof fs.processPath !== 'function') return false
+    let probe: string | undefined
+    try {
+      const started = await cache.createTemp()
+      probe = started.temp
+      try {
+        await started.handle.writeFile('probe')
+      } finally {
+        await started.handle.close()
+      }
+      const entry = await fs.lstat(probe, { cwd: route.placeholderCwd })
+      if (entry === undefined || entry.type !== 'file') return false
+      const target = await fs.resolve(probe, { cwd: route.placeholderCwd })
+      return resolveLocalPath(fs.processPath(target)) === resolveLocalPath(probe)
+    } catch {
+      // A throwing probe is a failed probe: the delivery still has the
+      // placeholder path to fall back to. A probe that could not even be written
+      // says the same thing about the cache, so it is one branch, not two.
+      return false
+    } finally {
+      // Removed however the probe went, including a failed write: the temp
+      // directory is pruned by age only, so a leak here would outlive the run.
+      if (probe !== undefined) await rm(probe, { force: true }).catch(() => undefined)
+    }
   }
 
   async trust(hostId: string, fingerprint: string): Promise<void> {
@@ -1687,6 +1803,13 @@ export async function runOfficialBash(
     const remote = resolved.kind === 'remote'
       ? resolved.remoteCwd
       : resolveRemotePath(args.workdir, route.remoteCwd, route.placeholderCwd)
+    // `args.workdir` is model-supplied and is mapped onto a placeholder below,
+    // so a snapshot path must be caught before that mapping: `mapRemoteToLocal`
+    // always builds `<root>/<hostId>/<encoded>`, which can never be a snapshot,
+    // and checking the mapped value would silently never match.
+    if (isPresentCachePath(args.workdir)) {
+      throw new Error(`refusing to run bash in ${args.workdir}: that path is a read-only delivery snapshot; open it from the card instead`)
+    }
     const placeholder = mapRemoteToLocal(route.hostId, remote)
     if (placeholder === null) throw new Error(`cannot map remote workdir ${remote} back to the SSH workspace placeholder`)
     return official({ ...args, workdir: placeholder }, exec)
@@ -1794,6 +1917,14 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   clearSupersededRoots()
   core.applyRemoteRootOverride()
   ctx.effect(() => ctx.on('settings/document-updated', ns => core.onSettingsUpdated(ns)))
+  // Expire delivery snapshots left by earlier runs. A card recorded before the
+  // last restart still names its file, so this must not run at unload — the
+  // snapshots outlive the plugin on purpose. It is fire-and-forget for the same
+  // reason: a slow or failing scan cannot delay the plugin load, and there is
+  // no caller to report to. `effect` would await a returned promise.
+  ctx.effect(() => {
+    void core.presentCacheFor().then(cache => cache?.prune()).catch(() => undefined)
+  })
   const api = new SshApi(rawCtx, core)
   const unregisters = new Set<() => void>()
   let fsPatchReady = false
@@ -1815,6 +1946,8 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     // Delivery copies live in the placeholder tree and a card may still name
     // them, so this is the only safe moment to remove them. The disposer is
     // async so Cordis waits for the files to disappear before the pool closes.
+    // Snapshots are not affected: they are content addressed and pruned by age,
+    // so a card recorded before the unload keeps opening after a reload.
     await clearStagedPresentFiles()
     clearWorkerCache()
     // Also drop the process-wide spill directory when it is empty; directories
@@ -2083,21 +2216,25 @@ function commitRemoteWorkingDirectory(
  * `present` is not a filesystem tool that can be reimplemented remotely: DSH
  * checks `fs.lstat`/`fs.stat` for each path and then records an event the card
  * opens through the same local filesystem. Both run on this computer, so a
- * remote session's delivery has to leave a real file at a local path. The
- * placeholder path is exactly that: the local backend can `stat` it and the
- * card can open it.
+ * remote session's delivery has to leave a real file at a local path.
  *
- * The copies are written first, then the official tool runs with the staged
- * placeholder paths. Substituting them, rather than replaying the model's
- * spelling, is what makes every accepted form work: a relative path, a
- * placeholder path, and a real remote absolute path (`/home/me/out.pdf`,
- * which bash can also use) are three spellings of one remote file. One failed
- * copy refuses the whole call, so a partial delivery never reaches the log.
+ * The copies land in the content-addressed snapshot cache, then the official
+ * tool runs with those snapshot paths. Substituting them, rather than replaying
+ * the model's spelling, is what makes every accepted form work: a relative
+ * path, a placeholder path, and a real remote absolute path
+ * (`/home/me/out.pdf`, which bash can also use) are three spellings of one
+ * remote file. One failed copy refuses the whole call, so a partial delivery
+ * never reaches the log.
  *
- * The one behaviour that is not the official one: this rewrites the placeholder
- * copy on every delivery. The event stores only the path, so the card shows
- * whatever is there now — rewriting keeps a second delivery of an updated file
- * showing current content instead of the first version.
+ * A snapshot is immutable, so a second delivery of changed content lands at a
+ * new path instead of rewriting the bytes an older card still points at. The
+ * event therefore keeps the snapshot path — and the model still gets the
+ * placeholder spelling it works in, which is why the result is copied
+ * before its paths are rewritten (see {@link presentResultForModel}).
+ *
+ * When the snapshot path cannot be proven to survive that round trip, staging
+ * falls back to the placeholder path with the previous behaviour,
+ * rewriting on every delivery.
  */
 async function runPresent(
   official: ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined,
@@ -2105,6 +2242,7 @@ async function runPresent(
   route: RemoteRoute,
   args: Record<string, unknown>,
   exec: ToolExec,
+  core: Core,
 ): Promise<unknown> {
   if (official === undefined) throw new Error('dsh-permission-remote: present is not mounted in this session')
   const requested = Array.isArray(args.files) ? args.files : []
@@ -2116,17 +2254,64 @@ async function runPresent(
     if (typeof record.path !== 'string') throw new FsError('Cannot present a file: each entry needs a string path', 'FS_NOT_FOUND')
     return { path: record.path }
   })
-  const staged = await stagePresentFiles(host, route, files, exec)
+  const cache = await core.presentDeliveryCache(route)
+  const staged = await stagePresentFiles(host, route, files, exec, {
+    maxBytes: core.transferLimits().maxBytes,
+    cache,
+  })
   // Replace each path with the staged one and keep every other field, so a
   // description survives. The lists always line up: staging returns one entry
   // per requested file or throws.
   const presented = requested.map((file, index) => ({ ...(file as Record<string, unknown>), path: staged[index]!.path }))
-  return official({ ...args, files: presented }, exec)
+  const result = await official({ ...args, files: presented }, exec)
+  if (cache !== undefined) {
+    // Expiry is a background concern: a delivery that succeeded must not wait
+    // on a directory scan, and a scan that fails changes nothing the caller sees.
+    void cache.prune().catch(() => undefined)
+  }
+  return presentResultForModel(result, staged, route)
+}
+
+/**
+ * Hand the model the placeholder spelling while the event keeps the snapshot path.
+ *
+ * The official tool stores the exact `files` array it returns in its own
+ * `pending` map and later emits that same array as `deliverables/presented`.
+ * Rewriting `path` in place would rewrite the event too, so the card would name
+ * a placeholder the remote filesystem cannot open — the delivery would be
+ * recorded and then fail to open. Copy the record and the entries first.
+ *
+ * `toModelPath` is the same spelling the other remote file tools return, so one
+ * remote file has one path whichever tool named it.
+ */
+function presentResultForModel(result: unknown, staged: readonly StagedFile[], route: RemoteRoute): unknown {
+  if (typeof result !== 'object' || result === null) return result
+  const record = result as Record<string, unknown>
+  if (!Array.isArray(record.files)) return result
+  const files = record.files.map((file, index) => {
+    if (typeof file !== 'object' || file === null) return file
+    const entry = file as Record<string, unknown>
+    const remote = staged[index]?.remotePath
+    if (typeof remote !== 'string') return { ...entry }
+    return { ...entry, path: toModelPath(remote, route) }
+  })
+  return { ...record, files }
 }
 
 interface CanonicalFs {
   resolve(path: string, opts?: { cwd?: string, signal?: AbortSignal }): Promise<unknown>
   processPath(target: unknown): string
+}
+
+/**
+ * The subset of the filesystem service a delivery probe needs.
+ *
+ * `lstat` is what `present` uses to refuse a non-file, and it takes the cwd:
+ * the remote patch decides from that cwd whether a path is the local copy or a
+ * path on the server. The probe cannot prove anything without it.
+ */
+interface PresentProbeFs extends CanonicalFs {
+  lstat(path: string, opts?: { cwd?: string, signal?: AbortSignal }): Promise<{ type?: string } | undefined>
 }
 
 function canonicalFs(ctx: HostContext): CanonicalFs | undefined {
@@ -2156,6 +2341,11 @@ async function assertLocalWorkingDirectory(
   const requested = typeof args.cd === 'string' ? args.cd.trim() : ''
   if (requested.length === 0 || current === undefined) return
   const lexical = resolveLocalPath(current, requested)
+  // A snapshot is a real local directory, so routing alone would accept it and
+  // the session would silently leave the remote workspace for a read-only tree.
+  if (isPresentCachePath(lexical)) {
+    throw new Error('refusing to change directory: that path is a read-only delivery snapshot; open it from the card instead')
+  }
   if (fs === undefined) {
     const lexicalRoute = routeByCwd(lexical)
     if (lexicalRoute.kind === 'remote') {
@@ -2261,7 +2451,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           if (plan.name === 'glob' || plan.name === 'grep') {
             return runOfficialSearch(official as (value: unknown, execution: ToolExec) => Promise<unknown> | unknown, current, record, exec)
           }
-          if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec)
+          if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec, core)
           if (plan.name === 'str_replace_editor') return runRemoteStrReplaceEditor(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
           return RUNNERS[plan.name as 'bash' | 'terminal_open'](host, current, record, exec, ctx)
         },
