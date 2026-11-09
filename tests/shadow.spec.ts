@@ -53,8 +53,8 @@ test('present is routed so a remote session can deliver a file', () => {
 test('official read, write, edit and apply_patch tools stay outside the shadow plan', () => {
   const plans = planShadows(name => ({ execute: async () => name }))
   const names = plans.map(plan => String(plan.name))
-  // str_replace_editor is the exception: its official resolveTarget omits cwd,
-  // so a thin path-rewriting shadow is required (see shell-install.spec.ts).
+  // Adding a name here means the official function has no cwd seam. Say which
+  // seam is missing in src/shadow.ts. read_image is served by ctx.fs.readBytes.
   assert.deepEqual(names, ['bash', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'])
-  assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit' || name === 'apply_patch'), false)
+  assert.equal(names.some(name => name === 'read' || name === 'write' || name === 'edit' || name === 'apply_patch' || name === 'read_image'), false)
 })

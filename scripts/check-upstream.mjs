@@ -14,6 +14,7 @@
  * The module exports `run()` and only executes when invoked as the entry
  * point, so tests can drive it without spawning a process.
  */
+import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
 import { clearOverlayManifest, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, CHECK_UPSTREAM_FLAGS, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, unknownFlagLines, unknownFlags, usage, withDshRoot } from './cli-common.mjs'
 
@@ -101,30 +102,48 @@ function runCheck(options, env) {
     return { code: 0 }
   }
 
+  // Sandbox is probed before the worker locator returns, so a worker failure
+  // cannot hide a sandbox failure from `--explain`.
+  const sandbox = assertSandboxProfilesLoad(env)
   let worker
   try {
     worker = locateUpstreamWorker(env, { allowUnverified: true })
   } catch (failure) {
     error(`check:upstream: ${failure instanceof Error ? failure.message : String(failure)}`)
-    // `locateUpstreamWorker()` throws on any probe failure, so this is the only
-    // reachable place where a probe's guide rows can be printed. Re-read the
-    // worker sources and ask `probeContract()` directly for the failures.
+    // `locateUpstreamWorker()` throws on any probe failure. Re-read the worker
+    // sources and ask `probeContract()` directly for the failures, then print
+    // the sandbox rows collected before this throw.
     if (explain) {
       const failures = probeFailures(env)
+      error('check:upstream: what changed and where to fix it')
       if (failures !== undefined && failures.length > 0) {
-        error('check:upstream: what changed and where to fix it')
         for (const failure of failures) renderFailureGuide(failure, error)
       } else {
         error('check:upstream: the worker could not be located; fix the DSH install before asking for guide rows')
       }
+      for (const failure of sandbox.failures) renderFailureGuide(failure, error)
     } else {
       error('check:upstream: rerun with --explain for the file and function behind each failure')
+      if (sandbox.failures.length > 0) {
+        error(`check:upstream: sandbox profile contract failed: ${sandbox.failures.join('; ')}`)
+      }
     }
     return { code: 1 }
   }
 
   const probes = probeContract(worker)
   const entry = manifestEntryFor(worker)
+  if (sandbox.failures.length > 0) {
+    error(`check:upstream: sandbox profile contract failed: ${sandbox.failures.join('; ')}`)
+    if (explain) {
+      error('check:upstream: what changed and where to fix it')
+      for (const failure of sandbox.failures) renderFailureGuide(failure, error)
+    } else {
+      error('check:upstream: rerun with --explain for the file and function behind each failure')
+    }
+    return { code: 1 }
+  }
+  log(`check:upstream: sandbox profile sha256 ${sandbox.profileSha256}`)
 
   if (update && dryRun) {
     const target = adapt ? overlayManifestPath(env) : 'vendor/upstream/ptc-worker.manifest.json'

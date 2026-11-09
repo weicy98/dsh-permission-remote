@@ -18,6 +18,7 @@
  * "nothing ran", so a run that reports `tests 0` is a `2`, never a `0`.
  */
 import { spawnSync } from 'node:child_process'
+import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
 import { clearOverlayManifest, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, readOverlayManifest, readWorkerManifest, writeOverlayManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, UPGRADE_FLAGS, unknownFlagLines, unknownFlags, withDshRoot } from './cli-common.mjs'
 
@@ -167,8 +168,10 @@ function runGate(options, env) {
     return { code: 2 }
   }
 
-  // [1/4] locate + probe
+  // [1/4] locate + probe. Sandbox runs on `--dry-run` and `--ptc-only` too;
+  // the PTC subset does not include the profile contract tests.
   log('upgrade:ptc: [1/4] locate the host worker and probe its contract')
+  const sandbox = assertSandboxProfilesLoad(env)
   let worker
   try {
     worker = locateUpstreamWorker(env, { allowUnverified: true })
@@ -182,16 +185,25 @@ function runGate(options, env) {
     // `probeContract().failures` get rows; anything else gets the raw error
     // plus a pointer to the command that can explain it.
     const failures = probeFailures(env)
+    error('upgrade:ptc: what changed and where to fix it')
     if (failures !== undefined && failures.length > 0) {
-      error('upgrade:ptc: what changed and where to fix it')
       for (const failure of failures) renderFailureGuide(failure, error)
     } else {
       error('upgrade:ptc: rerun `npm run check:upstream -- --explain` for the file and function behind this failure')
     }
+    for (const failure of sandbox.failures) renderFailureGuide(failure, error)
+    return { code: 1 }
+  }
+  if (sandbox.failures.length > 0) {
+    error(`upgrade:ptc: sandbox profile contract failed: ${sandbox.failures.join('; ')}`)
+    error('upgrade:ptc: what changed and where to fix it')
+    for (const failure of sandbox.failures) renderFailureGuide(failure, error)
+    error('upgrade:ptc: nothing was written')
     return { code: 1 }
   }
   const entry = manifestEntryFor(worker)
   log(`upgrade:ptc: host worker DSH ${entry.dshVersion} / runtime ${entry.ptcRuntimeNodeVersion}, all probes passed`)
+  log(`upgrade:ptc: sandbox profile sha256 ${sandbox.profileSha256}`)
 
   if (dryRun) {
     log(`upgrade:ptc: --dry-run stops here. Would record into ${overlayManifestPath(env)}`)

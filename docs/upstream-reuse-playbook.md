@@ -75,6 +75,61 @@ probe/adapter or refuse remote execution in `docs/upstream-ptc-worker.md`.
 | `working_directory` shadow | `@deepseek-ai/dsh-tool-working-directory` | Keep only remote validation; the official service commit does the work. |
 | `present` staging | `@deepseek-ai/dsh-tool-present` | Cannot be replaced: the official card opens a local path, so staging is required. |
 | `terminal_open` / sidebar PTY | `@deepseek-ai/dsh-tool-terminal` / `dsh-terminal-bash` | Separate remote `spawnTerminal`/TerminalBackend work; not the PTC seam. |
+| bash / PTC confinement argv | `@deepseek-ai/dsh-sandbox-local` profile region | Constructors are not exported. `src/profile-contract.ts` extracts them, calls them, and refuses a different argv. The file-write profile reuses the official read-only bwrap base, then bind-mounts the remote temp dirs. |
+
+## Sandbox profile contract
+
+`bwrapProfileArgs` and `seatbeltProfileArgs` live inside the installed
+`dsh-sandbox-local` bundle and are not part of its public export. Remote bash
+and PTC call those functions. The file-write profile does not: it needs the
+real remote temp directories to stay on disk, so it reuses only the official
+read-only bwrap base and then adds its own binds.
+
+This extractor is a bridge. The installed package publishes
+`lib/types/profiles.d.ts`, which declares `bwrapProfileArgs` and
+`seatbeltProfileArgs` under `@module @deepseek-ai/dsh-sandbox-local/profiles`,
+and the package `exports` map has no `./profiles` JavaScript entry. When that
+subpath exists, call it and delete the region extractor. Until then,
+`engines.dsh` (`>=0.2.2-rc.1 <0.3.0`) is the intended window, and the probe is
+the real constraint: a bundle that drops the `lib/types/profiles.js` region
+comment, or that returns a different argv, refuses remote confinement.
+`@deepseek-ai/dsh-sandbox-local` is read from that DSH install. It is not a
+`peerDependency`: the plugin does not import it, and listing it would make
+`npm ci` fetch a second copy.
+
+`npm run check:upstream` calls the constructors with sentinel roots and
+requires that argv. It also calls `workspaceWritableRoots` and `writableRoots`
+with inert `canonicalPath` / `additionalRoot` / `tmpdir` hooks, so a comment
+that still spells the old calls does not keep the old meaning. It prints
+`sandbox profile sha256`. The hash is a diagnostic: it is not compared, and it
+is not a second manifest. A source edit that leaves the literals the shape
+probes check unchanged, and that still returns the accepted argv and helper
+lists, stays usable. Rewording one of those literals fails the shape probe
+before the calls run. A different argv fails the gate before a remote command,
+including when the source still mentions the old flags. The sandbox probe runs even when the worker locator fails, and
+`upgrade:ptc` runs it on `--dry-run` and `--ptc-only` as well. Every load reads
+the installed files again. The command does not fall back to a copied argv.
+
+The injected root helpers keep remote paths as spelled. Official
+`workspaceWritableRoots` / `writableRoots` realpath on this computer, so they
+must not be called on a remote path. `fileWritableRoots` in `src/profile.ts`
+is the remote translation of `writableRoots`.
+
+| Probe failure | Change |
+| --- | --- |
+| `sandbox profile package could not be read` | Install a complete DSH, or set `DSH_INSTALL_ROOT`. `src/profile-contract.ts` `locateSources` |
+| `sandbox profile region markers changed` | `src/profile-contract.ts` `extractProfileRegion` |
+| `bwrapProfileArgs function not found` | `src/profile-contract.ts` `extractFunction` |
+| `bwrap base flags changed` | `src/profile-contract.ts` `bwrapBaseIntact`, then `src/profile.ts` if the file-write base must diverge |
+| `bwrap workspace-write no longer mounts a private /tmp` | `src/profile-contract.ts` `bwrapPrivateTmp`, then `src/profile.ts` |
+| `bwrap workspace binds no longer come from workspaceWritableRoots` | `src/profile-contract.ts` `bwrapUsesWorkspaceRoots` and `remoteWorkspaceRoots` |
+| `seatbelt profile skeleton changed` | `src/profile-contract.ts` `seatbeltSkeleton` |
+| `seatbelt grants no longer come from writableRoots` | `src/profile-contract.ts` `seatbeltUsesWritableRoots` and `remoteWritableRoots` |
+| `workspaceWritableRoots no longer means the workspace plus explicit extra directories` | `src/profile-contract.ts` `workspaceRootsMeanWorkspace` and `remoteWorkspaceRoots` |
+| `writableRoots no longer adds the host temp directories on top of the workspace` | `src/profile-contract.ts` `writableRootsMeanTemp`, then `src/profile.ts` `fileWritableRoots` |
+| `sandbox root helpers did not return the accepted directories` | `src/profile-contract.ts` `acceptedRootHelpers`, then `remoteWorkspaceRoots` |
+| `sandbox profile argv does not match the accepted contract` | `src/profile-contract.ts` `acceptedProfileArgv`, then `src/profile.ts` when the file-write base must follow |
+| `sandbox profile constructors did not evaluate` | `src/profile-contract.ts` `compileProfiles` |
 
 Do **not** replace `remote-fs.ts`, `remote-write.ts`, `ssh-pool.ts`, `uploads.ts`,
 `ops.ts`, `login-env.ts`, or `rg-fetch.ts`: they are remote transport or

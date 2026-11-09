@@ -190,6 +190,7 @@ test('--check against the installed host is green', () => {
   const h = harness(['--check'])
   try {
     assert.equal(h.outcome().code, 0)
+    assert.match(h.lines.join('\n'), /check:upstream: sandbox profile sha256 [0-9a-f]{64}/u)
     assert.match(h.lines.join('\n'), /check:upstream: OK/u)
   } finally {
     h.restore()
@@ -237,9 +238,10 @@ test('drift advice splits between an installed package and a source checkout', a
   const copy = mkdtempSync(join(tmpdir(), 'dsh-drift-'))
   const previousRoot = process.env.DSH_INSTALL_ROOT
   try {
-    // Copy only the three files the locator reads, not the whole install.
+    // Copy only the packages the locator reads, not the whole install.
+    // The sandbox profile probe reads the two sandbox bundles as well.
     const dshRoot = join(copy, 'dsh')
-    const packages = ['dsh-ptc-runtime-node', 'dsh-subprocess']
+    const packages = ['dsh-ptc-runtime-node', 'dsh-subprocess', 'dsh-sandbox-local', 'dsh-sandbox']
     mkdirSync(dshRoot, { recursive: true })
     writeFileSync(join(dshRoot, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.2' }))
     for (const name of packages) {

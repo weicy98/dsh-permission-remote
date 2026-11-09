@@ -10,6 +10,14 @@
  * `ctx.fs.resolve(path, { signal })` without a cwd, so a remote real absolute
  * path would fall through to the local provider. Its shadow only rewrites
  * `args.path` and delegates to the official execute; the schema stays official.
+ *
+ * A name belongs in `ROUTED_TOOLS` when the official function cannot see the
+ * session cwd, or when a path argument is a different spelling from that cwd.
+ * `read` / `write` / `edit` / `apply_patch` / `read_image` go through `ctx.fs`
+ * and stay off this list. `bash`, `glob`, and `grep` stay because a path
+ * argument is a different spelling from the routing key. `working_directory`
+ * only validates, then the official service commits. `present` stages bytes
+ * for a local card. `terminal_open` refuses.
  */
 
 export const ROUTED_TOOLS = ['bash', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'] as const

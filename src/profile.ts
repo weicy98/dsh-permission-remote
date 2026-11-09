@@ -1,14 +1,18 @@
 /**
- * Remote confinement argv copied from @deepseek-ai/dsh-sandbox-local.
+ * Remote confinement argv.
  *
- * bwrapProfileArgs and seatbeltProfileArgs are internal to that package
- * (not re-exported from its public entry). The spellings below match
- * lib/index.js of dsh 0.2.1-rc.3.
+ * Bash and PTC profiles call the installed `@deepseek-ai/dsh-sandbox-local`
+ * constructors (`profile-contract.ts`). Those functions are not exported. A
+ * shape-literal change or a different argv refuses the command instead of
+ * running a copied argv.
  *
- * Bash and file writes do not share a temp root: bash workspace-write mounts
- * a private tmpfs on /tmp, while file tools may write the real remote temp dirs.
+ * File writes do not share that temp root. Their bwrap base is the official
+ * read-only profile; workspace-write then bind-mounts the real remote temp
+ * directories so a write is still on disk after bwrap exits. Bash keeps the
+ * official private tmpfs on `/tmp`.
  */
 
+import { loadSandboxProfiles } from './profile-contract.ts'
 import { shJoin } from './shell-quote.ts'
 
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
@@ -22,40 +26,27 @@ export interface RemoteFileRoots {
   readonly userTmp: string
 }
 
-/** bwrap arguments before the `--` separator. danger-full-access does not wrap. */
+/** Official bwrap arguments before `--`. danger-full-access does not wrap. */
 export function bwrapProfileArgs(mode: SandboxMode, workspaceRoot: string): string[] | null {
   if (mode === 'danger-full-access') return null
-  const args = bwrapBaseArgs()
-  if (mode === 'workspace-write') {
-    args.push('--tmpfs', '/tmp', '--bind', workspaceRoot, workspaceRoot)
-  }
-  return args
+  return loadSandboxProfiles().bwrap({ mode, workspaceRoot })
 }
 
 /**
- * File-tool bwrap profile. workspace-write bind-mounts the real workspace,
- * `/tmp`, and user temp. It does not mount a private tmpfs, so a write the
- * policy allows is still on the remote disk after bwrap exits.
- * Shorter roots are mounted first; a later mount of a longer path stays visible.
+ * File-tool bwrap profile. The base flags are the official read-only profile.
+ * workspace-write bind-mounts the real workspace, `/tmp`, and user temp, and
+ * does not mount a private tmpfs, so a write the policy allows is still on
+ * the remote disk after bwrap exits. Shorter roots are mounted first; a later
+ * mount of a longer path stays visible.
  */
 export function bwrapFileProfileArgs(mode: SandboxMode, roots: RemoteFileRoots): string[] | null {
   if (mode === 'danger-full-access') return null
-  const args = bwrapBaseArgs()
+  const args = [...loadSandboxProfiles().bwrap({ mode: 'read-only', workspaceRoot: roots.workspaceRoot })]
   if (mode === 'workspace-write') {
     const binds = fileWritableRoots(mode, roots).slice().sort((left, right) => left.length - right.length || left.localeCompare(right))
     for (const root of binds) args.push('--bind', root, root)
   }
   return args
-}
-
-function bwrapBaseArgs(): string[] {
-  return [
-    '--ro-bind', '/', '/',
-    '--dev', '/dev',
-    '--unshare-pid',
-    '--proc', '/proc',
-    '--die-with-parent',
-  ]
 }
 
 /** `cd` happens before `sandbox-exec`, which inherits the calling process directory. */
@@ -70,30 +61,25 @@ export function bwrapProbeArgv(): string[] {
 }
 
 /**
- * Seatbelt arguments before `--`. Writable roots are the remote-probed set,
- * not writableRoots() from the harness host.
+ * Official seatbelt arguments before `--`.
+ *
+ * `roots` is the remote-probed grant list. The constructor would otherwise
+ * call `writableRoots()` and grant this computer's temp directories.
+ * read-only passes no roots. The workspace root then stays empty: falling
+ * back to `/` would grant the whole filesystem if upstream starts reading
+ * `policy.workspaceRoot`.
  */
 export function seatbeltProfileArgs(mode: SandboxMode, roots: readonly string[]): string[] | null {
   if (mode === 'danger-full-access') return null
-  const forms = [
-    '(version 1)',
-    '(allow default)',
-    '(deny file-write*)',
-    '(allow file-write* (literal "/dev/null"))',
-  ]
-  if (mode === 'workspace-write' && roots.length > 0) {
-    const grants = roots.map(root => `(subpath ${sbplString(root)})`).join(' ')
-    forms.push(`(allow file-write* ${grants})`)
-  }
-  return ['-p', forms.join(' ')]
+  return loadSandboxProfiles().seatbelt({
+    mode,
+    workspaceRoot: roots.find(root => root.length > 0) ?? '',
+    remoteWritableRoots: roots,
+  })
 }
 
 export function seatbeltProbeArgv(): string[] {
   return ['sandbox-exec', ...seatbeltProfileArgs('read-only', [])!, '--', 'true']
-}
-
-function sbplString(value: string): string {
-  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
 /**

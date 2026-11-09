@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { probeInstalledSandboxProfiles } from '../src/profile-contract.ts'
 import { atomicWriteScript, bwrapFileProfileArgs, bwrapProbeArgv, bwrapProfileArgs, fileWriteAllowed, seatbeltBashCommand, seatbeltProbeArgv } from '../src/profile.ts'
 
-test('read-only bwrap profile matches the official argv', () => {
+const REQUIRE_PROFILE = process.env.DSH_REQUIRE_OFFICIAL_TOOLS === '1'
+const profileProbe = probeInstalledSandboxProfiles()
+const profileMissing = profileProbe.failures.length > 0
+  && profileProbe.failures.every(failure => failure.startsWith('sandbox profile package could not be read'))
+if (profileProbe.failures.length > 0 && (!profileMissing || REQUIRE_PROFILE)) {
+  throw new Error(profileProbe.failures.join('; '))
+}
+const profileSkip: string | false = profileMissing ? profileProbe.failures.join('; ') : false
+
+test('read-only bwrap profile matches the official argv', { skip: profileSkip }, () => {
   assert.deepEqual(bwrapProfileArgs('read-only', '/srv/app'), [
     '--ro-bind', '/', '/',
     '--dev', '/dev',
@@ -22,18 +33,27 @@ test('read-only bwrap profile matches the official argv', () => {
   ])
 })
 
-test('workspace-write adds a private /tmp and binds the remote workspace', () => {
+test('workspace-write adds a private /tmp and binds the remote workspace', { skip: profileSkip }, () => {
   const args = bwrapProfileArgs('workspace-write', '/srv/app')
   assert.ok(args)
   assert.deepEqual(args!.slice(-5), ['--tmpfs', '/tmp', '--bind', '/srv/app', '/srv/app'])
   assert.equal(bwrapProfileArgs('danger-full-access', '/srv/app'), null)
 })
 
-test('seatbelt probe runs true under the read-only profile', () => {
+test('seatbelt probe runs true under the read-only profile', { skip: profileSkip }, () => {
   const argv = seatbeltProbeArgv()
   assert.equal(argv[0], 'sandbox-exec')
   assert.equal(argv.at(-1), 'true')
   assert.match(argv[2] ?? '', /deny file-write\*/)
+})
+
+test('read-only seatbelt does not substitute the filesystem root', () => {
+  const source = readFileSync(new URL('../src/profile.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('export function seatbeltProfileArgs')
+  const end = source.indexOf('export function seatbeltProbeArgv')
+  assert.notEqual(start, -1)
+  assert.ok(end > start)
+  assert.doesNotMatch(source.slice(start, end), /\?\?\s*'\/'/u)
 })
 
 test('file writes use the remote temp roots, not the harness host temp', () => {
@@ -46,19 +66,20 @@ test('file writes use the remote temp roots, not the harness host temp', () => {
   assert.equal(fileWriteAllowed('danger-full-access', '/etc/passwd', roots), true)
 })
 
-test('file writes bind the real temp directories and skip the private tmpfs', () => {
+test('file writes bind the real temp directories and skip the private tmpfs', { skip: profileSkip }, () => {
   const args = bwrapFileProfileArgs('workspace-write', {
     workspaceRoot: '/tmp/proj',
     tmp: '/tmp',
     userTmp: '/var/tmp',
   })
   assert.ok(args)
+  assert.equal(args![0], '--ro-bind')
   assert.equal(args!.includes('--tmpfs'), false)
   assert.ok(args!.indexOf('/tmp') < args!.lastIndexOf('/tmp/proj'))
   assert.equal(args!.filter(arg => arg === '/var/tmp').length, 2)
 })
 
-test('a missing temp root is not a bwrap bind source', () => {
+test('a missing temp root is not a bwrap bind source', { skip: profileSkip }, () => {
   const roots = { workspaceRoot: '/srv/app', tmp: '', userTmp: '' }
   const args = bwrapFileProfileArgs('workspace-write', roots)
   assert.ok(args)
@@ -69,7 +90,7 @@ test('a missing temp root is not a bwrap bind source', () => {
   assert.equal(fileWriteAllowed('workspace-write', '/tmp/x', roots), false)
 })
 
-test('seatbelt bash enters the workdir before sandbox-exec', () => {
+test('seatbelt bash enters the workdir before sandbox-exec', { skip: profileSkip }, () => {
   const line = seatbeltBashCommand('workspace-write', ['/srv/app', '/private/tmp'], '/srv/app/src', 'pwd')
   assert.match(line, /^cd '\/srv\/app\/src' && 'sandbox-exec' /)
   assert.match(line, /'bash' '-c' 'pwd'/)

@@ -712,6 +712,7 @@ test('--explain shows guide rows for real probe failures, not a dead branch', ()
       assert.match(text, /\[entry\]/u)
       assert.match(text, /\[control-fd\]/u)
       assert.match(text, /\[spawn-control\]/u)
+      assert.match(text, /\[sandbox-package\]/u)
     })
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -729,6 +730,7 @@ test('upgrade prints one guide row per probe failure, never one for the combined
       assert.match(text, /\[entry\]/u)
       assert.match(text, /\[imports\]/u)
       assert.match(text, /\[spawn-control\]/u)
+      assert.match(text, /\[sandbox-package\]/u)
       assert.doesNotMatch(text, /no guide row matches/u)
     })
   } finally {

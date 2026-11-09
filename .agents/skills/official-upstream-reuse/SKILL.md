@@ -35,6 +35,14 @@ fall back to a plugin-authored implementation.
 - Keep the official tool definition and patch the execution seams beneath it:
   `ctx.fs`, `ctx.sandbox.confine`, `ctx.subprocess.spawn`,
   `ctx.subprocess.resolveExecutable`, and `ctx.workingDirectory`.
+- Bash and PTC confinement argv calls the installed `dsh-sandbox-local`
+  constructors. They are not a public JavaScript export (`lib/types/profiles.d.ts`
+  declares them; `exports` has no `./profiles`). `src/profile-contract.ts` is the
+  bridge: it extracts the region, calls the constructors with sentinel roots,
+  and calls the official root helpers with inert path hooks. A failed probe
+  refuses the command. Every load reads the installed files again. Do not copy
+  the argv back into the plugin. The file-write profile reuses the official
+  read-only bwrap base and then bind-mounts the remote temp directories.
 - A generic remote world must implement the full `SubprocessSpawnSpec`:
   `stdin: ignore|pipe|{data}`, `stdout/stderr: pipe|collect{maxBytes,spill}`,
   `collected` readers, `control`, `signal`, `graceMs`, `terminate`,

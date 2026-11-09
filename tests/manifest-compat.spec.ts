@@ -37,7 +37,8 @@ test('engines.dsh accepts the tested DSH line and rejects the next major', () =>
 
 test('every DSH peer dependency is a range, not a one-release pin', () => {
   const peers = Object.entries(manifest.peerDependencies).filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
-  // The nine packages this plugin imports at runtime.
+  // The nine packages this plugin imports at runtime. dsh-sandbox-local is
+  // read from the DSH install and is intentionally not a peer.
   assert.equal(peers.length, 9)
   for (const [name, range] of peers) {
     assert.equal(semver.valid(range), null, `${name} pins one release: ${range}`)

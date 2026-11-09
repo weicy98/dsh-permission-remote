@@ -150,6 +150,41 @@ pass rather than an exit code.
 | `bootstrapArgs no longer maps process.js through fs.processPathFromHostPath` | The upload swap lost its hook | `src/remote-world.ts` `installWorkerPathMap` |
 | `subprocess.spawn no longer requests a control pipe` | The remote spawn seam stopped taking over | `src/remote-world.ts` `installRemoteWorld` |
 
+## Sandbox profile contract
+
+Remote bash and PTC call the installed `bwrapProfileArgs` and
+`seatbeltProfileArgs`. Those functions are not a public JavaScript export.
+`src/profile-contract.ts` reads the installed bundle, calls the constructors,
+and calls the official root helpers with inert path hooks. `npm run check:upstream`
+runs this contract beside the worker probe. A worker locate error does not hide
+a sandbox failure: `--explain` prints both. `npm run upgrade:ptc` runs the same
+sandbox probe on `--dry-run` and `--ptc-only`, because the PTC subset does not
+include the profile tests.
+
+This is a bridge. `lib/types/profiles.d.ts` already declares the two functions.
+When `@deepseek-ai/dsh-sandbox-local` exports `./profiles`, call that entry and
+delete the extractor. `engines.dsh` names the intended window; the probe is what
+accepts a bundle. A missing region comment or a different argv refuses remote
+confinement, including `danger-full-access`, because `probeHost` builds the
+read-only bwrap argv before the session mode is applied. File reads do not use
+that probe.
+
+| Probe failure | Change |
+| --- | --- |
+| `sandbox profile package could not be read` | Install a complete DSH, or set `DSH_INSTALL_ROOT`. `src/profile-contract.ts` `locateSources` |
+| `sandbox profile region markers changed` | `src/profile-contract.ts` `extractProfileRegion` |
+| `bwrapProfileArgs function not found` | `src/profile-contract.ts` `extractFunction` |
+| `bwrap base flags changed` | `src/profile-contract.ts` `bwrapBaseIntact`, then `src/profile.ts` if the file-write base must diverge |
+| `bwrap workspace-write no longer mounts a private /tmp` | `src/profile-contract.ts` `bwrapPrivateTmp`, then `src/profile.ts` |
+| `bwrap workspace binds no longer come from workspaceWritableRoots` | `src/profile-contract.ts` `bwrapUsesWorkspaceRoots` and `remoteWorkspaceRoots` |
+| `seatbelt profile skeleton changed` | `src/profile-contract.ts` `seatbeltSkeleton` |
+| `seatbelt grants no longer come from writableRoots` | `src/profile-contract.ts` `seatbeltUsesWritableRoots` and `remoteWritableRoots` |
+| `workspaceWritableRoots no longer means the workspace plus explicit extra directories` | `src/profile-contract.ts` `workspaceRootsMeanWorkspace` and `remoteWorkspaceRoots` |
+| `writableRoots no longer adds the host temp directories on top of the workspace` | `src/profile-contract.ts` `writableRootsMeanTemp`, then `src/profile.ts` `fileWritableRoots` |
+| `sandbox root helpers did not return the accepted directories` | `src/profile-contract.ts` `acceptedRootHelpers`, then `remoteWorkspaceRoots` |
+| `sandbox profile argv does not match the accepted contract` | `src/profile-contract.ts` `acceptedProfileArgv`, then `src/profile.ts` when the file-write base must follow |
+| `sandbox profile constructors did not evaluate` | `src/profile-contract.ts` `compileProfiles` |
+
 ### Package manifest vs host overlay
 
 - `npm run check:upstream -- --update` writes the package manifest and is for

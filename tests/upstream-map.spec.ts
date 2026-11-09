@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { CHANNEL_GUIDES, guideFor, PROBE_GUIDES, renderGuide } from '../scripts/upstream-map.mjs'
+import { CHANNEL_GUIDES, guideFor, PROBE_GUIDES, renderGuide, SANDBOX_PROFILE_GUIDES } from '../scripts/upstream-map.mjs'
 
 /**
  * `src/upstream-worker.ts` is the authority, not a hand-copied list. Extract
@@ -32,6 +32,33 @@ test('every failures.push(...) literal in src resolves to a guide row', () => {
     return guide!.id
   })
   assert.equal(new Set(ids).size, PROBE_GUIDES.length, 'two probe failures map to the same guide row')
+})
+
+function sandboxProbeFailures(): string[] {
+  const source = readFileSync(new URL('../src/profile-contract.ts', import.meta.url), 'utf8')
+  const pushes = [...source.matchAll(/failures\.push\(\s*(['"`])(.*?)\1\s*\)/gsu)]
+  assert.ok(pushes.length > 0, 'no failures.push(...) literals found in src/profile-contract.ts')
+  return pushes.map(match => match[2]!.replace(/\$\{[^}]*\}/gu, 'UPSTREAM_VALUE'))
+}
+
+test('every sandbox profile failure literal resolves to one guide row', () => {
+  const failures = sandboxProbeFailures()
+  const ids = failures.map(failure => {
+    const guide = guideFor(failure)
+    assert.notEqual(guide, undefined, `no guide row for sandbox probe failure: ${failure}`)
+    return guide!.id
+  })
+  const guides = new Set(SANDBOX_PROFILE_GUIDES.map(guide => guide.id))
+  assert.deepEqual(new Set(ids), guides, 'a sandbox guide is unused, or a failure maps outside the sandbox table')
+})
+
+test('the sandbox profile runbook names every probe', () => {
+  for (const file of ['../docs/upstream-reuse-playbook.md', '../docs/upstream-ptc-worker.md']) {
+    const docs = readFileSync(new URL(file, import.meta.url), 'utf8')
+    for (const guide of SANDBOX_PROFILE_GUIDES) {
+      assert.ok(docs.includes(guide.match), `${file} has no row for ${guide.id}: ${guide.match}`)
+    }
+  }
 })
 
 test('the interpolated control-env failure resolves after placeholder substitution', () => {
@@ -65,8 +92,8 @@ test('channel failures the upgrade script can hit also resolve', () => {
   }
 })
 
-test('guide ids are unique across both tables', () => {
-  const ids = [...PROBE_GUIDES, ...CHANNEL_GUIDES].map(guide => guide.id)
+test('guide ids are unique across the probe tables', () => {
+  const ids = [...PROBE_GUIDES, ...SANDBOX_PROFILE_GUIDES, ...CHANNEL_GUIDES].map(guide => guide.id)
   assert.equal(new Set(ids).size, ids.length)
 })
 
@@ -101,7 +128,7 @@ test('the runbook decision table covers every probe guide', () => {
 
 test('each guide points at a file that exists', () => {
   // Guards against a renamed module leaving the runbook pointing at nothing.
-  const sources = [...PROBE_GUIDES, ...CHANNEL_GUIDES].flatMap(guide =>
+  const sources = [...PROBE_GUIDES, ...SANDBOX_PROFILE_GUIDES, ...CHANNEL_GUIDES].flatMap(guide =>
     [...guide.where.matchAll(/`?((?:src|scripts)\/[\w.-]+)/gu)].map(match => match[1]))
   assert.ok(sources.length > 0)
   for (const source of new Set(sources)) {

@@ -4,9 +4,9 @@
  * `check-upstream.mjs --explain` and `upgrade.mjs` print matching rows when a
  * contract probe fails. This table is NOT derived from the probe code: the
  * regression test in `tests/upstream-map.spec.ts` reads `src/upstream-worker.ts`
- * and extracts every `failures.push(...)` literal, so adding or rewording a
- * probe without a row here fails the test instead of silently losing its
- * runbook entry.
+ * and `src/profile-contract.ts` and extracts every `failures.push(...)` literal,
+ * so adding or rewording a probe without a row here fails the test instead of
+ * silently losing its runbook entry.
  */
 
 /**
@@ -71,6 +71,108 @@ export const PROBE_GUIDES = [
   },
 ]
 
+/**
+ * Sandbox-profile probes. These are not PTC worker probes. A green probe means
+ * the constructors were called and returned the accepted argv.
+ * `tests/upstream-map.spec.ts` reads every `failures.push(...)` in
+ * `src/profile-contract.ts`, same as the worker table above.
+ *
+ * @type {readonly Guide[]}
+ */
+export const SANDBOX_PROFILE_GUIDES = [
+  {
+    id: 'sandbox-package',
+    match: 'sandbox profile package could not be read',
+    meaning: 'The installed DSH package has no readable @deepseek-ai/dsh-sandbox-local or @deepseek-ai/dsh-sandbox bundle. Remote confinement will not invent a profile.',
+    where: 'src/profile-contract.ts locateSources()',
+    next: 'npm run check:upstream -- --explain',
+  },
+  {
+    id: 'sandbox-region',
+    match: 'sandbox profile region markers changed',
+    meaning: 'lib/index.js no longer wraps the profile constructors in the `lib/types/profiles.js` region comment. The extractor has nothing safe to evaluate.',
+    where: 'src/profile-contract.ts extractProfileRegion()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-bwrap-missing',
+    match: 'bwrapProfileArgs function not found',
+    meaning: 'The profile region no longer defines function bwrapProfileArgs. Remote bash and PTC cannot build a bubblewrap argv.',
+    where: 'src/profile-contract.ts extractFunction()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-bwrap-base',
+    match: 'bwrap base flags changed',
+    meaning: 'The official read-only bwrap sequence changed. The file-write profile reuses that sequence, so accept it only after reviewing the new flags.',
+    where: 'src/profile-contract.ts bwrapBaseIntact(), then src/profile.ts bwrapFileProfileArgs()',
+    next: 'npm test -- tests/profile-contract.spec.ts tests/profile.spec.ts',
+  },
+  {
+    id: 'sandbox-bwrap-tmpfs',
+    match: 'bwrap workspace-write no longer mounts a private /tmp',
+    meaning: 'Official workspace-write bwrap no longer mounts a private tmpfs. Remote bash and PTC follow that profile; the file-write profile must stay on real temp binds.',
+    where: 'src/profile-contract.ts bwrapPrivateTmp(), then src/profile.ts',
+    next: 'npm test -- tests/profile.spec.ts',
+  },
+  {
+    id: 'sandbox-bwrap-roots',
+    match: 'bwrap workspace binds no longer come from workspaceWritableRoots',
+    meaning: 'Official bwrap stopped binding workspaceWritableRoots, or started binding writableRoots. The injected helper would then grant the wrong directories.',
+    where: 'src/profile-contract.ts bwrapUsesWorkspaceRoots() and remoteWorkspaceRoots()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-seatbelt-skeleton',
+    match: 'seatbelt profile skeleton changed',
+    meaning: 'The official SBPL skeleton (version, default allow, file-write deny, /dev/null) moved, or sbplString disappeared. Remote seatbelt calls that constructor.',
+    where: 'src/profile-contract.ts seatbeltSkeleton()',
+    next: 'npm test -- tests/profile.spec.ts',
+  },
+  {
+    id: 'sandbox-seatbelt-roots',
+    match: 'seatbelt grants no longer come from writableRoots',
+    meaning: 'Official seatbelt stopped asking writableRoots for its grant list. The injected remote temp roots would no longer be what the profile writes.',
+    where: 'src/profile-contract.ts seatbeltUsesWritableRoots() and remoteWritableRoots()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-workspace-roots',
+    match: 'workspaceWritableRoots no longer means the workspace plus explicit extra directories',
+    meaning: 'The shared helper changed. Remote bwrap injects a helper with that meaning and does not realpath remote paths on this computer. A temp directory inside this helper would collide with the private tmpfs.',
+    where: 'src/profile-contract.ts workspaceRootsMeanWorkspace() and remoteWorkspaceRoots()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-writable-roots',
+    match: 'writableRoots no longer adds the host temp directories on top of the workspace',
+    meaning: 'Official writableRoots is no longer workspace roots plus /tmp plus os.tmpdir(). fileWritableRoots() is the remote translation of that set and has to be reviewed with it.',
+    where: 'src/profile-contract.ts writableRootsMeanTemp(), then src/profile.ts fileWritableRoots()',
+    next: 'npm test -- tests/profile.spec.ts',
+  },
+  {
+    id: 'sandbox-root-helpers',
+    match: 'sandbox root helpers did not return the accepted directories',
+    meaning: 'workspaceWritableRoots and writableRoots were called with inert path helpers. A comment that still names canonicalPath("/tmp") does not keep the old meaning. The plugin injects spelled remote paths in place of these helpers, so this result is what that injection is allowed to stand in for.',
+    where: 'src/profile-contract.ts acceptedRootHelpers() and remoteWorkspaceRoots()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+  {
+    id: 'sandbox-argv',
+    match: 'sandbox profile argv does not match the accepted contract',
+    meaning: 'The constructors ran, and the argv is not the accepted bwrap and seatbelt contract. A conditional flag, a narrower mount, an extra flag, or a helper shadowed by a declaration in the region all look like this. Accept the new argv only after reviewing remote bash and the file-write base.',
+    where: 'src/profile-contract.ts acceptedProfileArgv(), then src/profile.ts when the file-write base must follow',
+    next: 'npm test -- tests/profile-contract.spec.ts tests/profile.spec.ts',
+  },
+  {
+    id: 'sandbox-evaluate',
+    match: 'sandbox profile constructors did not evaluate',
+    meaning: 'The constructors were called and threw. A region can compile and still name a binding that exists only outside the evaluated region. Remote confinement will not fall back to a handwritten argv.',
+    where: 'src/profile-contract.ts compileProfiles()',
+    next: 'npm test -- tests/profile-contract.spec.ts',
+  },
+]
+
 /** Non-probe failures the upgrade path must also explain. */
 export const CHANNEL_GUIDES = [
   {
@@ -108,7 +210,7 @@ export const CHANNEL_GUIDES = [
  */
 export function guideFor(message) {
   const text = String(message)
-  const all = [...PROBE_GUIDES, ...CHANNEL_GUIDES]
+  const all = [...PROBE_GUIDES, ...SANDBOX_PROFILE_GUIDES, ...CHANNEL_GUIDES]
   return all.find(guide => text.includes(guide.match))
 }
 

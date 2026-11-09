@@ -13,6 +13,8 @@ export interface Guide {
 }
 
 export declare const PROBE_GUIDES: readonly Guide[]
+/** Sandbox-profile probes. Separate from the PTC worker table. */
+export declare const SANDBOX_PROFILE_GUIDES: readonly Guide[]
 export declare const CHANNEL_GUIDES: readonly Guide[]
 
 /** Match a failure message against the guide table; undefined when no row fits. */
