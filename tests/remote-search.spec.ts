@@ -65,7 +65,7 @@ test('official runRipgrep uses placeholder workingDirectory and complete collect
     1000,
   )
   assert.equal(captured.cwd, placeholder)
-  assert.equal(captured.argv[0].endsWith('/rg') || captured.argv[0].endsWith('\rg.exe'), true)
+  assert.equal(captured.argv[0].endsWith('/rg') || captured.argv[0].endsWith('\\rg.exe'), true)
   assert.deepEqual(result, { stdout: 'src/a.ts\n', noMatches: false, workdir: placeholder })
 })
 

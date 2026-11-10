@@ -1334,49 +1334,29 @@ test('relative traversal from a remote cwd stays in the remote namespace', async
 })
 
 
-test('a remote target outside the policy workspace is refused before any remote write', async () => {
-  const { backend, access } = createHarness()
-  let writes = 0
-  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
-    writes += 1
-    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+test('a target outside the workspace is refused before any remote write', async () => {
+  // Both a relative traversal and a remote absolute spelling escape the
+  // registered workspace. The gate resolves containment on the realpath, so
+  // it needs a probe to report a sandbox denial rather than failing closed as
+  // FS_IO_ERROR -- and in neither case may any remote write happen.
+  for (const spelling of ['../../../../etc/passwd', '/etc/passwd']) {
+    const { backend, access } = createHarness()
+    let writes = 0
+    ;(access.pool as unknown as { exec: unknown }).exec = async () => {
+      writes += 1
+      return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+    }
+    ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
+      sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
+      os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
+    })
+    const outside = await backend.resolve(spelling, { cwd: placeholder() })
+    await assert.rejects(
+      () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
+      (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
+    )
+    assert.equal(writes, 0)
   }
-  // The write gate now proves containment with `fileWriteAllowed()` against the
-  // realpath-resolved target, so it needs a probe before it can refuse. Without
-  // one the call fails closed as FS_IO_ERROR; with one it is a sandbox denial.
-  // Either way no remote write happens.
-  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
-    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
-    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
-  })
-  const outside = await backend.resolve('../../../../etc/passwd', { cwd: placeholder() })
-  await assert.rejects(
-    () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
-    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
-  )
-  assert.equal(writes, 0)
-})
-
-test('a target outside the workspace is refused even with a probe available', async () => {
-  const { backend, access } = createHarness()
-  let writes = 0
-  ;(access.pool as unknown as { exec: unknown }).exec = async () => {
-    writes += 1
-    return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
-  }
-  ;(access as unknown as { statusOf: unknown }).statusOf = async () => ({
-    sandbox: { available: true, reason: 'ok' }, sandboxTool: 'bwrap', roots: { workspaceRoot: REMOTE, tmp: '/tmp', userTmp: '/tmp' },
-    os: 'linux', ripgrep: 'system', ripgrepPath: '/usr/bin/rg', install: null,
-  })
-  // A remote absolute spelling that is outside the registered workspace: it
-  // must not slip through just because `workspaceBinding` decoded the whole
-  // path rather than the workspace root.
-  const outside = await backend.resolve('/etc/passwd', { cwd: placeholder() })
-  await assert.rejects(
-    () => backend.writeText(outside, 'x', undefined, undefined, { mode: 'workspace-write', workspaceRoot: placeholder(), sessionId: 'session-1' as never }),
-    (error: unknown) => codeOf(error) === 'FS_SANDBOX_DENIED',
-  )
-  assert.equal(writes, 0)
 })
 
 

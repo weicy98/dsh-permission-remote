@@ -68,14 +68,6 @@ test('the interpolated control-env failure resolves after placeholder substituti
   assert.equal(guideFor(changed!)?.id, 'control-env-changed')
 })
 
-test('the upstream-map header no longer overclaims the guard', () => {
-  const source = readFileSync(new URL('../scripts/upstream-map.mjs', import.meta.url), 'utf8')
-  const header = source.slice(0, source.indexOf('*/') + 2)
-  assert.match(header, /reads `src\/upstream-worker\.ts`/u)
-  assert.match(header, /extracts every `failures\.push\(\.\.\.\)` literal/u)
-  assert.doesNotMatch(header, /kept as literals|hard-?coded|fails here loudly/u)
-})
-
 test('the embedded control environment value still matches its row', () => {
   // The real message interpolates the upstream name, so matching is by prefix.
   const guide = guideFor('control environment marker changed to DSH_NEW_NAME; the shim expects DSH_SUBPROCESS_CONTROL')

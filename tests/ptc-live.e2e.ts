@@ -43,6 +43,12 @@ const host: HostConfig = {
   loginEnv: false,
 }
 const ready = live && password.length > 0 && remoteRoot.length > 0 && host.username.length > 0 && host.fingerprint.length > 0
+if (!live) {
+  // A fully skipped run exits 0 and proves nothing. `upgrade.mjs --live`
+  // already rejects that (and is covered by upgrade-script.spec.ts), but a
+  // bare `npm run e2e:ptc` would otherwise look green with four skips.
+  throw new Error('ptc-live.e2e.ts requires DSH_PTC_LIVE=1 plus DSH_PTC_HOST/USER/PASSWORD/FINGERPRINT/REMOTE_DIR; see the file header for the full command')
+}
 const secret: SecretMaterial = { password }
 const require = createRequire(import.meta.url)
 const HOST_PROCESS_JS = join(dirname(require.resolve('@deepseek-ai/dsh-ptc-runtime-node/package.json')), 'lib', 'process.js')

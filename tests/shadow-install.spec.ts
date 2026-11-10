@@ -107,13 +107,28 @@ test('a remote shadow install failure fails agent creation', async () => {
   await assert.rejects(() => created(ctx, agent), /register failed/)
 })
 
-test('a local shadow install failure leaves the local tools in place', async () => {
+test('a local shadow install failure does not arm a deny guard', async () => {
   const ctx = plugin()
+  const guards: Array<(execution: { name: string }) => string | undefined> = []
+  const attempted: string[] = []
   apply(ctx, { hosts: [], maxConnections: 4 })
   const { agent } = agentFor('/tmp/not-a-remote-workspace', () => {
     throw new Error('register failed')
   })
-  await created(ctx, agent)
+  // The fixture's `get()` always returns an official tool, so an equality on
+  // its result proves nothing. Record the registration attempt instead: the
+  // failure path must be exercised, while no deny guard may be left behind.
+  agent.ctx.tools.register = ((definition: { name: string }) => {
+    attempted.push(definition.name)
+    throw new Error('register failed')
+  }) as typeof agent.ctx.tools.register
+  agent.ctx.tools.guard = (guard: (execution: { name: string }) => string | undefined) => {
+    guards.push(guard)
+    return () => undefined
+  }
+  await assert.doesNotReject(() => created(ctx, agent))
+  assert.ok(attempted.length > 0, 'the local shadow install must be attempted')
+  assert.equal(guards.length, 0, 'a local agent must not get a deny guard')
 })
 
 test('ending the agent effect lets the same agent install again', async () => {

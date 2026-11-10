@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -178,20 +179,35 @@ test('ptc-shim cleans up and exits when stdin closes before a client connects', 
 
 test('ptc-shim rejects a TCP client that does not present the token', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-ptc-shim-'))
+  const sentinel = join(dir, 'worker-spawned')
   try {
-    const childPath = await echoChild(dir)
+    // The worker leaves evidence the instant it starts. A bad token must be
+    // rejected before spawnWorker() runs, so the file must never appear.
+    const childPath = join(dir, 'sentinel-child.cjs')
+    await writeFile(childPath, `
+const { writeFileSync } = require('node:fs')
+writeFileSync(${JSON.stringify(sentinel)}, 'spawned')
+`)
     const shim = await startShim('-', [process.execPath, childPath])
     const { connect } = await import('node:net')
     const wrong = connect(shim.endpoint.port!, '127.0.0.1')
     wrong.on('error', () => undefined)
     await once(wrong, 'connect')
+    let received = ''
+    wrong.on('data', chunk => { received += chunk.toString('utf8') })
     wrong.write('__DSH_PTC_AUTH__ wrong-token\n')
-    await new Promise(resolve => setTimeout(resolve, 200))
-    // The bad connection must not have spawned a child; the shim stays alive
-    // for the real host connection (or exits when its stdin closes).
+    // The shim destroys an unauthenticated socket. Use an explicit deadline so
+    // a regression that leaves the bad connection open fails instead of hanging.
+    const closed = await new Promise<boolean>(resolve => {
+      const timer = setTimeout(() => resolve(false), 2000)
+      wrong.once('close', () => { clearTimeout(timer); resolve(true) })
+    })
+    assert.equal(closed, true, 'the unauthenticated connection was not closed')
+    assert.equal(received, '', 'a rejected client must not receive the auth ack')
+    assert.equal(existsSync(sentinel), false, 'the worker must not be spawned for a bad token')
     shim.child.stdin.end()
-    await once(shim.child, 'exit')
-    wrong.destroy()
+    const [code] = await once(shim.child, 'exit')
+    assert.equal(code, 0, 'the shim must still exit cleanly after rejecting a client')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

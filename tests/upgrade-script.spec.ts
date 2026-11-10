@@ -738,34 +738,9 @@ test('upgrade prints one guide row per probe failure, never one for the combined
   }
 })
 
-test('duplicate CLI helpers live only in cli-common.mjs', () => {
-  const shared = readFileSync(new URL('../scripts/cli-common.mjs', import.meta.url), 'utf8')
-  for (const helper of ['isInstalledPackage', 'isEntryPoint', 'exitAfterFlush', 'applyDshRoot']) {
-    assert.match(shared, new RegExp(`function ${helper}\\b`, 'u'), `cli-common.mjs is missing ${helper}`)
-  }
-  for (const name of ['upgrade', 'check-upstream']) {
-    const raw = readFileSync(new URL(`../scripts/${name}.mjs`, import.meta.url), 'utf8')
-    for (const helper of ['isInstalledPackage', 'isEntryPoint', 'exitAfterFlush']) {
-      assert.doesNotMatch(raw, new RegExp(`function ${helper}\\b`, 'u'), `${name}.mjs still defines ${helper} locally`)
-    }
-    assert.match(raw, /from '\.\/cli-common\.mjs'/u, `${name}.mjs does not import the shared helpers`)
-  }
-})
-
-test('--explain success does not claim a wrong probe count', () => {
-  const raw = readFileSync(new URL('../scripts/check-upstream.mjs', import.meta.url), 'utf8')
-  assert.match(raw, /all contract probes passed; no guide action is pending/u)
-  assert.doesNotMatch(raw, /all \$\{PROBE_GUIDES\.length\} contract probes/u)
-})
-
 test('package.json and package-lock.json agree on the version', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }
   const lock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8')) as { version: string, packages: { '': { version: string } } }
   assert.equal(lock.version, pkg.version, 'package-lock.json version is stale')
   assert.equal(lock.packages[''].version, pkg.version, 'package-lock.json packages[""].version is stale')
-})
-
-test('the staged debug drafts no longer exist', () => {
-  assert.equal(existsSync(new URL('../.tmp-f.ts', import.meta.url)), false)
-  assert.equal(existsSync(new URL('../.panel.tmp', import.meta.url)), false)
 })

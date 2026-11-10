@@ -243,14 +243,23 @@ test('generic remote spawn terminates on abort', async () => {
   const h = await harness()
   try {
     const controller = new AbortController()
+    const started = Date.now()
     const handle = h.spawn(spec(h.placeholder, {
       argv: ['bash', '-c', 'printf before; sleep 2; printf after'],
       signal: controller.signal,
     }))
     setTimeout(() => controller.abort(), 500)
     const result = await handle.done
-    assert.equal(result.signal === null || result.signal === 'SIGKILL' || result.signal === 'SIGTERM', true)
-    assert.equal(handle.collected.stdout?.readFrom(0).text.includes('before'), true)
+    // The old assertion accepted `signal === null`, i.e. the process running
+    // to completion: an abort that did nothing still passed. Assert the kill
+    // outcome and that it happened before the 2s sleep could finish.
+    assert.equal(result.exitCode, null)
+    assert.equal(result.signal, 'SIGKILL')
+    const elapsed = Date.now() - started
+    assert.ok(elapsed < 1500, `abort waited ${elapsed}ms; the child was not killed`)
+    const stdout = handle.collected.stdout?.readFrom(0).text ?? ''
+    assert.equal(stdout.includes('before'), true)
+    assert.equal(stdout.includes('after'), false, 'the child must die before it prints after')
   } finally {
     await h.close()
   }

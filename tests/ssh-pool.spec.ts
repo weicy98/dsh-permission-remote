@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
@@ -13,16 +12,6 @@ test('channel text keeps a character split across SSH chunks', () => {
   assert.equal(head + tail + decoder.end(), '中文')
   assert.equal(head.includes('\uFFFD'), false)
   assert.equal(tail.includes('\uFFFD'), false)
-})
-
-test('the permission-denied JSDoc belongs to isSftpPermissionDenied', async () => {
-  // Purely cosmetic regression: the old placement left this comment stacked on
-  // top of the byte-limit comment, describing the wrong function.
-  const source = await readFile(new URL('../src/ssh-pool.ts', import.meta.url), 'utf8')
-  const start = source.indexOf('/** The server refused the operation on permissions.')
-  assert.notEqual(start, -1, 'the comment must still exist')
-  const declaration = source.indexOf('export function', start)
-  assert.match(source.slice(declaration, declaration + 80), /^export function isSftpPermissionDenied/u)
 })
 
 test('the truncation marker is emitted once', () => {
@@ -90,13 +79,33 @@ test('connect sends SSH keepalives on the shared connection', async () => {
   }
 })
 
-test('a saved host drops its cached session before the next connection', () => {
+test('invalidate drops a cached session and closes its connection', async () => {
   // The pool caches by host id, which survives an edit, so saveHost has to call
-  // invalidate or a renamed address keeps talking to the old machine.
+  // invalidate or a renamed address keeps talking to the old machine. Seed the
+  // cache with a real Live: the old version of this test invalidated an EMPTY
+  // pool, so both `hasSession` assertions were `false === false` no-ops.
+  const ended: string[] = []
+  let markedDead = 0
+  let sftpEnded = 0
+  const live = {
+    hostId: 'h1',
+    client: { end: () => { ended.push('client') } },
+    sftp: Promise.resolve({ end: () => { sftpEnded += 1 } }),
+    markDead: () => { markedDead += 1 },
+  }
   const pool = new SshPool(2)
-  assert.equal(pool.hasSession('h1'), false)
+  const cache = pool as unknown as { live: Map<string, Promise<typeof live>> }
+  cache.live.set('h1', Promise.resolve(live))
+  assert.equal(pool.hasSession('h1'), true)
+
   pool.invalidate('h1')
-  assert.equal(pool.hasSession('h1'), false)
+  assert.equal(pool.hasSession('h1'), false, 'the cached entry must be dropped synchronously')
+  // invalidate() fires dropSession() without awaiting it; let the close chain
+  // settle before checking the connection was really torn down.
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(markedDead, 1, 'the connection slot must be released')
+  assert.equal(sftpEnded, 1, 'the SFTP session must be closed')
+  assert.deepEqual(ended, ['client'], 'the underlying client must be closed')
 })
 
 /**

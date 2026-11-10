@@ -15,7 +15,12 @@ import type { RemoteExecHandle, RemoteTransport } from '../../src/remote-transpo
 export class LocalTransport implements RemoteTransport {
   async exec(_host: unknown, _secret: unknown, command: string, signal?: AbortSignal): Promise<RemoteExecHandle> {
     if (signal?.aborted === true) throw abortError()
-    const child = spawn('/bin/sh', ['-lc', command], { stdio: ['pipe', 'pipe', 'pipe'] })
+    // `detached` puts the shell in its own process group so abort can kill the
+    // whole tree. `sh -lc` spawns children (e.g. `sleep`) that inherit the
+    // stdio pipes; killing only the shell leaves those fds open and delays the
+    // 'close' event until the children exit on their own -- which is exactly
+    // how an abort can look like it did nothing.
+    const child = spawn('/bin/sh', ['-lc', command], { stdio: ['pipe', 'pipe', 'pipe'], detached: true })
     const stdout = new PassThrough()
     const stderr = new PassThrough()
     child.stdout.pipe(stdout)
@@ -35,6 +40,16 @@ export class LocalTransport implements RemoteTransport {
       })
     })
     const abort = () => {
+      if (child.exitCode === null && child.pid !== undefined) {
+        try {
+          // Kill the process group, not just the shell. Falls back to the
+          // single child on platforms without negative-pid process groups.
+          process.kill(-child.pid, 'SIGKILL')
+          return
+        } catch {
+          // No such group (Windows, or already reaped); fall through.
+        }
+      }
       try {
         child.kill('SIGKILL')
       } catch {

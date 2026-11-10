@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { applyHunks, parsePatch, type PatchHunk } from '../src/patch-hunks.ts'
 

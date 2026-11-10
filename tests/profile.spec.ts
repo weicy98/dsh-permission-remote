@@ -13,24 +13,20 @@ if (profileProbe.failures.length > 0 && (!profileMissing || REQUIRE_PROFILE)) {
 }
 const profileSkip: string | false = profileMissing ? profileProbe.failures.join('; ') : false
 
-test('read-only bwrap profile matches the official argv', { skip: profileSkip }, () => {
-  assert.deepEqual(bwrapProfileArgs('read-only', '/srv/app'), [
+test('the bwrap probe wraps the official read-only profile', { skip: profileSkip }, () => {
+  const readOnly = [
     '--ro-bind', '/', '/',
     '--dev', '/dev',
     '--unshare-pid',
     '--proc', '/proc',
     '--die-with-parent',
-  ])
-  assert.deepEqual(bwrapProbeArgv(), [
-    'bwrap',
-    '--ro-bind', '/', '/',
-    '--dev', '/dev',
-    '--unshare-pid',
-    '--proc', '/proc',
-    '--die-with-parent',
-    '--',
-    'true',
-  ])
+  ]
+  // Check the wrapper and the profile it delegates to. The literal array is
+  // intentionally repeated here: the wrapper is used by execute.ts and
+  // remote-world.ts, so a mode mix-up in the wrapper must fail in this file
+  // even if profile-contract.spec.ts pins the official constructor.
+  assert.deepEqual(bwrapProfileArgs('read-only', '/srv/app'), readOnly)
+  assert.deepEqual(bwrapProbeArgv(), ['bwrap', ...readOnly, '--', 'true'])
 })
 
 test('workspace-write adds a private /tmp and binds the remote workspace', { skip: profileSkip }, () => {
