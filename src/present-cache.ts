@@ -255,7 +255,12 @@ export function createPresentCache(root: string, options?: { ttlMs?: number, roo
           // A directory mtime moves when an entry inside it is added or removed,
           // and a delivery adds one: the age is the age of its newest snapshot.
           if (now - entry.at < ttl) continue
-          await rm(entry.path, { recursive: true, force: true })
+          try {
+            await rm(entry.path, { recursive: true, force: true })
+          } catch {
+            // A locked expired directory must not skip the budget pass below.
+            continue
+          }
           removed += 1
         }
         await dropStaleTemps(path.join(scanRoot, TEMP_DIR), now, TEMP_TTL_MS)
@@ -273,8 +278,12 @@ export function createPresentCache(root: string, options?: { ttlMs?: number, roo
  * directory someone still has a card open for is a real risk, so this only runs
  * once the total is already over budget — it is a backstop for a delivery loop,
  * not the normal expiry path. A directory that cannot be measured is skipped
- * rather than guessed at, and `rm` failures leave the rest of the pass running:
- * a sweep that gives up on the first locked file would never bound the total.
+ * rather than guessed at. A removal that fails is measured again and only the
+ * bytes that actually disappeared leave the running total, so a locked file
+ * does not stop the pass and a half-deleted directory is not counted in full.
+ * An undeletable directory that by itself exceeds `budget` stops the pass.
+ * Deleting every newer snapshot cannot get under the budget, and those
+ * snapshots are the ones a card is most likely to still have open.
  */
 async function enforceBudget(roots: readonly string[], budget: number): Promise<void> {
   if (budget <= 0) return
@@ -291,8 +300,14 @@ async function enforceBudget(roots: readonly string[], budget: number): Promise<
   found.sort((left, right) => left.at - right.at)
   for (const entry of found) {
     if (total <= budget) return
-    await rm(entry.path, { recursive: true, force: true }).catch(() => undefined)
-    total -= entry.bytes
+    try {
+      await rm(entry.path, { recursive: true, force: true })
+      total -= entry.bytes
+    } catch {
+      const left = await directoryBytes(entry.path).catch(() => entry.bytes)
+      total -= Math.max(0, entry.bytes - left)
+      if (left > budget) return
+    }
   }
 }
 

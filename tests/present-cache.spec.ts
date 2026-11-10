@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -390,6 +390,68 @@ test('a total budget evicts the oldest snapshot first', async () => {
     assert.equal(existsSync(join(dirs[1]!, 'two.bin')), false)
     assert.equal(existsSync(join(dirs[2]!, 'three.bin')), true)
   } finally {
+    await dispose()
+  }
+})
+
+test('an expired directory that cannot be removed does not skip the budget', async () => {
+  const { dir, dispose } = await scratch()
+  const root = join(dir, '.deliverables')
+  let locked = ''
+  try {
+    const cache = createPresentCache(root, { ttlMs: SNAPSHOT_TTL_MS, budgetBytes: 250 })
+    const aged = join(root, 'a'.repeat(64))
+    const mid = join(root, 'b'.repeat(64))
+    const fresh = join(root, 'c'.repeat(64))
+    await mkdir(aged, { recursive: true })
+    await mkdir(mid, { recursive: true })
+    await mkdir(fresh, { recursive: true })
+    await writeFile(join(aged, 'old.bin'), 'x'.repeat(100))
+    await writeFile(join(mid, 'mid.bin'), 'x'.repeat(200))
+    await writeFile(join(fresh, 'new.bin'), 'x'.repeat(100))
+    const day = 86_400_000
+    await utimes(aged, (Date.now() - 40 * day) / 1000, (Date.now() - 40 * day) / 1000)
+    await utimes(mid, (Date.now() - day) / 1000, (Date.now() - day) / 1000)
+    locked = aged
+    await chmod(locked, 0o500)
+    await cache.prune()
+    // The 40-day directory is over the TTL and cannot be removed. The budget
+    // pass still runs: 400 bytes against 250 drops the middle directory and
+    // keeps the newest.
+    assert.equal(existsSync(join(locked, 'old.bin')), true)
+    assert.equal(existsSync(join(mid, 'mid.bin')), false)
+    assert.equal(existsSync(join(fresh, 'new.bin')), true)
+  } finally {
+    if (locked.length > 0) await chmod(locked, 0o700).catch(() => undefined)
+    await dispose()
+  }
+})
+
+test('an undeletable directory that itself exceeds the budget keeps the newer snapshots', async () => {
+  const { dir, dispose } = await scratch()
+  const root = join(dir, '.deliverables')
+  let locked = ''
+  try {
+    const cache = createPresentCache(root, { ttlMs: SNAPSHOT_TTL_MS, budgetBytes: 250 })
+    const dirs: string[] = []
+    for (const [index, name] of ['old', 'mid', 'new'].entries()) {
+      const holder = join(root, String(index + 1).repeat(64))
+      await mkdir(holder, { recursive: true })
+      await writeFile(join(holder, `${name}.bin`), 'x'.repeat(index === 0 ? 300 : 200))
+      const at = (Date.now() - (3 - index) * 86_400_000) / 1000
+      await utimes(holder, at, at)
+      dirs.push(holder)
+    }
+    locked = dirs[0]!
+    await chmod(locked, 0o500)
+    await cache.prune()
+    // 700 bytes, budget 250. The oldest 300 cannot be removed and already
+    // exceeds the budget, so the newer snapshots stay.
+    assert.equal(existsSync(join(locked, 'old.bin')), true)
+    assert.equal(existsSync(join(dirs[1]!, 'mid.bin')), true)
+    assert.equal(existsSync(join(dirs[2]!, 'new.bin')), true)
+  } finally {
+    if (locked.length > 0) await chmod(locked, 0o700).catch(() => undefined)
     await dispose()
   }
 })

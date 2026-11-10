@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, posix } from 'node:path'
+import { dirname, join, posix } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
 import { clearStagedPresentFiles, finishBackground, runBash, runWorkingDirectory, stagePresentFiles, type RunnerStatus, type ToolHost } from '../src/execute.ts'
@@ -501,6 +501,109 @@ test('identical content reuses its snapshot and changed content gets a new one',
     assert.equal(await readFile(first!.path, 'utf8'), 'first version')
     assert.equal(await readFile(second!.path, 'utf8'), 'second version')
   } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a publish failure keeps a snapshot the batch only reused', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-reuse-fail-'))
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const kept = Buffer.from('first version')
+    const fresh = Buffer.from('brand new bytes')
+    const clash = Buffer.from('clash-body')
+    const bodies: Record<string, Buffer> = { 'report.txt': kept, 'fresh.txt': fresh, 'clash.txt': clash }
+    const api = {
+      pool: {
+        sftpAttrs: async (_h: unknown, _s: unknown, remotePath: string) => {
+          const name = remotePath.split('/').pop() ?? ''
+          return { type: 'file' as const, size: bodies[name]?.length ?? 0 }
+        },
+        async *sftpReadChunks(_h: unknown, _s: unknown, remotePath: string) {
+          const name = remotePath.split('/').pop() ?? ''
+          yield bodies[name]!
+        },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+
+    const [first] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    const planted = cache.targetFor(createHash('sha256').update(clash).digest('hex'), 'clash.txt')
+    await mkdir(dirname(planted), { recursive: true })
+    await writeFile(planted, 'different bytes already here')
+
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }, { path: 'fresh.txt' }, { path: 'clash.txt' }], {}, { maxBytes: 0, cache }),
+      /already holds different content/,
+    )
+    assert.equal(await readFile(first!.path, 'utf8'), 'first version')
+    const freshPath = cache.targetFor(createHash('sha256').update(fresh).digest('hex'), 'fresh.txt')
+    assert.equal(existsSync(freshPath), false)
+  } finally {
+    delete process.env.DSH_SSH_REMOTE_ROOT
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a cleanup failure still reports the publish error', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-present-cleanup-'))
+  let locked = ''
+  try {
+    process.env.DSH_SSH_REMOTE_ROOT = root
+    const mapping = mapRemoteToLocal('host1', '/srv/app')!
+    const sessionRoute: RemoteRoute = { ...route, remoteCwd: '/srv/app', placeholderCwd: mapping }
+    const cache = createPresentCache(join(root, '.deliverables'))
+    const publish = cache.publish.bind(cache)
+    let arm = false
+    cache.publish = async pending => {
+      const ref = await publish(pending)
+      if (arm && !ref.reused) {
+        locked = dirname(ref.path)
+        await chmod(locked, 0o500)
+      }
+      return ref
+    }
+    const kept = Buffer.from('first version')
+    const fresh = Buffer.from('brand new bytes')
+    const clash = Buffer.from('clash-body')
+    const bodies: Record<string, Buffer> = { 'report.txt': kept, 'fresh.txt': fresh, 'clash.txt': clash }
+    const api = {
+      pool: {
+        sftpAttrs: async (_h: unknown, _s: unknown, remotePath: string) => {
+          const name = remotePath.split('/').pop() ?? ''
+          return { type: 'file' as const, size: bodies[name]?.length ?? 0 }
+        },
+        async *sftpReadChunks(_h: unknown, _s: unknown, remotePath: string) {
+          const name = remotePath.split('/').pop() ?? ''
+          yield bodies[name]!
+        },
+      } as unknown as SshPool,
+      hostOf: () => host,
+      secretOf: async () => ({}),
+      statusOf: async () => status,
+      resolveMode: async () => 'read-only' as const,
+    } satisfies ToolHost
+
+    const [first] = await stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }], {}, { maxBytes: 0, cache })
+    arm = true
+    const planted = cache.targetFor(createHash('sha256').update(clash).digest('hex'), 'clash.txt')
+    await mkdir(dirname(planted), { recursive: true })
+    await writeFile(planted, 'different bytes already here')
+
+    await assert.rejects(
+      () => stagePresentFiles(api, sessionRoute, [{ path: 'report.txt' }, { path: 'fresh.txt' }, { path: 'clash.txt' }], {}, { maxBytes: 0, cache }),
+      (error: Error) => /already holds different content/.test(error.message) && !/EACCES/.test(error.message),
+    )
+    assert.equal(await readFile(first!.path, 'utf8'), 'first version')
+  } finally {
+    if (locked.length > 0) await chmod(locked, 0o700).catch(() => undefined)
     delete process.env.DSH_SSH_REMOTE_ROOT
     await rm(root, { recursive: true, force: true })
   }

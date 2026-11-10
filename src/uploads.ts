@@ -27,7 +27,7 @@ import { remotePathInside } from './workspaces.ts'
  * setting. Production passes that setting, so this is only the fallback.
  */
 export const UPLOAD_CAP = 32 * 1024 * 1024
-/** How long a ready upload skips the parent-symlink walk and the re-copy. */
+/** How long a ready upload skips the re-copy. The parent-symlink walk still runs. */
 export const UPLOAD_FRESH_MS = 60_000
 const LEAF_MAX = 120
 
@@ -294,12 +294,11 @@ function begin(
     return Promise.resolve()
   }
   const known = records.get(recordKey(host.id, ref.hostPath))
-  // A fresh ready record skips the parent-symlink walk and the copy. The leaf
-  // is still lstat'd: a symlink or a changed mtime must not keep being served.
-  // A symlink planted on a parent directory during this window is not seen
-  // until the record expires.
+  // A fresh ready record skips the copy. `checkedAt` stays at the publish
+  // time, so the window does not slide while the session keeps sending.
+  // The parent walk still runs: a symlink planted on a parent is seen.
   if (known?.kind === 'ready' && known.bytes === ref.bytes && clock(access) - known.checkedAt < UPLOAD_FRESH_MS) {
-    return confirmFresh(ctx, access, records, host, ref, known, signal).then(kept => {
+    return confirmFresh(ctx, access, homes, host, ref, known, signal).then(kept => {
       if (kept) return undefined
       return startUpload(ctx, access, records, flights, homes, epochs, host, ref, known, signal)
     })
@@ -348,7 +347,7 @@ function startUpload(
 async function confirmFresh(
   ctx: UploadContext,
   access: UploadAccess,
-  records: Map<string, UploadRecord>,
+  homes: Map<string, Promise<string>>,
   host: HostConfig,
   ref: FileRef,
   known: Extract<UploadRecord, { kind: 'ready' }>,
@@ -359,6 +358,9 @@ async function confirmFresh(
   try {
     const secret = await access.secret(host)
     if (isAborted(signal)) throw abortError()
+    const home = await homeOf(access, homes, host)
+    if (isAborted(signal)) throw abortError()
+    await assertUploadParent(access, host, secret, home, known.remotePath)
     if (access.pool.sftpAttrs !== undefined) {
       leaf = await access.pool.sftpAttrs(host, secret, known.remotePath, false)
     } else {
@@ -374,7 +376,6 @@ async function confirmFresh(
   }
   if (leaf === undefined || leaf.type !== 'file' || leaf.size !== known.bytes) return false
   if (known.mtime !== undefined && leaf.mtime !== known.mtime) return false
-  records.set(recordKey(host.id, ref.hostPath), { ...known, checkedAt: clock(access) })
   return true
 }
 

@@ -699,15 +699,22 @@ export async function stagePresentFiles(
       })
     }
   } catch (error) {
-    await Promise.all(pending.map(item => cache!.discard(item.temp)))
+    // Cleanup must not replace the error that failed the batch. `force` only
+    // hides a missing path; a permission error would otherwise be what the
+    // model sees, and the steps after it would not run.
+    await Promise.all(pending.map(item => cache!.discard(item.temp).catch(() => undefined)))
     // A published snapshot from this batch is new content nobody can reference
     // yet: the event is written only after the whole call succeeds. Remove just
     // those files; the hash directory may hold other names this batch did not
     // create, so it is never removed as a whole.
-    await Promise.all(created.map(async path => { await rm(path, { force: true }) }))
-    // A placeholder this batch wrote is equally unreferenced. `staged` only
-    // holds entries written by the loop above, so nothing older is touched.
-    await Promise.all([...staged.values()].map(async entry => { await rm(entry.path, { force: true }) }))
+    await Promise.all(created.map(async path => { await rm(path, { force: true }).catch(() => undefined) }))
+    // Placeholder copies from this batch are unreferenced too. A reused
+    // snapshot belongs to a card from an earlier delivery, so it stays.
+    // `created` already removes a file this batch published for the first
+    // time, including one a later file in the same batch reused.
+    await Promise.all([...staged.values()].filter(entry => entry.reused !== true).map(async entry => {
+      await rm(entry.path, { force: true }).catch(() => undefined)
+    }))
     throw error
   }
   // Rebuild in request order. `staged` is keyed by remote path, so a request

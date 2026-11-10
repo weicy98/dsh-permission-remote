@@ -598,13 +598,9 @@ export async function runSshUpload(
   )
   if (mkdir.code !== 0) throw new Error(mkdir.stderr || 'remote upload failed')
   let bytes = 0
+  const sending = hostApi.pool.sftpSendLocal(host, secret, localPath, tmp, { maxBytes: limits.maxBytes, signal })
   try {
-    bytes = await withTransferDeadline(
-      hostApi.pool.sftpSendLocal(host, secret, localPath, tmp, { maxBytes: limits.maxBytes, signal }),
-      signal,
-      exec.signal,
-      limits,
-    )
+    bytes = await withTransferDeadline(sending, signal, exec.signal, limits)
     const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([remotePath])}`
     const moved = await withTransferDeadline(
       hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, remotePath])}${bits}`, limits.timeoutMs, signal),
@@ -614,7 +610,11 @@ export async function runSshUpload(
     )
     if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload failed')
   } catch (error) {
-    await hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, limits.timeoutMs, signal).catch(() => undefined)
+    // The deadline can reject while `open` is still pending. Wait for that
+    // open, then remove the temp. An already-aborted signal would close the
+    // cleanup channel before `rm` runs, so this exec carries no signal.
+    await sending.catch(() => undefined)
+    await hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, 15_000).catch(() => undefined)
     throw error
   }
   return {

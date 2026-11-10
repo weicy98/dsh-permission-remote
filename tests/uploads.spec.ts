@@ -338,6 +338,61 @@ test('a fresh upload is not copied again, and a changed mtime is', async () => {
   assert.equal(harness.puts.length, puts)
 })
 
+test('a fresh upload still checks parent directories for a symlink', async () => {
+  const harness = setup()
+  const seen: string[] = []
+  harness.setStat(async () => ({ isDirectory: false, size: 4 }))
+  harness.setAttrs(async remotePath => {
+    seen.push(remotePath ?? '')
+    return remotePath === UPLOADED
+      ? { type: 'file', size: 4, mtime: 10 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  })
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  seen.length = 0
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 0)
+  assert.ok(seen.includes('/home/me/.dsh-permission-remote'))
+})
+
+test('a parent symlink planted inside the fresh window is refused', async () => {
+  const harness = setup()
+  let planted = false
+  harness.setStat(async () => ({ isDirectory: false, size: 4 }))
+  harness.setAttrs(async remotePath => {
+    if (planted && remotePath === '/home/me/.dsh-permission-remote') return { type: 'symlink', size: 0 }
+    return remotePath === UPLOADED
+      ? { type: 'file', size: 4, mtime: 10 }
+      : { type: 'directory', size: 0, mtime: 1 }
+  })
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  planted = true
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 0)
+  harness.setInitiator(placeholder)
+  assert.notEqual(harness.fs.processPathFromHostPath(HOST_PATH), UPLOADED)
+})
+
+test('the fresh window does not slide forward on each recheck', async () => {
+  const harness = setup()
+  let stats = 0
+  harness.setStat(async () => {
+    stats += 1
+    return { isDirectory: false, size: 4 }
+  })
+  harness.setAttrs(async remotePath => remotePath === UPLOADED
+    ? { type: 'file', size: 4, mtime: 10 }
+    : { type: 'directory', size: 0, mtime: 1 })
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  const afterPublish = stats
+  harness.setNow(1_000 + UPLOAD_FRESH_MS - 1)
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(stats, afterPublish)
+  harness.setNow(1_000 + UPLOAD_FRESH_MS - 1 + UPLOAD_FRESH_MS - 1)
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.ok(stats > afterPublish)
+})
+
 test('a raised transfer ceiling allows a chat upload above 32 MiB, and 0 does not cap it', async () => {
   const raised = setup()
   raised.setMax(64 * 1024 * 1024)

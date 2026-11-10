@@ -69,7 +69,7 @@ interface TransferApi {
   /** Commands, excluding the harmless home probe. */
   commands: string[]
   bodies: Array<string | Buffer | undefined>
-  execs: Array<{ command: string, timeoutMs: number | undefined }>
+  execs: Array<{ command: string, timeoutMs: number | undefined, signal: AbortSignal | undefined }>
   reads: string[]
   attrs: Array<{ path: string, follow: boolean }>
   writes: Array<{ path: string, bytes: number }>
@@ -83,7 +83,7 @@ function api(options: {
   remoteBytes?: Buffer
   attrs?: (path: string, follow: boolean) => Attrs | undefined
   /** Replaces the local-to-remote copy. A rejection must still delete the temp. */
-  send?: () => Promise<number>
+  send?: (limits?: { maxBytes?: number, signal?: AbortSignal }) => Promise<number>
   /** Replaces the remote-to-local chunk source. */
   chunks?: () => AsyncIterable<Buffer>
 } = {}): TransferApi {
@@ -92,7 +92,7 @@ function api(options: {
   forgetOpsHost('prod1')
   const commands: string[] = []
   const bodies: Array<string | Buffer | undefined> = []
-  const execs: Array<{ command: string, timeoutMs: number | undefined }> = []
+  const execs: Array<{ command: string, timeoutMs: number | undefined, signal: AbortSignal | undefined }> = []
   const reads: string[] = []
   const attrs: Array<{ path: string, follow: boolean }> = []
   const writes: Array<{ path: string, bytes: number }> = []
@@ -104,7 +104,7 @@ function api(options: {
       _secret: unknown,
       command: string,
       timeoutMs?: number,
-      _signal?: AbortSignal,
+      signal?: AbortSignal,
       stdin?: string | Buffer,
     ) => {
       // The override must be able to hang the home probe, so it comes before
@@ -112,7 +112,7 @@ function api(options: {
       if (command.includes('"$HOME"')) return options.exec?.(command, stdin) ?? result({ stdout: markedHome })
       commands.push(command)
       bodies.push(stdin)
-      execs.push({ command, timeoutMs })
+      execs.push({ command, timeoutMs, signal })
       return options.exec?.(command, stdin) ?? result()
     },
     sftpRead: async (_host: HostConfig, _secret: unknown, remotePath: string, maxBytes?: number) => {
@@ -133,8 +133,8 @@ function api(options: {
     sftpWrite: async (_host: HostConfig, _secret: unknown, remotePath: string, data: Buffer | string) => {
       writes.push({ path: remotePath, bytes: typeof data === 'string' ? Buffer.byteLength(data) : data.length })
     },
-    sftpSendLocal: async (_host: HostConfig, _secret: unknown, localPath: string, remotePath: string, limits?: { maxBytes?: number }) => {
-      if (options.send !== undefined) return options.send()
+    sftpSendLocal: async (_host: HostConfig, _secret: unknown, localPath: string, remotePath: string, limits?: { maxBytes?: number, signal?: AbortSignal }) => {
+      if (options.send !== undefined) return options.send(limits)
       const data = await readFile(localPath)
       const maxBytes = limits?.maxBytes ?? 0
       if (maxBytes > 0 && data.length > maxBytes) {
@@ -820,6 +820,48 @@ test('an upload that fails during the copy deletes the temp and does not replace
     assert.match(script, /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
     assert.doesNotMatch(script, /mv -f/)
   } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('an aborted upload removes the temp only after the copy settles, without the aborted signal', async () => {
+  const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcd')
+    const order: string[] = []
+    const upload = api({
+      exec: command => {
+        if (command.startsWith('rm -f ')) order.push('rm')
+        return result()
+      },
+      send: limits => new Promise<number>((_resolve, reject) => {
+        const signal = limits?.signal
+        if (signal === undefined) {
+          reject(new Error('upload copy was not given a deadline signal'))
+          return
+        }
+        const created = (): void => {
+          setTimeout(() => {
+            order.push('created')
+            reject(Object.assign(new Error('SSH operation aborted'), { name: 'AbortError' }))
+          }, 40)
+        }
+        if (signal?.aborted === true) created()
+        else signal?.addEventListener('abort', created, { once: true })
+      }),
+    })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 20 }),
+      (error: Error) => error.name === 'TimeoutError',
+    )
+    assert.deepEqual(order, ['created', 'rm'])
+    const removed = upload.execs.find(entry => entry.command.startsWith('rm -f '))
+    assert.ok(removed)
+    assert.equal(removed?.signal, undefined)
+  } finally {
+    clearInterval(keepAlive)
     await rm(local, { recursive: true, force: true })
   }
 })

@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { streamLocalToSftp, type SshFailure } from '../src/ssh-pool.ts'
+import { finishOrCleanup, streamLocalToSftp, type SshFailure } from '../src/ssh-pool.ts'
 
 const CHUNK = 64 * 1024
 
@@ -125,6 +125,26 @@ test('a server packet limit caps each write', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('cleanup waits until a late open has created the temp file', async () => {
+  const events: string[] = []
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const controller = new AbortController()
+  const work = (async () => {
+    await gate
+    events.push('created')
+    throw new Error('open finished after abort')
+  })()
+  controller.abort()
+  const finished = finishOrCleanup(work, controller.signal, async () => {
+    events.push('rm')
+  })
+  assert.deepEqual(events, [])
+  release()
+  await assert.rejects(finished, (error: Error) => error.name === 'AbortError')
+  assert.deepEqual(events, ['created', 'rm'])
 })
 
 test('a fifo is refused without waiting for a writer', async () => {

@@ -866,29 +866,33 @@ export class SshPool {
     // a symlink; the rename replaces the directory entry, never its target.
     const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
     const session = await this.sftp(host, secret)
+    // A hung SFTP write does not notice the signal between chunks. Racing the
+    // publish lets the deadline return while `open` is still pending. The
+    // temporary file is removed only after that open has settled: deleting
+    // first lets the late open recreate it.
+    const publish = (async () => {
+      await streamLocalToSftp(session, localPath, temporary, limits?.maxBytes ?? 0, signal)
+      try {
+        await renameRemote(session, temporary, remotePath)
+      } catch {
+        // Standard SFTP rename is allowed to refuse an existing target. The
+        // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
+        // atomic because the temporary file is in the same directory.
+        const moved = await this.exec(host, secret, `mv -f ${shJoin([temporary, remotePath])}`, 20_000, signal)
+        if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload rename failed')
+      }
+      if (previous?.mode !== undefined) {
+        // Drop the file-type bits. `0o100640` must chmod `640`, and `0` stays `0`.
+        const mode = (previous.mode & 0o7777).toString(8)
+        await this.exec(host, secret, `chmod ${mode} ${shJoin([remotePath])}`, 15_000).catch(() => undefined)
+      }
+    })()
     try {
-      // A hung SFTP write does not notice the signal between chunks. Racing
-      // the whole publish lets the deadline return while the handle is still
-      // closing; the temporary file is removed below.
-      await raceAbort((async () => {
-        await streamLocalToSftp(session, localPath, temporary, limits?.maxBytes ?? 0, signal)
-        try {
-          await renameRemote(session, temporary, remotePath)
-        } catch {
-          // Standard SFTP rename is allowed to refuse an existing target. The
-          // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
-          // atomic because the temporary file is in the same directory.
-          const moved = await this.exec(host, secret, `mv -f ${shJoin([temporary, remotePath])}`, 20_000, signal)
-          if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload rename failed')
-        }
-        if (previous?.mode !== undefined) {
-          // Drop the file-type bits. `0o100640` must chmod `640`, and `0` stays `0`.
-          const mode = (previous.mode & 0o7777).toString(8)
-          await this.exec(host, secret, `chmod ${mode} ${shJoin([remotePath])}`, 15_000).catch(() => undefined)
-        }
-      })(), signal)
+      await finishOrCleanup(publish, signal, async () => {
+        // No signal: an already-aborted signal closes the channel before `rm` runs.
+        await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
+      })
     } catch (error) {
-      await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
       if (signal?.aborted === true) throw abortError()
       throw error
     }
@@ -1684,11 +1688,32 @@ function writeAt(sftp: SftpLike, handle: Buffer, data: Buffer, position: number)
 }
 
 /**
+ * Run `work` until it finishes or `signal` aborts.
+ *
+ * On failure, `cleanup` runs only after `work` has settled. An abort rejects
+ * while `work` can still be inside `open`; deleting first lets that open
+ * recreate the temporary file with nobody left to remove it.
+ */
+export async function finishOrCleanup<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined,
+  cleanup: () => Promise<void>,
+): Promise<T> {
+  try {
+    return await raceAbort(work, signal)
+  } catch (error) {
+    await work.catch(() => undefined)
+    await cleanup()
+    throw error
+  }
+}
+
+/**
  * Settle with `work`, or with an abort when `signal` fires first.
  *
  * The loser is observed so a write that finishes after the deadline does not
- * become an unhandled rejection. The caller still has to delete any partial
- * remote file: this only decides which error the caller sees.
+ * become an unhandled rejection. Cleanup belongs in {@link finishOrCleanup}:
+ * this only decides which error the caller sees.
  */
 function raceAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (signal === undefined) return work
@@ -1769,6 +1794,7 @@ export async function streamLocalToSftp(
   try {
     const info = await local.stat()
     if (!info.isFile()) throw new Error(`local path is not a regular file: ${localPath}`)
+    if (signal?.aborted) throw abortError()
     remote = await openWrite(sftp, remotePath)
     while (true) {
       if (signal?.aborted) {
