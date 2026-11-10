@@ -99,7 +99,7 @@
   "registrySaved": "Download source saved.",
   "transferMaxBytes": "Transfer ceiling (bytes)",
   "transferTimeoutMs": "Transfer timeout (ms)",
-  "transferLimitsHint": "Ceiling and deadline shared by ssh_upload / ssh_download. Leave the byte count empty or 0 for no ceiling (the whole file is held in memory); leave the timeout empty or 0 for no deadline. Saves take effect immediately.",
+  "transferLimitsHint": "Ceiling and deadline shared by ssh_upload / ssh_download and files uploaded in the conversation. Uploads keep about 1 MiB in flight; downloads read one chunk at a time. An empty or 0 byte count removes only the byte ceiling; the default 120 s deadline still stops the copy. An empty or 0 timeout means no deadline. present stays at 256 MiB per file and 1 GiB overall, and text tools stay at 32 MiB. Saves take effect immediately.",
   "transferLimitsSaved": "Transfer ceiling and timeout saved.",
   "transferLimitsInvalid": "The ceiling and timeout must be non-negative integers; empty or 0 means unlimited.",
   "transferLimitsClamped": "Saved at the 2147483647 ms cap; larger deadlines overflow Node's timer.",

@@ -11,6 +11,7 @@ import {
   NO_TRANSFER_LIMITS,
   renderOpsDownload,
   renderOpsUpload,
+  openExclusiveTemp,
   runSshDownload,
   runSshUpload,
   type OpsTransferLimits,
@@ -81,6 +82,10 @@ function api(options: {
   exec?: (command: string, stdin?: string | Buffer) => ExecResult
   remoteBytes?: Buffer
   attrs?: (path: string, follow: boolean) => Attrs | undefined
+  /** Replaces the local-to-remote copy. A rejection must still delete the temp. */
+  send?: () => Promise<number>
+  /** Replaces the remote-to-local chunk source. */
+  chunks?: () => AsyncIterable<Buffer>
 } = {}): TransferApi {
   // The home probe is cached per host id across tests; every fixture starts
   // from an unknown `$HOME`, so a hang override is actually exercised.
@@ -127,6 +132,27 @@ function api(options: {
     sftpRealpath: async (_host: HostConfig, _secret: unknown, remotePath: string) => remotePath,
     sftpWrite: async (_host: HostConfig, _secret: unknown, remotePath: string, data: Buffer | string) => {
       writes.push({ path: remotePath, bytes: typeof data === 'string' ? Buffer.byteLength(data) : data.length })
+    },
+    sftpSendLocal: async (_host: HostConfig, _secret: unknown, localPath: string, remotePath: string, limits?: { maxBytes?: number }) => {
+      if (options.send !== undefined) return options.send()
+      const data = await readFile(localPath)
+      const maxBytes = limits?.maxBytes ?? 0
+      if (maxBytes > 0 && data.length > maxBytes) {
+        throw new Error(`local file is ${data.length} bytes, over the ${maxBytes} byte transfer ceiling`)
+      }
+      writes.push({ path: remotePath, bytes: data.length })
+      bodies.push(data)
+      return data.length
+    },
+    sftpReadChunks: async function* (_host: HostConfig, _secret: unknown, remotePath: string) {
+      reads.push(remotePath)
+      if (options.chunks !== undefined) {
+        yield* options.chunks()
+        return
+      }
+      const body = options.remoteBytes ?? Buffer.from('remote bytes')
+      const window = 3
+      for (let offset = 0; offset < body.length; offset += window) yield body.subarray(offset, offset + window)
     },
   } as unknown as SshPool
 
@@ -291,14 +317,13 @@ test('upload sends the exact bytes through a same-directory temp file', async ()
     const value = await runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/blob.bin' }, {}, LIMITS)
     assert.equal(value.bytes, body.length)
     assert.equal(value.operation, 'create')
-    assert.equal(upload.commands.length, 1)
-    const script = upload.commands[0] ?? ''
-    assert.match(script, /^mkdir -p .* && /)
-    assert.match(script, /cat > '\/srv\/\.dsh-permission-remote-/)
+    const script = upload.commands.join('\n')
+    assert.match(script, /mkdir -p '\/srv'/)
     assert.match(script, /mv -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+' '\/srv\/blob\.bin'/)
-    const forwarded = upload.bodies[0]
-    assert.ok(Buffer.isBuffer(forwarded))
-    assert.deepEqual([...forwarded], [...body])
+    assert.doesNotMatch(script, /cat >/)
+    const forwarded = upload.bodies.find(item => Buffer.isBuffer(item))
+    assert.ok(forwarded)
+    assert.deepEqual([...(forwarded as Buffer)], [...body])
   } finally {
     await rm(local, { recursive: true, force: true })
   }
@@ -362,7 +387,10 @@ test('upload preserves the mode of an existing remote file and reports an update
     const upload = api({ attrs: () => ({ type: 'file', size: 9, mode: 0o100640 }) })
     const value = await runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, LIMITS)
     assert.equal(value.operation, 'update')
-    assert.match(upload.commands[0] ?? '', /chmod 640 '\/srv\/a\.bin'/)
+    assert.match(upload.commands.join('\n'), /chmod 640 '\/srv\/a\.bin'/)
+    const zero = api({ attrs: () => ({ type: 'file', size: 1, mode: 0 }) })
+    await runSshUpload(zero.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, LIMITS)
+    assert.match(zero.commands.join('\n'), /chmod 0 '\/srv\/a\.bin'/)
   } finally {
     await rm(local, { recursive: true, force: true })
   }
@@ -431,6 +459,25 @@ test('download writes the remote bytes atomically beside the target', async () =
     if (process.platform !== 'win32') assert.equal((await stat(target)).mode & 0o777, 0o600)
     // No sibling temp file survives.
     assert.deepEqual(await readdir(local), ['out.bin'])
+    // Replacing a wider file publishes the temp inode's mode.
+    await writeFile(target, 'old', { mode: 0o644 })
+    await runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/in.bin', local_path: target }, {}, LIMITS)
+    assert.deepEqual([...await readFile(target)], [...body])
+    if (process.platform !== 'win32') assert.equal((await stat(target)).mode & 0o777, 0o600)
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('an exclusive temp create does not follow a symlink planted on that path', async () => {
+  const local = await tempDir()
+  try {
+    const secret = join(local, 'secret')
+    await writeFile(secret, 'keep')
+    const planted = join(local, 'planted')
+    await symlink(secret, planted)
+    await assert.rejects(() => openExclusiveTemp(planted))
+    assert.equal(await readFile(secret, 'utf8'), 'keep')
   } finally {
     await rm(local, { recursive: true, force: true })
   }
@@ -745,12 +792,55 @@ test('a remote file that grows after the pre-check is not read past the ceiling'
   try {
     // `attrs` says one byte, but the read returns ten: the read-side cap is
     // what has to stop it, and the failure must not be rewritten as "missing".
+    const target = join(local, 'b.bin')
     const download = api({ attrs: () => ({ type: 'file', size: 1 }), remoteBytes: Buffer.alloc(10, 0x63) })
     await assert.rejects(
-      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: join(local, 'b.bin') }, {}, { maxBytes: 4, timeoutMs: 0 }),
-      (error: Error) => /over the 4 byte limit/.test(error.message) && !/no file at remote path/.test(error.message),
+      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: target }, {}, { maxBytes: 4, timeoutMs: 0 }),
+      (error: Error) => /over the 4 byte transfer ceiling/.test(error.message) && !/no file at remote path/.test(error.message),
     )
+    await assert.rejects(() => stat(target), (error: NodeJS.ErrnoException) => error.code === 'ENOENT')
+    assert.deepEqual(await readdir(local), [])
   } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('an upload that fails during the copy deletes the temp and does not replace the target', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcd')
+    const upload = api({ send: async () => { throw new Error('local file is over the 8 byte transfer ceiling') } })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 8, timeoutMs: 0 }),
+      /over the 8 byte transfer ceiling/,
+    )
+    const script = upload.commands.join('\n')
+    assert.match(script, /mkdir -p '\/srv'/)
+    assert.match(script, /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
+    assert.doesNotMatch(script, /mv -f/)
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a timeout during the download copy is a timeout and leaves no local file', async () => {
+  const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
+  try {
+    const target = join(local, 'b.bin')
+    const download = api({
+      attrs: () => ({ type: 'file', size: 10 }),
+      chunks: async function* () { await new Promise(() => undefined) },
+    })
+    await assert.rejects(
+      () => runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: target }, {}, { maxBytes: 0, timeoutMs: 30 }),
+      (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 30 ms/.test(error.message),
+    )
+    await assert.rejects(() => stat(target), (error: NodeJS.ErrnoException) => error.code === 'ENOENT')
+    assert.deepEqual(await readdir(local), [])
+  } finally {
+    clearInterval(keepAlive)
     await rm(local, { recursive: true, force: true })
   }
 })

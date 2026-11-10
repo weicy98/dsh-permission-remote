@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { open, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, posix } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -740,6 +741,24 @@ export class SshPool {
     return readAll(session, remotePath)
   }
 
+  /**
+   * Stream one local file to an existing remote path.
+   *
+   * `maxBytes` of `0` means the operator chose no ceiling: the copy still
+   * moves one chunk at a time, and a full disk fails the write instead of
+   * growing the process without bound.
+   */
+  async sftpSendLocal(
+    host: HostConfig,
+    secret: SecretMaterial,
+    localPath: string,
+    remotePath: string,
+    options: { maxBytes?: number, signal?: AbortSignal } = {},
+  ): Promise<number> {
+    const session = await this.sftp(host, secret)
+    return streamLocalToSftp(session, localPath, remotePath, options.maxBytes ?? 0, options.signal)
+  }
+
   async sftpWrite(host: HostConfig, secret: SecretMaterial, remotePath: string, body: Buffer | string): Promise<void> {
     const session = await this.sftp(host, secret)
     await writeAll(session, remotePath, body)
@@ -818,11 +837,19 @@ export class SshPool {
    * the remote umask: `sftpUpload` marks a binary executable, and a document
    * must not become one.
    */
-  async sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string, allowedRoot?: string): Promise<void> {
-    const body = await readFile(localPath)
+  async sftpPutFile(
+    host: HostConfig,
+    secret: SecretMaterial,
+    localPath: string,
+    remotePath: string,
+    allowedRoot?: string,
+    limits?: { maxBytes?: number, signal?: AbortSignal },
+  ): Promise<void> {
     const dir = remotePath.slice(0, remotePath.lastIndexOf('/'))
+    const signal = limits?.signal
     if (dir.length > 0) {
-      await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000)
+      await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000, signal)
+      if (signal?.aborted === true) throw abortError()
       if (allowedRoot !== undefined) {
         const realDir = await this.sftpRealpath(host, secret, dir)
         if (!remotePathWithin(allowedRoot, realDir)) {
@@ -833,24 +860,63 @@ export class SshPool {
     // A replacement should keep the old file's mode; a new file keeps the
     // remote umask. Read this before the rename replaces the directory entry.
     const previous = await this.sftpAttrs(host, secret, remotePath, false).catch(() => undefined)
-    // Write beside the target and rename over it. A dropped connection or a
+    // Stream beside the target and rename over it. A dropped connection or a
     // full disk leaves the old target intact instead of truncating it with the
     // SFTP `w` open. The caller has already checked the final component is not
     // a symlink; the rename replaces the directory entry, never its target.
     const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
+    const session = await this.sftp(host, secret)
+    try {
+      // A hung SFTP write does not notice the signal between chunks. Racing
+      // the whole publish lets the deadline return while the handle is still
+      // closing; the temporary file is removed below.
+      await raceAbort((async () => {
+        await streamLocalToSftp(session, localPath, temporary, limits?.maxBytes ?? 0, signal)
+        try {
+          await renameRemote(session, temporary, remotePath)
+        } catch {
+          // Standard SFTP rename is allowed to refuse an existing target. The
+          // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
+          // atomic because the temporary file is in the same directory.
+          const moved = await this.exec(host, secret, `mv -f ${shJoin([temporary, remotePath])}`, 20_000, signal)
+          if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload rename failed')
+        }
+        if (previous?.mode !== undefined) {
+          // Drop the file-type bits. `0o100640` must chmod `640`, and `0` stays `0`.
+          const mode = (previous.mode & 0o7777).toString(8)
+          await this.exec(host, secret, `chmod ${mode} ${shJoin([remotePath])}`, 15_000).catch(() => undefined)
+        }
+      })(), signal)
+    } catch (error) {
+      await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
+      if (signal?.aborted === true) throw abortError()
+      throw error
+    }
+  }
+
+  /**
+   * Write one private file from memory.
+   *
+   * The parent directory is `0700`. The file is written beside the target,
+   * `chmod 600`'d, then renamed over it. `sftpPutFile` cannot do this: it
+   * reads a local path, keeps the remote umask for a new file, and restores
+   * the previous mode of an existing one. A rename that refuses an existing
+   * target falls back to `mv -f`, which keeps the temporary file's mode.
+   */
+  async publishPrivateFile(host: HostConfig, secret: SecretMaterial, remotePath: string, body: Buffer): Promise<void> {
+    const dir = remotePath.slice(0, remotePath.lastIndexOf('/'))
+    if (dir.length > 0) {
+      await this.exec(host, secret, `mkdir -p ${shJoin([dir])} && chmod 700 ${shJoin([dir])}`, 20_000)
+    }
+    const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
     try {
       await this.sftpWrite(host, secret, temporary, body)
+      await this.exec(host, secret, `chmod 600 ${shJoin([temporary])}`, 15_000)
       try {
         await this.sftpRename(host, secret, temporary, remotePath)
       } catch {
-        // Standard SFTP rename is allowed to refuse an existing target. The
-        // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
-        // atomic because the temporary file is in the same directory.
         const moved = await this.exec(host, secret, `mv -f ${shJoin([temporary, remotePath])}`, 20_000)
-        if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload rename failed')
-      }
-      if (previous?.mode !== undefined) {
-        await this.exec(host, secret, `chmod ${previous.mode.toString(8)} ${shJoin([remotePath])}`, 15_000).catch(() => undefined)
+        if (moved.code !== 0) throw new Error(moved.stderr || 'remote publish rename failed')
       }
     } catch (error) {
       await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
@@ -1233,6 +1299,14 @@ interface SftpLike {
   opendir(path: string, callback: (error: Error | undefined, handle?: Buffer) => void): void
   open(path: string, flags: string, callback: (error: Error | undefined, handle: Buffer) => void): void
   read(handle: Buffer, buffer: Buffer, offset: number, length: number, position: number, callback: (error: Error | undefined, bytesRead: number, buffer: Buffer, position: number) => void): void
+  /**
+   * ssh2 calls `callback(undefined, endOffset)` with the buffer index
+   * `offset + length` once the request is accepted, not with a byte count.
+   * A short write reports an `endOffset` strictly inside the request.
+   */
+  write(handle: Buffer, buffer: Buffer, offset: number, length: number, position: number, callback: (error: Error | undefined, endOffset: number) => void): void
+  /** One-packet write budget from ssh2 (`_maxWriteLen`), when this session has it. */
+  _maxWriteLen?: number
   close(handle: Buffer, callback: (error: Error | undefined) => void): void
   rename(oldPath: string, newPath: string, callback: (error: Error | undefined) => void): void
   /** OpenSSH's atomic POSIX rename extension, when the server offers it. */
@@ -1552,6 +1626,172 @@ export async function readOpenRange(sftp: SftpLike, remotePath: string, offset: 
     return Buffer.concat(parts, got)
   } finally {
     await closeHandle(sftp, handle)
+  }
+}
+
+const WRITE_CHUNK = READ_CHUNK
+/** How many bytes may sit in unanswered SFTP writes. The transfer deadline still applies. */
+const WRITE_BUDGET = 1024 * 1024
+
+/** One packet when ssh2 advertises it, otherwise a 64 KiB window that fits a non-OpenSSH packet split. */
+function writeChunkBytes(sftp: SftpLike): number {
+  const packet = sftp._maxWriteLen
+  if (typeof packet !== 'number' || !Number.isSafeInteger(packet) || packet < 8 * 1024) return WRITE_CHUNK
+  return Math.min(packet, 256 * 1024)
+}
+
+function openWrite(sftp: SftpLike, remotePath: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    sftp.open(remotePath, 'w', (error, handle) => {
+      if (error || handle === undefined) reject(error === undefined ? new SshFailure('sftp open failed', 'sftp-write') : failureOf(error, 'sftp-write'))
+      else resolve(handle)
+    })
+  })
+}
+
+/**
+ * Write `data` at `position`.
+ *
+ * The callback's second value is an end index in `data` (`offset + length`
+ * when ssh2 finishes the request). A smaller index is a short write and is
+ * continued from that index. A missing index means the request finished
+ * without one. An index that does not advance is a fault: treating it as
+ * success would drop bytes, and retrying it would spin.
+ */
+function writeAt(sftp: SftpLike, handle: Buffer, data: Buffer, position: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const step = (offset: number): void => {
+      const length = data.length - offset
+      sftp.write(handle, data, offset, length, position + offset, (error, endOffset) => {
+        if (error) {
+          reject(failureOf(error, 'sftp-write'))
+          return
+        }
+        if (typeof endOffset !== 'number') {
+          resolve()
+          return
+        }
+        if (endOffset <= offset) {
+          reject(new SshFailure('sftp write made no progress', 'sftp-write'))
+          return
+        }
+        if (endOffset >= offset + length) resolve()
+        else step(endOffset)
+      })
+    }
+    step(0)
+  })
+}
+
+/**
+ * Settle with `work`, or with an abort when `signal` fires first.
+ *
+ * The loser is observed so a write that finishes after the deadline does not
+ * become an unhandled rejection. The caller still has to delete any partial
+ * remote file: this only decides which error the caller sees.
+ */
+function raceAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return work
+  if (signal.aborted) {
+    work.catch(() => undefined)
+    return Promise.reject(abortError())
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (settle: () => void): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      settle()
+    }
+    const onAbort = (): void => {
+      work.catch(() => undefined)
+      finish(() => reject(abortError()))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    work.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    )
+  })
+}
+
+/**
+ * Copy a local file onto a remote path.
+ *
+ * Several chunks are in flight, bounded by {@link WRITE_BUDGET}, so a
+ * round trip is not paid once per 64 KiB. `maxBytes` of `0` does not stop
+ * the copy; the transfer deadline still does. A file that grows past a
+ * positive ceiling is rejected on the bytes actually read.
+ */
+export async function streamLocalToSftp(
+  sftp: SftpLike,
+  localPath: string,
+  remotePath: string,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<number> {
+  if (signal?.aborted) throw abortError()
+  const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+  const nonBlock = fsConstants.O_NONBLOCK ?? 0
+  // `O_NONBLOCK` keeps a FIFO swapped in after the caller's lstat from
+  // blocking the open. The fstat below then refuses anything that is no
+  // longer a regular file.
+  const local = await open(localPath, fsConstants.O_RDONLY | nonBlock | noFollow)
+  let remote: Buffer | undefined
+  const chunkBytes = writeChunkBytes(sftp)
+  const window = Math.max(1, Math.min(32, Math.floor(WRITE_BUDGET / chunkBytes)))
+  const chunk = Buffer.alloc(chunkBytes)
+  const inflight: Promise<void>[] = []
+  let failure: unknown
+  const track = (job: Promise<void>): void => {
+    const tracked = job.then(() => undefined, (error: unknown) => {
+      if (failure === undefined) failure = error
+    }).finally(() => {
+      const index = inflight.indexOf(tracked)
+      if (index >= 0) inflight.splice(index, 1)
+    })
+    inflight.push(tracked)
+  }
+  const consume = async (all: boolean): Promise<void> => {
+    while (inflight.length > 0 && (all || inflight.length >= window)) {
+      await Promise.race(inflight)
+      if (failure !== undefined) {
+        const pending = inflight.splice(0)
+        await Promise.all(pending)
+        throw failure
+      }
+      if (!all) return
+    }
+  }
+  let position = 0
+  try {
+    const info = await local.stat()
+    if (!info.isFile()) throw new Error(`local path is not a regular file: ${localPath}`)
+    remote = await openWrite(sftp, remotePath)
+    while (true) {
+      if (signal?.aborted) {
+        await Promise.all(inflight.splice(0)).catch(() => undefined)
+        throw abortError()
+      }
+      const { bytesRead } = await local.read(chunk, 0, chunk.length, null)
+      if (bytesRead === 0) break
+      position += bytesRead
+      if (maxBytes > 0 && position > maxBytes) {
+        await consume(true)
+        throw new SshFailure(`local file is over the ${maxBytes} byte transfer ceiling`, 'sftp-write', undefined, true)
+      }
+      // Copy the window out of the reusable buffer before the next read.
+      const copy = Buffer.from(chunk.subarray(0, bytesRead))
+      track(writeAt(sftp, remote, copy, position - bytesRead))
+      await consume(false)
+    }
+    await consume(true)
+    return position
+  } finally {
+    if (remote !== undefined) await closeHandle(sftp, remote)
+    await local.close().catch(() => undefined)
   }
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, rm } from 'node:fs/promises'
 import { isAbsolute, join as joinPath, posix, resolve as resolveLocalPath, sep } from 'node:path'
@@ -403,8 +404,14 @@ export class Core {
   private readonly status = new Map<string, Promise<RunnerStatus>>()
   private readonly shellLists = new Map<string, Promise<SidebarShell[]>>()
   private readonly loginEnvs = new LoginEnvCache((hostId, signal) => this.readLoginEnv(hostId, signal))
+  /** sha256 of the snapshot already written to the remote login-env file. */
+  private readonly loginEnvPublished = new Map<string, { hash: string, path: string }>()
+  /** Hosts already warned that a capture failed, so later commands stay quiet. */
+  private readonly loginEnvWarned = new Set<string>()
   /** Drops realpath, stat, and containment records for one host. The file tree installs this. */
   private readonly remoteTrees = new Set<(hostId: string) => void>()
+  /** Drops attribute and version-evidence caches after a remote bash process exits. */
+  private readonly attrFlushers = new Set<(hostId: string) => void>()
   /** The first apply installs the configured root; only a later change keeps the previous one routable. */
   private remoteRootApplied = false
   /** tool/call args for the approval-detail bridge, bounded and per session. */
@@ -490,6 +497,7 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    this.forgetLoginEnv(hostId)
     this.dropRemoteTree(hostId)
     await this.persistHosts()
   }
@@ -522,6 +530,7 @@ export class Core {
     this.pool.invalidate(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
+    this.forgetLoginEnv(hostId)
     this.dropRemoteTree(hostId)
     return { workspaces: removed }
   }
@@ -574,6 +583,21 @@ export class Core {
   /** Ceiling and deadline for one ssh_upload / ssh_download; `0` means no limit. */
   transferLimits(): OpsTransferLimits {
     return { maxBytes: this.config.transferMaxBytes, timeoutMs: this.config.transferTimeoutMs }
+  }
+
+  /**
+   * Byte ceiling for one chat upload. This is the same setting as
+   * {@link transferLimits}: a positive value is the ceiling, and `0` means
+   * no ceiling. The copy is streamed, so `0` writes until the disk is full
+   * instead of holding the file in memory.
+   */
+  maxUploadBytes(): number {
+    return this.config.transferMaxBytes
+  }
+
+  /** Deadline for one chat upload. `0` means no deadline. */
+  uploadTimeoutMs(): number {
+    return this.config.transferTimeoutMs
   }
 
   /**
@@ -677,9 +701,9 @@ export class Core {
     forgetOpsHost(hostId)
     // A rotated key may belong to a different machine; the cached login
     // environment snapshot came from the previous one's bashrc and must not be
-    // eval'd against the new host. (The file tree is deliberately kept: the
+    // sourced against the new host. (The file tree is deliberately kept: the
     // address did not change, only the key.)
-    this.loginEnvs.forget(hostId)
+    this.forgetLoginEnv(hostId)
     await this.persistHosts()
   }
 
@@ -694,7 +718,7 @@ export class Core {
     this.pool.invalidate(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
-    this.loginEnvs.forget(hostId)
+    this.forgetLoginEnv(hostId)
     this.dropRemoteTree(hostId)
   }
 
@@ -702,6 +726,22 @@ export class Core {
   bindRemoteTree(invalidate: (hostId: string) => void): () => void {
     this.remoteTrees.add(invalidate)
     return () => { this.remoteTrees.delete(invalidate) }
+  }
+
+  /** The file tree installs this so a finished bash can drop stale attributes. */
+  bindAttrFlush(flush: (hostId: string) => void): () => void {
+    this.attrFlushers.add(flush)
+    return () => { this.attrFlushers.delete(flush) }
+  }
+
+  forgetHostAttrs(hostId: string): void {
+    for (const flush of this.attrFlushers) {
+      try {
+        flush(hostId)
+      } catch (error) {
+        this.ctx.logger?.warn(`[@dsh-permission-remote] attribute cache reset failed for ${hostId}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
   }
 
   private dropRemoteTree(hostId: string): void {
@@ -720,7 +760,14 @@ export class Core {
    */
   refreshLoginEnv(hostId: string): void {
     this.requireHost(hostId)
+    this.forgetLoginEnv(hostId)
+  }
+
+  /** Drop the captured snapshot and the record of the file it was published to. */
+  private forgetLoginEnv(hostId: string): void {
     this.loginEnvs.forget(hostId)
+    this.loginEnvPublished.delete(hostId)
+    this.loginEnvWarned.delete(hostId)
   }
 
   /** Drop the sidebar shell menu for one host. The label includes the server name. */
@@ -806,7 +853,7 @@ export class Core {
     else {
       forgetOpsHost(host.id)
       // The snapshot is not part of the handshake. Drop it only when the switch flips.
-      if (previous !== undefined && (previous.loginEnv === true) !== normalized.loginEnv) this.loginEnvs.forget(host.id)
+      if (previous !== undefined && (previous.loginEnv === true) !== normalized.loginEnv) this.forgetLoginEnv(host.id)
     }
     // A rename keeps the connection. The shell menu still caches `host · zsh`.
     this.forgetShells(normalized.id)
@@ -834,6 +881,7 @@ export class Core {
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
+    this.forgetLoginEnv(hostId)
     this.dropRemoteTree(hostId)
     await this.persistHosts()
   }
@@ -1732,7 +1780,47 @@ export class Core {
       createWorkspace: (host, remotePath, title, signal) => this.registerWorkspace(host, remotePath, title, signal),
       resolveMode: buildResolveMode(this.ctx),
       loginEnvOf: (host, signal) => this.loginEnvs.get(host.id, signal),
+      loginEnvFileOf: (host, signal) => this.loginEnvFile(host, signal),
+      forgetHostAttrs: hostId => this.forgetHostAttrs(hostId),
       jobs,
+    }
+  }
+
+  /**
+   * Publish the captured snapshot and return its remote path.
+   *
+   * `loginEnvOf` still returns the text. The command sources a `0600` file so
+   * the exports are not on the process command line. A failed capture stays
+   * cached and warns once. A failed publish returns `''` without caching the
+   * path, so the next command tries the write again and does not source a
+   * file that is not there.
+   */
+  private async loginEnvFile(host: HostConfig, signal?: AbortSignal): Promise<string> {
+    const snapshot = await this.loginEnvs.get(host.id, signal)
+    if (snapshot.length === 0) {
+      if (!this.loginEnvWarned.has(host.id)) {
+        this.loginEnvWarned.add(host.id)
+        this.ctx.logger?.warn(`[@dsh-permission-remote] login environment for ${host.id} was not captured; commands keep the SSH environment until it is read again`)
+      }
+      return ''
+    }
+    this.loginEnvWarned.delete(host.id)
+    const hash = createHash('sha256').update(snapshot).digest('hex')
+    const published = this.loginEnvPublished.get(host.id)
+    if (published !== undefined && published.hash === hash) return published.path
+    try {
+      const secret = await this.secret(host)
+      const home = normalizeRemoteDirectory(await this.pool.sftpRealpath(host, secret, '.'))
+      if (home === null) throw new Error('remote home is not an absolute path')
+      const file = posix.join(home, '.dsh-permission-remote', 'login-env.sh')
+      const rel = posix.relative(home, file)
+      if (rel === '' || rel.startsWith('..') || posix.isAbsolute(rel)) throw new Error('login env path escapes the remote home')
+      await this.pool.publishPrivateFile(host, secret, file, Buffer.from(snapshot, 'utf8'))
+      this.loginEnvPublished.set(host.id, { hash, path: file })
+      return file
+    } catch (error) {
+      this.ctx.logger?.warn(`[@dsh-permission-remote] login environment for ${host.id} could not be published (${error instanceof Error ? error.message : String(error)}); this command keeps the SSH environment`)
+      return ''
     }
   }
 
@@ -1986,7 +2074,8 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     const remove = installRemoteShell(bridged as unknown as { get(name: string): unknown }, {
       routeByCwd: cwd => routeByCwd(cwd),
       hostOf: id => core.listHosts().find(host => host.id === id),
-      loginEnvOf: (host, signal) => hostApi.loginEnvOf?.(host, signal) ?? Promise.resolve(''),
+      loginEnvFileOf: (host, signal) => hostApi.loginEnvFileOf?.(host, signal) ?? Promise.resolve(''),
+      onCommandFinished: hostId => core.forgetHostAttrs(hostId),
     })
     if (remove === undefined) return
     unregisters.add(remove)
@@ -2043,6 +2132,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       const unbind = core.bindRemoteTree(hostId => removeFs.invalidateHost(hostId))
       unbinds.push(unbind)
       unregisters.add(unbind)
+      const unbindFlush = core.bindAttrFlush(hostId => removeFs.forgetHostAttrs(hostId))
+      unbinds.push(unbindFlush)
+      unregisters.add(unbindFlush)
     }
     unregisters.add(removeWorkerPath)
     if (removeUploads !== undefined) {

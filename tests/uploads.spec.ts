@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
 import { encodeRemotePath, resolveRemotePath, setRemoteRootOverride } from '../src/router.ts'
 import { SshFailure } from '../src/ssh-pool.ts'
-import { installRemoteUploads, remoteUploadPath, type UploadAccess } from '../src/uploads.ts'
+import { UPLOAD_CAP, UPLOAD_FRESH_MS, installRemoteUploads, remoteUploadPath, uploadCeiling, type UploadAccess } from '../src/uploads.ts'
 
 const root = mkdtempSync(path.join(tmpdir(), 'dsh-remote-uploads-'))
 process.env.DSH_SSH_REMOTE_ROOT = root
@@ -41,10 +41,16 @@ function setup() {
   let stat = async (): Promise<{ isDirectory: boolean, size: number }> => {
     throw new SshFailure('no such file', 'sftp-stat')
   }
-  let attrs: () => Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number } | undefined> = async () => undefined
+  let attrs: (remotePath?: string) => Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number, mtime?: number } | undefined> = async () => undefined
   let failPut = false
   let home = '/home/me'
-  let putHook: () => void | Promise<void> = () => undefined
+  let now = 1_000
+  let maxBytes = UPLOAD_CAP
+  let timeoutMs = 0
+  let hostPath = HOST_PATH
+  let attrCalls = 0
+  const warnings: string[] = []
+  let putHook: (signal?: AbortSignal) => void | Promise<void> = () => undefined
   const fs = {
     processPathFromHostPath(hostPath: string): string | undefined { return hostPath },
   }
@@ -57,25 +63,31 @@ function setup() {
       if (name === 'sessions') return { get(id: string) { return id === 's1' ? session : undefined } }
       if (name === 'workingDirectory') return { get(value: { header?: { cwd?: string } }) { return value.header?.cwd ?? '' } }
       if (name === 'agents') return { currentInitiator() { return initiator } }
-      if (name === 'attachments') return { fileHostPath() { return HOST_PATH } }
+      if (name === 'attachments') return { fileHostPath() { return hostPath } }
       throw new Error(name)
     },
     on(_event: 'llm/stream', fn: StreamListener) {
       listener = fn
       return () => { listener = undefined }
     },
-    logger: { warn(_message: string) { /* expected on failed copies */ } },
+    logger: { warn(message: string) { warnings.push(message) } },
   }
   const access: UploadAccess = {
     requireHost: () => ({ id: 'lo' } as HostConfig),
     async secret() { return {} },
+    maxUploadBytes: () => maxBytes,
+    uploadTimeoutMs: () => timeoutMs,
+    now: () => now,
     pool: {
       async sftpRealpath(_host, _secret, remotePath) { return remotePath === '.' ? home : remotePath },
       sftpStat: () => stat(),
-      sftpAttrs: () => attrs(),
-      async sftpPutFile(_host, _secret, local, remote) {
+      sftpAttrs: async (_host, _secret, remotePath) => {
+        attrCalls += 1
+        return attrs(remotePath)
+      },
+      async sftpPutFile(_host, _secret, local, remote, _root?: string, limits?: { signal?: AbortSignal }) {
         sawNextDuringPut = nextCalled
-        await putHook()
+        await putHook(limits?.signal)
         if (failPut) throw new Error('disk full')
         puts.push({ local, remote })
       },
@@ -98,7 +110,13 @@ function setup() {
     setAttrs(next: typeof attrs) { attrs = next },
     setFailPut(value: boolean) { failPut = value },
     setHome(value: string) { home = value },
-    setPut(hook: () => void | Promise<void>) { putHook = hook },
+    setNow(value: number) { now = value },
+    setMax(value: number) { maxBytes = value },
+    setUploadTimeout(value: number) { timeoutMs = value },
+    setHostPath(value: string) { hostPath = value },
+    get attrCalls() { return attrCalls },
+    warnings,
+    setPut(hook: (signal?: AbortSignal) => void | Promise<void>) { putHook = hook },
     setInitiator(cwd: string | undefined) {
       initiator = cwd === undefined ? undefined : { session: { header: { cwd } } }
     },
@@ -178,6 +196,31 @@ test('the same remote size is not copied again and the model sees the remote pat
   assert.equal(resolveRemotePath(seen ?? '', REMOTE, placeholder), seen)
   harness.setInitiator(undefined)
   assert.equal(harness.fs.processPathFromHostPath(HOST_PATH), HOST_PATH)
+})
+
+test('a transfer timeout fails that upload, names the deadline, and lets the turn continue', async () => {
+  const harness = setup()
+  harness.setUploadTimeout(40)
+  harness.setPut(signal => new Promise((_resolve, reject) => {
+    const fail = () => {
+      const error = new Error('SSH operation aborted')
+      error.name = 'AbortError'
+      reject(error)
+    }
+    if (signal?.aborted === true) fail()
+    else signal?.addEventListener('abort', fail, { once: true })
+  }))
+  const keepAlive = setInterval(() => undefined, 5)
+  try {
+    await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+    assert.match(harness.warnings.join('\n'), /timed out after 40 ms/)
+    assert.match(harness.warnings.join('\n'), /Transfer timeout/)
+    assert.equal(harness.puts.length, 0)
+    harness.setInitiator(placeholder)
+    assert.equal(harness.fs.processPathFromHostPath(HOST_PATH), undefined)
+  } finally {
+    clearInterval(keepAlive)
+  }
 })
 
 test('a failed copy and an oversize file leave no readable path, and the turn continues', async () => {
@@ -266,4 +309,54 @@ test('an existing symbolic link at the upload path is refused, not followed and 
   assert.equal(harness.puts.length, 0)
   harness.setInitiator(placeholder)
   assert.notEqual(harness.fs.processPathFromHostPath(HOST_PATH), UPLOADED)
+})
+
+test('a fresh upload is not copied again, and a changed mtime is', async () => {
+  assert.deepEqual(uploadCeiling(undefined), { bytes: UPLOAD_CAP, source: 'upload' })
+  assert.deepEqual(uploadCeiling(0), { bytes: 0, source: 'transfer' })
+  assert.deepEqual(uploadCeiling(1024), { bytes: 1024, source: 'transfer' })
+  assert.deepEqual(uploadCeiling(64 * 1024 * 1024), { bytes: 64 * 1024 * 1024, source: 'transfer' })
+  const harness = setup()
+  let mtime = 10
+  harness.setStat(async () => ({ isDirectory: false, size: 4 }))
+  harness.setAttrs(async remotePath => remotePath === UPLOADED
+    ? { type: 'file', size: 4, mtime }
+    : { type: 'directory', size: 0, mtime: 1 })
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 0)
+  const afterFirst = harness.attrCalls
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 0)
+  assert.ok(harness.attrCalls > afterFirst)
+  mtime = 11
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, 1)
+  harness.setNow(1_000 + UPLOAD_FRESH_MS)
+  mtime = 11
+  const puts = harness.puts.length
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage() })
+  assert.equal(harness.puts.length, puts)
+})
+
+test('a raised transfer ceiling allows a chat upload above 32 MiB, and 0 does not cap it', async () => {
+  const raised = setup()
+  raised.setMax(64 * 1024 * 1024)
+  await pull(raised.listener, { sessionId: 's1', messages: fileMessage(40 * 1024 * 1024) })
+  assert.equal(raised.puts.length, 1)
+
+  const open = setup()
+  open.setMax(0)
+  await pull(open.listener, { sessionId: 's1', messages: fileMessage(CAP + 1) })
+  assert.equal(open.puts.length, 1)
+})
+
+test('a local file larger than the attachment metadata is not read into memory', async () => {
+  const harness = setup()
+  const local = path.join(root, 'big.bin')
+  writeFileSync(local, Buffer.alloc(32))
+  harness.setHostPath(local)
+  harness.setMax(8)
+  await pull(harness.listener, { sessionId: 's1', messages: fileMessage(4) })
+  assert.equal(harness.puts.length, 0)
+  assert.match(harness.warnings.join('\n'), /32 bytes, over the 8 byte transfer limit/)
 })

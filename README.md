@@ -54,7 +54,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 | 选项 | 行为 |
 |---|---|
 | SSH 登录环境 | 沿用 SSH 登录时拿到的变量，通常只有 `/etc/environment` 里那几个（默认） |
-| 读取 bash 启动脚本 | 捕获一次启动文件导出的变量并复用。卡片上显示「重新读取环境」按钮 |
+| 读取 bash 启动脚本 | 捕获一次启动文件导出的变量，写到远端 `~/.dsh-permission-remote/login-env.sh` 再 source。卡片上显示「重新读取环境」按钮 |
 
 会读 `/etc/profile`、`~/.bash_profile` / `~/.bash_login` / `~/.profile`、`/etc/bash.bashrc`、`~/.bashrc`，丢弃输出，最多 10 秒；超时或失败时沿用 SSH 环境，不反复重试。`PWD`、`OLDPWD`、`SHLVL` 不缓存，`~/.zshrc` 不读，别名和函数不保留。`ssh_exec` 固定用 `bash -lc`，不受这个设置影响。缓存与重读细节见[详细说明](docs/advanced.md#环境变量来源)。
 
@@ -111,7 +111,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 - 运维工具不受远端工作区沙箱约束，目标通常是本机工作区之外的机器。
 - **信任一台主机也意味着信任它能拿到会话让它上传的本机文件**；「信任」下下载/上传不再看当前会话档位。
 - 上传、下载都只处理单个文件，不递归、不续传；符号链接、FIFO、设备一律拒绝。
-- 单次上限默认 32 MiB、超时默认 120 秒，可在设置页改；`0` 表示不封顶/不限时。超时可能仍完成落盘，失败可能留下同目录临时文件。
+- 单次上限默认 32 MiB、超时默认 120 秒，可在设置页改。字节填 `0` 只取消字节上限，超时填 `0` 才不限时。上传同时在途大约 1 MiB，下载仍逐块读；默认 120 秒仍会先停住慢链路或大文件。`ssh_upload` / `ssh_download` 到点报 `TimeoutError` 并写明毫秒数。超时可能仍完成落盘，失败可能留下同目录临时文件。
 - `ssh_exec` 用 `bash -lc`，`sudo` 只能免密（`sudo -n`）；只支持直连 Linux/macOS，不支持跳板机和 Windows 远端。
 
 传输上限、超时、符号链接与 `ssh_workspace` 的细节见[详细说明](docs/advanced.md#传输工具细节)。
@@ -127,8 +127,8 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 ## 已知限制
 
-- **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用，手动刷新后属性可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`。
-- **`present` 可用。** 插件先把远端文件流式复制到本机的内容寻址快照（`<占位根>/.deliverables/<sha256>/<文件名>`），再用快照路径调用官方 `present`，所以卡片和预览拿到的是本机副本；远端原文件不动，快照只读、不可变，改过内容再交付不会顶掉旧卡片。上限跟随设置页的单次传输上限，另有 256 MiB 快照硬顶；任一文件失败整次拒绝。卸载不删已交付的快照；快照按 30 天过期，全部快照合计上限 1 GiB。细节见[详细说明](docs/advanced.md#交付文件present)。
+- **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用。远端 `bash` 结束后属性缓存会清掉；侧栏、运维工具和运行代码改过的文件，手动刷新后属性仍可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`，单文件大小和超时跟着设置页的「单次传输上限」和「单次传输超时」；默认 32 MiB、120 秒。字节填 `0` 只取消字节上限，默认超时仍然生效。复制分段进行，同时在途大约 1 MiB。传到点会记一条带毫秒数的警告，这一轮对话继续，该附件不会变成远端路径。
+- **`present` 可用。** 快照目录能打开时，插件把远端文件分段复制到本机的内容寻址快照（`<占位根>/.deliverables/<sha256>/<文件名>`），再用快照路径调用官方 `present`。快照目录打不开时退回整段缓冲，单文件仍不超过 256 MiB。卡片和预览拿到的是本机副本；远端原文件不动，快照只读、不可变，改过内容再交付不会顶掉旧卡片。上限跟随设置页的单次传输上限，另有 256 MiB 快照硬顶；任一文件失败整次拒绝。卸载不删已交付的快照；快照按 30 天过期，全部快照合计上限 1 GiB。细节见[详细说明](docs/advanced.md#交付文件present)。
 - **文件工具已经是官方 `dsh-tool-fs` 的工具层。** `read`、`write`、`edit`、`read_image`、`apply_patch` 的 schema、校验和审批由 DSH 提供；插件只实现远端 `ctx.fs` 的 `writeText`/`editText`/`patchText` 等后端方法，不会把文件写到本机 placeholder。
 - **可选的 `apply_patch` / `str_replace_editor`。** 两者默认都关着，由组合配置决定是否启用了 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 或挂载 `@deepseek-ai/dsh-tool-str-replace-editor`；启用后在远端执行，遵守同一套 Permissions、审批和沙箱，整补丁先预检、失败不回滚。细节见[详细说明](docs/advanced.md#可选的-apply_patch--str_replace_editor)。
 - **DSH 跑在 Windows 上时**，远端工作区只暴露远端 `bash`；`pwsh`、`powershell`、`cmd` 会被工具过滤和守卫挡住。`minimal` 这类完整 persona 不会被改写。
@@ -193,7 +193,7 @@ Both settings live in the host's **edit dialog**; the card shows a label when on
 | Option | Behaviour |
 |---|---|
 | SSH login environment | Keeps what SSH logged in with (default) |
-| Read bash startup files | Captures exported variables once and reuses them; the card offers **Re-read environment** |
+| Read bash startup files | Captures exported variables once, writes `~/.dsh-permission-remote/login-env.sh`, and sources that file; the card offers **Re-read environment** |
 
 Reads `/etc/profile`, the first of `~/.bash_profile` / `~/.bash_login` / `~/.profile`, then `/etc/bash.bashrc` and `~/.bashrc`, discarding output, capped at 10 s. `PWD` / `OLDPWD` / `SHLVL` are not cached, `~/.zshrc` is not read, aliases and functions are not kept. `ssh_exec` stays `bash -lc`. Details: [detailed notes](docs/advanced.md#环境变量来源).
 
@@ -229,7 +229,7 @@ An ordinary local workspace can operate a configured SSH host with `ssh_hosts`, 
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops calls are not wrapped in the remote workspace sandbox — the target is usually outside the local workspace. Trusting a host also trusts it with local files a session uploads. Transfers are single files, no recursion or resume; symlinks, FIFOs, and devices are refused. Ceiling 32 MiB and deadline 120 s by default (settings page; `0` means unlimited). Details: [detailed notes](docs/advanced.md#传输工具细节).
+Ops calls are not wrapped in the remote workspace sandbox — the target is usually outside the local workspace. Trusting a host also trusts it with local files a session uploads. Transfers are single files, no recursion or resume; symlinks, FIFOs, and devices are refused. Ceiling 32 MiB and deadline 120 s by default. A byte ceiling of `0` leaves the deadline in force. Uploads keep about 1 MiB of writes in flight; downloads still read one chunk at a time. A slow link still stops at 120 s unless the timeout is raised or set to `0`. `ssh_upload` / `ssh_download` report that as `TimeoutError` with the millisecond count. Details: [detailed notes](docs/advanced.md#传输工具细节).
 
 ### Sidebar terminal
 
@@ -242,8 +242,8 @@ The right sidebar's terminal on a remote workspace connects to that host: the sh
 
 ### Known limitations
 
-- **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh (manual refresh can lag ~5 s). Non-image uploads are copied to `~/.dsh-permission-remote/uploads/`.
-- **`present` works** by streaming the remote file into a content-addressed local snapshot (`<placeholder root>/.deliverables/<sha256>/<name>`) and then calling the official tool with that path; the remote original is untouched, snapshots are read-only and immutable, and re-delivering changed content never replaces an older card's bytes. The size limit follows the transfer setting with a 256 MiB snapshot ceiling, and any bad file refuses the whole call. Unloading the plugin keeps delivered snapshots; they expire after 30 days, and all snapshots together are capped at 1 GiB. Details: [detailed notes](docs/advanced.md#交付文件present).
+- **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh. A remote `bash` drops the attribute cache when it exits; files changed from the sidebar, ops tools, or Run Code can still lag ~5 s on manual refresh. Non-image uploads are copied to `~/.dsh-permission-remote/uploads/` and follow the transfer ceiling and timeout on the settings page: 32 MiB and 120 s by default. A byte ceiling of `0` leaves the deadline in force. The copy keeps about 1 MiB in flight. A timeout logs the millisecond count and the turn continues; that attachment is not published as a remote path.
+- **`present` works** by copying the remote file into a content-addressed local snapshot (`<placeholder root>/.deliverables/<sha256>/<name>`) and then calling the official tool with that path. When the snapshot directory can be opened the copy is chunked; when it cannot, the file is buffered up to the same 256 MiB cap. The remote original is untouched, snapshots are read-only and immutable, and re-delivering changed content never replaces an older card's bytes. The size limit follows the transfer setting with a 256 MiB snapshot ceiling, and any bad file refuses the whole call. Unloading the plugin keeps delivered snapshots; they expire after 30 days, and all snapshots together are capped at 1 GiB. Details: [detailed notes](docs/advanced.md#交付文件present).
 - **File tools already use the official `dsh-tool-fs` surface.** `read`, `write`, `edit`, `read_image`, and `apply_patch` keep DSH schemas, validation, and approvals; the plugin only implements the remote `ctx.fs` backend methods such as `writeText`/`editText`/`patchText`, never a local write to the placeholder.
 - **Optional `apply_patch` / `str_replace_editor`** are off unless the composition enables `applyPatch` or mounts the editor package. They then run remotely under the same Permissions, approval, and sandbox; a patch is preflighted first and is not rolled back on failure. Details: [detailed notes](docs/advanced.md#可选的-apply_patch--str_replace_editor).
 - **Windows-hosted DSH** exposes only the remote `bash` in a remote workspace; `pwsh` / `powershell` / `cmd` are filtered and guarded. A `complete: true` persona is not rewritten.

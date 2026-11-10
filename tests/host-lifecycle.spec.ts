@@ -205,6 +205,40 @@ test('a timed out login-environment read is not tried again on the same connecti
   }
 })
 
+test('a published login environment is a private file, and a failed publish is not sourced', async () => {
+  const warnings: string[] = []
+  const core = new Core({
+    ...fakeContext(),
+    logger: { info() {}, warn(message: string) { warnings.push(message) } },
+  } as never, readConfig({ hosts: [host({ loginEnv: true })], deletedHosts: [] }), new FakeRegistry())
+  const commands: string[] = []
+  const pool = core.pool
+  pool.exec = (async (_host: unknown, _secret: unknown, command: string) => {
+    commands.push(command)
+    return {
+      code: 0, signal: null, stdout: 'declare -x FROM=1\n', stderr: '',
+      timedOut: false, stdoutTruncated: false, stderrTruncated: false,
+    }
+  }) as typeof pool.exec
+  pool.sftpRealpath = async () => '/home/me'
+  pool.sftpWrite = async () => undefined
+  pool.sftpRename = async () => undefined
+  const api = core.toolHost(undefined)
+  const row = host({ loginEnv: true })
+  const file = await api.loginEnvFileOf!(row)
+  assert.equal(file, '/home/me/.dsh-permission-remote/login-env.sh')
+  assert.match(commands[0] ?? '', /--noprofile/)
+  assert.match(commands.join('\n'), /chmod 700/)
+  assert.match(commands.join('\n'), /chmod 600/)
+  commands.length = 0
+  assert.equal(await api.loginEnvFileOf!(row), file)
+  assert.equal(commands.length, 0)
+  pool.publishPrivateFile = async () => { throw new Error('disk full') }
+  core.refreshLoginEnv('host1')
+  assert.equal(await api.loginEnvFileOf!(row), '')
+  assert.match(warnings.join('\n'), /could not be published/)
+})
+
 test('re-reading the login environment drops the snapshot and keeps the session', async () => {
   const core = build(new FakeRegistry())
   const invalidated = watchInvalidate(core)

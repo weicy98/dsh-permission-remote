@@ -51,9 +51,12 @@ const TEXT_CAP = 32 * 1024 * 1024
  * `agent/pre-step` stats the working directory, `.git`, and every instruction
  * candidate on each step. A realpath must not be trusted for long: replacing a
  * directory with a symlink is the escape this cache could otherwise hide, so the
- * window is only a few seconds. Attributes are shorter: `write`, `edit`, and
- * `bash` talk to SFTP directly and do not tell this cache, so the sidebar must
- * notice a new file within a few seconds. A disconnected host can still answer
+ * window is only a few seconds. Attributes are shorter. `write` and `edit` drop
+ * the path they just changed. A remote `bash` tool drops the host's attributes
+ * when the process exits, because the command can create or replace files the
+ * cache had already recorded as absent. The sidebar PTY, ops tools, and PTC
+ * have no such boundary, so a manual refresh can still show the previous
+ * existence and size for a few seconds. A disconnected host can still answer
  * from an older entry.
  */
 const REALPATH_TTL_MS = 3_000
@@ -152,6 +155,8 @@ export interface RemoteFsOptions {
 export interface RemoteTree {
   (): void
   invalidateHost(hostId: string): void
+  /** Drop cached attributes and version evidence. Realpath and identity stay. */
+  forgetHostAttrs(hostId: string): void
 }
 
 /**
@@ -250,6 +255,12 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
     for (const restore of restorers) restore()
     Reflect.deleteProperty(fs, MARKER)
   }) as RemoteTree
+  const dropDescriptors = (hostId: string) => {
+    const prefix = `${hostId}\0`
+    for (const key of descriptors.keys()) {
+      if (key.startsWith(prefix)) descriptors.delete(key)
+    }
+  }
   remove.invalidateHost = (hostId: string) => {
     meta.invalidateHost(hostId)
     for (const [key, record] of identity) {
@@ -258,12 +269,14 @@ export function installRemoteFs(ctx: FsContext, access: RemoteAccess, options?: 
     for (const key of versions.keys()) {
       if (key.startsWith(`${hostId}\0`)) versions.delete(key)
     }
-    for (const key of descriptors.keys()) {
-      if (key.startsWith(`${hostId}\0`)) descriptors.delete(key)
-    }
+    dropDescriptors(hostId)
     for (const key of locks.keys()) {
       if (key.startsWith(`${hostId}\0`)) locks.delete(key)
     }
+  }
+  remove.forgetHostAttrs = (hostId: string) => {
+    meta.forgetHostAttrs(hostId)
+    dropDescriptors(hostId)
   }
   return remove
 }
@@ -321,6 +334,7 @@ async function lstatRemote(runtime: Runtime, requested: string, opts: { cwd?: st
     throwIfFsAborted(signal)
     // This is deliberately not served from the attribute cache: a directory
     // can be replaced by a symlink between two sidebar clicks.
+    const ticket = runtime.meta.attrTicket(host.id)
     const info = await uncachedAttrs(runtime, host, secret, route.remoteCwd, false, signal)
     throwIfFsAborted(signal)
     // Seen as a link: drop any realpath/attribute cache for it, so the next
@@ -331,7 +345,7 @@ async function lstatRemote(runtime: Runtime, requested: string, opts: { cwd?: st
       runtime.meta.forgetAttrs(host.id, route.remoteCwd, true)
       runtime.meta.forgetAttrs(host.id, route.remoteCwd, false)
     }
-    runtime.meta.rememberAttrs(host.id, route.remoteCwd, false, info)
+    runtime.meta.rememberAttrs(host.id, route.remoteCwd, false, info, ticket)
     if (info === undefined) return undefined
     // `lstat` is the sidebar/existence fast path: do not spawn a shell `stat`
     // for every entry. A cached descriptor from a preceding `stat` is still
@@ -367,20 +381,28 @@ async function statRemote(runtime: Runtime, target: FsTarget, signal?: AbortSign
   if (fresh.hit) {
     if (fresh.value === undefined) return undefined
     if (fresh.value.type !== 'file') return infoOf(fresh.value, versionFor(runtime, place.host.id, place.remote, fresh.value))
-    const key = versionKey(place.host.id, place.remote)
-    const known = cachedEvidence(runtime, key, baseVersion(fresh.value))
+    const versionKeyForPlace = versionKey(place.host.id, place.remote)
+    const known = cachedEvidence(runtime, versionKeyForPlace, baseVersion(fresh.value))
     if (known !== undefined) return infoOf(fresh.value, versionFor(runtime, place.host.id, place.remote, fresh.value, known))
+    const ticket = runtime.meta.attrTicket(place.host.id)
     const secret = await runtime.access.secret(place.host)
     const evidence = await remoteVersionEvidence(runtime.access.pool as unknown as SshPool, place.host, secret, place.remote, signal, { hash: true })
-    rememberDescriptor(runtime, key, baseVersion(fresh.value), evidence)
+    if (runtime.meta.attrTicket(place.host.id) === ticket) rememberDescriptor(runtime, versionKeyForPlace, baseVersion(fresh.value), evidence)
     return infoOf(fresh.value, versionFor(runtime, place.host.id, place.remote, fresh.value, evidence))
   }
   try {
+    const ticket = runtime.meta.attrTicket(place.host.id)
     const secret = await runtime.access.secret(place.host)
     const info = await attrsFor(runtime, place.host, secret, place.remote, true, signal)
     throwIfFsAborted(signal)
-    runtime.meta.rememberAttrs(place.host.id, place.remote, true, info)
+    if (runtime.meta.attrTicket(place.host.id) !== ticket) {
+      return info === undefined ? undefined : infoOf(info, versionFor(runtime, place.host.id, place.remote, info))
+    }
+    runtime.meta.rememberAttrs(place.host.id, place.remote, true, info, ticket)
     const evidence = info === undefined || info.type !== 'file' ? {} : await remoteVersionEvidence(runtime.access.pool as unknown as SshPool, place.host, secret, place.remote, signal, { hash: true })
+    if (runtime.meta.attrTicket(place.host.id) !== ticket) {
+      return info === undefined ? undefined : infoOf(info, versionFor(runtime, place.host.id, place.remote, info, evidence))
+    }
     if (info !== undefined) rememberDescriptor(runtime, versionKey(place.host.id, place.remote), baseVersion(info), evidence)
     return info === undefined ? undefined : infoOf(info, versionFor(runtime, place.host.id, place.remote, info, evidence))
   } catch (error) {
@@ -1575,8 +1597,9 @@ async function attrsFor(
 ): Promise<SftpAttrs | undefined> {
   const fresh = runtime.meta.attrs(host.id, remotePath, follow, false)
   if (fresh.hit) return fresh.value
+  const ticket = runtime.meta.attrTicket(host.id)
   const info = await uncachedAttrs(runtime, host, secret, remotePath, follow, signal)
-  runtime.meta.rememberAttrs(host.id, remotePath, follow, info)
+  runtime.meta.rememberAttrs(host.id, remotePath, follow, info, ticket)
   return info
 }
 
@@ -1719,6 +1742,7 @@ async function verifiedPlace(
   const secret = await runtime.access.secret(host)
   throwIfFsAborted(signal)
   const lexical = route.remoteCwd
+  const ticket = runtime.meta.attrTicket(host.id)
   let info = await uncachedAttrs(runtime, host, secret, lexical, false, signal)
   throwIfFsAborted(signal)
   if (info === undefined) throw new FsError(`no entry at "${target.displayPath}"`, 'FS_NOT_FOUND')
@@ -1751,7 +1775,7 @@ async function verifiedPlace(
   if (expected === 'file' && type !== 'file') {
     throw new FsError(`"${target.displayPath}" is not a regular file`, 'FS_NOT_REGULAR_FILE')
   }
-  runtime.meta.rememberAttrs(host.id, lexical, true, info)
+  runtime.meta.rememberAttrs(host.id, lexical, true, info, ticket)
   return { host, remote: effective }
 }
 
@@ -1945,6 +1969,8 @@ interface MetaMiss {
 class MetaCache {
   private readonly realPaths = new Map<string, { at: number, value: string }>()
   private readonly attrEntries = new Map<string, { at: number, value: SftpAttrs | undefined }>()
+  /** Bumped when a host's attributes are dropped, so an in-flight probe cannot write them back. */
+  private readonly attrEpoch = new Map<string, number>()
 
   constructor(
     private readonly now: () => number,
@@ -1971,6 +1997,27 @@ class MetaCache {
     this.attrEntries.delete(`${hostId}\0${follow ? 's' : 'l'}\0${remotePath}`)
   }
 
+  /** Generation a probe must present to store attributes captured before a flush. */
+  attrTicket(hostId: string): number {
+    return this.attrEpoch.get(hostId) ?? 0
+  }
+
+  /**
+   * Drop every cached attribute for one host and invalidate probes already in flight.
+   *
+   * Realpath entries stay: those have their own short TTL, and forgetting them
+   * here would make a command's exit also forget which directory a symlink
+   * pointed at. The generation moves first, so a probe that read the old
+   * generation cannot `rememberAttrs` after this returns.
+   */
+  forgetHostAttrs(hostId: string): void {
+    this.attrEpoch.set(hostId, this.attrTicket(hostId) + 1)
+    const prefix = `${hostId}\0`
+    for (const key of this.attrEntries.keys()) {
+      if (key.startsWith(prefix)) this.attrEntries.delete(key)
+    }
+  }
+
   /** Whether an identity captured at `at` is still inside the realpath window. */
   isRealpathFresh(at: number): boolean {
     return this.now() - at < this.realTtl
@@ -1980,14 +2027,15 @@ class MetaCache {
     return this.read(this.attrEntries, `${hostId}\0${follow ? 's' : 'l'}\0${remotePath}`, stale, this.attrTtl)
   }
 
-  rememberAttrs(hostId: string, remotePath: string, follow: boolean, value: SftpAttrs | undefined): void {
+  rememberAttrs(hostId: string, remotePath: string, follow: boolean, value: SftpAttrs | undefined, ticket: number): void {
+    if (this.attrTicket(hostId) !== ticket) return
     this.write(this.attrEntries, `${hostId}\0${follow ? 's' : 'l'}\0${remotePath}`, value)
   }
 
   invalidateHost(hostId: string): void {
+    this.forgetHostAttrs(hostId)
     const prefix = `${hostId}\0`
     for (const key of this.realPaths.keys()) if (key.startsWith(prefix)) this.realPaths.delete(key)
-    for (const key of this.attrEntries.keys()) if (key.startsWith(prefix)) this.attrEntries.delete(key)
   }
 
   private read<T>(map: Map<string, { at: number, value: T }>, key: string, stale: boolean, ttl: number): MetaHit<T> | MetaMiss {

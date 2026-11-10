@@ -12,6 +12,7 @@
  * status stay the project's. Bash can read it because the sandbox bind-mounts
  * `/` read-only. Images are not file blocks and stay where they are.
  */
+import { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { posix } from 'node:path'
 import { symbols } from '@deepseek-ai/cordis'
@@ -21,9 +22,33 @@ import { normalizeRemoteDirectory, routeByCwd, type RemoteRoute } from './router
 import { settleThen, type SecretMaterial } from './ssh-pool.ts'
 import { remotePathInside } from './workspaces.ts'
 
-/** Same ceiling `present` uses before it will copy a remote file. */
-const UPLOAD_CAP = 32 * 1024 * 1024
+/**
+ * Default chat-upload ceiling when the caller does not supply the transfer
+ * setting. Production passes that setting, so this is only the fallback.
+ */
+export const UPLOAD_CAP = 32 * 1024 * 1024
+/** How long a ready upload skips the parent-symlink walk and the re-copy. */
+export const UPLOAD_FRESH_MS = 60_000
 const LEAF_MAX = 120
+
+/**
+ * The byte ceiling for one chat upload.
+ *
+ * A positive transfer setting is the ceiling, including values above 32 MiB.
+ * `0` is the settings-page "no limit" sentinel. Omitting the setting keeps
+ * the historical 32 MiB default.
+ */
+export function uploadCeiling(configured: number | undefined): { bytes: number, source: 'upload' | 'transfer' } {
+  if (configured === undefined) return { bytes: UPLOAD_CAP, source: 'upload' }
+  if (configured > 0) return { bytes: configured, source: 'transfer' }
+  return { bytes: 0, source: 'transfer' }
+}
+
+function withinCeiling(bytes: number, ceiling: number): boolean {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return false
+  if (ceiling <= 0) return true
+  return bytes <= ceiling
+}
 
 const MARKER = Symbol('dsh-permission-remote.uploads')
 
@@ -34,9 +59,25 @@ export interface UploadAccess {
     sftpRealpath(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<string>
     sftpStat(host: HostConfig, secret: SecretMaterial, remotePath: string): Promise<{ isDirectory: boolean, size: number }>
     /** `lstat` (follow=false) so an existing symbolic link can be refused. */
-    sftpAttrs?(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number } | undefined>
-    sftpPutFile(host: HostConfig, secret: SecretMaterial, localPath: string, remotePath: string, allowedRoot?: string): Promise<void>
+    sftpAttrs?(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<{ type: 'file' | 'directory' | 'symlink' | 'other', size: number, mtime?: number } | undefined>
+    sftpPutFile(
+      host: HostConfig,
+      secret: SecretMaterial,
+      localPath: string,
+      remotePath: string,
+      allowedRoot?: string,
+      limits?: { maxBytes?: number, signal?: AbortSignal },
+    ): Promise<void>
   }
+  /**
+   * Settings-page transfer ceiling. `0` means no byte ceiling. Omission keeps
+   * the 32 MiB default.
+   */
+  maxUploadBytes?(): number
+  /** Settings-page transfer deadline. `0` or omission means no deadline. */
+  uploadTimeoutMs?(): number
+  /** Test clock. Production uses `Date.now`. */
+  now?(): number
 }
 
 interface StreamOptions {
@@ -60,10 +101,16 @@ interface FileRef {
   readonly hostPath: string
 }
 
-type UploadRecord = { readonly kind: 'ready', readonly remotePath: string } | { readonly kind: 'failed' }
+type UploadRecord = {
+  readonly kind: 'ready'
+  readonly remotePath: string
+  readonly bytes: number
+  readonly mtime?: number
+  readonly checkedAt: number
+} | { readonly kind: 'failed' }
 
 /** `aborted` is a successful copy whose turn was cancelled before projection. */
-type Outcome = { readonly kind: 'ready', readonly remotePath: string, readonly aborted?: boolean } | { readonly kind: 'failed' }
+type Outcome = { readonly kind: 'ready', readonly remotePath: string, readonly mtime?: number, readonly aborted?: boolean } | { readonly kind: 'failed' }
 
 interface FsPathMap {
   processPathFromHostPath(hostPath: string): string | undefined
@@ -240,21 +287,48 @@ function begin(
   signal?: AbortSignal,
 ): Promise<void> {
   if (isAborted(signal)) return Promise.reject(abortError())
-  if (!acceptable(ref)) {
+  const ceiling = uploadCeiling(access.maxUploadBytes?.())
+  if (!acceptable(ref, ceiling.bytes)) {
     fail(records, host.id, ref.hostPath)
-    ctx.logger?.warn(`[@dsh-permission-remote] remote upload skipped for ${uploadLeaf(ref.name)}: file is not a readable upload under ${UPLOAD_CAP} bytes`)
+    ctx.logger?.warn(`[@dsh-permission-remote] remote upload skipped for ${uploadLeaf(ref.name)}: file is not a readable upload under the ${ceiling.bytes} byte ${ceiling.source} limit`)
     return Promise.resolve()
   }
+  const known = records.get(recordKey(host.id, ref.hostPath))
+  // A fresh ready record skips the parent-symlink walk and the copy. The leaf
+  // is still lstat'd: a symlink or a changed mtime must not keep being served.
+  // A symlink planted on a parent directory during this window is not seen
+  // until the record expires.
+  if (known?.kind === 'ready' && known.bytes === ref.bytes && clock(access) - known.checkedAt < UPLOAD_FRESH_MS) {
+    return confirmFresh(ctx, access, records, host, ref, known, signal).then(kept => {
+      if (kept) return undefined
+      return startUpload(ctx, access, records, flights, homes, epochs, host, ref, known, signal)
+    })
+  }
+  return startUpload(ctx, access, records, flights, homes, epochs, host, ref, known?.kind === 'ready' ? known : undefined, signal)
+}
+
+function startUpload(
+  ctx: UploadContext,
+  access: UploadAccess,
+  records: Map<string, UploadRecord>,
+  flights: Map<string, Promise<Outcome>>,
+  homes: Map<string, Promise<string>>,
+  epochs: Map<string, number>,
+  host: HostConfig,
+  ref: FileRef,
+  previous: Extract<UploadRecord, { kind: 'ready' }> | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
   // The digest and the leaf are the remote path, minus the home directory,
   // so two blocks can share a flight before the home lookup resolves.
   const flightKey = `${host.id}\0${flightIdentity(ref.attachmentId)}\0${uploadLeaf(ref.name)}`
   const existing = flights.get(flightKey)
-  if (existing !== undefined) return applyOutcome(records, host.id, ref.hostPath, existing)
+  if (existing !== undefined) return applyOutcome(records, access, host.id, ref, existing)
   const epoch = epochs.get(host.id) ?? 0
   let start!: () => void
   const flight = new Promise<Outcome>((resolve, reject) => {
     start = () => {
-      uploadOne(ctx, access, homes, host, ref, signal).then(outcome => {
+      uploadOne(ctx, access, homes, host, ref, previous, signal).then(outcome => {
         resolve((epochs.get(host.id) ?? 0) === epoch ? outcome : { kind: 'failed' })
       }, reject)
     }
@@ -267,7 +341,41 @@ function begin(
     if (flights.get(flightKey) === flight) flights.delete(flightKey)
   })
   start()
-  return applyOutcome(records, host.id, ref.hostPath, flight)
+  return applyOutcome(records, access, host.id, ref, flight)
+}
+
+/** `true` when the leaf is still the file this record published. */
+async function confirmFresh(
+  ctx: UploadContext,
+  access: UploadAccess,
+  records: Map<string, UploadRecord>,
+  host: HostConfig,
+  ref: FileRef,
+  known: Extract<UploadRecord, { kind: 'ready' }>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (isAborted(signal)) throw abortError()
+  let leaf: { type: string, size: number, mtime?: number } | undefined
+  try {
+    const secret = await access.secret(host)
+    if (isAborted(signal)) throw abortError()
+    if (access.pool.sftpAttrs !== undefined) {
+      leaf = await access.pool.sftpAttrs(host, secret, known.remotePath, false)
+    } else {
+      const info = await access.pool.sftpStat(host, secret, known.remotePath)
+      leaf = info.isDirectory ? { type: 'directory', size: info.size } : { type: 'file', size: info.size }
+    }
+  } catch (error) {
+    if (isAborted(signal) || isAbort(error)) throw abortError()
+    if (!isRemoteMissing(error)) {
+      ctx.logger?.warn(`[@dsh-permission-remote] remote upload recheck failed for ${uploadLeaf(ref.name)}: ${errorText(error)}`)
+    }
+    return false
+  }
+  if (leaf === undefined || leaf.type !== 'file' || leaf.size !== known.bytes) return false
+  if (known.mtime !== undefined && leaf.mtime !== known.mtime) return false
+  records.set(recordKey(host.id, ref.hostPath), { ...known, checkedAt: clock(access) })
+  return true
 }
 
 /** A bad id still gets its own flight; `uploadOne` records the failure. */
@@ -279,13 +387,13 @@ function flightIdentity(attachmentId: string): string {
   }
 }
 
-function applyOutcome(records: Map<string, UploadRecord>, hostId: string, hostPath: string, flight: Promise<Outcome>): Promise<void> {
+function applyOutcome(records: Map<string, UploadRecord>, access: UploadAccess, hostId: string, ref: FileRef, flight: Promise<Outcome>): Promise<void> {
   return flight.then(outcome => {
     if (outcome.kind === 'failed') {
-      fail(records, hostId, hostPath)
+      fail(records, hostId, ref.hostPath)
       return
     }
-    ready(records, hostId, hostPath, outcome.remotePath)
+    ready(records, access, hostId, ref.hostPath, outcome.remotePath, ref.bytes, outcome.mtime)
     if (outcome.aborted === true) throw abortError()
   })
 }
@@ -296,6 +404,7 @@ async function uploadOne(
   homes: Map<string, Promise<string>>,
   host: HostConfig,
   ref: FileRef,
+  previous: Extract<UploadRecord, { kind: 'ready' }> | undefined,
   signal: AbortSignal | undefined,
 ): Promise<Outcome> {
   if (isAborted(signal)) throw abortError()
@@ -317,8 +426,9 @@ async function uploadOne(
     }
     // Refuse a pre-existing symbolic link: `sftpPutFile` opens with `w`, so
     // following the link would truncate a file outside the upload directory.
+    let leafMtime: number | undefined
     if (access.pool.sftpAttrs !== undefined) {
-      let attrs: { type: string } | undefined
+      let attrs: { type: string, mtime?: number } | undefined
       try {
         attrs = await access.pool.sftpAttrs(host, secret, remotePath, false)
       } catch (error) {
@@ -331,6 +441,7 @@ async function uploadOne(
         ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: the upload path is a ${attrs.type === 'symlink' ? 'symbolic link' : 'non-regular file'}`)
         return { kind: 'failed' }
       }
+      if (attrs?.type === 'file') leafMtime = attrs.mtime
     }
     let info: { isDirectory: boolean, size: number } | undefined
     try {
@@ -346,12 +457,38 @@ async function uploadOne(
       ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: a directory is already at the upload path`)
       return { kind: 'failed' }
     }
-    if (info !== undefined && info.size === ref.bytes) return { kind: 'ready', remotePath }
-    await access.pool.sftpPutFile(host, secret, ref.hostPath, remotePath, home)
-    if (isAborted(signal)) return { kind: 'ready', remotePath, aborted: true }
-    return { kind: 'ready', remotePath }
+    const sameMtime = previous?.mtime === undefined || leafMtime === previous.mtime
+    if (info !== undefined && info.size === ref.bytes && sameMtime) return { kind: 'ready', remotePath, mtime: leafMtime ?? previous?.mtime }
+    const ceiling = uploadCeiling(access.maxUploadBytes?.())
+    let actual = ref.bytes
+    try {
+      actual = (await stat(ref.hostPath)).size
+    } catch {
+      // A missing local file is reported by the copy itself.
+    }
+    if (!withinCeiling(actual, ceiling.bytes)) {
+      ctx.logger?.warn(`[@dsh-permission-remote] remote upload skipped for ${uploadLeaf(ref.name)}: local file is ${actual} bytes, over the ${ceiling.bytes} byte ${ceiling.source} limit`)
+      return { kind: 'failed' }
+    }
+    await access.pool.sftpPutFile(host, secret, ref.hostPath, remotePath, home, {
+      maxBytes: ceiling.bytes,
+      signal: uploadSignal(access, signal),
+    })
+    if (access.pool.sftpAttrs !== undefined) {
+      const written = await access.pool.sftpAttrs(host, secret, remotePath, false).catch(() => undefined)
+      if (written?.type === 'file') leafMtime = written.mtime
+    }
+    if (isAborted(signal)) return { kind: 'ready', remotePath, mtime: leafMtime, aborted: true }
+    return { kind: 'ready', remotePath, mtime: leafMtime }
   } catch (error) {
-    if (isAborted(signal) || isAbort(error)) throw abortError()
+    // The turn signal aborts the stream. A transfer deadline aborts only the
+    // copy: the model stream continues, and the warning names the setting.
+    if (isAborted(signal)) throw abortError()
+    const timeoutMs = access.uploadTimeoutMs?.() ?? 0
+    if (timeoutMs > 0 && isAbort(error)) {
+      ctx.logger?.warn(`[@dsh-permission-remote] remote upload timed out after ${timeoutMs} ms for ${uploadLeaf(ref.name)} (the deadline is the "Transfer timeout" setting; 0 means unlimited)`)
+      return { kind: 'failed' }
+    }
     ctx.logger?.warn(`[@dsh-permission-remote] remote upload failed for ${uploadLeaf(ref.name)}: ${errorText(error)}`)
     return { kind: 'failed' }
   }
@@ -414,12 +551,23 @@ async function assertUploadParent(
   }
 }
 
-function acceptable(ref: FileRef): boolean {
-  return Number.isSafeInteger(ref.bytes) && ref.bytes >= 0 && ref.bytes <= UPLOAD_CAP && path.isAbsolute(ref.hostPath)
+function acceptable(ref: FileRef, ceiling: number): boolean {
+  return withinCeiling(ref.bytes, ceiling) && path.isAbsolute(ref.hostPath)
 }
 
-function ready(records: Map<string, UploadRecord>, hostId: string, hostPath: string, remotePath: string): void {
-  records.set(recordKey(hostId, hostPath), { kind: 'ready', remotePath })
+function clock(access: UploadAccess): number {
+  return access.now?.() ?? Date.now()
+}
+
+function uploadSignal(access: UploadAccess, signal: AbortSignal | undefined): AbortSignal | undefined {
+  const timeoutMs = access.uploadTimeoutMs?.() ?? 0
+  if (timeoutMs <= 0) return signal
+  const timeout = AbortSignal.timeout(timeoutMs)
+  return signal === undefined ? timeout : AbortSignal.any([signal, timeout])
+}
+
+function ready(records: Map<string, UploadRecord>, access: UploadAccess, hostId: string, hostPath: string, remotePath: string, bytes: number, mtime: number | undefined): void {
+  records.set(recordKey(hostId, hostPath), { kind: 'ready', remotePath, bytes, ...(mtime !== undefined ? { mtime } : {}), checkedAt: clock(access) })
 }
 
 function fail(records: Map<string, UploadRecord>, hostId: string, hostPath: string): void {

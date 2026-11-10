@@ -14,12 +14,12 @@
  * - Under the remote root with a leading dot, so `routeUnderRoot` reads it as a
  *   local path rather than a host id (`router.ts` explains why that matters).
  *
- * There is no index and no total-size budget. Both would need a "last used"
- * signal, and opening a card never comes back through this plugin, so the only
- * moment a snapshot looks unused is the moment it was written. Pruning on that
- * would delete the file behind a card still on screen — the exact failure the
- * snapshot design exists to prevent. Expiry is therefore a plain mtime age on
- * the hash directories, and an expired card stops opening.
+ * There is no use index. Opening a card never comes back through this plugin,
+ * so the only freshness signal is the directory mtime of the delivery itself.
+ * Expiry is that age ({@link SNAPSHOT_TTL_MS}). A separate byte budget
+ * ({@link CACHE_BUDGET_BYTES}) drops the oldest hash directories when every
+ * snapshot together exceeds 1 GiB; that can remove a card that is still on
+ * screen, which is why the budget is documented as a disk backstop.
  */
 import { randomBytes } from 'node:crypto'
 import type { FileHandle } from 'node:fs/promises'
@@ -31,10 +31,11 @@ import { presentCacheRoot, presentCacheRoots } from './router.ts'
 /**
  * Hard ceiling for one delivered file, independent of the transfer setting.
  *
- * `transferMaxBytes` supports `0` meaning "no limit", which is safe for a
- * transfer that streams to disk on a remote host but not here: this writes to
- * the user's own disk, on behalf of a model call that has no approval gate of
- * its own. The setting raises the limit up to this ceiling, never past it.
+ * `transferMaxBytes` supports `0` meaning "no limit". Chat uploads,
+ * `ssh_upload`, and `ssh_download` are chunked, so `0` runs until the file
+ * ends or the disk is full. This path writes the operator's own disk for a
+ * model call with no approval of its own, so the setting raises the limit up
+ * to this ceiling and never past it.
  */
 export const HARD_MAX_BYTES = 256 * 1024 * 1024
 

@@ -20,11 +20,11 @@ test('the capture reads each startup file once and a command only evals the snap
   assert.match(capture, /unset __dsh_hit_sys __dsh_hit_rc PWD OLDPWD SHLVL _\nexport -p/)
   assert.equal(LOGIN_ENV_CAPTURE_MS, 10_000)
 
-  const command = loginEnvApply('declare -x FROM=1\n', 'printf READY', "/srv/o'brien")
-  assert.match(command, /eval /)
+  const command = loginEnvApply('/home/me/.dsh-permission-remote/login-env.sh', 'printf READY', "/srv/o'brien")
+  assert.match(command, /^\. '\/home\/me\/\.dsh-permission-remote\/login-env\.sh' \|\| true\n/)
   assert.match(command, /cd '\/srv\/o'\\''brien'/)
   assert.match(command, /printf READY$/)
-  assert.doesNotMatch(command, /bashrc|bash_profile|bash -ic|--noprofile/)
+  assert.doesNotMatch(command, /eval |declare -x|bashrc|bash_profile|bash -ic|--noprofile/)
 })
 
 test('a timed out, truncated, or noisy capture is dropped', () => {
@@ -115,6 +115,12 @@ test('one host keeps one capture, including a failed one, until it is forgotten'
   assert.equal(attempts, 2)
 })
 
+async function sourced(dir: string, body: string, command: string, workdir: string): Promise<string> {
+  const file = join(dir, 'login-env.sh')
+  await writeFile(file, body.endsWith('\n') ? body : `${body}\n`, { mode: 0o600 })
+  return loginEnvApply(file, command, workdir)
+}
+
 function runShell(shell: string, script: string, home: string): Promise<{ code: number | null, stdout: string, stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(shell, ['-c', script], {
@@ -175,7 +181,7 @@ test('a profile that sources bashrc does not run it again', async () => {
     assert.equal(snap.includes('declare -x SHLVL='), false)
     assert.equal(snap.includes('declare -x _='), false)
 
-    const body = loginEnvApply(snap, 'printf \'%s\\n\' "$BASHRC_COUNT" "$FROM_PROFILE" "$FROM_Q" "$PWD" "$SHLVL" "$PATH"', work)
+    const body = await sourced(home, snap, 'printf \'%s\\n\' "$BASHRC_COUNT" "$FROM_PROFILE" "$FROM_Q" "$PWD" "$SHLVL" "$PATH"', work)
     const outer = `cd ${shJoin([work])} && ${shJoin(['bash', '-c', body])}`
     for (const shell of ['bash', 'zsh']) {
       const printed = await runShell(shell, outer, home)
@@ -193,7 +199,7 @@ test('a profile that sources bashrc does not run it again', async () => {
       assert.equal(printed.stdout.includes('BANNER'), false)
     }
 
-    const failed = await runShell('bash', loginEnvApply(captured.stdout, 'exit 9', work), home)
+    const failed = await runShell('bash', await sourced(home, captured.stdout, 'exit 9', work), home)
     assert.equal(failed.code, 9)
     assert.equal(failed.stdout, '')
     assert.equal(failed.stderr, '')
@@ -214,7 +220,7 @@ test('a poisoned SHLVL in the capture is not what the command shell sees', async
       'declare -x PATH="/usr/bin:/bin"',
     ].join('\n')
     const snap = loginEnvSnapshot({ stdout: raw, timedOut: false, stdoutTruncated: false })
-    const body = loginEnvApply(snap, 'printf \'%s\\n\' "$FROM" "$PWD" "$SHLVL"', work)
+    const body = await sourced(root, snap, 'printf \'%s\\n\' "$FROM" "$PWD" "$SHLVL"', work)
     const printed = await runShell('bash', body, root)
     const natural = await runShell('bash', 'printf %s "$SHLVL"', root)
     assert.equal(printed.code, 0)
@@ -239,7 +245,7 @@ test('bashrc still loads when the login file does not source it', async () => {
   try {
     const captured = await runShell('bash', loginEnvCaptureCommand(), home)
     const snap = loginEnvSnapshot({ stdout: captured.stdout, timedOut: false, stdoutTruncated: false })
-    const printed = await runShell('bash', loginEnvApply(snap, 'printf \'%s\\n\' "$BASHRC_COUNT" "$PWD"', work), home)
+    const printed = await runShell('bash', await sourced(home, snap, 'printf \'%s\\n\' "$BASHRC_COUNT" "$PWD"', work), home)
     assert.equal(printed.stderr, '')
     assert.equal(printed.stdout, `1\n${work}\n`)
   } finally {

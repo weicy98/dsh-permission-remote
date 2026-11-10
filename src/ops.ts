@@ -1,8 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { constants as fsConstants } from 'node:fs'
-import { lstat, open, stat } from 'node:fs/promises'
+import { lstat, open, rename, rm, stat, type FileHandle } from 'node:fs/promises'
 import { dirname as dirnameLocal, isAbsolute, posix } from 'node:path'
-import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { HostConfig, OpsPolicy } from './config.ts'
 import {
@@ -24,13 +22,11 @@ const READ_CAP = 1024 * 1024
 const HOME_BEGIN = '__DSH_OPS_HOME_BEGIN__'
 const HOME_END = '__DSH_OPS_HOME_END__'
 
-/** Window used when reading a local upload source; the ceiling is enforced per byte. */
-const LOCAL_READ_CHUNK = 64 * 1024
-
 /**
  * Ceiling and deadline for one transfer, as configured on the settings page.
- * `0` means "no limit" for both: the operator opted in explicitly, so the
- * upload source may be held in memory and a read may run unbounded.
+ * `0` means "no limit" for both. The bytes move one chunk at a time, so an
+ * unlimited transfer does not hold the file in memory; it runs until the file
+ * ends or the disk refuses another write.
  */
 export interface OpsTransferLimits {
   /** Byte ceiling for one transfer; `0` means unlimited. */
@@ -406,9 +402,7 @@ function parseRemoteHome(stdout: string): string | undefined {
  * Intermediate directories are ordinary path components and may be links.
  * ------------------------------------------------------------------------- */
 
-function transferCap(limits: OpsTransferLimits): number {
-  return limits.maxBytes > 0 ? limits.maxBytes : Number.MAX_SAFE_INTEGER
-}
+
 
 function transferDeadline(exec: ToolExec, limits: OpsTransferLimits): AbortSignal | undefined {
   if (limits.timeoutMs <= 0) return exec.signal
@@ -444,64 +438,24 @@ function requireLocalPath(value: unknown, field = 'local_path'): string {
 }
 
 /**
- * Read one local file under a ceiling.
+ * Refuse a local path that is not a regular file, and one already over the ceiling.
  *
- * The size from `fstat` is only a pre-check: the file can grow between that
- * call and the read, so the loop stops at `maxBytes + 1` bytes and rejects.
- * Reading the whole file first and comparing afterwards would still allocate
- * the grown file. `O_NOFOLLOW` refuses a symlink at the final component
- * (ignored on Windows, where `lstat` above is the guard).
+ * The size is only a pre-check. The stream counts the bytes it reads, so a
+ * file that grows afterwards is still stopped without being buffered.
  */
-async function readLocalCapped(path: string, maxBytes: number, signal: AbortSignal | undefined): Promise<Buffer> {
+async function assertLocalSource(path: string, maxBytes: number): Promise<void> {
   let info
   try {
     info = await lstat(path)
   } catch (error) {
-    if (signal?.aborted === true) throw error
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-      throw new Error(`no such local file: ${path}`)
-    }
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') throw new Error(`no such local file: ${path}`)
     throw new Error(`cannot read local file ${path}: ${error instanceof Error ? error.message : String(error)}`)
   }
   if (info.isSymbolicLink()) throw new Error(`refusing to transfer a symbolic link: ${path}`)
   if (info.isDirectory()) throw new Error(`local path is a directory: ${path}`)
   if (!info.isFile()) throw new Error(`local path is not a regular file: ${path}`)
-  let handle
-  try {
-    // `O_NOFOLLOW` is 0 on Windows, where it would silently do nothing; the
-    // lstat above is the only symlink guard that platform has.
-    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
-    handle = await open(path, fsConstants.O_RDONLY | noFollow)
-  } catch (error) {
-    // ELOOP means the path became a symlink after the lstat above.
-    if ((error as NodeJS.ErrnoException)?.code === 'ELOOP') {
-      throw new Error(`refusing to transfer a symbolic link: ${path}`)
-    }
-    throw error
-  }
-  try {
-    const opened = await handle.stat()
-    if (!opened.isFile()) throw new Error(`local path is not a regular file: ${path}`)
-    if (maxBytes > 0 && opened.size > maxBytes) {
-      throw new Error(`local file is ${opened.size} bytes, over the ${maxBytes} byte transfer ceiling`)
-    }
-    const parts: Buffer[] = []
-    let total = 0
-    while (true) {
-      throwIfAborted(signal)
-      const room = maxBytes > 0 ? Math.min(LOCAL_READ_CHUNK, maxBytes + 1 - total) : LOCAL_READ_CHUNK
-      const chunk = Buffer.allocUnsafe(room)
-      const { bytesRead } = await handle.read(chunk, 0, room, null)
-      if (bytesRead === 0) break
-      total += bytesRead
-      if (maxBytes > 0 && total > maxBytes) {
-        throw new Error(`local file is over the ${maxBytes} byte transfer ceiling`)
-      }
-      parts.push(chunk.subarray(0, bytesRead))
-    }
-    return parts.length === 0 ? Buffer.alloc(0) : Buffer.concat(parts, total)
-  } finally {
-    await handle.close().catch(() => undefined)
+  if (maxBytes > 0 && info.size > maxBytes) {
+    throw new Error(`local file is ${info.size} bytes, over the ${maxBytes} byte transfer ceiling`)
   }
 }
 
@@ -609,8 +563,8 @@ export async function runSshUpload(
   )
   throwIfAborted(exec.signal)
   const signal = transferDeadline(exec, limits)
+  await assertLocalSource(localPath, limits.maxBytes)
   const secret = await withTransferDeadline(hostApi.secretOf(host), signal, exec.signal, limits)
-  const body = await withTransferDeadline(readLocalCapped(localPath, limits.maxBytes, signal), signal, exec.signal, limits)
   throwIfTransferAborted(signal, exec.signal, limits)
   // `resolveOpsPath` runs the remote `$HOME` probe for `~/`; racing it here
   // makes a slow probe obey the transfer deadline. The probe itself cannot be
@@ -636,17 +590,38 @@ export async function runSshUpload(
   }
   const directory = posix.dirname(remotePath)
   const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
-  const script = atomicWriteScript(directory, tmp, remotePath, existing?.mode)
-  // `timeoutMs` 0 disables the channel timer, matching the "no deadline"
-  // setting; a non-zero value aborts the write at the same instant the
-  // transfer signal does.
-  const result = await withTransferDeadline(hostApi.pool.exec(host, secret, script, limits.timeoutMs, signal, body), signal, exec.signal, limits)
-  if (result.code !== 0) throw new Error(result.stderr || 'remote upload failed')
+  const mkdir = await withTransferDeadline(
+    hostApi.pool.exec(host, secret, `mkdir -p ${shJoin([directory])}`, limits.timeoutMs, signal),
+    signal,
+    exec.signal,
+    limits,
+  )
+  if (mkdir.code !== 0) throw new Error(mkdir.stderr || 'remote upload failed')
+  let bytes = 0
+  try {
+    bytes = await withTransferDeadline(
+      hostApi.pool.sftpSendLocal(host, secret, localPath, tmp, { maxBytes: limits.maxBytes, signal }),
+      signal,
+      exec.signal,
+      limits,
+    )
+    const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([remotePath])}`
+    const moved = await withTransferDeadline(
+      hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, remotePath])}${bits}`, limits.timeoutMs, signal),
+      signal,
+      exec.signal,
+      limits,
+    )
+    if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload failed')
+  } catch (error) {
+    await hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, limits.timeoutMs, signal).catch(() => undefined)
+    throw error
+  }
   return {
     host: opsHostView(host),
     localPath,
     remotePath,
-    bytes: body.length,
+    bytes,
     operation: existing === undefined ? 'create' : 'update',
     maxBytes: limits.maxBytes,
     timeoutMs: limits.timeoutMs,
@@ -714,26 +689,82 @@ export async function runSshDownload(
     throw new Error(`remote file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
   }
   throwIfTransferAborted(signal, exec.signal, limits)
-  const data = await withTransferDeadline(
-    withSignal(hostApi.pool.sftpRead(host, secret, remotePath, transferCap(limits), signal), signal),
-    signal,
-    exec.signal,
-    limits,
-  )
-  throwIfTransferAborted(signal, exec.signal, limits)
-  await withTransferDeadline(
-    withSignal(writeFileAtomic(localPath, data, { mode: 0o600, dirMode: 0o700 }), signal),
-    signal,
-    exec.signal,
-    limits,
-  )
+  const temporary = `${localPath}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+  const handle = await openExclusiveTemp(temporary)
+  let bytes = 0
+  try {
+    // The chunk generator only notices the signal between reads, and it
+    // reports that as an SFTP failure. Racing the deadline here makes a hung
+    // read return on time, and an abort that arrives as that SFTP failure is
+    // turned back into `AbortError` so the deadline can name it a timeout.
+    await withTransferDeadline((async () => {
+      try {
+        for await (const chunk of hostApi.pool.sftpReadChunks(host, secret, remotePath, signal)) {
+          throwIfTransferAborted(signal, exec.signal, limits)
+          bytes += chunk.length
+          if (limits.maxBytes > 0 && bytes > limits.maxBytes) {
+            throw new Error(`remote file is over the ${limits.maxBytes} byte transfer ceiling`)
+          }
+          await handle.write(chunk)
+        }
+      } catch (error) {
+        if (signal?.aborted === true) throw abortError()
+        throw error
+      }
+    })(), signal, exec.signal, limits)
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    await rm(temporary, { force: true }).catch(() => undefined)
+    throw error
+  }
+  await handle.close()
+  try {
+    await renameReplacing(temporary, localPath)
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined)
+    throw error
+  }
   return {
     host: opsHostView(host),
     remotePath,
     localPath,
-    bytes: data.length,
+    bytes,
     maxBytes: limits.maxBytes,
     timeoutMs: limits.timeoutMs,
+  }
+}
+
+const WINDOWS_RENAME_ERRORS = new Set(['EACCES', 'EBUSY', 'EPERM'])
+
+/**
+ * Exclusive create at mode `0600`.
+ *
+ * `wx` refuses to follow a symlink planted on the temp path and does not
+ * reuse a leftover inode, so the mode on that inode is the one `rename`
+ * publishes. `'w'` would truncate either target and keep a leftover's mode.
+ */
+export function openExclusiveTemp(path: string): Promise<FileHandle> {
+  return open(path, 'wx', 0o600)
+}
+
+/**
+ * `rename` over the target, retrying the transient Windows errors that
+ * `writeFileAtomic` retries. The temp file stays the source until one
+ * attempt succeeds.
+ */
+export async function renameReplacing(from: string, to: string): Promise<void> {
+  let delay = 20
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      const transient = process.platform === 'win32' && code !== undefined && WINDOWS_RENAME_ERRORS.has(code)
+      if (!transient || attempt >= 8) throw error
+      await new Promise(resolve => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, 200)
+    }
   }
 }
 

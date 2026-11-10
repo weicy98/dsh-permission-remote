@@ -115,6 +115,7 @@ test('a non-positive timeout falls back to the default instead of passing it on'
 })
 
 const SNAPSHOT = 'declare -x FROM_RC=rc\n'
+const ENV_FILE = '/home/me/.dsh-permission-remote/login-env.sh'
 
 function capturingBash(options: {
   loginEnv?: boolean
@@ -140,9 +141,9 @@ function capturingBash(options: {
     secretOf: async () => ({}),
     statusOf: async () => options.status ?? status,
     resolveMode: async () => options.mode ?? 'danger-full-access' as const,
-    loginEnvOf: async () => {
+    loginEnvFileOf: async () => {
       reads += 1
-      return options.snapshot ?? ''
+      return options.snapshot ? ENV_FILE : ''
     },
     jobs: {
       start(spec: { run: (job: { append: () => void }) => { cancel(): void, done: Promise<unknown> } }) {
@@ -166,15 +167,14 @@ test('workspace bash stays a plain bash -c when login environment is off', async
   assert.equal(explicit.reads(), 0)
 })
 
-test('a captured snapshot is evaled, and an empty capture leaves the command alone', async () => {
+test('a captured snapshot is sourced from a file, and an empty capture leaves the command alone', async () => {
   const ready = capturingBash({ loginEnv: true, snapshot: SNAPSHOT })
   await runBash(ready.api, route, { command: 'printf READY' }, {})
   const argv = ready.command()
   assert.equal(ready.reads(), 1)
-  assert.match(argv, /eval /)
-  assert.match(argv, /FROM_RC/)
+  assert.match(argv, /login-env\.sh/)
   assert.match(argv, /printf READY/)
-  assert.doesNotMatch(argv, /--noprofile|bashrc|__dsh_hit/)
+  assert.doesNotMatch(argv, /FROM_RC|eval |--noprofile|bashrc|__dsh_hit/)
 
   const missed = capturingBash({ loginEnv: true, snapshot: '' })
   await runBash(missed.api, route, { command: 'printf READY' }, {})
@@ -187,10 +187,9 @@ test('a background command reuses the snapshot and does not source startup files
   const value = await runBash(api, route, { command: 'printf READY', run_in_background: true }, {})
   assert.equal(value.kind, 'background')
   assert.equal(reads(), 1)
-  assert.match(command(), /eval /)
-  assert.match(command(), /FROM_RC/)
+  assert.match(command(), /login-env\.sh/)
   assert.match(command(), /printf READY/)
-  assert.doesNotMatch(command(), /--noprofile|bashrc/)
+  assert.doesNotMatch(command(), /FROM_RC|eval |--noprofile|bashrc/)
 })
 
 test('the snapshot stays inside bwrap and seatbelt', async () => {
@@ -203,9 +202,9 @@ test('the snapshot stays inside bwrap and seatbelt', async () => {
   await runBash(bwrap.api, route, { command: 'printf READY' }, {})
   assert.match(bwrap.command(), /bwrap/)
   assert.match(bwrap.command(), /--chdir/)
-  assert.match(bwrap.command(), /FROM_RC/)
+  assert.match(bwrap.command(), /login-env\.sh/)
   assert.match(bwrap.command(), /printf READY/)
-  assert.doesNotMatch(bwrap.command(), /--noprofile/)
+  assert.doesNotMatch(bwrap.command(), /FROM_RC|--noprofile/)
 
   const seatbelt = capturingBash({
     loginEnv: true,
@@ -215,9 +214,9 @@ test('the snapshot stays inside bwrap and seatbelt', async () => {
   })
   await runBash(seatbelt.api, route, { command: 'printf READY' }, {})
   assert.match(seatbelt.command(), /sandbox-exec/)
-  assert.match(seatbelt.command(), /FROM_RC/)
+  assert.match(seatbelt.command(), /login-env\.sh/)
   assert.match(seatbelt.command(), /printf READY/)
-  assert.doesNotMatch(seatbelt.command(), /--noprofile/)
+  assert.doesNotMatch(seatbelt.command(), /FROM_RC|--noprofile/)
 })
 
 test('working_directory reports the remote directory alongside the placeholder', async () => {

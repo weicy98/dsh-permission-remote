@@ -94,6 +94,14 @@ export interface ToolHost {
   readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: ApprovalDetail) => Promise<SandboxMode>
   /** Captured Bash startup exports for this host. Empty when the capture failed or timed out. */
   readonly loginEnvOf?: (host: HostConfig, signal?: AbortSignal) => Promise<string>
+  /**
+   * Absolute remote path of the published snapshot, or `''` when this command
+   * should keep the SSH environment. Empty covers a failed capture and a
+   * publish that did not land a file.
+   */
+  readonly loginEnvFileOf?: (host: HostConfig, signal?: AbortSignal) => Promise<string>
+  /** Drop cached remote attributes after a bash process on this host has exited. */
+  readonly forgetHostAttrs?: (hostId: string) => void
   readonly jobs?: {
     start(spec: {
       kind: string
@@ -378,8 +386,13 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   }
   throwIfAborted(exec.signal)
   const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
-  const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
-  const result = await hostApi.pool.exec(host, secret, argv, timeoutMs, exec.signal)
+  const argv = commandArgv(status, mode, roots, workdir, command, await bashEnvFile(hostApi, host, exec.signal))
+  let result: Awaited<ReturnType<SshPool['exec']>>
+  try {
+    result = await hostApi.pool.exec(host, secret, argv, timeoutMs, exec.signal)
+  } finally {
+    hostApi.forgetHostAttrs?.(route.hostId)
+  }
   const denied = mode !== 'danger-full-access' && sandboxDenied(result.code, result.stderr)
   return {
     kind: 'foreground',
@@ -397,15 +410,15 @@ export async function runBash(hostApi: ToolHost, route: RemoteRoute, args: Recor
   }
 }
 
-async function bashSnapshot(hostApi: ToolHost, host: HostConfig, signal?: AbortSignal): Promise<string> {
-  if (host.loginEnv !== true || hostApi.loginEnvOf === undefined) return ''
-  return hostApi.loginEnvOf(host, signal)
+async function bashEnvFile(hostApi: ToolHost, host: HostConfig, signal?: AbortSignal): Promise<string> {
+  if (host.loginEnv !== true || hostApi.loginEnvFileOf === undefined) return ''
+  return hostApi.loginEnvFileOf(host, signal)
 }
 
-function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, workdir: string, command: string, snapshot: string): string {
-  // The snapshot is the bash -c body, so bwrap and seatbelt still confine the command.
+function commandArgv(status: RunnerStatus, mode: SandboxMode, roots: RemoteFileRoots, workdir: string, command: string, envFile: string): string {
+  // The file is sourced inside the bash -c body, so bwrap and seatbelt still confine the command.
   // Startup files were read once, on their own, and are not sourced again here.
-  const body = snapshot.length > 0 ? loginEnvApply(snapshot, command, workdir) : command
+  const body = envFile.length > 0 ? loginEnvApply(envFile, command, workdir) : command
   const inner = ['bash', '-c', body]
   if (mode === 'danger-full-access' || !status.sandbox.available) {
     return `cd ${shJoin([workdir])} && ${shJoin(inner)}`
@@ -457,7 +470,7 @@ async function startBackground(
     throw new SandboxUnavailableError(mode, 'remote sandbox probe failed')
   }
   const roots = await sandboxRoots(hostApi, route, exec, status, host, secret)
-  const argv = commandArgv(status, mode, roots, workdir, command, await bashSnapshot(hostApi, host, exec.signal))
+  const argv = commandArgv(status, mode, roots, workdir, command, await bashEnvFile(hostApi, host, exec.signal))
   const reaped = status.sandbox.available && status.sandboxTool === 'bwrap' && mode !== 'danger-full-access'
   const note = reaped ? '' : '\n[dsh-permission-remote] stopping this job closes its SSH channel; descendant processes may survive when no sandbox runner is wrapping the command'
   const id = jobs.start({
@@ -482,6 +495,10 @@ async function startBackground(
           status: 'failed' as const,
           detail: error instanceof Error ? error.message : String(error),
         }))
+        .then(outcome => {
+          hostApi.forgetHostAttrs?.(route.hostId)
+          return outcome
+        })
       return {
         cancel: () => {
           cancelled = true

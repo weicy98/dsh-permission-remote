@@ -7,7 +7,8 @@ import test from 'node:test'
 import { FsError, FsTargetKey, type FsDirEntry, type FsTarget } from '@deepseek-ai/dsh-fs'
 import type { HostConfig } from '../src/config.ts'
 import { installRemoteFs, type RemoteAccess } from '../src/remote-fs.ts'
-import { parseRemoteVersion, remoteVersionToken } from '../src/remote-write.ts'
+import { parseRemoteVersion, remoteVersionToken, versionStatCommand } from '../src/remote-write.ts'
+import { shJoin } from '../src/shell-quote.ts'
 import { addSupersededRoot, clearSupersededRoots, encodeRemotePath, mapRemoteToLocal, routeByCwd, setRemoteRootOverride } from '../src/router.ts'
 import { listingType, probeOpenDir, readOpenChunks, readOpenRange, SshFailure, type RemoteDirEntry, type SftpAttrs } from '../src/ssh-pool.ts'
 
@@ -521,6 +522,54 @@ test('a later connection answers a path that failed while the host was down', as
   down = false
   assert.equal((await backend.stat(file))?.type, 'file')
   assert.equal(attrs, 2)
+})
+
+test('a fractional mtime is strong version evidence and is not hashed', async () => {
+  const { backend, pool, access } = createHarness()
+  pool.attrs = async () => ({ type: 'file', size: 4, mtime: 2, mode: 0o100644 })
+  pool.read = async () => {
+    pool.reads += 1
+    return Buffer.from('abcd')
+  }
+  let command = ''
+  ;(access.pool as unknown as { exec: (host: unknown, secret: unknown, command: string) => Promise<unknown> }).exec = async (_host, _secret, text) => {
+    command = text
+    return { code: 0, signal: null, stdout: '1:2:4:1700000000.5\n', stderr: '', timedOut: false, stdoutTruncated: false, stderrTruncated: false }
+  }
+  const info = await backend.stat(await backend.resolve(placeholder('a.ts')))
+  assert.equal(pool.reads, 0)
+  assert.equal(command, versionStatCommand(shJoin([`${REMOTE}/a.ts`])))
+  assert.equal(command.includes('|| true'), false)
+  assert.equal(parseRemoteVersion(info?.version ?? '')?.strong, '1:2:4:1700000000.5')
+})
+
+test('forgetting host attributes drops an in-flight refill and keeps the next stat honest', async () => {
+  const { backend, pool, remove } = createHarness()
+  const target = await backend.resolve(placeholder('a.ts'))
+  let release: () => void = () => undefined
+  let entered: () => void = () => undefined
+  const started = new Promise<void>(resolve => { entered = resolve })
+  let calls = 0
+  let hold = true
+  pool.attrs = async () => {
+    calls += 1
+    entered()
+    if (hold) {
+      await new Promise<void>(resolve => { release = resolve })
+      return { type: 'file', size: 4, mtime: 1, mode: 0o100644 }
+    }
+    return undefined
+  }
+  const pending = backend.stat(target)
+  await started
+  assert.equal(calls, 1)
+  remove.forgetHostAttrs('lo')
+  hold = false
+  release()
+  await pending
+  const again = await backend.stat(target)
+  assert.equal(again, undefined)
+  assert.equal(calls, 2)
 })
 
 test('forgetting a host drops its realpath and the cached stat', async () => {

@@ -112,13 +112,26 @@ export interface RemoteVersionProbeOptions {
 const VERSION_HASH_MAX_BYTES = 32 * 1024 * 1024
 
 /**
+ * One stat pipeline for the version probe and the pre-rename guard.
+ *
+ * GNU `stat -c %y` prints a nanosecond timestamp. BSD `stat -f %Fm` prints the
+ * mtime as epoch seconds with a fractional part (commonly six digits, not
+ * nine). Either form is strong evidence. Seconds-only `%m` is not, so the
+ * probe still falls through to a content hash when the line has no fraction.
+ * The guard appends `|| true` itself: folding that into this string would hide
+ * a failed stat from the probe's exit code.
+ */
+export function versionStatCommand(quotedPath: string): string {
+  return `stat -c '%d:%i:%s:%y' -- ${quotedPath} 2>/dev/null || stat -f '%d:%i:%z:%Fm' ${quotedPath} 2>/dev/null`
+}
+
+/**
  * Collect remote version evidence.
  *
- * GNU/Linux `stat -c` provides nanosecond mtime. BSD `stat -f` may only provide
- * seconds; that is not strong evidence. Callers that need a guarded write must
- * either get strong evidence or request a complete-content hash. The hash reads
- * the whole file through a signal-aware iterator; a partial prefix is never
- * accepted as a version because that would silently weaken the stale guard.
+ * Callers that need a guarded write must either get strong evidence or request
+ * a complete-content hash. The hash reads the whole file through a
+ * signal-aware iterator; a partial prefix is never accepted as a version
+ * because that would silently weaken the stale guard.
  */
 export async function remoteVersionEvidence(
   pool: SshPool,
@@ -129,8 +142,7 @@ export async function remoteVersionEvidence(
   options: RemoteVersionProbeOptions = {},
 ): Promise<RemoteVersionEvidence> {
   if (typeof pool.exec === 'function') {
-    const quoted = shJoin([remotePath])
-    const command = `stat -c '%d:%i:%s:%y' -- ${quoted} 2>/dev/null || stat -f '%d:%i:%z:%m' ${quoted} 2>/dev/null`
+    const command = versionStatCommand(shJoin([remotePath]))
     try {
       const result = await pool.exec(host, secret, command, 10_000, signal)
       if (result.code === 0) {
@@ -210,7 +222,7 @@ function writeGuardScript(target: string, intent: FsWriteIntent | undefined): st
   const version = parseRemoteVersion(intent.version)
   if (version?.strong !== undefined) {
     const expected = shJoin([version.strong])
-    return `actual=$(stat -c '%d:%i:%s:%y' -- ${quoted} 2>/dev/null || stat -f '%d:%i:%z:%m' ${quoted} 2>/dev/null || true); if [ "$actual" != ${expected} ]; then echo 'remote file version changed' >&2; exit 24; fi`
+    return `actual=$(${versionStatCommand(quoted)} || true); if [ "$actual" != ${expected} ]; then echo 'remote file version changed' >&2; exit 24; fi`
   }
   if (version?.hash !== undefined) {
     const expected = shJoin([version.hash])

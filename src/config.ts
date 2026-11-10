@@ -84,16 +84,19 @@ export const Config = Schema.object({
    */
   remoteRoot: Schema.string().default('').volatile(),
   /**
-   * Byte ceiling for one `ssh_upload` / `ssh_download`. `0` means no ceiling:
-   * the whole file is held in memory, so the operator opts in explicitly.
-   * Volatile so the settings page can write it; a non-volatile field would be
-   * read once at load and every save would be a silent no-op.
+   * Byte ceiling for one chat upload, `ssh_upload`, or `ssh_download`.
+   * `0` means no byte ceiling. The copy is still bound by
+   * {@link transferTimeoutMs}: a slow link stops at that deadline before the
+   * disk fills. Volatile so the settings page can write it; a non-volatile
+   * field would be read once at load and every save would be a silent no-op.
    */
   transferMaxBytes: Schema.natural().default(TRANSFER_MAX_BYTES_DEFAULT).volatile(),
   /**
-   * Abort deadline for one transfer, in milliseconds. `0` means no deadline.
-   * Applied to the remote write and the remote read; the pre-transfer `stat`
-   * cannot be cancelled mid-flight and only rejects the caller's promise.
+   * Abort deadline for one chat upload, `ssh_upload`, or `ssh_download`, in
+   * milliseconds. `0` means no deadline. This stays in force when the byte
+   * ceiling is `0`. Ops tools surface it as `TimeoutError`. A chat upload
+   * logs the same deadline and lets the turn continue. A hung SFTP request
+   * itself cannot be cancelled mid-flight.
    */
   transferTimeoutMs: Schema.natural().default(TRANSFER_TIMEOUT_MS_DEFAULT).max(TRANSFER_TIMEOUT_MS_MAX).volatile(),
 })

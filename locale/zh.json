@@ -99,7 +99,7 @@
   "registrySaved": "下载源已保存。",
   "transferMaxBytes": "单次传输上限（字节）",
   "transferTimeoutMs": "单次传输超时（毫秒）",
-  "transferLimitsHint": "ssh_upload / ssh_download 共用的上限与超时。字节数留空或填 0 表示不封顶（整个文件会进内存）；超时留空或填 0 表示不限时。保存后立即生效。",
+  "transferLimitsHint": "ssh_upload / ssh_download 和对话上传共用上限与超时。上传同时在途大约 1 MiB，下载逐块读。字节留空或填 0 只取消字节上限，默认 120 秒超时仍会停。超时留空或填 0 才不限时。present 的 256 MiB / 1 GiB 和文本工具的 32 MiB 不看这项。保存后立即生效。",
   "transferLimitsSaved": "传输上限与超时已保存。",
   "transferLimitsInvalid": "上限和超时只能填非负整数；留空或 0 表示不限制。",
   "transferLimitsClamped": "已按 2147483647 毫秒上限保存（更大的超时会溢出 Node 定时器）。",

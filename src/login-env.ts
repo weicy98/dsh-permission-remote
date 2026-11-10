@@ -69,10 +69,15 @@ export function loginEnvCaptureCommand(): string {
   return `bash --noprofile --norc -ic ${shQuote(capture)} 2>/dev/null || true`
 }
 
-/** Bash text that installs a captured snapshot, returns to `workdir`, and runs `command`. */
-export function loginEnvApply(snapshot: string, command: string, workdir: string): string {
+/**
+ * Bash text that sources a published snapshot, returns to `workdir`, and runs `command`.
+ *
+ * The snapshot stays in the file. Putting `export -p` on the command line would
+ * show bashrc secrets in `ps` and in the executor's command string.
+ */
+export function loginEnvApply(envFile: string, command: string, workdir: string): string {
   return [
-    `eval ${shQuote(snapshot)} || true`,
+    `. ${shQuote(envFile)} || true`,
     `cd ${shQuote(workdir)} || exit $?`,
     command,
   ].join('\n')

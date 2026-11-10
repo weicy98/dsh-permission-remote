@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
@@ -129,10 +129,12 @@ test('remote shell adapter preserves loginEnv through the official SandboxBashEx
       maxSpillBytes: 1_000_000,
       graceMs: 1000,
     })
+    const envFile = join(root, 'login-env.sh')
+    await writeFile(envFile, 'declare -x SNAP=from-login\n', { mode: 0o600 })
     restoreShell = installRemoteShell(ctx as unknown as { get(name: string): unknown }, {
       routeByCwd: cwd => cwd === placeholder ? { kind: 'remote', hostId: 'h1', remoteCwd: root, placeholderCwd: placeholder } : { kind: 'local' },
       hostOf: () => host,
-      loginEnvOf: async () => 'declare -x SNAP=from-login\n',
+      loginEnvFileOf: async () => envFile,
     })
     assert.ok(restoreShell !== undefined)
     const shell = ctx.get('shell') as any
