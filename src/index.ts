@@ -30,7 +30,7 @@ import {
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
-import { hostLabel, isRemoteMissing, opsHostView, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
+import { hostLabel, isRemoteMissing, opsHostView, renderOpsCopy, renderOpsDownload, renderOpsExec, renderOpsRead, renderOpsUpload, renderSshWorkspace, resolveOpsHost, runSshCopy, runSshDownload, runSshExec, runSshRead, runSshUpload, runSshWorkspace, runSshWrite, forgetOpsHost, type OpsTransferLimits } from './ops.ts'
 import { addSupersededRoot, childDirectoryPath, clearSupersededRoots, defaultRemoteRoot, encodeRemotePath, expandRemoteRoot, isValidHostId, isPresentCachePath, listingPath, mapRemoteToLocal, normalizeRemoteDirectory, presentCacheRoot, remoteRoot, resolveRemotePath, routeByCwd, setRemoteRootOverride, toModelPath, type RemoteRoute, type Route } from './router.ts'
 import { relocateSessions, sessionLogExists, type SessionRelocationSummary } from './session-relocate.ts'
 import { emptyMigrationState, readMigrationState, writeMigrationState, type MigrationState } from './migration-state.ts'
@@ -53,7 +53,7 @@ import {
   withoutWindowsShells,
 } from './shell-surface.ts'
 import { TERMINAL_OPEN_REFUSED, dispatchShadow, planShadows, type RoutedToolName } from './shadow.ts'
-import { parseShellProbe, shellProbeCommand, installSidebarBridge, type SidebarShell } from './sidebar-terminal.ts'
+import { parseShellProbe, shellProbeCommand, installSidebarBridge, installTerminalSpawnBridge, closeSharedProbes, type SidebarShell } from './sidebar-terminal.ts'
 import { attachRemotePtc, isRemotePtcRuntime } from './ptc-remote.ts'
 import { disposeSpillDirectory, installRemoteWorld, installWorkerPathMap } from './remote-world.ts'
 import { installRemoteShell } from './remote-shell.ts'
@@ -495,6 +495,7 @@ export class Core {
     this.config.hosts = [...this.config.hosts, { ...row.host }]
     this.config.deletedHosts = this.config.deletedHosts.filter(item => item.host.id !== hostId)
     this.pool.invalidate(hostId)
+    closeSharedProbes(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     this.forgetLoginEnv(hostId)
@@ -528,6 +529,7 @@ export class Core {
       await this.persistHosts()
     }
     this.pool.invalidate(hostId)
+    closeSharedProbes(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     this.forgetLoginEnv(hostId)
@@ -697,6 +699,7 @@ export class Core {
     this.requireHost(hostId)
     this.config.hosts = this.config.hosts.map(item => item.id === hostId ? { ...item, fingerprint } : item)
     this.pool.invalidate(hostId)
+    closeSharedProbes(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     // A rotated key may belong to a different machine; the cached login
@@ -716,6 +719,7 @@ export class Core {
   forgetStatus(hostId: string): void {
     this.status.delete(hostId)
     this.pool.invalidate(hostId)
+    closeSharedProbes(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
     this.forgetLoginEnv(hostId)
@@ -878,6 +882,7 @@ export class Core {
     }
     this.config.hosts = this.config.hosts.filter(item => item.id !== hostId)
     this.pool.invalidate(hostId)
+    closeSharedProbes(hostId)
     this.status.delete(hostId)
     forgetOpsHost(hostId)
     this.forgetShells(hostId)
@@ -1701,7 +1706,9 @@ export class Core {
    */
   allowsRemoteCwd(route: RemoteRoute, headerCwd: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
     const registry = this.workspaces as WorkspaceRegistryLike | undefined
-    // A host build without the registry cannot be checked; keep the old routing.
+    // The host always injects `workspaceRegistry` (see `export const inject`),
+    // so this branch is unreachable in production; a harness without it keeps
+    // the old routing rather than failing every remote session.
     if (registry === undefined) return true
     const opened = routeByCwd(headerCwd, env)
     return opened.kind === 'remote' && opened.hostId === route.hostId
@@ -1872,13 +1879,6 @@ function markRemote(service: SshApi): void {
   })
 }
 
-/**
- * Remote implementations of the routed file and shell tools.
- *
- * `working_directory` and `present` are dispatched before this table: the first
- * commits a directory through the official service, the second stages files and
- * delegates to the official tool, so neither has a runner of its own.
- */
 /** Delegate official bash after mapping its raw `workdir` into the remote placeholder. */
 export async function runOfficialBash(
   official: ((args: unknown, exec: ToolExec) => Promise<unknown>) | ((args: unknown, exec: ToolExec) => unknown),
@@ -1903,6 +1903,48 @@ export async function runOfficialBash(
     return official({ ...args, workdir: placeholder }, exec)
   }
   return official(args, exec)
+}
+
+/**
+ * Delegate official `terminal_open` after mapping `cwd` onto this host's placeholder.
+ *
+ * The official tool does `resolve(sessionCwd, args.cwd)`. An absolute remote
+ * path such as `/srv/app` therefore becomes a directory on this computer, and
+ * `spawnTerminal` would route it local. A relative path that climbs out of the
+ * placeholder does the same. Rewrite every supplied cwd to an absolute
+ * placeholder on the session host before that resolve runs. Creating the
+ * session placeholder first keeps `workingDirectory.ensure` from snapping an
+ * omitted cwd back to the workspace root.
+ */
+export async function runOfficialTerminalOpen(
+  official: (args: unknown, exec: ToolExec) => Promise<unknown> | unknown,
+  route: RemoteRoute,
+  args: Record<string, unknown>,
+  exec: ToolExec,
+): Promise<unknown> {
+  let created = true
+  await mkdir(route.placeholderCwd, { recursive: true }).catch(() => { created = false })
+  const requested = typeof args.cwd === 'string' ? args.cwd.trim() : ''
+  if (requested.length === 0) {
+    // Passing the placeholder explicitly keeps `workingDirectory.ensure` from
+    // falling back to the session header's local cwd and routing the terminal
+    // to this computer.
+    if (!created) throw new Error(`cannot create the remote terminal directory for ${route.remoteCwd} on SSH host ${route.hostId}`)
+    return official({ ...args, cwd: route.placeholderCwd }, exec)
+  }
+  if (isPresentCachePath(requested)) {
+    throw new Error(`refusing to open a terminal in ${requested}: that path is a read-only delivery snapshot; open it from the card instead`)
+  }
+  const resolved = routeByCwd(requested)
+  if (resolved.kind === 'remote' && resolved.hostId !== route.hostId) {
+    throw new Error(`refusing to open a terminal on another host's placeholder: ${requested} belongs to ${resolved.hostId}, not ${route.hostId}`)
+  }
+  const remote = resolved.kind === 'remote'
+    ? resolved.remoteCwd
+    : resolveRemotePath(requested, route.remoteCwd, route.placeholderCwd)
+  const placeholder = mapRemoteToLocal(route.hostId, remote)
+  if (placeholder === null) throw new Error(`cannot map remote terminal cwd ${remote} back to the SSH workspace placeholder`)
+  return official({ ...args, cwd: placeholder }, exec)
 }
 
 /** Delegate official glob/grep after mapping placeholder paths to remote paths. */
@@ -1933,16 +1975,6 @@ export async function runOfficialSearch(
     })
   }
   return result
-}
-
-const RUNNERS: Record<'bash' | 'terminal_open', (host: ToolHost, route: NonNullable<ReturnType<typeof routeByCwd> & { kind: 'remote' }>, args: Record<string, unknown>, exec: ToolExec, ctx: HostContext) => Promise<unknown>> = {
-  bash: (host, route, args, exec) => runBash(host, route, args, exec),
-  // A local PTY backend would open a shell inside the placeholder directory
-  // while the sidebar terminal is already on the server. Refuse instead of
-  // handing the model a prompt that is not where the Session is.
-  terminal_open: async () => {
-    throw new Error(TERMINAL_OPEN_REFUSED)
-  },
 }
 
 /** First path named by a Codex-style patch, for the approval card only. */
@@ -2017,6 +2049,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
   const unregisters = new Set<() => void>()
   let fsPatchReady = false
   let worldReady = false
+  let spawnReady = false
   let ptcDisposed = false
   ctx.effect(() => ctx.settings.configure({ auto: false }))
   ctx.effect(() => async () => {
@@ -2025,6 +2058,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     // a stale "ready" flag and route through a half-unloaded world.
     fsPatchReady = false
     worldReady = false
+    spawnReady = false
     // One agent disposer must not skip the remaining agents or the pool.
     const failure = settleDisposers([...unregisters])
     unregisters.clear()
@@ -2044,7 +2078,10 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     await core.pool.dispose()
   })
   rawCtx.inject(['terminalController', 'subprocess', 'workingDirectory'], bridged => {
-    const remove = installSidebarBridge(bridged, core)
+    // The sidebar path only needs the remote PTY, not the sandbox/world patch;
+    // gate it on the spawn bridge alone. `terminal.shells` stays usable even
+    // before the (separate) remote-world injection is ready.
+    const remove = installSidebarBridge(bridged, core, () => spawnReady)
     if (remove === undefined) return
     unregisters.add(remove)
     bridged.effect(() => () => {
@@ -2053,20 +2090,34 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     })
   })
   rawCtx.inject(['sandbox', 'subprocess'], bridged => {
-    const remove = installRemoteWorld(bridged as unknown as { get(name: string): unknown }, {
+    const removeWorld = installRemoteWorld(bridged as unknown as { get(name: string): unknown }, {
       transport: new SshPoolTransport(core.pool),
       hostOf: id => core.listHosts().find(host => host.id === id),
       secretOf: host => core.secret(host),
       statusOf: host => core.statusOf(host),
       routeByCwd: cwd => routeByCwd(cwd),
     })
-    if (remove === undefined) return
+    if (removeWorld === undefined) return
     worldReady = true
-    unregisters.add(remove)
+    unregisters.add(removeWorld)
     bridged.effect(() => () => {
-      remove()
-      unregisters.delete(remove)
+      removeWorld()
+      unregisters.delete(removeWorld)
       worldReady = false
+    })
+  })
+  rawCtx.inject(['subprocess'], bridged => {
+    // `spawnTerminal` is independent of the remote sandbox: sidebar terminals
+    // need it even when the sandbox service is absent. Model terminals still
+    // require `worldReady` through the shadow guard.
+    const removeSpawn = installTerminalSpawnBridge(bridged, core)
+    if (removeSpawn === undefined) return
+    spawnReady = true
+    unregisters.add(removeSpawn)
+    bridged.effect(() => () => {
+      removeSpawn()
+      unregisters.delete(removeSpawn)
+      spawnReady = false
     })
   })
   rawCtx.inject(['shell'], bridged => {
@@ -2206,7 +2257,7 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       // Ask about the instance the service holds right now: a replaced,
       // unwrapped runtime must restore the refusal instead of inheriting an
       // earlier successful wrap.
-      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed && isRemotePtcRuntime(rawCtx.get('ptcRuntime')))
+      installed = installShadows(ctx, core, agent, unregisters, () => { seen.delete(agent) }, () => fsPatchReady, () => detachPtc.installed && isRemotePtcRuntime(rawCtx.get('ptcRuntime')), () => worldReady && spawnReady)
     } catch (error) {
       // Shadows did not register. A remote session would otherwise keep the
       // official tools and run them in the placeholder directory.
@@ -2501,7 +2552,7 @@ async function runRemoteStrReplaceEditor(
   return official(rewriteRemoteEditorArgs(current, record), exec)
 }
 
-function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean, ptcReady: () => boolean): boolean {
+function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregisters: Set<() => void>, forget: () => void, fsReady: () => boolean, ptcReady: () => boolean, terminalReady: () => boolean): boolean {
   const headerCwd = agent.session?.header?.cwd
   // Seed events do not emit `session/event`. The live directory, not the
   // original project in `header.cwd`, decides the first shell surface.
@@ -2530,6 +2581,16 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           const record = args as Record<string, unknown>
           if (current.kind !== 'remote') {
             if (plan.name === 'working_directory') await assertLocalWorkingDirectory(core, record, cwd, headerCwd, canonicalFs(ctx), exec.signal)
+            if (plan.name === 'terminal_open' && typeof record.cwd === 'string' && record.cwd.length > 0) {
+              // A local session may try to hand the official terminal tool an
+              // absolute placeholder spelling. Routing by cwd alone would then
+              // open a remote shell on a host this session never opened.
+              const base = cwd ?? headerCwd
+              const target = isAbsolute(record.cwd) ? record.cwd : base !== undefined ? resolveLocalPath(base, record.cwd) : record.cwd
+              const targetRoute = routeByCwd(target)
+              const execHeaderCwd = exec.agent?.session?.header?.cwd
+              if (targetRoute.kind === 'remote') assertEnterableRemoteCwd(core, targetRoute, execHeaderCwd ?? headerCwd)
+            }
             return dispatchShadow(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, false, async () => {
               throw new Error('dsh-permission-remote: local call has no official tool')
             }, args, exec)
@@ -2545,7 +2606,8 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
           }
           if (plan.name === 'present') return runPresent(official as ((value: unknown, execution: ToolExec) => Promise<unknown>) | undefined, host, current, record, exec, core)
           if (plan.name === 'str_replace_editor') return runRemoteStrReplaceEditor(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
-          return RUNNERS[plan.name as 'bash' | 'terminal_open'](host, current, record, exec, ctx)
+          if (plan.name === 'terminal_open' && !terminalReady()) throw new Error(TERMINAL_OPEN_REFUSED)
+          return runOfficialTerminalOpen(official as (value: unknown, execution: ToolExec) => Promise<unknown>, current, record, exec)
         },
       }
       if (plan.name === 'working_directory') definition.output = workingDirectoryOutput(base.output)
@@ -2580,7 +2642,7 @@ function installShadows(ctx: HostContext, core: Core, agent: AgentLike, unregist
     return false
   }
   try {
-    for (const tool of opsTools(core)) disposers.push(agent.ctx.tools.register(tool))
+    for (const tool of opsTools(core, exec => effectiveCwd(ctx, exec, headerCwd))) disposers.push(agent.ctx.tools.register(tool))
   } catch (error) {
     // A missing ops tool must not take the remote workspace shadows down with it.
     ctx.logger?.warn(`[@dsh-permission-remote] ops tool install failed for agent ${agentLabel(agent)}: ${error instanceof Error ? error.message : String(error)}`)
@@ -2680,7 +2742,7 @@ function installRemoteShellSurface(
                 throw new Error('dsh-permission-remote: local call has no official tool')
               }, args, exec)
             }
-            return RUNNERS.bash(host, current, args as Record<string, unknown>, exec, ctx)
+            return runBash(host, current, args as Record<string, unknown>, exec)
           },
         })))
       }
@@ -3117,15 +3179,17 @@ function publishOpsTool(tool: {
   }
 }
 
-function opsTools(core: Core): object[] {
+function opsTools(core: Core, currentCwd: (exec: ToolExec) => string | undefined): object[] {
   const hostApi = core.toolHost(undefined)
   const pick = (args: Record<string, unknown>) => core.requireOpsHost(String(args.host ?? ''))
+  const listHosts = () => core.listHosts()
+  const pickBy = (selector: string) => resolveOpsHost(listHosts(), selector)
   // Read per call, not per registration: a Settings save applies to the next
   // transfer even in a session that is already open.
   const limits = () => core.transferLimits()
   return [publishOpsTool({
       name: 'ssh_hosts',
-      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, uploads, downloads, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
+      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, ssh_copy, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, uploads, downloads, copies, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
       parameters: {},
       output: textOutput(value => {
         const hosts = Array.isArray(value.hosts) ? value.hosts as Array<ReturnType<typeof opsHostView>> : []
@@ -3150,6 +3214,25 @@ function opsTools(core: Core): object[] {
         const record = args as Record<string, unknown>
         const host = pick(record)
         return runSshExec(hostApi, host, record, exec)
+      },
+    }), publishOpsTool({
+      name: 'ssh_copy',
+      description: 'Copy one file from one configured SSH host to another, streaming it between the two SFTP channels: it never lands on the machine running DSH and is never held in memory as a whole file. This is how a session inside a remote workspace moves a file to another host — that session has no useful local path, because ssh_upload reads the machine running DSH. source_path may be an absolute remote path, a path starting with "~/", or a placeholder path returned by read or the file tree; source_host may be omitted when the path is a placeholder path (its host comes from the path) or when this session is in a remote workspace (its host is the source). target_host is required. Reading the source follows ssh_read: a denied or untrusted source host is refused and needs no approval. Writing the target follows ssh_write: on an "ask" host this needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied, and the approval card names both ends. The filesystem root "/" and copying a file onto itself are refused. The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates it, an existing file keeps its permission bits, and a new file uses the remote umask. A source symlink, directory, or special file (FIFO/device) is refused, and so is a target that is a directory or symlink. Single files only, no recursion or resume; the byte ceiling and timeout come from Settings and 0 means unlimited. Cross-host copies hold one connection to each host at the same time. Call ssh_hosts when you do not know a host id or name.',
+      parameters: {
+        source_host: { type: 'string', description: 'SSH host id, name, or address to copy from; omit it to take the host from a placeholder source_path, or the current remote workspace host' },
+        source_path: { type: 'string', required: true, description: 'Absolute remote path, a path starting with "~/", or a placeholder path from read or the file tree' },
+        target_host: { type: 'string', required: true, description: 'SSH host id, name, or address to copy to; required, because the write side is never inferred' },
+        target_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/" on the target host' },
+        ...OPS_ESCALATION,
+      },
+      output: textOutput(renderOpsCopy),
+      execute(args: unknown, exec: ToolExec) {
+        const record = args as Record<string, unknown>
+        // This tool names its write side `target_host`; every other ops tool
+        // names it `host`. Reading `host` here resolved nothing and made every
+        // call fail, so it is spelled out rather than reusing `pick`.
+        const target = pickBy(String(record.target_host ?? ''))
+        return runSshCopy(hostApi, target, record, exec, pickBy, limits(), currentCwd(exec))
       },
     }), publishOpsTool({
       name: 'ssh_workspace',
@@ -3201,7 +3284,7 @@ function opsTools(core: Core): object[] {
       },
     }), publishOpsTool({
       name: 'ssh_upload',
-      description: 'Copy one local file to a configured SSH host over the SSH connection. This is for ops on a machine that is not your current workspace. local_path is an absolute path on the machine running DSH (not the remote host, and not a placeholder path when the session itself is remote); remote_path is an absolute remote path or starts with "~/". The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates the original, an existing file keeps its permission bits when the server reports them, and a new file uses the remote umask. The filesystem root "/" is refused, and so is a final symlink, a directory, or a special file (FIFO/device). Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      description: 'Copy one local file to a configured SSH host over the SSH connection. This is for ops on a machine that is not your current workspace. local_path is an absolute path on the machine running DSH — never a remote path or a remote workspace placeholder path, which a placeholder path in this session is: it is refused before the approval prompt. To move a file between two SSH hosts, use ssh_copy instead. remote_path is an absolute remote path or starts with "~/". The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates the original, an existing file keeps its permission bits when the server reports them, and a new file uses the remote umask. The filesystem root "/" is refused, and so is a final symlink, a directory, or a special file (FIFO/device). Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         local_path: { type: 'string', required: true, description: 'Absolute path on the machine running DSH' },
@@ -3216,7 +3299,7 @@ function opsTools(core: Core): object[] {
       },
     }), publishOpsTool({
       name: 'ssh_download',
-      description: 'Copy one file from a configured SSH host to a local path over SFTP. This is for ops on a machine that is not your current workspace. remote_path is an absolute remote path or starts with "~/"; local_path is an absolute path on the machine running DSH whose parent directory already exists. The file is replaced atomically and gets mode 0600. A remote symlink, directory, or special file (FIFO/device) is refused, and so is a local directory or symlink at the target. Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. Downloading writes a local file, so it is gated like ssh_write: on an "ask" host it needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      description: 'Copy one file from a configured SSH host to a local path over SFTP. This is for ops on a machine that is not your current workspace. remote_path is an absolute remote path or starts with "~/"; local_path is an absolute path on the machine running DSH whose parent directory already exists (a remote workspace placeholder path is refused before the approval prompt). The file is replaced atomically and gets mode 0600. A remote symlink, directory, or special file (FIFO/device) is refused, and so is a local directory or symlink at the target. Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. Downloading writes a local file, so it is gated like ssh_write: on an "ask" host it needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         remote_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },

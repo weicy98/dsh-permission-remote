@@ -34,6 +34,10 @@ overlay adaptation therefore records the version installed on the plugin host.
 
 ## Upgrade runbook
 
+`check:upstream`（因此 `upgrade:ptc`）还包含 `probeTerminalContract`：它校验 `TerminalController.spawn`（4/5 参）、`create`（3 参）、`shells`（2 参）、`openForAgent`、`dsh-terminal-bash` 的 `DSH_SESSION_ID`、`dsh-subprocess.spawnTerminal`，并拒绝不在 `VERIFIED_TERMINAL_DSH_VERSIONS` 里的 DSH 版本。终端路径的实机冒烟另有 `npm run smoke:terminal`。
+
+`npm run typecheck:host` 会按当前安装的 DSH 重写 `tsconfig` 的 `@deepseek-ai/*` 路径后跑 `tsc --noEmit`，避免类型检查对着旧版本头文件；`npm run smoke:terminal` 覆盖终端契约与真实 controller 路径。升级时两者都应通过。
+
 `npm run upgrade:ptc` is the whole gate in one command:
 
 ```bash

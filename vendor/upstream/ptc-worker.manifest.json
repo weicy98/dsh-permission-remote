@@ -17,6 +17,23 @@
         "bootstrapArgsMapsHostPath": true,
         "spawnControlPipe": true
       }
+    },
+    {
+      "dshVersion": "0.2.2-rc.2",
+      "ptcRuntimeNodeVersion": "0.2.2-rc.2",
+      "dshSubprocessVersion": "0.2.2-rc.2",
+      "processSha256": "c01308c52fc52d5f13edd2b65008f3bbcf67bd753eb17af5e4bc023216eca6b4",
+      "indexSha256": "2eee67bc472e933cc71f9ee25c04ed266f56be0310b809cadeb31d5d5c804349",
+      "controlSha256": "4afd0f7d7a7054b6fc8d727ea3f76731a78c9a972ddb6d5d2eef81cac4ffee3a",
+      "controlFd": 7,
+      "controlEnv": "DSH_SUBPROCESS_CONTROL",
+      "minimumNodeMajor": 22,
+      "probes": {
+        "entry": true,
+        "importsOnlyNode": true,
+        "bootstrapArgsMapsHostPath": true,
+        "spawnControlPipe": true
+      }
     }
   ]
 }

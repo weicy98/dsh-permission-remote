@@ -37,7 +37,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 ### 远程调用审批（默认「每次询问」）
 
-控制其他工作区的会话用 `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` 操作这台主机时放不放行：
+控制其他工作区的会话用 `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` / `ssh_copy` 操作这台主机时放不放行：
 
 | 选项 | 行为 |
 |---|---|
@@ -86,7 +86,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 ## 远程运维
 
-普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机。可用工具：`ssh_hosts`、`ssh_exec`、`ssh_read`、`ssh_write`、`ssh_upload`、`ssh_download`、`ssh_workspace`。
+普通工作区（目录在你这台电脑上）也可以让模型操作一台已配置的 SSH 主机。可用工具：`ssh_hosts`、`ssh_exec`、`ssh_read`、`ssh_write`、`ssh_upload`、`ssh_download`、`ssh_copy`、`ssh_workspace`。
 
 | 工具 | 作用 |
 |---|---|
@@ -96,11 +96,12 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 | `ssh_write` | 临时文件加 `mv -f` 原子替换远端文件，保留权限位 |
 | `ssh_upload` | 把一个本机文件传到远端，原子替换 |
 | `ssh_download` | 把远端一个文件取回本机，原子替换并置为 `0600` |
+| `ssh_copy` | 在远端两台主机之间（可同一台）直接复制一个文件，字节不经过运行 DSH 的这台机器 |
 | `ssh_workspace` | 给已有主机、以某个远端目录创建工作区 |
 
 每台主机在设置里有**远程运维**策略：
 
-| 策略 | 读取 `ssh_read` | 命令、写入、上传、下载、添加工作区 |
+| 策略 | 读取 `ssh_read`（以及 `ssh_copy` 的源端） | 命令、写入、上传、下载、跨主机复制、添加工作区 |
 |---|---|---|
 | 询问（默认） | 允许 | 只在本会话是 `danger-full-access` 时直接执行；否则第一次被拒，带理由重试后弹一次审批 |
 | 信任 | 允许 | 直接执行，不弹审批 |
@@ -110,8 +111,10 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 - 运维工具不受远端工作区沙箱约束，目标通常是本机工作区之外的机器。
 - **信任一台主机也意味着信任它能拿到会话让它上传的本机文件**；「信任」下下载/上传不再看当前会话档位。
-- 上传、下载都只处理单个文件，不递归、不续传；符号链接、FIFO、设备一律拒绝。
-- 单次上限默认 32 MiB、超时默认 120 秒，可在设置页改。字节填 `0` 只取消字节上限，超时填 `0` 才不限时。上传同时在途大约 1 MiB，下载仍逐块读；默认 120 秒仍会先停住慢链路或大文件。`ssh_upload` / `ssh_download` 到点报 `TimeoutError` 并写明毫秒数。超时可能仍完成落盘，失败可能留下同目录临时文件。
+- 上传、下载都只处理单个文件，不递归、不续传；符号链接、FIFO、设备一律拒绝（符号链接的拒绝是**检查时刻**的保证：SFTP v3 没有 `O_NOFOLLOW`）。
+- 单次上限默认 32 MiB、超时默认 120 秒，可在设置页改。字节填 `0` 只取消字节上限，超时填 `0` 才不限时。上传和跨主机复制按约 1 MiB 的字节预算保持在途，下载仍逐块读；默认 120 秒仍会先停住慢链路或大文件。`ssh_upload` / `ssh_download` / `ssh_copy` 到点报 `TimeoutError` 并写明毫秒数。超时可能仍完成落盘，失败可能留下同目录临时文件。
+- **`ssh_copy` 是远端工作区里搬运文件的唯一直接方式。** 那里的会话没有「运行 DSH 的这台机器」上可用的文件路径：`ssh_upload` / `ssh_download` 的 `local_path` 一律指这台机器，占位路径（`~/.dsh/remote/...`）在本机只是空目录骨架，传进去会在审批之前就被拒绝并提示改用 `ssh_copy`。源端按 `ssh_read` 放行（`deny` 和未信任拒绝、不需要额外审批），目标端按写入审批。同一条文件复制到它自己、以及两端任一端是 `/` 都会被拒绝。
+- 跨主机复制同时占用源、目标各一条连接（和远端命令、文件传输共用连接池，`maxConnections` 默认 4，目前只在插件配置里可改）；因此跨主机复制要求 `maxConnections` 至少为 2，同主机复制只占一条。池满时调用会排队；配置了超时的话，这个调用会按自己的超时先返回，排队位置留在池里等下一个调用者接手（不会因此影响同主机上已经在用的连接）；超时填 `0` 时只能等连接释放或手动取消。
 - `ssh_exec` 用 `bash -lc`，`sudo` 只能免密（`sudo -n`）；只支持直连 Linux/macOS，不支持跳板机和 Windows 远端。
 
 传输上限、超时、符号链接与 `ssh_workspace` 的细节见[详细说明](docs/advanced.md#传输工具细节)。
@@ -123,11 +126,11 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 - 侧栏终端是远端登录用户自己的 shell，**不套 bubblewrap**，也不按按键走 Agent 审批；闸门只有主机指纹已信任。要按权限档位跑命令，用对话里的 `bash`。
 - 每个标签一条 SSH 通道，和文件传输、远端命令共用连接（OpenSSH 默认 `MaxSessions 10`）。
 - 已打开的终端不跟随后续 `working_directory`；断线即结束，不自动重连。
-- 模型侧的 `terminal_open` 在远端会报错并提示改用 `bash` 或侧栏终端；`terminal_send` / `terminal_read` / `terminal_list` 不受影响。
+- 模型侧的 `terminal_open` 在远端打开持久 shell：cwd 先改写成这台主机的占位路径，再交给官方工具。`terminal_send` / `terminal_read` / `terminal_list` 仍操作已经打开的会话。非 `danger-full-access` 时 argv 是官方 `confine` 产出的 `bwrap` 或 `sandbox-exec`。前台进程组按主机共用一条探测通道，请求级取消不会拆掉其他会话（被放弃的命令跑完之前，同主机的下一次查询排在它后面，最长 5 秒）；超时会重建该主机的探测通道；capturePid 和信号投递走一次性 exec；`inspectForeground` 读不到正数进程组时返回空并退回提示符/静默；`signalForeground` 在 pid 文件有效而 tpgid 非正数时改打记录 pid，探测整体失败时回退到缓存的远端 pid，不再抛错拆会话。`inputWaiting` 固定为 false，所以精确的 stdin 等待不会成立，REPL/密码提示通常只能靠提示符证据或约 3 秒静默判定，最坏到 30 秒超时。前台组已经退出、信号没有打中时，会话保持打开。关闭时会清掉还能归到这棵进程树上的子进程。
 
 ## 已知限制
 
-- **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用。远端 `bash` 结束后属性缓存会清掉；侧栏、运维工具和运行代码改过的文件，手动刷新后属性仍可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`，单文件大小和超时跟着设置页的「单次传输上限」和「单次传输超时」；默认 32 MiB、120 秒。字节填 `0` 只取消字节上限，默认超时仍然生效。复制分段进行，同时在途大约 1 MiB。传到点会记一条带毫秒数的警告，这一轮对话继续，该附件不会变成远端路径。
+- **只有对话里的工具在远端。** 左侧文件列表和 `@` 补全仍扫本机占位目录；右侧文件树列出远端，但自动刷新不可用。远端 `bash` 结束后属性缓存会清掉；侧栏、运维工具和运行代码改过的文件，手动刷新后属性仍可能滞后约 5 秒。用户上传的非图片文件会先复制到远端 `~/.dsh-permission-remote/uploads/`，单文件大小和超时跟着设置页的「单次传输上限」和「单次传输超时」；默认 32 MiB、120 秒。字节填 `0` 只取消字节上限，默认超时仍然生效。复制分段进行，按约 1 MiB 的字节预算保持在途。传到点会记一条带毫秒数的警告，这一轮对话继续，该附件不会变成远端路径。
 - **`present` 可用。** 快照目录能打开时，插件把远端文件分段复制到本机的内容寻址快照（`<占位根>/.deliverables/<sha256>/<文件名>`），再用快照路径调用官方 `present`。快照目录打不开时退回整段缓冲，单文件仍不超过 256 MiB。卡片和预览拿到的是本机副本；远端原文件不动，快照只读、不可变，改过内容再交付不会顶掉旧卡片。上限跟随设置页的单次传输上限，另有 256 MiB 快照硬顶；任一文件失败整次拒绝。卸载不删已交付的快照；快照按 30 天过期，全部快照合计上限 1 GiB。细节见[详细说明](docs/advanced.md#交付文件present)。
 - **文件工具已经是官方 `dsh-tool-fs` 的工具层。** `read`、`write`、`edit`、`read_image`、`apply_patch` 的 schema、校验和审批由 DSH 提供；插件只实现远端 `ctx.fs` 的 `writeText`/`editText`/`patchText` 等后端方法，不会把文件写到本机 placeholder。
 - **可选的 `apply_patch` / `str_replace_editor`。** 两者默认都关着，由组合配置决定是否启用了 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 或挂载 `@deepseek-ai/dsh-tool-str-replace-editor`；启用后在远端执行，遵守同一套 Permissions、审批和沙箱，整补丁先预检、失败不回滚。细节见[详细说明](docs/advanced.md#可选的-apply_patch--str_replace_editor)。
@@ -178,7 +181,7 @@ No `pnpm-workspace.yaml` edit; the SSH library ships inside the plugin and insta
 
 Both settings live in the host's **edit dialog**; the card shows a label when one leaves its default.
 
-**Remote call approval** (default: ask each time) — for `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` from a session in another workspace:
+**Remote call approval** (default: ask each time) — for `ssh_exec` / `ssh_write` / `ssh_upload` / `ssh_download` / `ssh_copy` from a session in another workspace:
 
 | Option | Behaviour |
 |---|---|
@@ -186,7 +189,7 @@ Both settings live in the host's **edit dialog**; the card shows a label when on
 | Do not ask | Runs directly; amber label |
 | Block calls | Refuses every remote command and write; grey label |
 
-`ssh_read` is unaffected. A download counts as a write because it lands on the machine running DSH.
+`ssh_read` needs no approval unless the host is set to Block calls, which refuses reads too. A download counts as a write because it lands on the machine running DSH.
 
 **Environment source** (default: SSH login environment) — which variables a remote `bash` runs with:
 
@@ -221,15 +224,17 @@ In a remote workspace, `run_code` / `workflow` executes on the SSH host using th
 
 ### Remote ops
 
-An ordinary local workspace can operate a configured SSH host with `ssh_hosts`, `ssh_exec`, `ssh_read`, `ssh_write`, `ssh_upload`, `ssh_download`, and `ssh_workspace`. Each host has an ops policy:
+An ordinary local workspace can operate a configured SSH host with `ssh_hosts`, `ssh_exec`, `ssh_read`, `ssh_write`, `ssh_upload`, `ssh_download`, `ssh_copy`, and `ssh_workspace`. Each host has an ops policy:
 
-| Policy | `ssh_read` | Command, write, upload, download, workspace registration |
+| Policy | `ssh_read` (and a copy's source side) | Command, write, upload, download, cross-host copy, workspace registration |
 |---|---|---|
 | Ask (default) | allowed | only a `danger-full-access` session runs directly; otherwise denied once, then one approval on retry with a justification |
 | Trust | allowed | runs without a prompt |
 | Deny | denied | denied |
 
-Ops calls are not wrapped in the remote workspace sandbox — the target is usually outside the local workspace. Trusting a host also trusts it with local files a session uploads. Transfers are single files, no recursion or resume; symlinks, FIFOs, and devices are refused. Ceiling 32 MiB and deadline 120 s by default. A byte ceiling of `0` leaves the deadline in force. Uploads keep about 1 MiB of writes in flight; downloads still read one chunk at a time. A slow link still stops at 120 s unless the timeout is raised or set to `0`. `ssh_upload` / `ssh_download` report that as `TimeoutError` with the millisecond count. Details: [detailed notes](docs/advanced.md#传输工具细节).
+Ops calls are not wrapped in the remote workspace sandbox — the target is usually outside the local workspace. Trusting a host also trusts it with local files a session uploads. Transfers are single files, no recursion or resume; symlinks, FIFOs, and devices are refused (a symlink is refused at check time; SFTP v3 has no `O_NOFOLLOW`). Ceiling 32 MiB and deadline 120 s by default. A byte ceiling of `0` leaves the deadline in force. Uploads and cross-host copies keep about 1 MiB of bytes in flight; downloads still read one chunk at a time. A slow link still stops at 120 s unless the timeout is raised or set to `0`. `ssh_upload` / `ssh_download` / `ssh_copy` report that as `TimeoutError` with the millisecond count.
+
+**`ssh_copy` moves one file between two SSH hosts.** It is the direct way to move a file out of a remote workspace: that session has no usable path on the machine running DSH, so `ssh_upload` / `ssh_download` cannot serve it — their `local_path` always names the machine running DSH, and a placeholder path is refused before the approval prompt with a pointer at `ssh_copy`. A copy's source side follows `ssh_read` (a `deny` or untrusted source is refused, no approval), its target side follows `ssh_write`. Copying a file onto itself, and `/` on either end, are refused. A cross-host copy holds one connection to each host at the same time (the pool's `maxConnections`, default 4, currently set only in the plugin config), so it requires `maxConnections` of at least 2; a same-host copy uses one. When the pool is full the call queues; a configured timeout releases that caller while the queue position is handed to the next one instead of failing the host's other channels, and with timeout `0` it waits until a connection frees or the call is cancelled. Details: [detailed notes](docs/advanced.md#传输工具细节).
 
 ### Sidebar terminal
 
@@ -238,11 +243,11 @@ The right sidebar's terminal on a remote workspace connects to that host: the sh
 - It is the remote login user's own shell, **not** wrapped in bubblewrap and not gated per keystroke; only a trusted fingerprint is required. Use `bash` for permission-mode-aware commands.
 - One SSH channel per tab on the host's shared connection (OpenSSH `MaxSessions 10`).
 - Open terminals do not follow `working_directory`; a dropped connection ends the terminal.
-- `terminal_open` refuses remotely and points at `bash` or the sidebar terminal; `terminal_send` / `terminal_read` / `terminal_list` still work.
+- `terminal_open` on a remote workspace opens a persistent shell there. Its cwd is rewritten to this host's placeholder before the official tool runs. `terminal_send` / `terminal_read` / `terminal_list` still operate on sessions that are already open. Outside `danger-full-access` the argv is the official `confine` result (`bwrap` or `sandbox-exec`). Foreground checks share one probe channel per host, with per-request cancellation isolation (a cancelled probe is drained before the next one, so a query on the same host can wait behind it for up to 5 s); capturePid and signal delivery use one-shot execs. `inspectForeground` returns empty when it cannot see a positive process group; `signalForeground` falls back to the recorded pid when the pid file is valid but tpgid is non-positive, and to the cached remote pid when the probe itself fails instead of tearing down the session. Because `inputWaiting` is always false, an exact stdin wait never settles; REPL/password prompts rely on prompt evidence or about 3 s of silence, up to the 30 s timeout. A signal that misses, because that group has already exited, leaves the session open. Closing the session also signals the descendants still visible on that process tree.
 
 ### Known limitations
 
-- **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh. A remote `bash` drops the attribute cache when it exits; files changed from the sidebar, ops tools, or Run Code can still lag ~5 s on manual refresh. Non-image uploads are copied to `~/.dsh-permission-remote/uploads/` and follow the transfer ceiling and timeout on the settings page: 32 MiB and 120 s by default. A byte ceiling of `0` leaves the deadline in force. The copy keeps about 1 MiB in flight. A timeout logs the millisecond count and the turn continues; that attachment is not published as a remote path.
+- **Only conversation tools run remotely.** The left file list and `@` completion still use the local placeholder tree; the right file tree lists the remote directory but cannot auto-refresh. A remote `bash` drops the attribute cache when it exits; files changed from the sidebar, ops tools, or Run Code can still lag ~5 s on manual refresh. Non-image uploads are copied to `~/.dsh-permission-remote/uploads/` and follow the transfer ceiling and timeout on the settings page: 32 MiB and 120 s by default. A byte ceiling of `0` leaves the deadline in force. The copy keeps about 1 MiB of bytes in flight. A timeout logs the millisecond count and the turn continues; that attachment is not published as a remote path.
 - **`present` works** by copying the remote file into a content-addressed local snapshot (`<placeholder root>/.deliverables/<sha256>/<name>`) and then calling the official tool with that path. When the snapshot directory can be opened the copy is chunked; when it cannot, the file is buffered up to the same 256 MiB cap. The remote original is untouched, snapshots are read-only and immutable, and re-delivering changed content never replaces an older card's bytes. The size limit follows the transfer setting with a 256 MiB snapshot ceiling, and any bad file refuses the whole call. Unloading the plugin keeps delivered snapshots; they expire after 30 days, and all snapshots together are capped at 1 GiB. Details: [detailed notes](docs/advanced.md#交付文件present).
 - **File tools already use the official `dsh-tool-fs` surface.** `read`, `write`, `edit`, `read_image`, and `apply_patch` keep DSH schemas, validation, and approvals; the plugin only implements the remote `ctx.fs` backend methods such as `writeText`/`editText`/`patchText`, never a local write to the placeholder.
 - **Optional `apply_patch` / `str_replace_editor`** are off unless the composition enables `applyPatch` or mounts the editor package. They then run remotely under the same Permissions, approval, and sandbox; a patch is preflighted first and is not rolled back on failure. Details: [detailed notes](docs/advanced.md#可选的-apply_patch--str_replace_editor).

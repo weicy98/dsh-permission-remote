@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
-import { open, readFile } from 'node:fs/promises'
+import { open, readFile, type FileHandle } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, posix } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -82,6 +82,74 @@ export function settleThen(work: Promise<unknown>, cleanup: () => void): void {
   void work.then(run, run)
 }
 
+/**
+ * How long cleanup waits for an SFTP callback that ignores the abort signal.
+ *
+ * A hung `open`, `write`, or `close` callback cannot be cancelled at the
+ * protocol layer; the transfer deadline makes the caller return, but cleanup
+ * must not inherit that unbounded wait. Five seconds is enough for a live
+ * channel to report a close and short enough that a dead one still fails the
+ * tool call promptly.
+ */
+export const CLEANUP_SETTLE_TIMEOUT_MS = 5_000
+
+/**
+ * How long cleanup first gives a transfer to answer its own abort.
+ *
+ * A writer notices the signal between chunks, so a transfer that is not stuck
+ * settles well inside this window. Waiting the full cleanup bound and only
+ * then tearing the channel down would add five seconds to every ordinary
+ * timeout, which the model experiences as a hung tool call.
+ */
+export const COOPERATIVE_SETTLE_MS = 250
+
+/** Wait for `work` at most `timeoutMs`, swallowing its result/error. Returns whether it settled. */
+export function settleWithin(work: Promise<unknown>, timeoutMs = CLEANUP_SETTLE_TIMEOUT_MS): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    work.then(() => true, () => true),
+    new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(false), timeoutMs)
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
+/**
+ * Adopt `work` but stop waiting for it when `signal` aborts.
+ *
+ * The shared work is not cancelled: other callers may still be waiting on it.
+ * Only this caller detaches, which is what a transfer deadline or a cancelled
+ * tool call must do — it must not fail the host's connection for everyone else.
+ */
+function detachOnAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return work
+  if (signal.aborted) {
+    work.catch(() => undefined)
+    return Promise.reject(abortError())
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (settle: () => void): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      settle()
+    }
+    const onAbort = (): void => {
+      work.catch(() => undefined)
+      finish(() => reject(abortError()))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    work.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    )
+  })
+}
+
 export interface DirEntry {
   readonly name: string
   readonly path: string
@@ -101,6 +169,20 @@ export interface SftpAttrs {
   readonly size: number
   readonly mtime: number
   readonly mode?: number
+}
+
+/**
+ * One transfer's own SFTP channel.
+ *
+ * A transfer must not share `Live.sftp`: aborting it has to destroy its channel
+ * without disturbing a concurrent `ssh_read`, file tree listing, or PTC file
+ * operation on the same host. `close()` is idempotent and bounded by
+ * `CLEANUP_SETTLE_TIMEOUT_MS`; callers await it *before* removing a temporary
+ * file, so a late SFTP `OPEN` cannot recreate the file after the `rm`.
+ */
+export interface SftpLease {
+  readonly api: SftpLike
+  close(): Promise<void>
 }
 
 export interface SecretMaterial {
@@ -255,6 +337,8 @@ export function isRetryableOpenFailure(error: unknown): boolean {
 
 interface SftpSession {
   readonly api: SftpLike
+  /** Resolves when the channel is done emitting; `end()` alone does not await the handshake. */
+  readonly closed: Promise<void>
   end(): void
 }
 
@@ -268,6 +352,18 @@ interface Live {
    * wait for the event to free its slot.
    */
   markDead(): void
+}
+
+/**
+ * One in-flight connection open for a host, shared by every concurrent caller.
+ *
+ * `waiters` counts callers that have not detached yet. When it reaches zero
+ * before the opening settles, `controller` aborts so `openLive` releases the
+ * reserved slot instead of connecting for a caller that already gave up.
+ */
+interface OpeningState {
+  waiters: number
+  settled: boolean
 }
 
 const FINGERPRINT_PREFIX = 'SHA256:'
@@ -308,12 +404,13 @@ function expandTildePath(input: string): string {
 
 export class SshPool {
   private readonly live = new Map<string, Promise<Live>>()
+  private readonly openings = new Map<string, OpeningState>()
   private readonly waiters: Array<() => void> = []
   private readonly forwards = new Set<Duplex>()
   private active = 0
   private disposed = false
 
-  constructor(private readonly maxConnections: number) {}
+  constructor(readonly maxConnections: number) {}
 
   async dispose(): Promise<void> {
     this.disposed = true
@@ -327,6 +424,7 @@ export class SshPool {
     this.forwards.clear()
     const pending = [...this.live.values()]
     this.live.clear()
+    this.openings.clear()
     // A queued caller is waiting for a slot that `closeLive` will never hand
     // back on its own. Wake them first so unload cannot hang on `reserve`.
     const queued = this.waiters.splice(0)
@@ -360,6 +458,7 @@ export class SshPool {
     this.active = 0
     this.waiters.length = 0
     this.live.clear()
+    this.openings.clear()
   }
 
   invalidate(hostId: string): void {
@@ -398,7 +497,7 @@ export class SshPool {
    */
   async openPty(host: HostConfig, secret: SecretMaterial, request: PtyRequest): Promise<OpenPty> {
     if (request.signal?.aborted) throw new SshFailure('pty allocation aborted', 'pty')
-    const live = await this.acquire(host, secret, true)
+    const live = await this.acquire(host, secret, true, request.signal)
     if (request.signal?.aborted) throw new SshFailure('pty allocation aborted', 'pty')
     const channel = await execPty(live.client, request)
     if (request.signal?.aborted) {
@@ -442,7 +541,7 @@ export class SshPool {
 
   /** `timeoutMs` of 0 waits until the command exits, the signal aborts, or `close` kills its channel. */
   async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<RemoteCommand> {
-    const live = await this.acquire(host, secret, true)
+    const live = await this.acquire(host, secret, true, signal)
     const commandHandle = openChannel(live.client, command, timeoutMs, stdin, onOutput)
     if (signal !== undefined) {
       const abort = () => commandHandle.close()
@@ -461,7 +560,7 @@ export class SshPool {
    * output and it keeps the child descriptor open for the control channel.
    */
   async openPtcExec(host: HostConfig, secret: SecretMaterial, command: string, signal?: AbortSignal): Promise<PtcExecHandle> {
-    const live = await this.acquire(host, secret, true)
+    const live = await this.acquire(host, secret, true, signal)
     if (signal?.aborted === true) throw abortError()
     const stdout = new PassThrough()
     const stderr = new PassThrough()
@@ -591,9 +690,31 @@ export class SshPool {
     }
   }
 
+  /**
+   * One long-lived exec whose stdin is a series of probe lines. The caller
+   * owns the lifetime. This is the model terminal's foreground probe: a new
+   * `exec` per poll would spend a session slot every 50ms.
+   */
+  async openEval(host: HostConfig, secret: SecretMaterial, command: string, signal?: AbortSignal): Promise<{ stdout: PassThrough, write(data: string): void, close(): void }> {
+    const opened = await this.openPtcExec(host, secret, command, signal)
+    // `openEval` exposes only stdout. Without a reader, the stderr PassThrough
+    // buffers every diagnostic for the lifetime of this long-lived probe
+    // shell; the caller never sees it, so switch it into flowing/discard mode.
+    opened.stderr.on('error', () => undefined)
+    opened.stderr.resume()
+    // The caller only sees the byte stream. `done` rejects when the exec
+    // channel never opens; leaving that rejection unobserved takes dsh down.
+    void opened.done.catch(() => undefined)
+    return {
+      stdout: opened.stdout,
+      write: data => opened.write(data),
+      close: () => opened.close(),
+    }
+  }
+
   /** Open one direct-streamlocal channel for the PTC control socket. */
   async forwardOutStreamLocal(host: HostConfig, secret: SecretMaterial, socketPath: string, signal?: AbortSignal): Promise<Duplex> {
-    const live = await this.acquire(host, secret, true)
+    const live = await this.acquire(host, secret, true, signal)
     if (signal?.aborted === true) throw abortError()
     const client = live.client as unknown as {
       openssh_forwardOutStreamLocal(path: string, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
@@ -647,7 +768,7 @@ export class SshPool {
 
   /** Open one direct-tcpip channel for the PTC control socket fallback. */
   async forwardOutTcp(host: HostConfig, secret: SecretMaterial, hostname: string, port: number, signal?: AbortSignal): Promise<Duplex> {
-    const live = await this.acquire(host, secret, true)
+    const live = await this.acquire(host, secret, true, signal)
     if (signal?.aborted === true) throw abortError()
     const client = live.client as unknown as {
       forwardOut(srcIP: string, srcPort: number, dstIP: string, dstPort: number, callback: (error: Error | undefined, channel: Duplex | undefined) => void): void
@@ -725,7 +846,7 @@ export class SshPool {
 
   async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string, maxBytes?: number, signal?: AbortSignal): Promise<Buffer> {
     if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
-    const session = await this.sftp(host, secret)
+    const session = await this.sftp(host, secret, signal)
     if (maxBytes !== undefined) {
       const size = await statSize(session, remotePath)
       if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read', undefined, true)
@@ -742,6 +863,34 @@ export class SshPool {
   }
 
   /**
+   * Open a transfer-scoped SFTP channel on the host's shared SSH connection.
+   *
+   * Unlike {@link sftp}, the channel is not cached and is not shared with any
+   * other caller. Closing it on failure therefore cannot disturb a concurrent
+   * `ssh_read`, file tree listing, or PTC file operation.
+   */
+  async openSftpLease(host: HostConfig, secret: SecretMaterial, signal?: AbortSignal): Promise<SftpLease> {
+    const live = await this.acquire(host, secret, true, signal)
+    if (signal?.aborted === true) throw abortError()
+    const session = await openSftp(live.client)
+    let closing: Promise<void> | undefined
+    return {
+      api: session.api,
+      close: () => {
+        closing ??= (async () => {
+          session.end()
+          // `end()` already queues CHANNEL_CLOSE behind every OPEN/WRITE this
+          // transfer sent, so the server cannot process a late OPEN after it.
+          // A short wait drains the close event without adding seconds to a
+          // transfer whose server never answers the handshake.
+          await settleWithin(session.closed, COOPERATIVE_SETTLE_MS)
+        })()
+        return closing
+      },
+    }
+  }
+
+  /**
    * Stream one local file to an existing remote path.
    *
    * `maxBytes` of `0` means the operator chose no ceiling: the copy still
@@ -755,8 +904,46 @@ export class SshPool {
     remotePath: string,
     options: { maxBytes?: number, signal?: AbortSignal } = {},
   ): Promise<number> {
-    const session = await this.sftp(host, secret)
+    const session = await this.sftp(host, secret, options.signal)
     return streamLocalToSftp(session, localPath, remotePath, options.maxBytes ?? 0, options.signal)
+  }
+
+  /** {@link sftpSendLocal} on a transfer lease, so a failure cannot touch other SFTP work. */
+  async sftpSendLocalOn(
+    lease: SftpLease,
+    localPath: string,
+    remotePath: string,
+    options: { maxBytes?: number, signal?: AbortSignal } = {},
+  ): Promise<number> {
+    return streamLocalToSftp(lease.api, localPath, remotePath, options.maxBytes ?? 0, options.signal)
+  }
+
+  /**
+   * Stream a chunk source onto an existing remote path.
+   *
+   * The source is read lazily, so a caller can hand over another host's SFTP
+   * chunks without buffering the file. `maxBytes` of `0` still writes one
+   * bounded window at a time.
+   */
+  async sftpSendChunks(
+    host: HostConfig,
+    secret: SecretMaterial,
+    remotePath: string,
+    source: AsyncIterable<Buffer>,
+    options: StreamChunksOptions = {},
+  ): Promise<number> {
+    const session = await this.sftp(host, secret, options.signal)
+    return streamChunksToSftp(session, remotePath, source, options)
+  }
+
+  /** {@link sftpSendChunks} on a transfer lease. */
+  async sftpSendChunksOn(
+    lease: SftpLease,
+    remotePath: string,
+    source: AsyncIterable<Buffer>,
+    options: StreamChunksOptions = {},
+  ): Promise<number> {
+    return streamChunksToSftp(lease.api, remotePath, source, options)
   }
 
   async sftpWrite(host: HostConfig, secret: SecretMaterial, remotePath: string, body: Buffer | string): Promise<void> {
@@ -803,8 +990,8 @@ export class SshPool {
     await makeDirectory(session, remotePath)
   }
 
-  private async sftp(host: HostConfig, secret: SecretMaterial): Promise<SftpLike> {
-    const live = await this.acquire(host, secret, true)
+  private async sftp(host: HostConfig, secret: SecretMaterial, signal?: AbortSignal): Promise<SftpLike> {
+    const live = await this.acquire(host, secret, true, signal)
     if (live.sftp === undefined) {
       // A protocol fault destroys the SFTP channel but leaves the SSH connection
       // up (`doFatalSFTPError`). Clearing the cached session on that error makes
@@ -865,15 +1052,13 @@ export class SshPool {
     // SFTP `w` open. The caller has already checked the final component is not
     // a symlink; the rename replaces the directory entry, never its target.
     const temporary = `${remotePath}.tmp-${process.pid}-${randomUUID()}`
-    const session = await this.sftp(host, secret)
-    // A hung SFTP write does not notice the signal between chunks. Racing the
-    // publish lets the deadline return while `open` is still pending. The
-    // temporary file is removed only after that open has settled: deleting
-    // first lets the late open recreate it.
+    // A transfer-scoped channel: a hung open/write here can be closed without
+    // touching the host's other SFTP work.
+    const lease = await this.openSftpLease(host, secret, signal)
     const publish = (async () => {
-      await streamLocalToSftp(session, localPath, temporary, limits?.maxBytes ?? 0, signal)
+      await streamLocalToSftp(lease.api, localPath, temporary, limits?.maxBytes ?? 0, signal)
       try {
-        await renameRemote(session, temporary, remotePath)
+        await renameRemote(lease.api, temporary, remotePath)
       } catch {
         // Standard SFTP rename is allowed to refuse an existing target. The
         // remote `mv -f` is the POSIX-overwrite fallback and keeps the write
@@ -891,10 +1076,17 @@ export class SshPool {
       await finishOrCleanup(publish, signal, async () => {
         // No signal: an already-aborted signal closes the channel before `rm` runs.
         await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
+      }, async () => {
+        // A hung SFTP open/write ignores the deadline. Closing this transfer's
+        // own channel lets a late open fail instead of recreating the temp file
+        // after cleanup; the SSH connection and other SFTP channels stay up.
+        await lease.close()
       })
     } catch (error) {
       if (signal?.aborted === true) throw abortError()
       throw error
+    } finally {
+      void lease.close()
     }
   }
 
@@ -928,8 +1120,8 @@ export class SshPool {
     }
   }
 
-  async sftpAttrs(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean): Promise<SftpAttrs | undefined> {
-    const session = await this.sftp(host, secret)
+  async sftpAttrs(host: HostConfig, secret: SecretMaterial, remotePath: string, follow: boolean, signal?: AbortSignal): Promise<SftpAttrs | undefined> {
+    const session = await this.sftp(host, secret, signal)
     const info = await attrsOf(session, remotePath, follow)
     if (info === undefined || info.mode !== undefined || info.type !== 'other') return info
     // A mode-less server cannot distinguish a FIFO/device from a regular file
@@ -991,22 +1183,80 @@ export class SshPool {
   /** Chunks from one open handle. Stopping the generator closes the handle. */
   async *sftpReadChunks(host: HostConfig, secret: SecretMaterial, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
     if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
-    const session = await this.sftp(host, secret)
+    const session = await this.sftp(host, secret, signal)
     yield* readOpenChunks(session, remotePath, signal)
   }
 
-  private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean): Promise<Live> {
+  /** {@link sftpReadChunks} on a transfer lease. */
+  async *sftpReadChunksOn(lease: SftpLease, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
+    if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
+    yield* readOpenChunks(lease.api, remotePath, signal)
+  }
+
+  /**
+   * One caller's view of the host's connection.
+   *
+   * The connection itself is shared: `claimPending` hands every concurrent
+   * caller the same opening. A caller's `signal` therefore may not cancel it —
+   * that would reject every other caller waiting on the same host, and a
+   * transfer's deadline would surface as a failure of an unrelated read or
+   * terminal. Cancellation detaches this caller only. When the last waiting
+   * caller detaches before the connection is up, the opening is aborted so no
+   * unused connection is created and no slot is held for it.
+   */
+  private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, signal?: AbortSignal): Promise<Live> {
     if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
-    return claimPending(this.live, host.id, async () => {
+    let state = this.openings.get(host.id)
+    if (state === undefined) {
+      state = { waiters: 0, settled: false }
+      this.openings.set(host.id, state)
+    }
+    const joined = state
+    joined.waiters += 1
+    const opening = claimPending(this.live, host.id, () => this.openLive(host, secret, requireTrust, joined))
+    void opening.then(
+      () => { joined.settled = true; this.forgetOpening(host.id, joined) },
+      () => { joined.settled = true; this.forgetOpening(host.id, joined) },
+    )
+    return detachOnAbort(opening, signal).finally(() => {
+      joined.waiters -= 1
+      if (joined.waiters <= 0) this.forgetOpening(host.id, joined)
+    })
+  }
+
+  private forgetOpening(hostId: string, state: OpeningState): void {
+    if (state.settled && state.waiters <= 0 && this.openings.get(hostId) === state) this.openings.delete(hostId)
+  }
+
+  /**
+   * Establish the connection every caller for this host shares.
+   *
+   * It never receives a caller's signal. It checks the shared waiter count after
+   * reserving a slot and after connecting, so an opening whose last caller gave
+   * up releases the slot instead of caching a connection nobody asked for.
+   */
+  private openLive(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, state: OpeningState): Promise<Live> {
+    return (async () => {
       await this.reserve()
+      if (this.disposed) {
+        this.release()
+        throw new SshFailure('SSH pool is disposed', 'connect')
+      }
+      if (state.waiters <= 0) {
+        this.release()
+        throw abortError()
+      }
       try {
         const client = await connect(host, secret, key => {
           if (!requireTrust) return true
           return fingerprintMatches(host.fingerprint, key)
         })
+        if (state.waiters <= 0) {
+          client.end()
+          throw abortError()
+        }
         if (this.disposed) {
           client.end()
-          this.release()
           throw new SshFailure('SSH pool is disposed', 'connect')
         }
         const live: Live = {
@@ -1032,9 +1282,18 @@ export class SshPool {
         this.release()
         throw error
       }
-    })
+    })()
   }
 
+  /**
+   * Take one connection slot, waiting for a free one.
+   *
+   * This is part of the host's shared opening, so it takes no caller signal:
+   * cancelling it would reject the opening that every concurrent caller on the
+   * same host is waiting on. A caller whose deadline fires while it is queued
+   * detaches; if it was the last one, `openLive` cancels the opening and
+   * releases the slot before connecting.
+   */
   private reserve(): Promise<void> {
     if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     if (this.active < this.maxConnections) {
@@ -1042,10 +1301,11 @@ export class SshPool {
       return Promise.resolve()
     }
     return new Promise(resolve => {
-      this.waiters.push(() => {
+      const grant = () => {
         this.active += 1
         resolve()
-      })
+      }
+      this.waiters.push(grant)
     })
   }
 
@@ -1318,8 +1578,9 @@ interface SftpLike {
   /** `attrs` is optional in ssh2: `mkdir(path, callback)` sends an empty ATTRS. */
   mkdir(path: string, callback: (error: Error | undefined) => void): void
   end(callback?: () => void): void
-  /** The underlying SFTP implementation is an EventEmitter; only `error` matters here. */
+  /** The underlying SFTP implementation is an EventEmitter; `error` and channel end matter here. */
   on(event: 'error', listener: (error: Error) => void): void
+  on(event: 'end' | 'close', listener: () => void): void
 }
 
 function openSftp(client: Client, onFatal?: () => void): Promise<SftpSession> {
@@ -1339,8 +1600,13 @@ function openSftp(client: Client, onFatal?: () => void): Promise<SftpSession> {
       // in-flight request with it, so the call that triggered it still rejects.
       // It also reports the fatal error so the pool can drop the dead session.
       api.on('error', () => { onFatal?.() })
+      let resolveClosed: () => void = () => undefined
+      const closed = new Promise<void>(resolve => { resolveClosed = resolve })
+      api.on('end', resolveClosed)
+      api.on('close', resolveClosed)
       resolve({
         api,
+        closed,
         end: () => {
           try {
             api.end()
@@ -1636,6 +1902,8 @@ export async function readOpenRange(sftp: SftpLike, remotePath: string, offset: 
 const WRITE_CHUNK = READ_CHUNK
 /** How many bytes may sit in unanswered SFTP writes. The transfer deadline still applies. */
 const WRITE_BUDGET = 1024 * 1024
+/** Hard cap on the number of concurrent SFTP write requests, independent of their size. */
+const MAX_INFLIGHT_WRITES = 32
 
 /** One packet when ssh2 advertises it, otherwise a 64 KiB window that fits a non-OpenSSH packet split. */
 function writeChunkBytes(sftp: SftpLike): number {
@@ -1690,20 +1958,36 @@ function writeAt(sftp: SftpLike, handle: Buffer, data: Buffer, position: number)
 /**
  * Run `work` until it finishes or `signal` aborts.
  *
- * On failure, `cleanup` runs only after `work` has settled. An abort rejects
- * while `work` can still be inside `open`; deleting first lets that open
- * recreate the temporary file with nobody left to remove it.
+ * On failure, `cleanup` runs after `work` has settled or after a short bound.
+ * An abort rejects while `work` can still be inside `open`; deleting first
+ * lets that open recreate the temporary file with nobody left to remove it.
+ * `beforeCleanup` tears down the channel that owns a hung callback, but only
+ * once the work proves stuck: a transfer that answers its own abort needs no
+ * teardown, and the connection is shared with unrelated channels. The bound
+ * keeps a permanently stuck callback from hanging the tool call forever.
  */
 export async function finishOrCleanup<T>(
   work: Promise<T>,
   signal: AbortSignal | undefined,
   cleanup: () => Promise<void>,
+  beforeCleanup?: () => void | Promise<void>,
 ): Promise<T> {
   try {
     return await raceAbort(work, signal)
   } catch (error) {
-    await work.catch(() => undefined)
-    await cleanup()
+    const cleanupDeadline = Date.now() + CLEANUP_SETTLE_TIMEOUT_MS
+    const remaining = (): number => Math.max(0, cleanupDeadline - Date.now())
+    // Give a signal-aware transfer its short window to answer the abort.
+    // Only a callback still stuck after it costs us the channel, and the rest
+    // of the budget belongs to `cleanup()` so `rm` still runs and is awaited.
+    if (!await settleWithin(work, COOPERATIVE_SETTLE_MS)) {
+      try {
+        await beforeCleanup?.()
+      } catch {
+        // Cleanup must not mask the original failure.
+      }
+    }
+    await settleWithin(cleanup(), remaining())
     throw error
   }
 }
@@ -1742,13 +2026,150 @@ function raceAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   })
 }
 
+export interface StreamChunksOptions {
+  /** Byte ceiling; `0` means the operator chose no ceiling. */
+  maxBytes?: number
+  signal?: AbortSignal
+  /**
+   * Subject of the ceiling message. A local upload reads "local file"; a
+   * copy between hosts names the source side instead.
+   */
+  overflowLabel?: string
+}
+
+/**
+ * Write an async chunk sequence onto a remote path.
+ *
+ * Several chunks are in flight, bounded by {@link WRITE_BUDGET} bytes and
+ * {@link MAX_INFLIGHT_WRITES} requests. `maxBytes` of `0` does not stop the
+ * copy; the transfer deadline still does. A source that grows past a positive
+ * ceiling is rejected on the bytes actually written.
+ *
+ * The source owns the buffers it yields: it must not reuse a buffer for a
+ * later chunk, because several writes are in flight at once. Stopping before
+ * the source ends closes it through `return()`, so a generator holding an open
+ * handle (SFTP or local) releases it even when the target side fails first.
+ */
+export async function streamChunksToSftp(
+  sftp: SftpLike,
+  remotePath: string,
+  source: AsyncIterable<Buffer>,
+  options: StreamChunksOptions = {},
+): Promise<number> {
+  const maxBytes = options.maxBytes ?? 0
+  const signal = options.signal
+  const label = options.overflowLabel ?? 'local file'
+  if (signal?.aborted) throw abortError()
+  const inflight: Promise<void>[] = []
+  let inflightBytes = 0
+  let failure: unknown
+  const track = (job: Promise<void>, bytes: number): void => {
+    inflightBytes += bytes
+    const tracked = job.then(() => undefined, (error: unknown) => {
+      if (failure === undefined) failure = error
+    }).finally(() => {
+      inflightBytes -= bytes
+      const index = inflight.indexOf(tracked)
+      if (index >= 0) inflight.splice(index, 1)
+    })
+    inflight.push(tracked)
+  }
+  const drainFailure = async (): Promise<never> => {
+    const pending = inflight.splice(0)
+    // A sibling write may have failed while another callback never returns;
+    // never inherit that unbounded wait on the failure path.
+    await settleWithin(Promise.all(pending))
+    throw failure
+  }
+  const consume = async (all: boolean, nextBytes = 0): Promise<void> => {
+    // A write can reject and remove itself from `inflight` before the loop
+    // below notices; check the recorded failure even when the set is empty.
+    if (failure !== undefined) await drainFailure()
+    while (inflight.length > 0 && (all || inflight.length >= MAX_INFLIGHT_WRITES || inflightBytes + nextBytes > WRITE_BUDGET)) {
+      await Promise.race(inflight)
+      if (failure !== undefined) await drainFailure()
+      if (!all && inflight.length < MAX_INFLIGHT_WRITES && inflightBytes + nextBytes <= WRITE_BUDGET) return
+    }
+    if (failure !== undefined) await drainFailure()
+  }
+  const iterator = source[Symbol.asyncIterator]()
+  let remote: Buffer | undefined
+  let finished = false
+  let position = 0
+  try {
+    const opening = openWrite(sftp, remotePath)
+    try {
+      remote = await raceAbort(opening, signal)
+    } catch (error) {
+      // An abort can win while `open` is still in flight. Wait briefly for the
+      // late handle and close it; the caller's lease close destroys the channel
+      // after the bound, so a late `open` cannot recreate the temp file.
+      if (signal?.aborted === true) {
+        await settleWithin(opening.then(value => closeHandle(sftp, value)), COOPERATIVE_SETTLE_MS)
+      }
+      throw error
+    }
+    while (true) {
+      if (failure !== undefined) await drainFailure()
+      if (signal?.aborted) {
+        await settleWithin(Promise.all(inflight.splice(0)))
+        throw abortError()
+      }
+      const step = await raceAbort(iterator.next(), signal)
+      if (step.done === true) {
+        finished = true
+        break
+      }
+      const data = step.value
+      if (data.length === 0) {
+        if (failure !== undefined) await drainFailure()
+        continue
+      }
+      // Wait for room before this chunk joins the in-flight set. Counting
+      // chunks instead of bytes made a cross-host copy on a small-packet
+      // target hold 2 MiB while a local upload held 256 KiB.
+      await consume(false, data.length)
+      position += data.length
+      if (maxBytes > 0 && position > maxBytes) {
+        await consume(true)
+        throw new SshFailure(`${label} is over the ${maxBytes} byte transfer ceiling`, 'sftp-write', undefined, true)
+      }
+      track(raceAbort(writeAt(sftp, remote, data, position - data.length), signal), data.length)
+    }
+    await consume(true)
+    return position
+  } finally {
+    // A hung `close` callback must not hide the transfer result or turn an
+    // aborted transfer into an unbounded cleanup. The signal race returns
+    // immediately on abort; the bound covers a dead channel with no signal.
+    if (remote !== undefined) await settleWithin(raceAbort(closeHandle(sftp, remote), signal))
+    // Reaching the end already closed the source. Anything else — a ceiling,
+    // an abort, a failed write — has to close it from here.
+    if (!finished && typeof iterator.return === 'function') {
+      await settleWithin(raceAbort(Promise.resolve().then(() => iterator.return!()), signal))
+    }
+  }
+}
+
+/** Chunks from one open local file. The generator owns each buffer it yields. */
+async function* localChunks(local: FileHandle, chunkBytes: number, signal: AbortSignal | undefined): AsyncGenerator<Buffer> {
+  const chunk = Buffer.alloc(chunkBytes)
+  while (true) {
+    if (signal?.aborted) throw abortError()
+    const { bytesRead } = await local.read(chunk, 0, chunk.length, null)
+    if (bytesRead === 0) return
+    // The reusable read buffer cannot go out: several writes are in flight.
+    yield Buffer.from(chunk.subarray(0, bytesRead))
+  }
+}
+
 /**
  * Copy a local file onto a remote path.
  *
- * Several chunks are in flight, bounded by {@link WRITE_BUDGET}, so a
- * round trip is not paid once per 64 KiB. `maxBytes` of `0` does not stop
- * the copy; the transfer deadline still does. A file that grows past a
- * positive ceiling is rejected on the bytes actually read.
+ * The file is opened without following a symlink and without blocking on a
+ * FIFO swapped in after the caller's `lstat`; the fstat then refuses anything
+ * that is no longer a regular file. The write itself is
+ * {@link streamChunksToSftp}.
  */
 export async function streamLocalToSftp(
   sftp: SftpLike,
@@ -1760,80 +2181,41 @@ export async function streamLocalToSftp(
   if (signal?.aborted) throw abortError()
   const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
   const nonBlock = fsConstants.O_NONBLOCK ?? 0
-  // `O_NONBLOCK` keeps a FIFO swapped in after the caller's lstat from
-  // blocking the open. The fstat below then refuses anything that is no
-  // longer a regular file.
   const local = await open(localPath, fsConstants.O_RDONLY | nonBlock | noFollow)
-  let remote: Buffer | undefined
-  const chunkBytes = writeChunkBytes(sftp)
-  const window = Math.max(1, Math.min(32, Math.floor(WRITE_BUDGET / chunkBytes)))
-  const chunk = Buffer.alloc(chunkBytes)
-  const inflight: Promise<void>[] = []
-  let failure: unknown
-  const track = (job: Promise<void>): void => {
-    const tracked = job.then(() => undefined, (error: unknown) => {
-      if (failure === undefined) failure = error
-    }).finally(() => {
-      const index = inflight.indexOf(tracked)
-      if (index >= 0) inflight.splice(index, 1)
-    })
-    inflight.push(tracked)
-  }
-  const consume = async (all: boolean): Promise<void> => {
-    while (inflight.length > 0 && (all || inflight.length >= window)) {
-      await Promise.race(inflight)
-      if (failure !== undefined) {
-        const pending = inflight.splice(0)
-        await Promise.all(pending)
-        throw failure
-      }
-      if (!all) return
-    }
-  }
-  let position = 0
   try {
     const info = await local.stat()
     if (!info.isFile()) throw new Error(`local path is not a regular file: ${localPath}`)
     if (signal?.aborted) throw abortError()
-    remote = await openWrite(sftp, remotePath)
-    while (true) {
-      if (signal?.aborted) {
-        await Promise.all(inflight.splice(0)).catch(() => undefined)
-        throw abortError()
-      }
-      const { bytesRead } = await local.read(chunk, 0, chunk.length, null)
-      if (bytesRead === 0) break
-      position += bytesRead
-      if (maxBytes > 0 && position > maxBytes) {
-        await consume(true)
-        throw new SshFailure(`local file is over the ${maxBytes} byte transfer ceiling`, 'sftp-write', undefined, true)
-      }
-      // Copy the window out of the reusable buffer before the next read.
-      const copy = Buffer.from(chunk.subarray(0, bytesRead))
-      track(writeAt(sftp, remote, copy, position - bytesRead))
-      await consume(false)
-    }
-    await consume(true)
-    return position
+    return await streamChunksToSftp(sftp, remotePath, localChunks(local, writeChunkBytes(sftp), signal), { maxBytes, signal })
   } finally {
-    if (remote !== undefined) await closeHandle(sftp, remote)
-    await local.close().catch(() => undefined)
+    await settleWithin(raceAbort(local.close().catch(() => undefined), signal))
   }
 }
 
 /** Sequential windows from one handle. A short read ends the file. */
 export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
-  const handle = await openRead(sftp, remotePath)
+  const opening = openRead(sftp, remotePath)
+  let handle: Buffer
+  try {
+    handle = await raceAbort(opening, signal)
+  } catch (error) {
+    // An abort can win while `open` is still in flight. Wait briefly for the
+    // late handle and close it, so an aborted download does not leak it.
+    if (signal?.aborted === true) {
+      await settleWithin(opening.then(value => closeHandle(sftp, value)), COOPERATIVE_SETTLE_MS)
+    }
+    throw error
+  }
   try {
     let position = 0
     while (true) {
       if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
-      const chunk = await readAt(sftp, handle, position, READ_CHUNK)
+      const chunk = await raceAbort(readAt(sftp, handle, position, READ_CHUNK), signal)
       if (chunk.length === 0) return
       position += chunk.length
       yield chunk
     }
   } finally {
-    await closeHandle(sftp, handle)
+    await settleWithin(closeHandle(sftp, handle))
   }
 }

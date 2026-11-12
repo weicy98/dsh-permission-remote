@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
-import { apply } from '../src/index.ts'
-import { mapRemoteToLocal } from '../src/router.ts'
+import { apply, runOfficialTerminalOpen } from '../src/index.ts'
+import { isPresentCachePath, mapRemoteToLocal, routeByCwd, type RemoteRoute } from '../src/router.ts'
 import { SshPool } from '../src/ssh-pool.ts'
 
 const remoteCwd = mapRemoteToLocal('host1', '/srv/app')!
@@ -73,6 +74,22 @@ function pluginWithWorkspaces(paths: string[], liveCwd?: string): Context {
     })),
     create: async () => { throw new Error('not used') },
     delete: async () => true,
+  })
+  return ctx
+}
+
+class TerminalSubprocess {
+  async spawnTerminal(_spec: unknown): Promise<unknown> {
+    return { marker: 'fake-terminal' }
+  }
+}
+
+/** A plugin with just enough sandbox/subprocess surface to install the remote terminal world. */
+function pluginWithTerminalWorld(paths: string[] = []): Context {
+  const ctx = pluginWithWorkspaces(paths)
+  ctx.provide('subprocess', new TerminalSubprocess())
+  ctx.provide('sandbox', {
+    confine: async (argv: readonly string[]) => ({ argv: [...argv] }),
   })
   return ctx
 }
@@ -163,6 +180,7 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   const workspace = tools.find(tool => tool.name === 'ssh_workspace')
   const upload = tools.find(tool => tool.name === 'ssh_upload')
   const download = tools.find(tool => tool.name === 'ssh_download')
+  const copy = tools.find(tool => tool.name === 'ssh_copy')
   assert.equal(exec?.parameters.type, 'object')
   assert.deepEqual(exec?.parameters.required, ['host', 'command'])
   assert.equal(hosts?.parameters.type, 'object')
@@ -182,6 +200,21 @@ test('ops tools publish object JSON Schemas and reject missing arguments', async
   assert.deepEqual(upload?.parameters.required, ['host', 'local_path', 'remote_path'])
   assert.deepEqual(download?.parameters.required, ['host', 'remote_path', 'local_path'])
   assert.deepEqual(upload?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
+  // A copy names its source separately: the target is required so the write
+  // side is never inferred, while the source host may come from the path or
+  // the current remote workspace.
+  assert.equal(copy?.parameters.type, 'object')
+  assert.deepEqual(copy?.parameters.required, ['source_path', 'target_host', 'target_path'])
+  assert.deepEqual(Object.keys(copy?.parameters.properties ?? {}).sort(), ['justification', 'sandbox_permissions', 'source_host', 'source_path', 'target_host', 'target_path'])
+  assert.deepEqual(copy?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
+  await assert.rejects(async () => copy!.execute({ source_path: '/srv/a', target_path: '/srv/b' }, {}), /invalid arguments/)
+  // A valid argument set must get past the argument check and reach host
+  // resolution. This used to read `args.host`, which this tool does not have:
+  // every well-formed call failed with "ssh host is required".
+  await assert.rejects(
+    async () => copy!.execute({ source_path: '/srv/a', target_host: 'lo', target_path: '/srv/b' }, {}),
+    /unknown SSH host "lo"/,
+  )
   assert.deepEqual(download?.parameters.properties?.sandbox_permissions?.enum, ['danger-full-access'])
   await assert.rejects(async () => upload!.execute({ host: 'lo' }, {}), /invalid arguments/)
   await assert.rejects(async () => download!.execute({ host: 'lo' }, {}), /invalid arguments/)
@@ -391,36 +424,132 @@ test('working_directory refuses a symlink into a registered placeholder', async 
   assert.equal(officialCalls, 0)
 })
 
-test('terminal_open refuses on a remote workspace and still calls the local tool', async () => {
-  const ctx = plugin()
-  apply(ctx, { hosts: [], maxConnections: 4 })
-  const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
-  const official: string[] = []
-  const { agent } = agentFor(remoteCwd, () => () => undefined)
-  const toolsApi = agent.ctx.tools as { get: (name: string) => { execute: () => Promise<string> } | undefined, register: typeof agent.ctx.tools.register }
-  toolsApi.get = (name: string) => {
-    if (name !== 'terminal_open' && name !== 'bash') return undefined
-    return {
-      execute: async () => {
-        official.push(name)
-        return 'official'
-      },
+test('terminal_open rewrites a remote cwd onto this host and delegates to the official tool', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-terminal-open-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const ctx = pluginWithTerminalWorld()
+    apply(ctx, { hosts: [], maxConnections: 4 })
+    const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+    const official: Array<Record<string, unknown>> = []
+    const { agent } = agentFor(cwd, () => () => undefined)
+    const toolsApi = agent.ctx.tools as { get: (name: string) => { execute: (args: Record<string, unknown>) => Promise<string> } | undefined, register: typeof agent.ctx.tools.register }
+    toolsApi.get = (name: string) => {
+      if (name !== 'terminal_open' && name !== 'bash') return undefined
+      return {
+        execute: async (args: Record<string, unknown>) => {
+          official.push({ name, ...args })
+          return 'official'
+        },
+      }
     }
+    agent.ctx.tools.register = ((definition: { name: string, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
+      tools.push(definition)
+      return () => undefined
+    }) as typeof agent.ctx.tools.register
+    await created(ctx, agent)
+
+    const open = tools.find(tool => tool.name === 'terminal_open')
+    assert.ok(open)
+    const opened = await open.execute({ type: 'shell', cwd: '/srv/lib' }, { agent })
+    assert.equal(opened, 'official')
+    assert.equal(official[0]?.cwd, mapRemoteToLocal('host1', '/srv/lib'))
+    assert.equal(existsSync(cwd), true)
+
+    const foreign = mapRemoteToLocal('host2', '/var/lib')!
+    await assert.rejects(
+      () => open.execute({ type: 'shell', cwd: foreign }, { agent }),
+      /another host's placeholder/,
+    )
+
+    await open.execute({ type: 'shell', cwd: 'lib' }, { agent })
+    assert.equal(official[1]?.cwd, mapRemoteToLocal('host1', '/srv/app/lib'))
+
+    const local = await open.execute({ type: 'shell', cwd: '/srv/lib' }, { agent: { session: { header: { cwd: '/tmp/project' } } } })
+    assert.equal(local, 'official')
+    assert.equal(official[2]?.cwd, '/srv/lib')
+
+    await assert.rejects(
+      () => open.execute({ type: 'shell', cwd }, { agent: { session: { id: 'local-session', header: { cwd: '/tmp/project' } } } }),
+      /not opened on that host/,
+    )
+    assert.equal(official.length, 3)
+  } finally {
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    await rm(root, { recursive: true, force: true })
   }
-  agent.ctx.tools.register = ((definition: { name: string, execute: (args: unknown, exec: object) => Promise<unknown> }) => {
-    tools.push(definition)
-    return () => undefined
-  }) as typeof agent.ctx.tools.register
-  await created(ctx, agent)
+})
 
-  const open = tools.find(tool => tool.name === 'terminal_open')
-  assert.ok(open)
-  await assert.rejects(() => open.execute({}, { agent }), /terminal_open is not available in a remote workspace/)
-  assert.deepEqual(official, [])
+test('terminal_open refuses when the remote terminal world is not installed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-terminal-refused-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const ctx = plugin()
+    apply(ctx, {
+      hosts: [{ id: 'host1', name: 'dev', host: '10.0.0.5', port: 22, username: 'me', auth: 'key', privateKeyPath: '', fingerprint: 'SHA256:abc', opsPolicy: 'ask' }],
+      maxConnections: 4,
+    })
+    const tools: Array<{ name: string, execute: (args: unknown, exec: object) => Promise<unknown> }> = []
+    const official: unknown[] = []
+    const { agent } = agentFor(cwd, definition => {
+      tools.push(definition as { name: string, execute: (args: unknown, exec: object) => Promise<unknown> })
+      return () => undefined
+    })
+    const toolsApi = agent.ctx.tools as { get: (name: string) => { execute: (args: Record<string, unknown>) => Promise<string> } | undefined }
+    toolsApi.get = (name: string) => name === 'terminal_open'
+      ? { execute: async (args: Record<string, unknown>) => { official.push(args); return 'official' } }
+      : undefined
+    await created(ctx, agent)
+    const open = tools.find(tool => tool.name === 'terminal_open')
+    assert.ok(open)
+    await assert.rejects(
+      () => open.execute({ type: 'shell' }, { agent }),
+      /terminal_open is not ready in this remote workspace yet/,
+    )
+    assert.equal(official.length, 0)
+  } finally {
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
-  const local = await open.execute({}, { agent: { session: { header: { cwd: '/tmp/project' } } } })
-  assert.equal(local, 'official')
-  assert.deepEqual(official, ['terminal_open'])
+test('runOfficialTerminalOpen refuses a delivery snapshot and passes an omitted cwd through', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-terminal-open-direct-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
+  try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const route = routeByCwd(cwd)
+    assert.equal(route.kind, 'remote')
+    const seen: Array<Record<string, unknown>> = []
+    const official = async (args: unknown) => {
+      seen.push(args as Record<string, unknown>)
+      return 'official'
+    }
+    await runOfficialTerminalOpen(official, route as RemoteRoute, { type: 'shell' }, {})
+    assert.equal(seen[0]?.cwd, (route as RemoteRoute).placeholderCwd)
+    assert.equal(existsSync(cwd), true)
+    await runOfficialTerminalOpen(official, route as RemoteRoute, { type: 'shell', cwd: '../../etc' }, {})
+    assert.equal(seen[1]?.cwd, mapRemoteToLocal('host1', '/etc'))
+
+    const snapshot = join(root, '.deliverables', 'abc', 'file')
+    assert.equal(isPresentCachePath(snapshot), true)
+    await assert.rejects(
+      () => runOfficialTerminalOpen(official, route as RemoteRoute, { type: 'shell', cwd: snapshot }, {}),
+      /read-only delivery snapshot/,
+    )
+    assert.equal(seen.length, 2)
+  } finally {
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('an existing remote agent that cannot be shadowed refuses every tool call', () => {

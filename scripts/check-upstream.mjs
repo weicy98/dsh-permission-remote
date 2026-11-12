@@ -15,6 +15,7 @@
  * point, so tests can drive it without spawning a process.
  */
 import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
+import { probeTerminalContract } from '../src/upstream-terminal.ts'
 import { clearOverlayManifest, locateDshRoot, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, probePresentContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, CHECK_UPSTREAM_FLAGS, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, unknownFlagLines, unknownFlags, usage, withDshRoot } from './cli-common.mjs'
 
@@ -158,6 +159,23 @@ function runCheck(options, env) {
   log(present.installed
     ? 'check:upstream: present delivery contract ok (lstat/resolve carry the Session cwd, the recorded path is processPath(target))'
     : 'check:upstream: present delivery contract skipped: this DSH build does not ship dsh-tool-present, so nothing delegates to it')
+
+  // The terminal packages are the other upstream seam: rc.1 -> rc.2 changed
+  // TerminalController.spawn from 4 to 5 parameters, and a 4-parameter wrapper
+  // silently dropped the signal. This gate makes that drift red before a
+  // release, and also refuses a DSH version not in the verified list.
+  const located = locateDshRoot(env)
+  const terminal = probeTerminalContract(located.root, located.version)
+  if (terminal.failures.length > 0) {
+    error(`check:upstream: terminal contract failed: ${terminal.failures.join('; ')}`)
+    error('check:upstream: fix src/sidebar-terminal.ts (terminal.spawn/create/shells wrapper) and tests/sidebar-terminal.spec.ts before releasing')
+    if (explain) {
+      for (const [name, value] of terminal.rows) error(`  ${name}: ${value}`)
+    }
+    return { code: 1 }
+  }
+  log('check:upstream: terminal contract ok')
+  if (explain) for (const [name, value] of terminal.rows) log(`  ${name}: ${value}`)
 
   if (update && dryRun) {
     const target = adapt ? overlayManifestPath(env) : 'vendor/upstream/ptc-worker.manifest.json'

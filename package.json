@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
@@ -60,7 +60,9 @@
     "check:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --check",
     "adapt:upstream": "node --experimental-transform-types scripts/check-upstream.mjs --adapt",
     "upgrade:ptc": "node --experimental-transform-types scripts/upgrade.mjs",
-    "upgrade:ptc:live": "node --experimental-transform-types scripts/upgrade.mjs --live --write"
+    "upgrade:ptc:live": "node --experimental-transform-types scripts/upgrade.mjs --live --write",
+    "smoke:terminal": "node --experimental-transform-types --test tests/upstream-terminal-contract.spec.ts tests/sidebar-terminal.spec.ts tests/terminal-open-bridge.spec.ts",
+    "typecheck:host": "node --experimental-transform-types scripts/typecheck-host.mjs"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.11",

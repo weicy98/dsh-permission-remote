@@ -321,6 +321,23 @@ export function routeByCwd(cwd: string | undefined, env: NodeJS.ProcessEnv = pro
 }
 
 /**
+ * Whether an absolute local path is inside a remote workspace's placeholder
+ * namespace — the tree that only mirrors remote directory *names*.
+ *
+ * The placeholder holds no remote bytes: the model's `read`/`write` route it
+ * over SFTP, so the same path on this computer is an empty directory skeleton.
+ * A transfer tool that treats it as a local file either reports "no such file"
+ * or, worse, uploads an unrelated local file of the same name. Delivery
+ * snapshots under `.deliverables` are real local files and are not included:
+ * {@link routeUnderRoot} refuses `.deliverables` as a host id.
+ */
+export function isRemotePlaceholderPath(absolute: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (typeof absolute !== 'string' || absolute.length === 0) return false
+  if (!path.isAbsolute(absolute)) return false
+  return routeByCwd(absolute, env).kind === 'remote'
+}
+
+/**
  * The workspace a placeholder was opened on, ignoring later subdirectory segments.
  *
  * `routeByCwd` folds those segments into the live remote directory. The sandbox

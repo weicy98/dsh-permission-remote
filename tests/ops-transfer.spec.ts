@@ -1,21 +1,25 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import type { HostConfig } from '../src/config.ts'
 import type { ApprovalDetail, RunnerStatus, ToolHost } from '../src/execute.ts'
 import {
   forgetOpsHost,
   NO_TRANSFER_LIMITS,
+  renderOpsCopy,
   renderOpsDownload,
   renderOpsUpload,
   openExclusiveTemp,
+  runSshCopy,
   runSshDownload,
   runSshUpload,
+  runSshWrite,
   type OpsTransferLimits,
 } from '../src/ops.ts'
+import { mapRemoteToLocal, setRemoteRootOverride } from '../src/router.ts'
 import { SFTP_STATUS, SshFailure, type ExecResult, type SshPool } from '../src/ssh-pool.ts'
 
 /** `SSH_FX_PERMISSION_DENIED`; the numeric status wins over the message. */
@@ -74,6 +78,10 @@ interface TransferApi {
   attrs: Array<{ path: string, follow: boolean }>
   writes: Array<{ path: string, bytes: number }>
   modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]>
+  /** Hosts whose whole connection was dropped. A shared connection must not be. */
+  invalidated: string[]
+  /** Hosts whose SFTP channel alone was closed, which is what a stuck transfer needs. */
+  sftpClosed: string[]
 }
 
 /** A pool double for the two transfers. Everything else is a hard failure. */
@@ -86,6 +94,12 @@ function api(options: {
   send?: (limits?: { maxBytes?: number, signal?: AbortSignal }) => Promise<number>
   /** Replaces the remote-to-local chunk source. */
   chunks?: () => AsyncIterable<Buffer>
+  /** Replaces the SFTP-to-SFTP chunk sink used by ssh_copy. */
+  sendChunks?: (target: string, remotePath: string, source: AsyncIterable<Buffer>, limits: { maxBytes?: number, signal?: AbortSignal } | undefined) => Promise<number>
+  /** A second configured host, so a copy has somewhere to go. */
+  hosts?: HostConfig[]
+  /** Mirrors the pool's configured connection limit. */
+  maxConnections?: number
 } = {}): TransferApi {
   // The home probe is cached per host id across tests; every fixture starts
   // from an unknown `$HOME`, so a hang override is actually exercised.
@@ -97,6 +111,8 @@ function api(options: {
   const attrs: Array<{ path: string, follow: boolean }> = []
   const writes: Array<{ path: string, bytes: number }> = []
   const modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]> = []
+  const invalidated: string[] = []
+  const sftpClosed: string[] = []
 
   const pool = {
     exec: async (
@@ -154,12 +170,80 @@ function api(options: {
       const window = 3
       for (let offset = 0; offset < body.length; offset += window) yield body.subarray(offset, offset + window)
     },
+    maxConnections: options.maxConnections,
+    invalidate: (hostId: string) => { invalidated.push(hostId) },
+    openSftpLease: async (h: HostConfig) => {
+      let closed = false
+      return {
+        api: {} as never,
+        hostId: h.id,
+        close: async () => { if (!closed) { closed = true; sftpClosed.push(h.id) } },
+      }
+    },
+    sftpSendLocalOn: async (lease: { hostId: string }, localPath: string, remotePath: string, limits?: { maxBytes?: number, signal?: AbortSignal }) => {
+      if (options.send !== undefined) return options.send(limits)
+      const data = await readFile(localPath)
+      const maxBytes = limits?.maxBytes ?? 0
+      if (maxBytes > 0 && data.length > maxBytes) {
+        throw new Error(`local file is ${data.length} bytes, over the ${maxBytes} byte transfer ceiling`)
+      }
+      writes.push({ path: remotePath, bytes: data.length })
+      bodies.push(data)
+      return data.length
+    },
+    sftpReadChunksOn: async function* (_lease: unknown, remotePath: string) {
+      reads.push(remotePath)
+      if (options.chunks !== undefined) {
+        yield* options.chunks()
+        return
+      }
+      const body = options.remoteBytes ?? Buffer.from('remote bytes')
+      const window = 3
+      for (let offset = 0; offset < body.length; offset += window) yield body.subarray(offset, offset + window)
+    },
+    sftpSendChunksOn: async (
+      lease: { hostId: string },
+      remotePath: string,
+      source: AsyncIterable<Buffer>,
+      limits?: { maxBytes?: number, signal?: AbortSignal },
+    ) => {
+      if (options.sendChunks !== undefined) return options.sendChunks(lease.hostId, remotePath, source, limits)
+      const parts: Buffer[] = []
+      for await (const chunk of source) parts.push(chunk)
+      const data = Buffer.concat(parts)
+      const maxBytes = limits?.maxBytes ?? 0
+      if (maxBytes > 0 && data.length > maxBytes) {
+        throw new SshFailure(`source file is over the ${maxBytes} byte transfer ceiling`, 'sftp-write', undefined, true)
+      }
+      writes.push({ path: `${lease.hostId}:${remotePath}`, bytes: data.length })
+      bodies.push(data)
+      return data.length
+    },
+    sftpSendChunks: async (
+      target: HostConfig,
+      _secret: unknown,
+      remotePath: string,
+      source: AsyncIterable<Buffer>,
+      limits?: { maxBytes?: number, signal?: AbortSignal },
+    ) => {
+      if (options.sendChunks !== undefined) return options.sendChunks(target.id, remotePath, source, limits)
+      const parts: Buffer[] = []
+      for await (const chunk of source) parts.push(chunk)
+      const data = Buffer.concat(parts)
+      const maxBytes = limits?.maxBytes ?? 0
+      if (maxBytes > 0 && data.length > maxBytes) {
+        throw new SshFailure(`source file is over the ${maxBytes} byte transfer ceiling`, 'sftp-write', undefined, true)
+      }
+      writes.push({ path: `${target.id}:${remotePath}`, bytes: data.length })
+      bodies.push(data)
+      return data.length
+    },
   } as unknown as SshPool
 
   return {
     api: {
       pool,
-      hostOf: id => id === 'prod1' ? host() : undefined,
+      hostOf: id => (options.hosts ?? [host()]).find(item => item.id === id),
       secretOf: async () => ({}),
       statusOf: async () => status,
       resolveMode: async (_exec, requested, justification, _tool, _subject, detail) => {
@@ -175,11 +259,18 @@ function api(options: {
     attrs,
     writes,
     modes,
+    invalidated,
+    sftpClosed,
   }
 }
 
 async function tempDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'dsh-transfer-'))
+}
+
+/** Create the parent directories of a fixture file the caller writes next. */
+async function mkdirTree(file: string): Promise<void> {
+  await mkdir(dirname(file), { recursive: true })
 }
 
 const LIMITS: OpsTransferLimits = { maxBytes: 64 * 1024, timeoutMs: 30_000 }
@@ -824,44 +915,61 @@ test('an upload that fails during the copy deletes the temp and does not replace
   }
 })
 
-test('an aborted upload removes the temp only after the copy settles, without the aborted signal', async () => {
+test('an aborted upload closes its transfer lease and removes the temp without the aborted signal', async () => {
   const local = await tempDir()
   const keepAlive = setInterval(() => undefined, 5)
   try {
     const source = join(local, 'a.bin')
     await writeFile(source, 'abcd')
-    const order: string[] = []
     const upload = api({
-      exec: command => {
-        if (command.startsWith('rm -f ')) order.push('rm')
-        return result()
-      },
       send: limits => new Promise<number>((_resolve, reject) => {
         const signal = limits?.signal
         if (signal === undefined) {
           reject(new Error('upload copy was not given a deadline signal'))
           return
         }
-        const created = (): void => {
-          setTimeout(() => {
-            order.push('created')
-            reject(Object.assign(new Error('SSH operation aborted'), { name: 'AbortError' }))
-          }, 40)
-        }
-        if (signal?.aborted === true) created()
-        else signal?.addEventListener('abort', created, { once: true })
+        const aborted = (): void => reject(Object.assign(new Error('SSH operation aborted'), { name: 'AbortError' }))
+        if (signal?.aborted === true) aborted()
+        else signal?.addEventListener('abort', aborted, { once: true })
       }),
     })
     await assert.rejects(
       () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 20 }),
       (error: Error) => error.name === 'TimeoutError',
     )
-    assert.deepEqual(order, ['created', 'rm'])
+    // The transfer's own SFTP channel is closed before `rm`; no shared session
+    // is touched.
+    assert.deepEqual(upload.sftpClosed, ['prod1'])
+    assert.deepEqual(upload.invalidated, [])
     const removed = upload.execs.find(entry => entry.command.startsWith('rm -f '))
     assert.ok(removed)
     assert.equal(removed?.signal, undefined)
   } finally {
     clearInterval(keepAlive)
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a never-settling upload copy is bounded, closes only the SFTP channel, and removes the temp', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcd')
+    const upload = api({ send: () => new Promise(() => {}) })
+    const started = Date.now()
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 20 }),
+      (error: Error) => error.name === 'TimeoutError',
+    )
+    // The cleanup window, not the transfer deadline, bounds the call. The
+    // stuck write is what costs it; it must not grow with the transfer timeout.
+    assert.ok(Date.now() - started < 2_000, 'a stuck transfer must not wait out the full cleanup bound')
+    // The connection is shared with ssh_exec, terminals, and the PTC worker, so
+    // dropping it would make one timed-out upload a host-wide outage.
+    assert.deepEqual(upload.invalidated, [], 'the shared connection must stay up')
+    assert.deepEqual(upload.sftpClosed, ['prod1'], 'the stuck SFTP channel must be closed')
+    assert.match(upload.commands.join('\n'), /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
+  } finally {
     await rm(local, { recursive: true, force: true })
   }
 })
@@ -885,4 +993,556 @@ test('a timeout during the download copy is a timeout and leaves no local file',
     clearInterval(keepAlive)
     await rm(local, { recursive: true, force: true })
   }
+})
+
+/* ─────────── ssh_copy: remote A → remote B, no local bytes ─────────── */
+
+/** A second host so a copy has a target that is not the source. */
+function backup(overrides: Partial<HostConfig> = {}): HostConfig {
+  return host({ id: 'backup1', name: 'backup', host: '10.0.0.2', opsPolicy: 'trust', ...overrides })
+}
+
+/**
+ * The default pair: source `ask` (reads need no approval), target `trust`, so a
+ * success test is not also an approval test. The gate cases build their own pair.
+ */
+const TWO_HOSTS = [host(), backup()]
+
+const COPY_BYTES = Buffer.from('hello')
+const TARGET_PREFIX = '/backup'
+
+/**
+ * Both hosts in the copy fixture.
+ *
+ * The source side is any path under `/srv`, `/src`, or a home directory; the
+ * target side is anything under `/backup`. That split keeps the attrs stub from
+ * having to predict the exact path a `~/` expansion produces.
+ */
+function copyApi(options: {
+  /** `null` means the source path does not exist on the source host. */
+  source?: Attrs | null
+  target?: Attrs | undefined
+  hosts?: HostConfig[]
+  sendChunks?: (target: string, remotePath: string, source: AsyncIterable<Buffer>, limits: { maxBytes?: number, signal?: AbortSignal } | undefined) => Promise<number>
+  chunks?: () => AsyncIterable<Buffer>
+  remoteBytes?: Buffer
+  maxConnections?: number
+} = {}) {
+  return api({
+    hosts: options.hosts ?? TWO_HOSTS,
+    chunks: options.chunks,
+    remoteBytes: options.remoteBytes ?? COPY_BYTES,
+    sendChunks: options.sendChunks as never,
+    maxConnections: options.maxConnections,
+    attrs: (path: string) => {
+      if (path.startsWith(TARGET_PREFIX)) return options.target
+      if (options.source === null) return undefined
+      return options.source ?? { type: 'file', size: COPY_BYTES.length, mode: 0o100644 }
+    },
+  })
+}
+
+test('ssh_copy streams a file from one host to another without local bytes', async () => {
+  const copy = copyApi()
+  const value = await runSshCopy(copy.api, backup(), {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/backup/release.tar.gz',
+  }, {}, (selector) => (TWO_HOSTS.find(item => item.id === selector))!, LIMITS)
+  assert.equal(value.bytes, 5)
+  assert.equal(value.operation, 'create')
+  assert.equal(value.sourcePath, '/srv/release.tar.gz')
+  assert.equal(value.targetPath, '/backup/release.tar.gz')
+  // The source host is only read; the target host gets mkdir and mv.
+  assert.deepEqual(copy.reads, ['/srv/release.tar.gz'])
+  const script = copy.commands.join('\n')
+  assert.match(script, /mkdir -p '\/backup'/)
+  assert.match(script, /mv -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+' '\/backup\/release\.tar\.gz'/)
+  assert.doesNotMatch(script, /cat >/)
+  assert.match(renderOpsCopy(value), /^copied prod:\/srv\/release\.tar\.gz → backup:\/backup\/release\.tar\.gz \(5 bytes, created; 65536 byte ceiling, 30000 ms timeout\)$/)
+})
+
+test('a cross-host copy refuses a one-connection pool before approval', async () => {
+  const copy = copyApi({ maxConnections: 1 })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /maxConnections >= 2/,
+  )
+  assert.deepEqual(copy.reads, [])
+  assert.deepEqual(copy.modes, [])
+})
+
+test('a relative target is refused before the approval card', async () => {
+  const askTarget = backup({ opsPolicy: 'ask' })
+  const pair = [host(), askTarget]
+  const copy = copyApi({ hosts: pair })
+  await assert.rejects(
+    () => runSshCopy(copy.api, askTarget, { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: 'release.tar.gz' }, {}, selector => pair.find(item => item.id === selector)!, LIMITS),
+    /target_path must be an absolute remote path or start with "~\/"/,
+  )
+  assert.deepEqual(copy.modes, [])
+  assert.deepEqual(copy.reads, [])
+})
+
+test('a relative source with an explicit source_host is refused before approval', async () => {
+  const askTarget = backup({ opsPolicy: 'ask' })
+  const pair = [host(), askTarget]
+  const copy = copyApi({ hosts: pair })
+  await assert.rejects(
+    () => runSshCopy(copy.api, askTarget, { source_path: 'release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => pair.find(item => item.id === selector)!, LIMITS),
+    /source_path must be an absolute remote path or start with "~\/"/,
+  )
+  assert.deepEqual(copy.modes, [])
+  assert.deepEqual(copy.reads, [])
+})
+
+test('the approval card shows normalized remote paths', async () => {
+  const askTarget = backup({ opsPolicy: 'ask' })
+  const pair = [host(), askTarget]
+  const copy = copyApi({ hosts: pair })
+  const value = await runSshCopy(copy.api, askTarget, {
+    source_path: '/srv/../etc/cron.d/x',
+    source_host: 'prod1',
+    target_path: '/backup/../etc/cron.d/y',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'mirror the release',
+  }, {}, selector => pair.find(item => item.id === selector)!, LIMITS)
+  const detail = copy.modes.at(-1)?.[2]
+  assert.match(detail?.en ?? '', /copy \/etc\/cron\.d\/x on prod .* to \/etc\/cron\.d\/y on backup/)
+  assert.doesNotMatch(detail?.en ?? '', /\.\./)
+  assert.equal(value.sourcePath, '/etc/cron.d/x')
+  assert.equal(value.targetPath, '/etc/cron.d/y')
+})
+
+test('a copy over an existing target keeps its permission bits and reports an update', async () => {
+  const copy = copyApi({ target: { type: 'file', size: 9, mode: 0o100640 } })
+  const value = await runSshCopy(copy.api, backup(), {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/backup/release.tar.gz',
+  }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
+  assert.equal(value.operation, 'update')
+  assert.match(copy.commands.join('\n'), /chmod 640 '\/backup\/release\.tar\.gz'/)
+})
+
+test('a placeholder source_path carries its own host and needs no source_host', async () => {
+  const root = await tempDir()
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  setRemoteRootOverride(root)
+  try {
+    const placeholder = mapRemoteToLocal('prod1', '/srv/release.tar.gz')!
+    const copy = copyApi()
+    const value = await runSshCopy(copy.api, backup(), {
+      source_path: placeholder,
+      target_path: '/backup/release.tar.gz',
+    }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
+    assert.equal(value.sourcePath, '/srv/release.tar.gz')
+    assert.deepEqual(copy.reads, ['/srv/release.tar.gz'])
+  } finally {
+    setRemoteRootOverride(null)
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a placeholder source and a conflicting source_host are refused before any IO', async () => {
+  const root = await tempDir()
+  setRemoteRootOverride(root)
+  try {
+    const placeholder = mapRemoteToLocal('prod1', '/srv/release.tar.gz')!
+    const copy = copyApi()
+    await assert.rejects(
+      () => runSshCopy(copy.api, backup(), { source_path: placeholder, source_host: 'backup1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+      /does not match the placeholder path, which belongs to prod1/,
+    )
+    assert.deepEqual(copy.reads, [])
+    assert.equal(copy.commands.length, 0)
+  } finally {
+    setRemoteRootOverride(null)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a local session must name source_host', async () => {
+  const copy = copyApi()
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS, '/tmp/local-project'),
+    /source_host is required/,
+  )
+  const value = await runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS, '/tmp/local-project')
+  assert.equal(value.sourcePath, '/srv/release.tar.gz')
+})
+
+test('a remote session uses its own host as the source when source_host is omitted', async () => {
+  const root = await tempDir()
+  setRemoteRootOverride(root)
+  try {
+    const cwd = mapRemoteToLocal('prod1', '/srv/app')!
+    const copy = copyApi()
+    const value = await runSshCopy(copy.api, backup(), { source_path: 'release.tar.gz', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS, cwd)
+    assert.equal(value.sourcePath, '/srv/app/release.tar.gz')
+  } finally {
+    setRemoteRootOverride(null)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('copying a file onto itself is refused before any read', async () => {
+  const copy = copyApi()
+  await assert.rejects(
+    () => runSshCopy(copy.api, host({ opsPolicy: 'trust' }), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/srv/./release.tar.gz' }, {}, selector => (selector === 'prod1' ? host({ opsPolicy: 'trust' }) : backup())!, LIMITS),
+    /same file on prod \(10\.0\.0\.1\)/,
+  )
+  assert.deepEqual(copy.reads, [])
+})
+
+test('the filesystem root is refused on either end', async () => {
+  const copy = copyApi()
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /source_path must name a file/,
+  )
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /target_path must name a file/,
+  )
+})
+
+test('the source gate follows ssh_read: deny and untrusted refuse, trust does not need approval', async () => {
+  const denied = copyApi({ hosts: [host({ opsPolicy: 'deny' }), backup()] })
+  await assert.rejects(
+    () => runSshCopy(denied.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => (selector === 'prod1' ? host({ opsPolicy: 'deny' }) : backup())!, LIMITS),
+    /disabled for SSH host/,
+  )
+  assert.deepEqual(denied.reads, [])
+  assert.deepEqual(denied.modes, [])
+
+  const untrusted = copyApi()
+  await assert.rejects(
+    () => runSshCopy(untrusted.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => (selector === 'prod1' ? host({ fingerprint: '' }) : backup())!, LIMITS),
+    /trust its fingerprint/,
+  )
+  assert.deepEqual(untrusted.modes, [])
+})
+
+test('the target gate is write-class: an ask host needs danger-full-access', async () => {
+  const askTarget = backup({ opsPolicy: 'ask' })
+  const pair = [host(), askTarget]
+  const resolve = (selector: string) => pair.find(item => item.id === selector)!
+  const copy = copyApi({ hosts: pair })
+  await assert.rejects(
+    () => runSshCopy(copy.api, askTarget, { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, resolve, LIMITS),
+    /sandbox: escalation available/,
+  )
+  assert.deepEqual(copy.reads, [])
+  assert.equal(copy.commands.length, 0)
+})
+
+test('the approval card names both ends', async () => {
+  const askTarget = backup({ opsPolicy: 'ask' })
+  const pair = [host(), askTarget]
+  const resolve = (selector: string) => pair.find(item => item.id === selector)!
+  const copy = copyApi({ hosts: pair })
+  const value = await runSshCopy(copy.api, askTarget, {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/backup/release.tar.gz',
+    sandbox_permissions: 'danger-full-access',
+    justification: 'mirror the release',
+  }, {}, resolve, LIMITS)
+  assert.equal(value.bytes, 5)
+  const detail = copy.modes.at(-1)?.[2]
+  assert.match(detail?.en ?? '', /copy \/srv\/release\.tar\.gz on prod \(10\.0\.0\.1\) to \/backup\/release\.tar\.gz on backup \(10\.0\.0\.2\)/)
+  assert.match(detail?.zh ?? '', /把 prod \(10\.0\.0\.1\) 的 \/srv\/release\.tar\.gz 复制到 backup \(10\.0\.0\.2\) 的/)
+})
+
+test('a source that is not a regular file is refused before the target is touched', async () => {
+  for (const type of ['directory', 'symlink', 'other'] as const) {
+    const copy = copyApi({ source: { type, size: 3 } })
+    await assert.rejects(
+      () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+      new RegExp(`source path is not a regular file \\(${type}\\) on prod`),
+    )
+    assert.deepEqual(copy.reads, [])
+    assert.equal(copy.commands.length, 0)
+  }
+})
+
+test('a missing source names the source host, not the target', async () => {
+  const copy = copyApi({ source: null })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/none', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /no file at source path on prod \(10\.0\.0\.1\): \/srv\/none/,
+  )
+})
+
+test('a target that is a directory or symlink is refused before the copy starts', async () => {
+  for (const type of ['directory', 'symlink', 'other'] as const) {
+    const copy = copyApi({ target: { type, size: 3 } })
+    await assert.rejects(
+      () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+      new RegExp(`target path is not a regular file \\(${type}\\) on backup`),
+    )
+    assert.deepEqual(copy.reads, [])
+  }
+})
+
+test('a source over the ceiling fails on the pre-check, and one that grows fails on the stream', async () => {
+  const big = copyApi({ source: { type: 'file', size: 4096 } })
+  await assert.rejects(
+    () => runSshCopy(big.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 1024, timeoutMs: 0 }),
+    /source file is 4096 bytes, over the 1024 byte transfer ceiling/,
+  )
+  assert.deepEqual(big.reads, [])
+
+  const grows = copyApi({
+    // The pre-check sees a file inside the ceiling; the stream is what trips.
+    source: { type: 'file', size: 2 },
+    remoteBytes: Buffer.alloc(10, 0x41),
+    sendChunks: async () => { throw new SshFailure('source file is over the 4 byte transfer ceiling', 'sftp-write', undefined, true) },
+  })
+  await assert.rejects(
+    () => runSshCopy(grows.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 4, timeoutMs: 0 }),
+    /over the 4 byte transfer ceiling/,
+  )
+  const script = grows.commands.join('\n')
+  assert.match(script, /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+  assert.doesNotMatch(script, /mv -f/)
+})
+
+test('a failing copy closes the source chunks and removes the target temp', async () => {
+  const events: string[] = []
+  const sourceState = { returned: 0 }
+  const copy = copyApi({
+    chunks: () => ({
+      [Symbol.asyncIterator]() {
+        let sent = false
+        return {
+          async next() {
+            if (sent) return { done: true, value: undefined }
+            sent = true
+            return { done: false, value: Buffer.from('x') }
+          },
+          async return() {
+            sourceState.returned += 1
+            return { done: true, value: undefined }
+          },
+        }
+      },
+    }) as AsyncIterable<Buffer>,
+    sendChunks: async (_target, _remotePath, source) => {
+      // Pull one chunk, then fail; a real writer closes the source generator in
+      // its finally block, so mirror that here.
+      const iterator = source[Symbol.asyncIterator]()
+      await iterator.next()
+      events.push('failed')
+      await iterator.return?.()
+      throw new Error('target write failed')
+    },
+  })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /target write failed/,
+  )
+  assert.deepEqual(events, ['failed'])
+  assert.equal(sourceState.returned, 1)
+  assert.match(copy.commands.join('\n'), /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+  assert.doesNotMatch(copy.commands.join('\n'), /mv -f/)
+})
+
+test('a cancelled copy is an AbortError and cleans up without the aborted signal', async () => {
+  const controller = new AbortController()
+  const copy = copyApi({
+    sendChunks: async () => {
+      controller.abort()
+      throw Object.assign(new Error('tool call aborted'), { name: 'AbortError' })
+    },
+  })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, { signal: controller.signal }, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    (error: Error) => error.name === 'AbortError',
+  )
+  const cleanup = copy.execs.filter(exec => exec.command.startsWith('rm -f'))
+  assert.equal(cleanup.length, 1)
+  // The cleanup channel must outlive the aborted call.
+  assert.equal(cleanup[0]?.signal, undefined)
+})
+
+test('a timed-out copy is a TimeoutError with the configured milliseconds', async () => {
+  // A real SFTP write observes the signal and rejects, which is what lets the
+  // cleanup path await the copy before removing the temp. The fake has to do
+  // the same or the cleanup wait would be the test's own bug.
+  const copy = copyApi({
+    sendChunks: (_target, _remotePath, _source, limits) => new Promise((_resolve, reject) => {
+      const signal = limits?.signal
+      const fail = () => reject(Object.assign(new Error('tool call aborted'), { name: 'AbortError' }))
+      if (signal?.aborted === true) fail()
+      else signal?.addEventListener('abort', fail, { once: true })
+    }),
+  })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 0, timeoutMs: 20 }),
+    (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 20 ms/.test(error.message),
+  )
+})
+
+test('a never-settling copy send is bounded, closes only the SFTP channels, and removes the temp', async () => {
+  const copy = copyApi({ sendChunks: () => new Promise(() => {}) })
+  const started = Date.now()
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 0, timeoutMs: 20 }),
+    (error: Error) => error.name === 'TimeoutError',
+  )
+  assert.ok(Date.now() - started < 2_000, 'a stuck copy must not wait out the full cleanup bound')
+  // Both connections stay up: the source may be the session's own host, and
+  // the target's terminals and commands are not part of this failure.
+  assert.deepEqual(copy.invalidated, [], 'no shared connection may be dropped')
+  assert.deepEqual(copy.sftpClosed.sort(), ['backup1', 'prod1'], 'both stuck SFTP channels must be closed')
+  assert.match(copy.commands.join('\n'), /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+})
+
+test('~/ on either end expands against that host\'s own home', async () => {
+  const copy = copyApi({ source: { type: 'file', size: 5 } })
+  const value = await runSshCopy(copy.api, backup(), {
+    source_path: '~/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '~/backups/release.tar.gz',
+  }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
+  assert.equal(value.sourcePath, '/home/ops/release.tar.gz')
+  assert.equal(value.targetPath, '/home/ops/backups/release.tar.gz')
+})
+
+/* ─────────── the placeholder-path guard on the local transfers ─────────── */
+
+test('upload and download refuse a placeholder local_path before the approval gate', async () => {
+  const root = await tempDir()
+  setRemoteRootOverride(root)
+  try {
+    const placeholder = mapRemoteToLocal('prod1', '/srv/app/release.tar.gz')!
+    // A remote workspace placeholder tree is a real local directory skeleton, so
+    // without the guard the failure would arrive after the user approved.
+    await mkdirTree(placeholder)
+    const upload = api()
+    await assert.rejects(
+      () => runSshUpload(upload.api, host(), { local_path: placeholder, remote_path: '/srv/x' }, {}, LIMITS),
+      /remote workspace placeholder path .*use ssh_copy/s,
+    )
+    assert.deepEqual(upload.modes, [])
+    assert.deepEqual(upload.reads, [])
+
+    const download = api({ attrs: () => present })
+    await assert.rejects(
+      () => runSshDownload(download.api, host(), { remote_path: '/srv/a.bin', local_path: placeholder }, {}, LIMITS),
+      /remote workspace placeholder path .*use ssh_copy/s,
+    )
+    assert.deepEqual(download.modes, [])
+    assert.deepEqual(download.reads, [])
+  } finally {
+    setRemoteRootOverride(null)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the guard does not fire for a delivery snapshot under the same root', async () => {
+  const root = await tempDir()
+  setRemoteRootOverride(root)
+  try {
+    // `.deliverables` is never a valid host id, so a snapshot is a real local
+    // file and must keep uploading normally.
+    const snapshot = join(root, '.deliverables', 'abc', 'file.bin')
+    await mkdirTree(snapshot)
+    await writeFile(snapshot, 'snapshot bytes')
+    const upload = api()
+    const value = await runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: snapshot, remote_path: '/srv/x' }, {}, LIMITS)
+    assert.equal(value.bytes, 14)
+  } finally {
+    setRemoteRootOverride(null)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a native placeholder path is recognised on every platform', async () => {
+  // On Windows a placeholder is a drive path, which `posix.isAbsolute` rejects: a
+  // posix check in front of the placeholder branch dropped it through to "treat this
+  // as a remote path" and asked for the wrong host. The predicate has to
+  // decide absoluteness with the native rules only.
+  const root = await tempDir()
+  setRemoteRootOverride(root)
+  try {
+    // `mapRemoteToLocal` builds a native path, so this covers the Windows
+    // spelling when the suite runs there.
+    const placeholder = mapRemoteToLocal('prod1', '/srv/release.tar.gz')!
+    assert.equal(placeholder.startsWith(root), true)
+    const isRemotePlaceholderPath = (await import('../src/router.ts')).isRemotePlaceholderPath
+    assert.equal(isRemotePlaceholderPath(placeholder), true)
+    assert.equal(isRemotePlaceholderPath('/srv/release.tar.gz'), false)
+  } finally {
+    setRemoteRootOverride(null)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a Windows native absolute source is refused instead of joined under the remote cwd', async () => {
+  const root = await tempDir()
+  const previous = process.env.DSH_SSH_REMOTE_ROOT
+  setRemoteRootOverride(root)
+  try {
+    const cwd = mapRemoteToLocal('prod1', '/srv/app')!
+    const copy = copyApi()
+    await assert.rejects(
+      () => runSshCopy(copy.api, backup(), { source_path: 'C:\\data\\a.bin', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS, cwd),
+      /Windows local paths are not remote paths/,
+    )
+    assert.deepEqual(copy.reads, [])
+    assert.deepEqual(copy.modes, [])
+  } finally {
+    setRemoteRootOverride(null)
+    if (previous === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a copy whose target connection fails never opens the source and still removes the temp', async () => {
+  // `sftpSendChunks` can reject before `streamChunksToSftp` pulls a chunk, so
+  // the source generator is never started and holds no handle. The invariant
+  // worth pinning is that: nothing is left open, and the temp is cleaned up.
+  let pulled = 0
+  const copy = api({
+    hosts: TWO_HOSTS,
+    attrs: () => ({ type: 'file', size: 5 }),
+    chunks: () => ({
+      [Symbol.asyncIterator]() {
+        return {
+          async next() { pulled += 1; return { done: true, value: undefined } },
+          async return() { return { done: true, value: undefined } },
+        }
+      },
+    }),
+    sendChunks: async () => { throw new Error('target SFTP channel refused') },
+  })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    /target SFTP channel refused/,
+  )
+  // The target channel must be open before the first source byte is read.
+  assert.equal(pulled, 0)
+  assert.match(copy.commands.join('\n'), /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+})
+
+
+test('ssh_write resolves the target exactly once and uses it for the write', async () => {
+  let realpaths = 0
+  let execs = 0
+  const pool = {
+    async sftpRealpath(_h: unknown, _s: unknown, remotePath: string) { realpaths += 1; return remotePath },
+    async sftpStat() { return { isDirectory: false, size: 3, mode: 0o644 } },
+    async sftpRead() { return Buffer.from('old') },
+    async exec(_h: unknown, _s: unknown, command: string) { execs += 1; return { code: 0, stdout: '', stderr: '' } },
+  } as unknown as SshPool
+  const api = { pool, secretOf: async () => ({}), resolveMode: async () => 'read-only' } as unknown as ToolHost
+  await runSshWrite(api, host({ opsPolicy: 'trust' }), { file_path: '/srv/a.txt', content: 'new content' }, {})
+  assert.equal(realpaths, 1, 'the target is resolved once, not once for the card and again for the write')
+  assert.equal(execs, 1, 'the write goes through the resolved target')
 })

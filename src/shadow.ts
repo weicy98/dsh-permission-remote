@@ -17,7 +17,9 @@
  * and stay off this list. `bash`, `glob`, and `grep` stay because a path
  * argument is a different spelling from the routing key. `working_directory`
  * only validates, then the official service commits. `present` stages bytes
- * for a local card. `terminal_open` refuses.
+ * for a local card. `terminal_open` rewrites `cwd` onto this host's placeholder
+ * and delegates; the official tool resolves an absolute path on this computer.
+ * When the remote terminal world is not fully installed it refuses instead.
  */
 
 export const ROUTED_TOOLS = ['bash', 'glob', 'grep', 'working_directory', 'terminal_open', 'present', 'str_replace_editor'] as const
@@ -31,14 +33,11 @@ export type RoutedToolName = (typeof ROUTED_TOOLS)[number]
  */
 
 /**
- * Why `terminal_open` refuses on a remote workspace.
- *
- * It asks the local PTY backend for a shell, so it would hand the model a
- * prompt on this computer inside the placeholder directory while the sidebar
- * terminal is already on the SSH host. Until a remote PTY backend exists,
- * saying so beats pretending; the same sentence is the test's expectation.
+ * Why `terminal_open` refuses on a remote workspace when the remote terminal
+ * world is not ready. Without the `spawnTerminal` bridge the official tool
+ * would ask the local PTY backend for a shell in the placeholder directory.
  */
-export const TERMINAL_OPEN_REFUSED = 'terminal_open is not available in a remote workspace: the local PTY backend would open a shell on this computer, not on the SSH host. Use bash for a one-shot command, or open the sidebar terminal (it connects to the remote host) for an interactive shell.'
+export const TERMINAL_OPEN_REFUSED = 'terminal_open is not ready in this remote workspace yet: the remote terminal bridge or the remote sandbox world is still installing. Retry shortly or reload the plugin. It will not fall back to a local shell on this computer.'
 
 export interface OfficialTool<TArgs = unknown, TExec = unknown, TResult = unknown> {
   readonly execute: (args: TArgs, exec: TExec) => Promise<TResult> | TResult

@@ -104,6 +104,30 @@ test('an asynchronous channel-open failure leaves no unhandled rejection', async
   assert.deepEqual(leaked, [], 'a failed command must not become an unhandled rejection')
 })
 
+test('a failed probe channel open leaves no unhandled rejection', async () => {
+  // `openEval` returns before ssh2 confirms the channel. The exec callback
+  // then rejects `done`. The probe caller never awaits `done`, so that
+  // rejection has to be observed inside the pool.
+  const leaked = await trackUnhandled(async () => {
+    await withConnect(function (this: Client) {
+      process.nextTick(() => this.emit('ready'))
+      return this
+    }, async () => {
+      await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+        const callback = rest.find(item => typeof item === 'function') as (error: Error) => void
+        process.nextTick(() => callback(new Error('No response from server')))
+        return this
+      } as unknown as Client['exec'], async () => {
+        const pool = new SshPool(2)
+        const opened = await pool.openEval(host, {}, 'bash --noprofile --norc -c true')
+        await new Promise(resolve => setTimeout(resolve, 20))
+        opened.close()
+      })
+    })
+  })
+  assert.deepEqual(leaked, [], 'a failed probe channel must not become an unhandled rejection')
+})
+
 test('a late channel failure after an abort leaves no unhandled rejection', async () => {
   // `settleThen` also has to hold when the abort and the failure interleave: the
   // exec callback is captured first, the signal is already attached, and only
@@ -275,5 +299,106 @@ test('dispose leaves the pool disposed so a post-unload acquire is refused', asy
     await assert.rejects(() => pool.exec(host, {}, 'echo hi', 1_000), /SSH pool is disposed/)
     assert.equal(connects, 0, 'a disposed pool must not open a fresh connection')
     assert.equal(pool.hasSession(host.id), false)
+  })
+})
+
+test('one caller aborting does not fail a concurrent caller on the same host', async () => {
+  // A transfer's deadline reaches `acquire()`, but the connection it waits for
+  // is shared: `claimPending` hands every caller the same opening. When that
+  // opening captured one caller's signal, aborting the transfer rejected every
+  // other caller waiting on the host, so a cancelled upload surfaced as a
+  // failure of an unrelated `ssh_read` or terminal.
+  let commands = 0
+  await withConnect(function (this: Client) {
+    setTimeout(() => this.emit('ready'), 30)
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      commands += 1
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      setTimeout(() => {
+        callback(undefined, stream)
+        stream.emit('close', 0, null)
+      }, 1)
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(2)
+      const controller = new AbortController()
+      const cancelled = pool.exec(host, {}, 'upload-leg', 5_000, controller.signal)
+        .then(() => 'ok', (error: Error) => error.name)
+      const unrelated = pool.exec(host, {}, 'ssh_read', 5_000).then(() => 'ok', (error: Error) => error.name)
+      setTimeout(() => controller.abort(), 10)
+      const [cancelledResult, unrelatedResult] = await Promise.all([cancelled, unrelated])
+      assert.equal(cancelledResult, 'AbortError', 'the cancelled caller keeps its own abort')
+      assert.equal(unrelatedResult, 'ok', 'an unrelated caller must still run its command')
+      assert.equal(commands, 1, 'only the surviving caller reached the channel')
+    })
+  })
+})
+
+test('closing a transfer lease leaves the shared connection and other SFTP work up', async () => {
+  // A transfer's own SFTP channel is closed on failure; the cached session used
+  // by ssh_read and the file tree, and the SSH connection itself, must survive.
+  const ended: string[] = []
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('sftp', function (this: Client, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, sftp: unknown) => void
+      const api = Object.assign(new EventEmitter(), {
+        readFile: (_path: string, done: (error: Error | undefined, data: Buffer) => void) => done(undefined, Buffer.from('ok')),
+        end: () => { ended.push('sftp'); api.emit('end') },
+      })
+      process.nextTick(() => {
+        api.emit('ready')
+        callback(undefined, api)
+      })
+      return this
+    } as unknown as Client['sftp'], async () => {
+      const pool = new SshPool(2)
+      const lease = await pool.openSftpLease(host, {})
+      assert.equal((await pool.sftpRead(host, {}, '/etc/hostname')).toString(), 'ok')
+      await lease.close()
+      assert.equal(ended.length, 1, 'the lease channel closes')
+      assert.equal(pool.hasSession(host.id), true, 'the host stays connected')
+      assert.equal((await pool.sftpRead(host, {}, '/etc/hostname')).toString(), 'ok', 'the cached session still works')
+      await pool.dispose()
+    })
+  })
+})
+
+test('a caller that aborts while queued never opens a connection', async () => {
+  // Removing `reserve(signal)` must not make an abandoned queued call open and
+  // cache a connection that then holds the only slot.
+  const connects: string[] = []
+  await withConnect(function (this: Client, _options: ConnectConfig) {
+    connects.push('connect')
+    setTimeout(() => this.emit('ready'), 20)
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), close: () => undefined })
+      setTimeout(() => callback(undefined, stream), 1)
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(1)
+      const hostA = { ...host, id: 'a' }
+      const hostB = { ...host, id: 'b' }
+      const held = pool.exec(hostA, {}, 'hold', 60_000).catch(() => undefined)
+      await new Promise(resolve => setTimeout(resolve, 40))
+      const controller = new AbortController()
+      const queued = pool.exec(hostB, {}, 'b', 60_000, controller.signal).then(() => 'ok', (error: Error) => error.name)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      controller.abort()
+      assert.equal(await queued, 'AbortError')
+      pool.invalidate('a')
+      await new Promise(resolve => setTimeout(resolve, 60))
+      assert.equal(pool.hasSession('b'), false, 'the abandoned queued call must not connect')
+      void held
+      await pool.dispose()
+    })
   })
 })

@@ -7,6 +7,9 @@
  * No SSH server: the working directory is a fake and the pool is never dialed.
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { createScope, scopeOf, scopeTarget, type Scope } from '@deepseek-ai/dsh-scope'
@@ -339,27 +342,36 @@ test('the remote directory context sits right after the working-directory contex
   }
 })
 
-test('terminal_open refuses through the real registry on a remote cwd and passes through locally', async () => {
-  // The refusal is the whole design for this tool: it would ask the local PTY
-  // backend for a shell, which opens on this computer inside the placeholder.
-  // A real ToolRuntime mount proves the wrapper is captured across scope
-  // layers — where a root- or preset-registered official tool used to be the
-  // doubt — and that a local session still reaches the official execute.
+test('terminal_open fails closed without a spawn bridge and passes through locally', async () => {
+  // Official `resolve(sessionCwd, args.cwd)` drops the session directory when
+  // the model passes an absolute path. The wrapper has to hand the official
+  // execute a placeholder on this host. A real ToolRuntime mount proves that
+  // wrapper is the one captured across scope layers, and that a local session
+  // still reaches the official execute unchanged.
+  const root = mkdtempSync(join(tmpdir(), 'dsh-terminal-open-registry-'))
+  const previousRoot = process.env.DSH_SSH_REMOTE_ROOT
+  process.env.DSH_SSH_REMOTE_ROOT = root
   const host = await boot()
   try {
+    const cwd = mapRemoteToLocal('host1', '/srv/app')!
+    const seen: Array<Record<string, unknown>> = []
     host.preset.tools.register(defineTool({
       name: 'terminal_open',
       description: 'official persistent terminal',
-      parameters: { type: { type: 'string', description: 'backend type', required: true } },
+      parameters: {
+        type: { type: 'string', description: 'backend type', required: true },
+        cwd: { type: 'string', description: 'directory' },
+      },
       output: {
         schema: { type: 'object', additionalProperties: false, properties: { sessionId: { type: 'string' } } },
         render: () => [{ type: 'text', text: '' }],
       },
-      async execute() {
+      async execute(args) {
+        seen.push(args as Record<string, unknown>)
         return { sessionId: 'official-1' }
       },
     }))
-    const remote = await host.makeAgent('term-remote', remoteCwd)
+    const remote = await host.makeAgent('term-remote', cwd)
     const local = await host.makeAgent('term-local', localCwd)
     await host.created(remote)
     await host.created(local)
@@ -367,15 +379,21 @@ test('terminal_open refuses through the real registry on a remote cwd and passes
     type LooseTool = { execute: (args: unknown, exec: unknown) => Promise<unknown> }
     const remoteTool = remote.ctx.tools.get('terminal_open', remote) as unknown as LooseTool
     assert.ok(remoteTool, 'the wrapper shadows the preset tool for a remote session')
+    // This fixture has no spawn bridge/sandbox, so the remote call must fail
+    // closed instead of reaching the official local PTY fallback.
     await assert.rejects(
-      () => remoteTool.execute({ type: 'shell' }, { agent: remote }),
-      /terminal_open is not available in a remote workspace/,
+      () => remoteTool.execute({ type: 'shell', cwd: '/srv/lib' }, { agent: remote }),
+      /terminal_open is not ready in this remote workspace yet/,
     )
     const localTool = local.ctx.tools.get('terminal_open', local) as unknown as LooseTool
     assert.ok(localTool)
-    const result = await localTool.execute({ type: 'shell' }, { agent: local }) as { sessionId: string }
+    const result = await localTool.execute({ type: 'shell', cwd: '/srv/lib' }, { agent: local }) as { sessionId: string }
     assert.equal(result.sessionId, 'official-1')
+    assert.equal(seen[0]?.cwd, '/srv/lib')
   } finally {
+    if (previousRoot === undefined) delete process.env.DSH_SSH_REMOTE_ROOT
+    else process.env.DSH_SSH_REMOTE_ROOT = previousRoot
+    rmSync(root, { recursive: true, force: true })
     await host.close()
   }
 })
