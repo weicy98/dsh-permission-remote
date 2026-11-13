@@ -2096,6 +2096,9 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
       secretOf: host => core.secret(host),
       statusOf: host => core.statusOf(host),
       routeByCwd: cwd => routeByCwd(cwd),
+      defaultShellOf: hostId => core.loadShells(hostId, ['zsh', 'bash', 'fish', 'pwsh', 'powershell', 'cmd'])
+        .then(shells => shells[0]?.path)
+        .catch(() => undefined),
     })
     if (removeWorld === undefined) return
     worldReady = true
@@ -2153,7 +2156,11 @@ export function apply(rawCtx: Context, rawConfig?: unknown): void {
     hostOf: id => core.listHosts().find(host => host.id === id),
     secretOf: host => core.secret(host),
     statusOf: host => core.statusOf(host),
-    ensureWorker: (host, secret, status, signal) => ensureWorker(core.pool, host, secret, status.home, signal),
+    ensureWorker: (host, secret, status, signal) => ensureWorker(core.pool, host, secret, status.home, signal, {
+      remoteNode: status.node?.available === true
+        ? { version: status.node.version, major: status.node.major, minor: status.node.minor }
+        : undefined,
+    }),
     worldReady: () => worldReady,
     fsReady: () => fsPatchReady,
     disposed: () => ptcDisposed,

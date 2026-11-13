@@ -10,6 +10,7 @@ import type { HostConfig } from '../src/config.ts'
 import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 import {
+  confineTerminalCwd,
   foregroundProbeCommand,
   installSidebarBridge,
   installTerminalSpawnBridge,
@@ -313,6 +314,21 @@ test('the probe command uses POSIX printf and leaves windows shells out', () => 
   assert.ok(sidebarText.startsWith("sh -c '"))
   assert.ok(sidebarText.includes("/remote/o"))
   assert.ok(sidebarText.includes("'/bin/zsh'"))
+})
+
+test('the terminal launcher points bwrap --chdir at the requested cwd, not the workspace root', () => {
+  const root = ['bwrap', '--ro-bind', '/', '/', '--tmpfs', '/tmp', '--bind', '/srv/app', '/srv/app', '--', 'bash', '-i']
+  const retargeted = confineTerminalCwd(root, '/srv/app/sub')
+  const separator = retargeted.indexOf('--')
+  assert.deepEqual(retargeted.slice(separator - 2, separator), ['--chdir', '/srv/app/sub'])
+  // An existing --chdir is replaced, not duplicated.
+  const existing = ['bwrap', '--tmpfs', '/tmp', '--chdir', '/srv/app', '--', 'bash']
+  const replaced = confineTerminalCwd(existing, '/srv/app/sub')
+  assert.equal(replaced.filter(value => value === '--chdir').length, 1)
+  assert.equal(replaced[replaced.indexOf('--chdir') + 1], '/srv/app/sub')
+  // Non-bwrap argv (danger-full-access, seatbelt, sidebar) is untouched.
+  assert.deepEqual(confineTerminalCwd(['/bin/bash', '-i'], '/srv/app/sub'), ['/bin/bash', '-i'])
+  assert.deepEqual(confineTerminalCwd(['sandbox-exec', '-p', 'x', '--', 'bash'], '/srv/app/sub'), ['sandbox-exec', '-p', 'x', '--', 'bash'])
 })
 
 test('a model terminal command quotes cwd, env, and argv', () => {

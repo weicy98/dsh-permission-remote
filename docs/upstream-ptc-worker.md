@@ -18,12 +18,12 @@ hashes it, and uploads the exact bytes to the SSH host.
 | Host launch chain | `resolveExecutable` -> `bootstrapArgs` -> `sandbox.confine` -> `subprocess.spawn({ stdio: { control: 'pipe' } })` |
 | Default bootstrap mapping | `fs.processPathFromHostPath(fileURLToPath(new URL('./process.js', import.meta.url)))` |
 | Worker imports | Node built-ins only (birpc/acorn are bundled into the file) |
-| Minimum remote Node | 22 (the worker uses `Promise.withResolvers`) |
+| Minimum remote Node | 22 for rc.1 (the worker uses `Promise.withResolvers`); **22.15+ (or 23.5+, 24+)** for rc.2's worker, which imports `node:module` `registerHooks` ([added in 22.15 / 23.5](https://nodejs.org/api/module.html#moduleregisterhooksoptions)). The floor is derived from the uploaded `process.js` bytes and recorded as `minimumNodeMinor` in each manifest entry; `ensureWorker` refuses an older remote Node with an actionable error. |
 | Worker upload name | `process.mjs` (ESM; never `.js` without a package.json) |
 
 The manifest `vendor/upstream/ptc-worker.manifest.json` records the DSH and
 package versions, hashes of `process.js`, `lib/index.js`, and `dsh-subprocess/lib/control.js`, the contract probe results,
-and the minimum remote Node major.
+and the minimum remote Node major **and minor** (`minimumNodeMinor`: 0 for rc.1, 15 for rc.2).
 
 ## Which version is used
 
@@ -34,7 +34,11 @@ overlay adaptation therefore records the version installed on the plugin host.
 
 ## Upgrade runbook
 
-`check:upstream`（因此 `upgrade:ptc`）还包含 `probeTerminalContract`：它校验 `TerminalController.spawn`（4/5 参）、`create`（3 参）、`shells`（2 参）、`openForAgent`、`dsh-terminal-bash` 的 `DSH_SESSION_ID`、`dsh-subprocess.spawnTerminal`，并拒绝不在 `VERIFIED_TERMINAL_DSH_VERSIONS` 里的 DSH 版本。终端路径的实机冒烟另有 `npm run smoke:terminal`。
+`check:upstream`（因此 `upgrade:ptc`）还包含 `probeTerminalContract`：它校验 `TerminalController.spawn`（4/5 参）、`create`（3 参）、`shells`（2 参）、`openForAgent`、控制器里的 `DSH_SESSION_ID: agent.id` 与 `spawnTerminal(` 调用、`dsh-terminal-bash` 的 `DSH_SESSION_ID: spec.owner.id`、**`dsh-subprocess-local` 里 `async spawnTerminal(spec)` 与 `async terminalEnvironment(signal)` 的方法形状**、`dsh-terminal` 的 `TerminalError.code`，以及 rc.2 的 `SUBPROCESS_ERROR_CODES` / `SubprocessError.code`，并拒绝不在 `VERIFIED_TERMINAL_DSH_VERSIONS` 里的 DSH 版本。注意真正的运行时方法在 `dsh-subprocess-local`：`dsh-subprocess/lib/index.js` 只有一条 `{@link spawnTerminal}` 注释，靠注释子串判定会让方法被改名或删除后门禁依然全绿。已安装完整 DSH 时缺少 `dsh-subprocess-local` / `dsh-terminal-bash` / `dsh-terminal` 也算漂移，不再静默跳过；只有连控制器都没有的精简 CI 安装才跳过。`check:upstream -- --explain` 会为每条失败打印 `scripts/upstream-map.mjs` 里的 `TERMINAL_GUIDES` 行。终端路径的实机冒烟另有 `npm run smoke:terminal`。
+
+rc.2 的 `agentLaunch` 会对 `terminalEnvironment()`（rc.1 已有的 API，rc.2 新增第二处调用）取本机的 platform 与 `$SHELL` 来决定默认 shell 和 `HISTFILE`。插件在 `installSidebarBridge` 包装的 `terminal.spawn` 期间用 `src/terminal-remote-state.ts` 的 `AsyncLocalStorage` 标记一次远端终端分配，`installRemoteWorld` 只在这条异步调用链里把 `terminalEnvironment()` 答成 `{ platform: 'posix', defaultShell: <远端探测到的登录 shell> }`；探测失败回落 `/bin/sh`，本地会话不受影响，窗口结束后不留状态。`removeHistory` 只在 workspace-write 下注册，其 `rm -f -- /tmp/dsh-agent-history-<id>` 用 `cwd: '/'` 调用；插件按终端 id 记录一条 24 小时、单次消费的远端路由，只匹配这条精确 argv 把它送回终端所属主机，不依赖「最近一次远端终端」，重复或伪造命令不会命中。
+
+rc.2 `dsh-sandbox-policy.registerWritableRoot` 带来的 `additionalWritableRoots` 是本机执行世界路径，远端 profile 无法按这个拼写绑定，因此远端分支的 `sandbox.confine` 明确拒绝而不是静默少给权限（本地会话和 PTC 路径保持各自原有行为）。
 
 `npm run typecheck:host` 会按当前安装的 DSH 重写 `tsconfig` 的 `@deepseek-ai/*` 路径后跑 `tsc --noEmit`，避免类型检查对着旧版本头文件；`npm run smoke:terminal` 覆盖终端契约与真实 controller 路径。升级时两者都应通过。
 
@@ -153,6 +157,7 @@ pass rather than an exit code.
 | `control environment marker changed to <name>` | Upstream renamed the variable | `PTC_CONTROL_ENV` and the shim env block |
 | `bootstrapArgs no longer maps process.js through fs.processPathFromHostPath` | The upload swap lost its hook | `src/remote-world.ts` `installWorkerPathMap` |
 | `subprocess.spawn no longer requests a control pipe` | The remote spawn seam stopped taking over | `src/remote-world.ts` `installRemoteWorld` |
+| `bootstrapArgs no longer passes --experimental-vm-modules for the vm-modules worker` | The rc.2 worker uses `vm.SourceTextModule`/`vm.SyntheticModule` and throws without that flag; the Node >= 22.15 floor comes separately from `node:module` `registerHooks` | `src/upstream-worker.ts` `probeContract` / `requiresVmModules` and `src/ptc-shim.mjs` `spawnWorker` |
 
 ## Sandbox profile contract
 

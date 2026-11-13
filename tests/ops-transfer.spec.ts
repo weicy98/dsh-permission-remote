@@ -100,6 +100,12 @@ function api(options: {
   hosts?: HostConfig[]
   /** Mirrors the pool's configured connection limit. */
   maxConnections?: number
+  /** Host ids whose SSH connection is already cached in the pool. */
+  connectedHostIds?: string[]
+  /** Free connection slots the pool reports for ssh_copy admission control. */
+  freeSlots?: number
+  /** When false, the lease reports that the server never confirmed its channel close. */
+  leaseSettled?: boolean
 } = {}): TransferApi {
   // The home probe is cached per host id across tests; every fixture starts
   // from an unknown `$HOME`, so a hang override is actually exercised.
@@ -171,6 +177,8 @@ function api(options: {
       for (let offset = 0; offset < body.length; offset += window) yield body.subarray(offset, offset + window)
     },
     maxConnections: options.maxConnections,
+    hasSession: (id: string) => (options.connectedHostIds ?? []).includes(id),
+    freeSlots: () => options.freeSlots ?? 32,
     invalidate: (hostId: string) => { invalidated.push(hostId) },
     openSftpLease: async (h: HostConfig) => {
       let closed = false
@@ -178,6 +186,7 @@ function api(options: {
         api: {} as never,
         hostId: h.id,
         close: async () => { if (!closed) { closed = true; sftpClosed.push(h.id) } },
+        settled: () => options.leaseSettled !== false,
       }
     },
     sftpSendLocalOn: async (lease: { hostId: string }, localPath: string, remotePath: string, limits?: { maxBytes?: number, signal?: AbortSignal }) => {
@@ -974,6 +983,59 @@ test('a never-settling upload copy is bounded, closes only the SFTP channel, and
   }
 })
 
+test('an upload still publishes when every write was acknowledged but the close is slow', async () => {
+  // `sending` resolving means every WRITE was acknowledged; a late CHANNEL_CLOSE
+  // cannot lose the bytes. Failing (and deleting the temp) here wasted a whole
+  // completed transfer.
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcd')
+    const upload = api({ leaseSettled: false })
+    const value = await runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 0 })
+    assert.equal(value.bytes, 4)
+    assert.match(upload.commands.join('\n'), /mv -f/)
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a timed-out upload whose channel never closes names the possible leak but keeps its error type', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcd')
+    const upload = api({
+      leaseSettled: false,
+      send: limits => new Promise<number>((_resolve, reject) => {
+        const signal = limits?.signal
+        if (signal === undefined) { reject(new Error('no deadline signal')); return }
+        const aborted = (): void => reject(Object.assign(new Error('SSH operation aborted'), { name: 'AbortError' }))
+        if (signal.aborted) aborted()
+        else signal.addEventListener('abort', aborted, { once: true })
+      }),
+    })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 0, timeoutMs: 20 }),
+      (error: Error) => error.name === 'TimeoutError'
+        && /a temporary file may remain/.test(error.message)
+        && /\.dsh-permission-remote-/.test(error.message),
+    )
+    // An unconfirmed close skips `rm`: the path is reported instead, because a
+    // late OPEN could recreate the file after a premature delete.
+    assert.doesNotMatch(upload.commands.join('\n'), /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a copy still publishes when every write was acknowledged but the close is slow', async () => {
+  const copy = copyApi({ leaseSettled: false })
+  const value = await runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
+  assert.equal(value.bytes, 5)
+  assert.match(copy.commands.join('\n'), /mv -f/)
+})
+
 test('a timeout during the download copy is a timeout and leaves no local file', async () => {
   const local = await tempDir()
   const keepAlive = setInterval(() => undefined, 5)
@@ -1027,6 +1089,9 @@ function copyApi(options: {
   chunks?: () => AsyncIterable<Buffer>
   remoteBytes?: Buffer
   maxConnections?: number
+  connectedHostIds?: string[]
+  freeSlots?: number
+  leaseSettled?: boolean
 } = {}) {
   return api({
     hosts: options.hosts ?? TWO_HOSTS,
@@ -1034,6 +1099,9 @@ function copyApi(options: {
     remoteBytes: options.remoteBytes ?? COPY_BYTES,
     sendChunks: options.sendChunks as never,
     maxConnections: options.maxConnections,
+    connectedHostIds: options.connectedHostIds,
+    freeSlots: options.freeSlots,
+    leaseSettled: options.leaseSettled,
     attrs: (path: string) => {
       if (path.startsWith(TARGET_PREFIX)) return options.target
       if (options.source === null) return undefined
@@ -1070,6 +1138,42 @@ test('a cross-host copy refuses a one-connection pool before approval', async ()
   )
   assert.deepEqual(copy.reads, [])
   assert.deepEqual(copy.modes, [])
+})
+
+test('a cross-host copy fails fast when the pool has only one free slot', async () => {
+  // The reported deadlock: maxConnections=2, one slot already held by a
+  // sidebar terminal, and both copy hosts still unconnected. The second
+  // reserve() would queue forever with no connection able to close.
+  const copy = copyApi({ maxConnections: 2, freeSlots: 1 })
+  await assert.rejects(
+    () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS),
+    (error: Error) => /needs 2 free SSH connection slots/.test(error.message) && /maxConnections=2/.test(error.message),
+  )
+  // Refuse before the approval card and before any connection is opened.
+  assert.deepEqual(copy.modes, [])
+  assert.deepEqual(copy.reads, [])
+})
+
+test('a copy whose hosts are already connected needs no free slots', async () => {
+  const copy = copyApi({ connectedHostIds: ['prod1', 'backup1'], freeSlots: 0 })
+  const value = await runSshCopy(copy.api, backup(), {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/backup/release.tar.gz',
+  }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
+  assert.equal(value.bytes, 5)
+})
+
+test('a same-host copy needs only one new connection', async () => {
+  const trusted = host({ opsPolicy: 'trust' })
+  const copy = copyApi({ hosts: [trusted], freeSlots: 1 })
+  const value = await runSshCopy(copy.api, trusted, {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/srv/copy.tar.gz',
+  }, {}, () => trusted, LIMITS)
+  assert.equal(value.bytes, 5)
+  assert.deepEqual(value.sourceHost, value.targetHost)
 })
 
 test('a relative target is refused before the approval card', async () => {

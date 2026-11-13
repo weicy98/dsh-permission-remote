@@ -222,6 +222,32 @@ test('finishOrCleanup settles near the cooperative window and awaits cleanup', a
   assert.deepEqual(events, ['rm'])
 })
 
+test('finishOrCleanup always confirms the channel close before rm', async () => {
+  // The transfer answers its own abort promptly. The old code skipped
+  // `beforeCleanup` in that case and ran `rm` first, letting a server-side OPEN
+  // that was still in flight recreate the temp file afterwards.
+  const events: string[] = []
+  const controller = new AbortController()
+  const work = Promise.reject(new Error('open finished after abort'))
+  controller.abort()
+  await assert.rejects(
+    () => finishOrCleanup(work, controller.signal, async () => { events.push('rm') }, async () => { await new Promise(resolve => setTimeout(resolve, 50)); events.push('close') }),
+    (error: Error) => error.name === 'AbortError',
+  )
+  assert.deepEqual(events, ['close', 'rm'])
+})
+
+test('finishOrCleanup skips rm when the channel close is not confirmed', async () => {
+  const events: string[] = []
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(
+    () => finishOrCleanup(Promise.reject(new Error('aborted')), controller.signal, async () => { events.push('rm') }, async () => false),
+    (error: Error) => error.name === 'AbortError',
+  )
+  assert.deepEqual(events, [])
+})
+
 test('cleanup waits until a late open has created the temp file', async () => {
   const events: string[] = []
   let release: () => void = () => undefined

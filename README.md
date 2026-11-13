@@ -80,7 +80,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 - 程序里的 `process.env` 与本地 PTC 一样为空；相对路径和 `process.cwd()` 都在远端工作区。
 - 支持 per-call `function-body`、`persistent-in-memory` 的 REPL，以及 `vm-script`（`scriptPersistence` 开启时保留状态）；保留状态按 state owner 留在 SSH 主机进程内。
-- 远端需要 Node.js 22+。插件把官方 worker 按 hash 上传到 `~/.dsh-permission-remote/ptc/<hash>/`，不因升级而重复上传。
+- 远端需要 Node.js 22+（DSH 0.2.2-rc.2 的 worker 用到 `node:module` 的 `registerHooks`，该主机需要 **22.15+（或 23.5+、24+）**；下限由上传的 worker 字节推导，太旧会在 `run_code` 里直接报出来）。插件把官方 worker 按 hash 上传到 `~/.dsh-permission-remote/ptc/<hash>/`，不因升级而重复上传。
 - 远端 SSH 需要允许 streamlocal 转发；不支持时回退 loopback TCP，两者都不可用会给出明确错误。
 - 上游 worker 契约和升级流程见 [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md)。
 
@@ -114,7 +114,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 - 上传、下载都只处理单个文件，不递归、不续传；符号链接、FIFO、设备一律拒绝（符号链接的拒绝是**检查时刻**的保证：SFTP v3 没有 `O_NOFOLLOW`）。
 - 单次上限默认 32 MiB、超时默认 120 秒，可在设置页改。字节填 `0` 只取消字节上限，超时填 `0` 才不限时。上传和跨主机复制按约 1 MiB 的字节预算保持在途，下载仍逐块读；默认 120 秒仍会先停住慢链路或大文件。`ssh_upload` / `ssh_download` / `ssh_copy` 到点报 `TimeoutError` 并写明毫秒数。超时可能仍完成落盘，失败可能留下同目录临时文件。
 - **`ssh_copy` 是远端工作区里搬运文件的唯一直接方式。** 那里的会话没有「运行 DSH 的这台机器」上可用的文件路径：`ssh_upload` / `ssh_download` 的 `local_path` 一律指这台机器，占位路径（`~/.dsh/remote/...`）在本机只是空目录骨架，传进去会在审批之前就被拒绝并提示改用 `ssh_copy`。源端按 `ssh_read` 放行（`deny` 和未信任拒绝、不需要额外审批），目标端按写入审批。同一条文件复制到它自己、以及两端任一端是 `/` 都会被拒绝。
-- 跨主机复制同时占用源、目标各一条连接（和远端命令、文件传输共用连接池，`maxConnections` 默认 4，目前只在插件配置里可改）；因此跨主机复制要求 `maxConnections` 至少为 2，同主机复制只占一条。池满时调用会排队；配置了超时的话，这个调用会按自己的超时先返回，排队位置留在池里等下一个调用者接手（不会因此影响同主机上已经在用的连接）；超时填 `0` 时只能等连接释放或手动取消。
+- 跨主机复制同时占用源、目标各一条连接（和远端命令、文件传输共用连接池，`maxConnections` 默认 4，目前只在插件配置里可改）；因此跨主机复制要求 `maxConnections` 至少为 2，同主机复制只占一条。一条连接只有在关闭时才还槽，而复制期间第一条连接不可能关闭，所以 `ssh_copy` 会先按「源/目标是否已在池里」算出还需要几条新连接，空闲槽不够就直接报「连接槽不足」，不会卡在排队里等一个永远不会释放的槽；这一步在审批卡之前，连目标腿之前还会再查一次。其它运维调用仍按原来的方式排队：配置了超时的话，那个调用会按自己的超时先返回，排队位置留给下一个调用者（不会波及同主机上已经在用的连接）；超时填 `0` 时只能等连接释放或手动取消。
 - `ssh_exec` 用 `bash -lc`，`sudo` 只能免密（`sudo -n`）；只支持直连 Linux/macOS，不支持跳板机和 Windows 远端。
 
 传输上限、超时、符号链接与 `ssh_workspace` 的细节见[详细说明](docs/advanced.md#传输工具细节)。
@@ -218,7 +218,7 @@ In a remote workspace, `run_code` / `workflow` executes on the SSH host using th
 
 - Program `process.env` is empty, exactly like local PTC; relative paths and `process.cwd()` are on the remote workspace.
 - Per-call `function-body`, `persistent-in-memory` REPL, and `vm-script` with `scriptPersistence` are supported; retained state stays in the SSH host process keyed by state owner.
-- The remote host needs Node.js 22+. The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
+- The remote host needs Node.js 22+ (DSH 0.2.2-rc.2's worker imports `registerHooks` from `node:module`, so that host needs **22.15+ (or 23.5+, 24+)**; the floor is derived from the uploaded worker bytes and an older Node is reported by `run_code`). The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
 - The SSH server must allow streamlocal forwarding; otherwise the plugin falls back to loopback TCP and reports a clear error if both fail.
 - Upstream contract and upgrade steps: [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md). The same runbook is offered to the agent as the `upstream-ptc-upgrade` skill, and `npm run upgrade:ptc` runs the probe, offline, and (with `--live`) real-host gates before recording anything.
 
@@ -234,7 +234,7 @@ An ordinary local workspace can operate a configured SSH host with `ssh_hosts`, 
 
 Ops calls are not wrapped in the remote workspace sandbox — the target is usually outside the local workspace. Trusting a host also trusts it with local files a session uploads. Transfers are single files, no recursion or resume; symlinks, FIFOs, and devices are refused (a symlink is refused at check time; SFTP v3 has no `O_NOFOLLOW`). Ceiling 32 MiB and deadline 120 s by default. A byte ceiling of `0` leaves the deadline in force. Uploads and cross-host copies keep about 1 MiB of bytes in flight; downloads still read one chunk at a time. A slow link still stops at 120 s unless the timeout is raised or set to `0`. `ssh_upload` / `ssh_download` / `ssh_copy` report that as `TimeoutError` with the millisecond count.
 
-**`ssh_copy` moves one file between two SSH hosts.** It is the direct way to move a file out of a remote workspace: that session has no usable path on the machine running DSH, so `ssh_upload` / `ssh_download` cannot serve it — their `local_path` always names the machine running DSH, and a placeholder path is refused before the approval prompt with a pointer at `ssh_copy`. A copy's source side follows `ssh_read` (a `deny` or untrusted source is refused, no approval), its target side follows `ssh_write`. Copying a file onto itself, and `/` on either end, are refused. A cross-host copy holds one connection to each host at the same time (the pool's `maxConnections`, default 4, currently set only in the plugin config), so it requires `maxConnections` of at least 2; a same-host copy uses one. When the pool is full the call queues; a configured timeout releases that caller while the queue position is handed to the next one instead of failing the host's other channels, and with timeout `0` it waits until a connection frees or the call is cancelled. Details: [detailed notes](docs/advanced.md#传输工具细节).
+**`ssh_copy` moves one file between two SSH hosts.** It is the direct way to move a file out of a remote workspace: that session has no usable path on the machine running DSH, so `ssh_upload` / `ssh_download` cannot serve it — their `local_path` always names the machine running DSH, and a placeholder path is refused before the approval prompt with a pointer at `ssh_copy`. A copy's source side follows `ssh_read` (a `deny` or untrusted source is refused, no approval), its target side follows `ssh_write`. Copying a file onto itself, and `/` on either end, are refused. A cross-host copy holds one connection to each host at the same time (the pool's `maxConnections`, default 4, currently set only in the plugin config), so it requires `maxConnections` of at least 2; a same-host copy uses one. A slot is returned only when its connection closes, and the first connection cannot close while the copy is streaming, so `ssh_copy` first counts how many *new* connections it needs (hosts already in the pool need none) and fails fast with "connection slots" when too few are free — before the approval card, and again before the target leg. Other ops calls still queue as before: a configured timeout releases that caller while the queue position is handed to the next one instead of failing the host's other channels, and with timeout `0` it waits until a connection frees or the call is cancelled. Details: [detailed notes](docs/advanced.md#传输工具细节).
 
 ### Sidebar terminal
 

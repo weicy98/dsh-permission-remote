@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { RunnerStatus } from '../src/execute.ts'
 import { installRemoteWorld, installWorkerPathMap, remoteWorldContext, type RemoteWorld } from '../src/remote-world.ts'
+import { rememberTerminalHistory, resetRemoteTerminalState, runRemoteTerminal } from '../src/terminal-remote-state.ts'
 import type { RemoteTransport } from '../src/remote-transport.ts'
 
 const status: RunnerStatus = {
@@ -134,6 +135,156 @@ test('seatbelt confinement grants the same writable roots as the remote bash pat
     for (const root of ['/Users/dev/app', '/private/tmp']) {
       assert.equal(readOnlyProfile.includes(root), false, `read-only must not grant ${root}`)
     }
+  } finally {
+    restore!()
+  }
+})
+
+test('generic remote confinement does not override the caller cd with --chdir', async () => {
+  // The generic branch only knows policy.workspaceRoot, while a terminal may
+  // `cd` to a requested subdirectory before exec. A --chdir here would send it
+  // back to the workspace root; the terminal command builders add the real cwd.
+  const subprocess = {
+    spawn: (..._args: unknown[]) => ({ marker: 'original-spawn' }),
+    resolveExecutable: async (..._args: unknown[]) => '/usr/local/bin/node',
+  }
+  const sandbox = {
+    confine: async (...args: unknown[]) => ({ argv: args[0] as readonly string[], enforcement: 'full' as const, denialSignatures: [], runnerFailureRules: [] }),
+  }
+  const ctx = { get: (name: string) => name === 'subprocess' ? subprocess : name === 'sandbox' ? sandbox : undefined }
+  const restore = installRemoteWorld(ctx, {
+    transport: fakeTransport(),
+    hostOf: () => world.host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    routeByCwd: cwd => cwd === world.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
+  })
+  assert.ok(restore !== undefined)
+  try {
+    const confined = await sandbox.confine(['bash', '-c', 'pwd'], {
+      mode: 'workspace-write',
+      workspaceRoot: world.remoteCwd,
+    } as never)
+    assert.equal(confined.argv[0], 'bwrap')
+    const separator = confined.argv.indexOf('--')
+    assert.ok(separator > 2, JSON.stringify(confined.argv))
+    // Leaving --chdir to the terminal launcher prevents this generic branch
+    // from overriding a different cwd the caller already cd'd into.
+    assert.equal(confined.argv.includes('--chdir'), false, JSON.stringify(confined.argv))
+    assert.ok(confined.argv.includes('--tmpfs'), JSON.stringify(confined.argv))
+    assert.deepEqual(confined.argv.slice(separator + 1), ['bash', '-c', 'pwd'])
+  } finally {
+    restore!()
+  }
+})
+
+test('terminalEnvironment reports the remote platform only during a remote allocation', async () => {
+  const localShell = { platform: 'posix', defaultShell: '/bin/zsh' }
+  const subprocess = {
+    spawn: (..._args: unknown[]) => ({ marker: 'original-spawn' }),
+    resolveExecutable: async (..._args: unknown[]) => '/usr/local/bin/node',
+    terminalEnvironment: async () => localShell,
+  }
+  const sandbox = {
+    confine: async (...args: unknown[]) => ({ argv: args[0] as readonly string[], enforcement: 'full' as const, denialSignatures: [], runnerFailureRules: [] }),
+  }
+  const ctx = { get: (name: string) => name === 'subprocess' ? subprocess : name === 'sandbox' ? sandbox : undefined }
+  const restore = installRemoteWorld(ctx, {
+    transport: fakeTransport(),
+    hostOf: () => world.host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    routeByCwd: cwd => cwd === world.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
+  })
+  assert.ok(restore !== undefined)
+  try {
+    // A local session must keep its own default shell.
+    assert.deepEqual(await subprocess.terminalEnvironment(), localShell)
+    const remote = { hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: '/placeholder' }
+    // Start a local call in the outer async context; it must keep the local
+    // default shell even while the remote allocation is running.
+    const concurrentLocal = subprocess.terminalEnvironment()
+    await runRemoteTerminal(remote, async () => {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      // No defaultShell: upstream resolveShell falls back to /bin/sh, which
+      // exists on every host this plugin supports.
+      assert.deepEqual(await subprocess.terminalEnvironment(), { platform: 'posix' })
+    })
+    assert.deepEqual(await concurrentLocal, localShell)
+    assert.deepEqual(await subprocess.terminalEnvironment(), localShell)
+  } finally {
+    restore!()
+    resetRemoteTerminalState()
+  }
+})
+
+test('rc.2 history cleanup is routed once by terminal id', async () => {
+  const subprocess = {
+    spawn: (..._args: unknown[]) => ({ marker: 'original-spawn' }),
+    resolveExecutable: async (..._args: unknown[]) => '/usr/local/bin/node',
+    terminalEnvironment: async () => ({ platform: 'posix' }),
+  }
+  const sandbox = {
+    confine: async (...args: unknown[]) => ({ argv: args[0] as readonly string[], enforcement: 'full' as const, denialSignatures: [], runnerFailureRules: [] }),
+  }
+  const ctx = { get: (name: string) => name === 'subprocess' ? subprocess : name === 'sandbox' ? sandbox : undefined }
+  const restore = installRemoteWorld(ctx, {
+    transport: fakeTransport(),
+    hostOf: () => world.host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    routeByCwd: cwd => cwd === world.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
+  })
+  assert.ok(restore !== undefined)
+  try {
+    const route = { hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: '/placeholder' }
+    rememberTerminalHistory('terminal-1', route)
+    const spec = {
+      argv: ['rm', '-f', '--', '/tmp/dsh-agent-history-terminal-1'],
+      cwd: '/',
+      stdio: { stdin: 'ignore' as const, stdout: { maxBytes: 4096 }, stderr: { maxBytes: 4096 } },
+    }
+    const routed = subprocess.spawn(spec) as unknown as { done: Promise<unknown> }
+    assert.notDeepEqual(routed, { marker: 'original-spawn' }, 'the cleanup must not spawn locally')
+    await routed.done.catch(() => undefined)
+    // Single use: a second identical rm is no longer hijacked.
+    assert.deepEqual(subprocess.spawn(spec), { marker: 'original-spawn' })
+  } finally {
+    restore!()
+    resetRemoteTerminalState()
+  }
+})
+
+test('session-registered additional writable roots are refused instead of ignored', async () => {
+  const subprocess = {
+    spawn: (..._args: unknown[]) => ({ marker: 'original-spawn' }),
+    resolveExecutable: async (..._args: unknown[]) => '/usr/local/bin/node',
+    terminalEnvironment: async () => ({ platform: 'posix' }),
+  }
+  const sandbox = {
+    confine: async (...args: unknown[]) => ({ argv: args[0] as readonly string[], enforcement: 'full' as const, denialSignatures: [], runnerFailureRules: [] }),
+  }
+  const ctx = { get: (name: string) => name === 'subprocess' ? subprocess : name === 'sandbox' ? sandbox : undefined }
+  const restore = installRemoteWorld(ctx, {
+    transport: fakeTransport(),
+    hostOf: () => world.host,
+    secretOf: async () => ({}),
+    statusOf: async () => status,
+    routeByCwd: cwd => cwd === world.remoteCwd ? { kind: 'remote', hostId: 'h1', remoteCwd: world.remoteCwd, placeholderCwd: cwd } : { kind: 'local' },
+  })
+  assert.ok(restore !== undefined)
+  try {
+    await assert.rejects(
+      () => sandbox.confine(['bash', '-c', 'true'], { mode: 'workspace-write', workspaceRoot: world.remoteCwd, additionalWritableRoots: ['/extra'] } as never),
+      /does not support additional writable roots/u,
+    )
+    // A local session must fall through to the original confine untouched.
+    const local = await sandbox.confine(['bash', '-c', 'true'], {
+      mode: 'workspace-write',
+      workspaceRoot: '/tmp/local-project',
+      additionalWritableRoots: ['/tmp/extra'],
+    } as never)
+    assert.deepEqual(local.argv, ['bash', '-c', 'true'])
   } finally {
     restore!()
   }

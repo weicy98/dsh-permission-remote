@@ -16,7 +16,7 @@
  */
 import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
 import { probeTerminalContract } from '../src/upstream-terminal.ts'
-import { clearOverlayManifest, locateDshRoot, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, probePresentContract, readOverlayManifest, readPackageManifest, readWorkerManifest, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
+import { clearOverlayManifest, locateDshRoot, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, probeContract, probePresentContract, readOverlayManifest, readPackageManifest, readWorkerManifest, sameWorkerContract, writeOverlayManifest, writeWorkerManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, CHECK_UPSTREAM_FLAGS, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, unknownFlagLines, unknownFlags, usage, withDshRoot } from './cli-common.mjs'
 
 export { isInstalledPackage }
@@ -168,9 +168,13 @@ function runCheck(options, env) {
   const terminal = probeTerminalContract(located.root, located.version)
   if (terminal.failures.length > 0) {
     error(`check:upstream: terminal contract failed: ${terminal.failures.join('; ')}`)
-    error('check:upstream: fix src/sidebar-terminal.ts (terminal.spawn/create/shells wrapper) and tests/sidebar-terminal.spec.ts before releasing')
+    error('check:upstream: fix src/upstream-terminal.ts (probe shapes and VERIFIED_TERMINAL_DSH_VERSIONS) and src/sidebar-terminal.ts (spawn wrappers) before releasing')
     if (explain) {
+      error('check:upstream: what changed and where to fix it')
+      for (const failure of terminal.failures) renderFailureGuide(failure, error)
       for (const [name, value] of terminal.rows) error(`  ${name}: ${value}`)
+    } else {
+      error('check:upstream: rerun with --explain for the file and function behind each failure')
     }
     return { code: 1 }
   }
@@ -187,8 +191,7 @@ function runCheck(options, env) {
     // `--adapt` updates only the writable host overlay; package `--update` must
     // never promote host-local overlay entries into the release baseline.
     const manifest = adapt ? readOverlayManifest(env) : readPackageManifest()
-    const verified = manifest.verified.filter(item => !(item.dshVersion === entry.dshVersion
-      && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion))
+    const verified = manifest.verified.filter(item => !sameWorkerContract(item, entry))
     verified.push(entry)
     let path
     try {
@@ -224,7 +227,8 @@ function runCheck(options, env) {
     && item.controlSha256 === entry.controlSha256
     && item.controlFd === entry.controlFd
     && item.controlEnv === entry.controlEnv
-    && item.minimumNodeMajor === entry.minimumNodeMajor)
+    && item.minimumNodeMajor === entry.minimumNodeMajor
+    && (item.minimumNodeMinor === undefined || item.minimumNodeMinor === entry.minimumNodeMinor))
   const rows = [
     ['DSH', entry.dshVersion, expected?.dshVersion === entry.dshVersion ? 'same' : 'new'],
     ['ptc-runtime-node', entry.ptcRuntimeNodeVersion, expected?.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion ? 'same' : 'new'],
@@ -233,7 +237,8 @@ function runCheck(options, env) {
     ['dsh-subprocess control sha256', entry.controlSha256, expected?.controlSha256 === entry.controlSha256 ? 'same' : 'changed'],
     ['control fd', String(entry.controlFd), String(expected?.controlFd)],
     ['control env', entry.controlEnv ?? '(missing)', expected?.controlEnv ?? '(missing)'],
-    ['minimum node', String(entry.minimumNodeMajor), String(expected?.minimumNodeMajor)],
+    ['minimum node', entry.minimumNodeMinor === undefined ? String(entry.minimumNodeMajor) : `${entry.minimumNodeMajor}.${entry.minimumNodeMinor}`, expected === undefined ? '(new)' : expected.minimumNodeMinor === undefined ? 'unrecorded' : `${expected.minimumNodeMajor}.${expected.minimumNodeMinor}`],
+    ['module hooks', String(probes.requiresModuleHooks), expected === undefined ? '(new)' : expected.minimumNodeMinor === undefined ? 'unrecorded' : String((expected.minimumNodeMinor ?? 0) > 0)],
     ['entry probe', String(probes.entry), String(expected?.probes.entry)],
     ['imports only node', String(probes.importsOnlyNode), String(expected?.probes.importsOnlyNode)],
     ['bootstrapArgs mapping', String(probes.bootstrapArgsMapsHostPath), String(expected?.probes.bootstrapArgsMapsHostPath)],
@@ -256,6 +261,7 @@ function runCheck(options, env) {
     || entry.controlFd !== expected.controlFd
     || entry.controlEnv !== expected.controlEnv
     || entry.minimumNodeMajor !== expected.minimumNodeMajor
+    || (expected.minimumNodeMinor !== undefined && entry.minimumNodeMinor !== expected.minimumNodeMinor)
     || entry.probes.entry !== expected.probes.entry
     || entry.probes.importsOnlyNode !== expected.probes.importsOnlyNode
     || entry.probes.bootstrapArgsMapsHostPath !== expected.probes.bootstrapArgsMapsHostPath

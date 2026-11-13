@@ -73,7 +73,7 @@ test('a login banner is not the system ripgrep path', () => {
 
 test('the node probe extracts an absolute path and version across a banner', () => {
   const stdout = ['banner line', NODE_LOOKUP_BEGIN, '/usr/local/bin/node', '22.20.0', NODE_LOOKUP_END, ''].join('\n')
-  assert.deepEqual(parseNodeProbe(stdout), { path: '/usr/local/bin/node', version: '22.20.0', major: 22 })
+  assert.deepEqual(parseNodeProbe(stdout), { path: '/usr/local/bin/node', version: '22.20.0', major: 22, minor: 20 })
   assert.match(nodeProbeCommand(), /command -v node/)
 })
 

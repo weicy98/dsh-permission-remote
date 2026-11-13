@@ -40,6 +40,7 @@ import { bwrapProfileArgs, fileWritableRoots, seatbeltProfileArgs } from './prof
 import { shJoin } from './shell-quote.ts'
 import type { RemoteTransport, RemoteExecHandle } from './remote-transport.ts'
 import type { ExecResult, SecretMaterial } from './ssh-pool.ts'
+import { remoteTerminalRoute, terminalHistoryRoute } from './terminal-remote-state.ts'
 
 export interface RemoteWorld {
   readonly host: HostConfig
@@ -67,6 +68,8 @@ export interface RemoteWorldDeps {
   readonly secretOf: (host: HostConfig) => Promise<SecretMaterial>
   readonly statusOf: (host: HostConfig) => Promise<RunnerStatus>
   readonly routeByCwd: (cwd: string | undefined) => { kind: 'remote', hostId: string, remoteCwd: string, placeholderCwd: string } | { kind: 'local' }
+  /** The remote login shell used by rc.2's agent terminals when no shell is preferred. */
+  readonly defaultShellOf?: (hostId: string) => Promise<string | undefined>
 }
 
 interface MutableService {
@@ -488,6 +491,17 @@ export function sharedSpillDirectory(): string {
   return spillDirectory
 }
 
+/**
+ * Whether this process has created its shared spill directory.
+ *
+ * Observing the directory directly is race-free; `os.tmpdir()` is shared by
+ * every spec file that `node --test` runs in parallel, so a `readdir` snapshot
+ * there reports other processes' spill directories as false positives.
+ */
+export function peekSpillDirectory(): string | undefined {
+  return spillDirectory
+}
+
 /** Retain at most this many success-path spill artifacts per process. */
 export const SPILL_KEEP_FILES = 64
 /** Retain at most this many bytes of success-path spill artifacts per process. */
@@ -884,19 +898,51 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
   const savedResolve = subprocess.resolveExecutable
   const ownConfine = Object.hasOwn(sandbox, 'confine')
   const savedConfine = sandbox.confine
+  const ownEnvironment = Object.hasOwn(subprocess, 'terminalEnvironment')
+  const savedEnvironment = subprocess.terminalEnvironment
   const originalSpawn = ownMethod<(...args: unknown[]) => SubprocessHandle>(subprocess, 'spawn', savedSpawn as never)
   const originalResolve = ownMethod<(...args: unknown[]) => Promise<string>>(subprocess, 'resolveExecutable', savedResolve as never)
   const originalConfine = ownMethod<(...args: unknown[]) => Promise<ConfinedArgv>>(sandbox, 'confine', savedConfine as never)
+  const originalEnvironment = ownMethod<((signal?: AbortSignal) => Promise<unknown>) | undefined>(subprocess, 'terminalEnvironment', undefined)
+  const defaultEnvironment = async (): Promise<unknown> => ({ platform: process.platform === 'win32' ? 'windows' : 'posix' })
 
   subprocess.spawn = ((spec: SubprocessSpawnSpec) => {
     const world = remoteWorldContext.getStore()
     if (world !== undefined && spec.stdio?.control === 'pipe') return new RemotePtcHandle(world, spec, deps.transport)
+    // rc.2's post-exit history cleanup runs with cwd '/' and an exact argv; the
+    // terminal bridge recorded where that terminal lived. Any other spawn falls
+    // through to the ordinary path.
+    const historyRoute = terminalHistoryRoute(spec.argv, spec.cwd)
+    if (historyRoute !== undefined) {
+      return new RemoteProcessHandle(historyRoute, { ...spec, cwd: historyRoute.remoteCwd }, deps.transport, deps)
+    }
     const route = deps.routeByCwd(spec.cwd)
     if (route.kind !== 'remote') return originalSpawn.call(subprocess, spec)
     return new RemoteProcessHandle(route, spec, deps.transport, deps)
   }) as never
 
+  // rc.2 calls `terminalEnvironment()` twice per agent terminal: to resolve the
+  // default shell and to decide HISTFILE. It has no cwd, so it would report THIS
+  // computer's platform and $SHELL. For a remote terminal, report posix and omit
+  // defaultShell: upstream `resolveShell` then falls back to /bin/sh, which is
+  // guaranteed on every host this plugin supports (Linux/macOS). The guard is
+  // scoped to a live remote terminal allocation, so local sessions keep their
+  // own default shell.
+  subprocess.terminalEnvironment = (async (signal?: AbortSignal): Promise<unknown> => {
+    const terminal = remoteTerminalRoute()
+    if (terminal !== undefined) {
+      signal?.throwIfAborted()
+      const defaultShell = deps.defaultShellOf === undefined ? undefined : await deps.defaultShellOf(terminal.hostId)
+      return { platform: 'posix', ...defaultShell === undefined ? {} : { defaultShell } }
+    }
+    if (originalEnvironment === undefined) return defaultEnvironment()
+    return originalEnvironment.call(subprocess, signal)
+  }) as never
+
   subprocess.resolveExecutable = (async (command: string, env?: Readonly<Record<string, string>>, signal?: AbortSignal) => {
+    // rc.2 resolves the terminal's default shell through this local service.
+    // An absolute remote shell path must not be checked against this computer.
+    if (remoteTerminalRoute() !== undefined && command.startsWith('/')) return command
     const result = await originalResolve.call(subprocess, command, env, signal)
     const world = remoteWorldContext.getStore()
     if (world !== undefined && (command === world.launchExecutable || command === process.execPath)) {
@@ -909,6 +955,7 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     const active = remoteWorldContext.getStore()
     if (active !== undefined && argv.includes(active.workerRemotePath)) {
       signal?.throwIfAborted()
+      rejectExtraWritableRoots(policy)
       if (!active.status.sandbox.available || active.status.sandboxTool === 'none') {
         throw new SandboxUnavailableError(policy.mode, 'remote sandbox probe failed')
       }
@@ -944,6 +991,7 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     const route = deps.routeByCwd(policy.workspaceRoot)
     if (route.kind !== 'remote') return originalConfine.call(sandbox, argv, policy, signal)
     signal?.throwIfAborted()
+    rejectExtraWritableRoots(policy)
     const host = deps.hostOf(route.hostId)
     if (host === undefined) throw new SandboxUnavailableError(policy.mode, 'remote host not configured')
     const status = await deps.statusOf(host)
@@ -960,6 +1008,12 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
       // Ordinary shell/process execution follows the bash-style profile:
       // workspace-write gets a private /tmp rather than the file-tool profile's
       // real temp binds. File tools use the file profile through remote-write.
+      //
+      // This generic branch deliberately does not add `--chdir`: its only
+      // knowledge is `policy.workspaceRoot`, while the caller may `cd` to a
+      // different directory (terminal_open's requested subdirectory) before
+      // exec. A `--chdir` here would override that `cd`. The terminal command
+      // builders add `--chdir` themselves, where the actual cwd is known.
       const profile = bwrapProfileArgs(policy.mode, roots.workspaceRoot) ?? []
       return {
         argv: ['bwrap', ...profile, '--', ...mapped],
@@ -985,10 +1039,25 @@ export function installRemoteWorld(ctx: { get(name: string): unknown }, deps: Re
     else delete subprocess.resolveExecutable
     if (ownConfine) sandbox.confine = savedConfine
     else delete sandbox.confine
+    if (ownEnvironment) subprocess.terminalEnvironment = savedEnvironment
+    else delete subprocess.terminalEnvironment
     delete (subprocess as { [WORLD_MARK]?: boolean })[WORLD_MARK]
     // An empty per-process temp dir must not survive unload. Directories that
     // still hold advertised recovery artifacts are intentionally kept.
     disposeSpillDirectory()
+  }
+}
+
+/**
+ * rc.2 lets a Session register extra writable roots (`registerWritableRoot`).
+ * They are local execution-world paths; the remote bwrap/seatbelt argv cannot
+ * bind them by that spelling. Refuse rather than silently granting less than the
+ * resolved policy promises. Local sessions never reach this check.
+ */
+function rejectExtraWritableRoots(policy: SandboxPolicy): void {
+  const extraRoots = (policy as { additionalWritableRoots?: readonly string[] }).additionalWritableRoots
+  if (extraRoots !== undefined && extraRoots.length > 0) {
+    throw new SandboxUnavailableError(policy.mode, 'remote confinement does not support additional writable roots yet; use the workspace root or run locally')
   }
 }
 

@@ -11,6 +11,7 @@
       "controlFd": 7,
       "controlEnv": "DSH_SUBPROCESS_CONTROL",
       "minimumNodeMajor": 22,
+      "minimumNodeMinor": 0,
       "probes": {
         "entry": true,
         "importsOnlyNode": true,
@@ -28,6 +29,7 @@
       "controlFd": 7,
       "controlEnv": "DSH_SUBPROCESS_CONTROL",
       "minimumNodeMajor": 22,
+      "minimumNodeMinor": 15,
       "probes": {
         "entry": true,
         "importsOnlyNode": true,

@@ -12,7 +12,7 @@ import type { RunnerStatus } from './execute.ts'
 import { remoteWorldContext, type RemoteWorld } from './remote-world.ts'
 import { routeByCwd, workspaceBinding } from './router.ts'
 import type { SecretMaterial, SshPool } from './ssh-pool.ts'
-import type { UploadedWorker } from './upstream-worker.ts'
+import { WorkerNodeFloorError, type UploadedWorker } from './upstream-worker.ts'
 
 const MARK = Symbol.for('dsh-permission-remote.ptc-remote-wrap')
 const REMOTE_NOTE = ' When the working directory is a remote workspace, the program runs on that SSH host and relative paths resolve there. Its process.env starts empty, exactly like local PTC. Per-call and retained modes use the host\'s official runtime; retained state remains on that SSH host.'
@@ -372,7 +372,14 @@ async function dispatch(
     uploaded = await deps.ensureWorker(host, secret, status, spec.signal)
   } catch (error) {
     if (spec.signal?.aborted === true) return failure('abort', 'run_code was aborted')
-    return failure('worker-exit', `the PTC worker could not be uploaded to ${host.host}: ${messageOf(error)}`)
+    const message = messageOf(error)
+    // A too-old remote Node is an environment problem, not a worker crash; do
+    // not report it as `worker-exit` and imply the uploaded worker was at fault.
+    if (error instanceof WorkerNodeFloorError) {
+      deps.forgetProbe?.(route.hostId)
+      return failure('exception', message)
+    }
+    return failure('worker-exit', `the PTC worker could not be uploaded to ${host.host}: ${message}`)
   }
   if (budget !== null && remaining() !== null && remaining()! <= 0) {
     return failure('timeout', 'run_code timed out while preparing the remote program')

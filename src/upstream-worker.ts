@@ -12,7 +12,7 @@ import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PTC_MIN_NODE_MAJOR } from './probe.ts'
+import { PTC_MIN_NODE_MAJOR, PTC_MIN_NODE_MODULE_HOOKS_MINOR, PTC_MIN_NODE_MODULE_HOOKS_MINOR_NEXT } from './probe.ts'
 import { shJoin } from './shell-quote.ts'
 import type { HostConfig } from './config.ts'
 import type { SecretMaterial, SshPool } from './ssh-pool.ts'
@@ -41,6 +41,8 @@ export interface UpstreamWorker {
   readonly processHash: string
   readonly indexHash: string
   readonly controlHash: string
+  /** Minor version floor within Node 22, derived from the worker's own imports. */
+  readonly minimumNodeMinor: number
 }
 
 export interface ContractProbe {
@@ -50,6 +52,14 @@ export interface ContractProbe {
   readonly controlEnv: string | undefined
   readonly bootstrapArgsMapsHostPath: boolean
   readonly spawnControlPipe: boolean
+  /** The worker imports node:module registerHooks, so it needs Node >= 22.15. */
+  readonly requiresModuleHooks: boolean
+  /** The worker uses vm.SourceTextModule/SyntheticModule, so the runner needs the vm-modules flag. */
+  readonly requiresVmModules: boolean
+  /** node-script bootstrapArgs still passes --experimental-vm-modules. */
+  readonly nodeScriptVmModules: boolean
+  /** Minor version floor within the supported Node major, derived from imports. */
+  readonly minimumNodeMinor: number
   readonly failures: readonly string[]
 }
 
@@ -63,6 +73,8 @@ export interface ManifestEntry {
   readonly controlFd: number | undefined
   readonly controlEnv: string | undefined
   readonly minimumNodeMajor: number
+  /** Node 22 minor required by this worker's ESM import hooks; 0 for rc.1; undefined = unrecorded legacy overlay. */
+  readonly minimumNodeMinor?: number
   readonly probes: {
     readonly entry: boolean
     readonly importsOnlyNode: boolean
@@ -130,6 +142,10 @@ function normalizeEntry(value: unknown): ManifestEntry | undefined {
     controlFd: typeof entry.controlFd === 'number' ? entry.controlFd : undefined,
     controlEnv: typeof entry.controlEnv === 'string' ? entry.controlEnv : undefined,
     minimumNodeMajor: entry.minimumNodeMajor,
+    // A missing floor is an unrecorded legacy entry, not proof of rc.1: an
+    // rc.2 overlay written before this field existed must keep working. The
+    // upload-time check derives the real floor from the worker bytes.
+    minimumNodeMinor: typeof entry.minimumNodeMinor === 'number' ? entry.minimumNodeMinor : undefined,
     probes: {
       entry: probes.entry,
       importsOnlyNode: probes.importsOnlyNode,
@@ -149,8 +165,17 @@ function readEntries(path: string): ManifestEntry[] {
   }
 }
 
-function manifestKey(entry: ManifestEntry): string {
-  return `${entry.processSha256}\0${entry.indexSha256}\0${entry.controlSha256}\0${String(entry.controlFd)}\0${entry.controlEnv ?? ''}\0${entry.minimumNodeMajor}`
+export function manifestKey(entry: ManifestEntry): string {
+  return `${entry.processSha256}\0${entry.indexSha256}\0${entry.controlSha256}\0${String(entry.controlFd)}\0${entry.controlEnv ?? ''}\0${entry.minimumNodeMajor}\0${entry.minimumNodeMinor ?? '*'}`
+}
+
+/** Byte/control identity of an entry, ignoring the metadata-only Node floor. */
+export function sameWorkerContract(left: ManifestEntry, right: ManifestEntry): boolean {
+  return left.processSha256 === right.processSha256
+    && left.indexSha256 === right.indexSha256
+    && left.controlSha256 === right.controlSha256
+    && left.controlFd === right.controlFd
+    && left.controlEnv === right.controlEnv
 }
 
 /** The package release baseline only; used by `check:upstream --update`. */
@@ -319,6 +344,7 @@ function hashesFor(worker: UpstreamWorker): ManifestEntry {
     controlFd: probes.controlFd,
     controlEnv: probes.controlEnv,
     minimumNodeMajor: PTC_MIN_REMOTE_NODE_MAJOR,
+    minimumNodeMinor: probes.minimumNodeMinor,
     probes: {
       entry: probes.entry,
       importsOnlyNode: probes.importsOnlyNode,
@@ -349,6 +375,7 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
     processHash: hash(processSource),
     indexHash: hash(indexSource),
     controlHash: hash(controlSource),
+    minimumNodeMinor: moduleHooksRequired(processSource.toString('utf8')) ? PTC_MIN_NODE_MODULE_HOOKS_MINOR : 0,
   }
   const probes = probeContract(worker)
   if (probes.failures.length > 0) {
@@ -364,7 +391,8 @@ export function locateUpstreamWorker(env: NodeJS.ProcessEnv = process.env, optio
       && entry.controlSha256 === worker.controlHash
       && entry.controlFd === probes.controlFd
       && entry.controlEnv === probes.controlEnv
-      && entry.minimumNodeMajor === PTC_MIN_REMOTE_NODE_MAJOR)
+      && entry.minimumNodeMajor === PTC_MIN_REMOTE_NODE_MAJOR
+      && (entry.minimumNodeMinor === undefined || entry.minimumNodeMinor === worker.minimumNodeMinor))
     if (expected === undefined) {
       // The package manifest lives inside the installed plugin, which is
       // read-only for a normal npm install, so the installed-host command comes
@@ -386,11 +414,23 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   const entry = /runNodeMain\s*\(\s*openInheritedControlChannel\s*\(\s*\)\s*,\s*Number\s*\(\s*process\.argv\[2\]\s*\)\s*,\s*process\s*\)/u.test(processText)
   const importLines = processText.split(/\r?\n/u).filter(line => /^\s*import\s/u.test(line))
   const importsOnlyNode = importLines.length > 0 && importLines.every(line => /from\s+['"]node:/u.test(line))
+  const requiresModuleHooks = moduleHooksRequired(processText)
+  const requiresVmModules = /vm\.(?:SourceTextModule|SyntheticModule)\b/u.test(processText)
   const controlFdMatch = /fd\s*:\s*7/u.exec(processText) ?? /SUBPROCESS_CONTROL_FD\s*=\s*7/u.exec(controlText)
   const controlEnvMatch = /SUBPROCESS_CONTROL_ENV\s*=\s*['"]([^'"]+)['"]/u.exec(processText) ?? /SUBPROCESS_CONTROL_ENV\s*=\s*['"]([^'"]+)['"]/u.exec(controlText)
   const controlEnv = controlEnvMatch?.[1]
   const bootstrapArgsMapsHostPath = /processPathFromHostPath\s*\(/u.test(indexText) && /process\.js/u.test(indexText)
   const spawnControlPipe = /control\s*:\s*['"]pipe['"]/u.test(indexText)
+  // DSH 0.2.2-rc.2's worker uses node:module registerHooks for ESM imports.
+  // That named export only exists on Node >= 22.15 / 23.5, so the minimum
+  // remote Node minor is derived from the very bytes that are uploaded.
+  // Must be in the node-script bootstrap argv itself, not merely in a
+  // NODE_OPTIONS assignment elsewhere: the shim builds the child argv from
+  // bootstrapArgs and resets the environment to PATH/TEMP/TMP. Read the whole
+  // bootstrapArgs block so a reformatted `case` still passes.
+  const bootstrapBlock = functionBlock(indexText, 'bootstrapArgs')
+  const nodeScriptVmModules = bootstrapBlock !== undefined && bootstrapBlock.includes('--experimental-vm-modules')
+  const minimumNodeMinor = requiresModuleHooks ? PTC_MIN_NODE_MODULE_HOOKS_MINOR : 0
   const failures: string[] = []
   if (!entry) failures.push('process.js entry line changed')
   if (!importsOnlyNode) failures.push('process.js imports a non-Node module')
@@ -399,6 +439,7 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
   else if (controlEnv !== PTC_CONTROL_ENV) failures.push(`control environment marker changed to ${controlEnv}; the shim expects ${PTC_CONTROL_ENV}`)
   if (!bootstrapArgsMapsHostPath) failures.push('bootstrapArgs no longer maps process.js through fs.processPathFromHostPath')
   if (!spawnControlPipe) failures.push('subprocess.spawn no longer requests a control pipe')
+  if (requiresVmModules && !nodeScriptVmModules) failures.push('bootstrapArgs no longer passes --experimental-vm-modules for the vm-modules worker')
   return {
     entry,
     importsOnlyNode,
@@ -406,8 +447,50 @@ export function probeContract(worker: UpstreamWorker): ContractProbe {
     controlEnv,
     bootstrapArgsMapsHostPath,
     spawnControlPipe,
+    requiresModuleHooks,
+    requiresVmModules,
+    nodeScriptVmModules,
+    minimumNodeMinor,
     failures,
   }
+}
+
+/** Approximate one `function name(...) { ... }` block; enough to scope a source-shape check. */
+function functionBlock(source: string, name: string): string | undefined {
+  const start = new RegExp(`function\\s+${name}\\s*\\(`, 'u').exec(source)
+  if (start === null) return undefined
+  const bodyStart = source.indexOf('{', start.index)
+  if (bodyStart < 0) return undefined
+  let depth = 0
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index]
+    if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) return source.slice(start.index, index + 1)
+    }
+  }
+  return undefined
+}
+
+/**
+ * Whether the uploaded worker imports `registerHooks` from `node:module`.
+ *
+ * DSH 0.2.2-rc.2 added synchronous ESM import hooks to `process.js`; that
+ * named export only exists from Node 22.15 / 23.5, and an ESM link error would
+ * kill the worker before the control handshake.
+ */
+function moduleHooksRequired(processText: string): boolean {
+  const imported = processText.split(/\r?\n/u)
+    .filter(line => /^\s*import\s/u.test(line))
+    .some(line => /\bregisterHooks\b/u.test(line) && /from\s+['"]node:module['"]/u.test(line))
+  // `import * as module` + `module.registerHooks(...)` is the namespace form.
+  return imported || /module\.registerHooks\s*\(/u.test(processText)
+}
+
+/** Node minor floor implied by a worker's own imports; used by the upload gate. */
+export function minimumNodeMinorFor(worker: UpstreamWorker): number {
+  return worker.minimumNodeMinor
 }
 
 export function manifestEntryFor(worker: UpstreamWorker): ManifestEntry {
@@ -473,8 +556,37 @@ async function uploadFile(
   }
 }
 
+/** The remote Node cannot run the bytes that would be uploaded. */
+export class WorkerNodeFloorError extends Error {
+  readonly code = 'WORKER_NODE_FLOOR'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'WorkerNodeFloorError'
+  }
+}
+
 export interface EnsureWorkerOptions {
   readonly allowUnverified?: boolean
+  /** Remote Node probe; checked against the floor implied by the worker bytes. */
+  readonly remoteNode?: { readonly version: string, readonly major: number, readonly minor?: number }
+}
+
+/**
+ * The rc.2 worker imports `registerHooks` from `node:module`, which only exists
+ * on Node >= 22.15 / 23.5. Version labels are metadata; this check is driven by
+ * the exact bytes about to be uploaded, so a host overlay cannot lower it.
+ */
+export function nodeSupportsWorker(node: { readonly version: string, readonly major: number, readonly minor?: number }, minimumNodeMinor: number): boolean {
+  if (node.major < PTC_MIN_NODE_MAJOR) return false
+  // No minor floor (rc.1 worker): every Node 22+ line is enough.
+  if (minimumNodeMinor === 0) return true
+  // A probe that only reported the major cannot prove the required API exists.
+  const minor = node.minor ?? 0
+  // registerHooks landed in Node 22.15 and 23.5, and is present in 24+.
+  if (node.major === PTC_MIN_NODE_MAJOR) return minor >= minimumNodeMinor
+  if (node.major === 23) return minor >= PTC_MIN_NODE_MODULE_HOOKS_MINOR_NEXT
+  return true
 }
 
 export async function ensureWorker(
@@ -487,6 +599,12 @@ export async function ensureWorker(
 ): Promise<UploadedWorker> {
   if (!home.startsWith('/')) throw new Error('the remote did not report an absolute home, so the PTC worker cannot be placed there')
   const worker = locateUpstreamWorker(process.env, options)
+  if (options.remoteNode !== undefined && !nodeSupportsWorker(options.remoteNode, worker.minimumNodeMinor)) {
+    const required = worker.minimumNodeMinor > 0
+      ? `22.${worker.minimumNodeMinor} or newer (or Node.js 23.5 or newer)`
+      : `${PTC_MIN_NODE_MAJOR} or newer`
+    throw new WorkerNodeFloorError(`the installed DSH PTC worker requires Node.js ${required} on ${host.host}; found ${options.remoteNode.version}. Upgrade Node on the remote host and re-probe with Test connection in Settings → SSH hosts`)
+  }
   const shimSource = ptcShimSource()
   const digest = createHash('sha256')
     .update(worker.processSource)

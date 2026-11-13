@@ -16,7 +16,7 @@ import { atomicWriteScript } from './profile.ts'
 import { resolveCreatedPath } from './remote-write.ts'
 import { isRemotePlaceholderPath, normalizeRemoteDirectory, routeByCwd } from './router.ts'
 import { shJoin } from './shell-quote.ts'
-import { CLEANUP_SETTLE_TIMEOUT_MS, isSftpMissing, settleWithin, type SecretMaterial } from './ssh-pool.ts'
+import { CLEANUP_SETTLE_TIMEOUT_MS, isSftpMissing, settleWithin, type SecretMaterial, type SftpLease } from './ssh-pool.ts'
 
 const READ_CAP = 1024 * 1024
 const HOME_BEGIN = '__DSH_OPS_HOME_BEGIN__'
@@ -605,6 +605,51 @@ async function withTransferDeadline<T>(
 }
 
 /**
+ * A cleanup whose SFTP channel never confirmed its close cannot prove the
+ * temporary file is gone: the server may still process an `OPEN` sent before
+ * `session.end()` and recreate it after the `rm`. Name the path in the
+ * original error so an operator can remove it, without changing the error's
+ * type — a timeout must stay a timeout and a cancellation must stay one.
+ */
+function notePossibleLeak(error: unknown, leases: readonly (SftpLease | undefined)[], tmp: string): unknown {
+  if (!leases.some(lease => lease?.settled?.() === false)) return error
+  if (!(error instanceof Error)) return error
+  try {
+    error.message = `${error.message}; the SFTP channel did not confirm its close, so a temporary file may remain: ${tmp}`
+  } catch {
+    // A frozen error keeps its original message.
+  }
+  return error
+}
+
+/** One cleanup budget for close+rm, so a dead channel cannot stack two waits. */
+function cleanupBudget(): () => number {
+  const deadline = Date.now() + CLEANUP_SETTLE_TIMEOUT_MS
+  return () => Math.max(250, deadline - Date.now())
+}
+
+/**
+ * A cross-host copy keeps two SSH connections alive until both SFTP legs
+ * finish. A slot is returned only when the connection closes, so a copy that
+ * needs two new connections while only one slot is free queues the second
+ * `reserve()` forever: the first connection cannot close while the copy is
+ * streaming. Check before any IO instead of letting the transfer deadline
+ * report a misleading timeout (or hang forever when the deadline is 0).
+ *
+ * This is an admission check, not a reservation: a concurrent caller can still
+ * take a slot between the check and the connect. It is re-run before the
+ * target leg for that reason.
+ */
+function requireCopySlots(pool: ToolHost['pool'], hosts: readonly HostConfig[]): void {
+  const needed = new Set(hosts.filter(item => !pool.hasSession(item.id)).map(item => item.id)).size
+  if (needed === 0) return
+  const free = pool.freeSlots()
+  if (free < needed) {
+    throw new Error(`ssh_copy needs ${needed} free SSH connection slot${needed === 1 ? '' : 's'} for host${needed === 1 ? '' : 's'} that are not connected yet, but only ${free} ${free === 1 ? 'is' : 'are'} free (maxConnections=${pool.maxConnections}); close a sidebar terminal or raise the connection limit`)
+  }
+}
+
+/**
  * A bare `throwIfAborted(signal)` between transfer steps cannot tell the
  * deadline from a user cancellation: both abort the same combined signal, so a
  * timeout would surface as `AbortError` ("tool call aborted") and the model
@@ -685,8 +730,9 @@ export async function runSshUpload(
   if (mkdir.code !== 0) throw new Error(mkdir.stderr || 'remote upload failed')
   // One channel that belongs to this transfer only. A hung SFTP callback is
   // closed here without touching the host's terminals, `ssh_exec`, or the PTC
-  // worker, and `rm` runs only after that close so a late SFTP `OPEN` cannot
-  // recreate the temporary file afterwards.
+  // worker. `close()` waits for the server to confirm that channel close, so
+  // the `rm` on the separate exec channel cannot be overtaken by an OPEN that
+  // the sftp-server still had queued.
   const lease = await withTransferDeadline(
     hostApi.pool.openSftpLease(host, secret, signal),
     signal,
@@ -697,7 +743,9 @@ export async function runSshUpload(
   const sending = hostApi.pool.sftpSendLocalOn(lease, localPath, tmp, { maxBytes: limits.maxBytes, signal })
   try {
     bytes = await withTransferDeadline(sending, signal, exec.signal, limits)
-    await lease.close()
+    // Bound the close by the same deadline: a dead channel must not extend a
+    // transfer that already answered every write.
+    await withTransferDeadline(lease.close(), signal, exec.signal, limits)
     const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([remotePath])}`
     const moved = await withTransferDeadline(
       hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, remotePath])}${bits}`, limits.timeoutMs, signal),
@@ -707,9 +755,14 @@ export async function runSshUpload(
     )
     if (moved.code !== 0) throw new Error(moved.stderr || 'remote upload failed')
   } catch (error) {
-    await settleWithin(lease.close(), CLEANUP_SETTLE_TIMEOUT_MS)
-    await settleWithin(hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, 15_000), CLEANUP_SETTLE_TIMEOUT_MS)
-    throw error
+    const remaining = cleanupBudget()
+    await settleWithin(lease.close(), remaining())
+    // Only remove after the server confirmed the channel close; otherwise an
+    // OPEN still queued in sftp-server could recreate the file after the rm.
+    if (lease.settled?.() !== false) {
+      await settleWithin(hostApi.pool.exec(host, secret, `rm -f ${shJoin([tmp])}`, 15_000), remaining())
+    }
+    throw notePossibleLeak(error, [lease], tmp)
   } finally {
     void lease.close()
   }
@@ -820,7 +873,8 @@ export async function runSshDownload(
       }
     })(), signal, exec.signal, limits)
   } catch (error) {
-    await settleWithin(lease === undefined ? Promise.resolve() : lease.close(), CLEANUP_SETTLE_TIMEOUT_MS)
+    const remaining = cleanupBudget()
+    if (lease !== undefined) await settleWithin(lease.close(), remaining())
     await handle.close().catch(() => undefined)
     await rm(temporary, { force: true }).catch(() => undefined)
     throw error
@@ -1029,6 +1083,10 @@ export async function runSshCopy(
   if (source.id !== target.id && typeof poolLimit === 'number' && poolLimit < 2) {
     throw new Error(`ssh_copy between different hosts needs maxConnections >= 2; current maxConnections is ${poolLimit}`)
   }
+  // Fail before any connection is taken when the pool cannot hold both legs.
+  // The configured ceiling alone is not enough: a sidebar terminal can already
+  // be holding one of the slots.
+  requireCopySlots(hostApi.pool, source.id === target.id ? [source] : [source, target])
   // Read gate, then write gate. Both run before any IO so a blocked or
   // untrusted host never opens a connection, and the approval card lands only
   // when the copy could actually proceed.
@@ -1081,6 +1139,10 @@ export async function runSshCopy(
   if (limits.maxBytes > 0 && info.size > limits.maxBytes) {
     throw new Error(`source file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
   }
+  // Connecting the source consumed a slot; a concurrent caller may have taken
+  // another. The target leg must not enter reserve() with no connection able
+  // to close and hand a slot back.
+  requireCopySlots(hostApi.pool, [target])
   const existing = await withTransferDeadline(
     remoteTargetOf(hostApi, target, targetSecret, targetPath, false, signal),
     signal,
@@ -1113,7 +1175,8 @@ export async function runSshCopy(
       ? sourceLease
       : await withTransferDeadline(hostApi.pool.openSftpLease(target, targetSecret, signal), signal, exec.signal, limits)
   } catch (error) {
-    await settleWithin(sourceLease.close(), CLEANUP_SETTLE_TIMEOUT_MS)
+    const remaining = cleanupBudget()
+    await settleWithin(sourceLease.close(), remaining())
     throw error
   }
   const chunks = hostApi.pool.sftpReadChunksOn(sourceLease, sourcePath, signal)
@@ -1125,8 +1188,14 @@ export async function runSshCopy(
   })
   try {
     bytes = await withTransferDeadline(sending, signal, exec.signal, limits)
-    if (sourceLease !== targetLease) await sourceLease.close()
-    await targetLease.close()
+    // Both sends are complete and acknowledged; close the two channels in
+    // parallel so two slow closes cannot cost two full cleanup budgets.
+    await withTransferDeadline(
+      Promise.all(sourceLease === targetLease ? [targetLease.close()] : [sourceLease.close(), targetLease.close()]),
+      signal,
+      exec.signal,
+      limits,
+    )
     const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([targetPath])}`
     const moved = await withTransferDeadline(
       hostApi.pool.exec(target, targetSecret, `mv -f ${shJoin([tmp, targetPath])}${bits}`, limits.timeoutMs, signal),
@@ -1136,12 +1205,18 @@ export async function runSshCopy(
     )
     if (moved.code !== 0) throw new Error(moved.stderr || 'remote copy failed')
   } catch (error) {
-    // Close both transfer channels (bounded) before `rm`. Only these channels
-    // are destroyed; the host's other SFTP work and its SSH connection stay up.
-    await settleWithin(sourceLease.close(), CLEANUP_SETTLE_TIMEOUT_MS)
-    if (targetLease !== sourceLease) await settleWithin(targetLease.close(), CLEANUP_SETTLE_TIMEOUT_MS)
-    await settleWithin(hostApi.pool.exec(target, targetSecret, `rm -f ${shJoin([tmp])}`, 15_000), CLEANUP_SETTLE_TIMEOUT_MS)
-    throw error
+    // Each close waits for the server to confirm that channel close; only then
+    // is it safe to `rm` on the separate exec channel. Only these channels are
+    // destroyed; the host's other SFTP work and its SSH connection stay up.
+    const remaining = cleanupBudget()
+    await settleWithin(sourceLease.close(), remaining())
+    if (targetLease !== sourceLease) await settleWithin(targetLease.close(), remaining())
+    // The target channel wrote the temp file; only an unconfirmed close there
+    // makes `rm` racy. A source-only timeout still permits the cleanup.
+    if (targetLease.settled?.() !== false) {
+      await settleWithin(hostApi.pool.exec(target, targetSecret, `rm -f ${shJoin([tmp])}`, 15_000), remaining())
+    }
+    throw notePossibleLeak(error, [sourceLease, targetLease], tmp)
   } finally {
     void sourceLease.close()
     if (targetLease !== sourceLease) void targetLease.close()

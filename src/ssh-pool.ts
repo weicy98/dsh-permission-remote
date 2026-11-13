@@ -116,6 +116,19 @@ export function settleWithin(work: Promise<unknown>, timeoutMs = CLEANUP_SETTLE_
   })
 }
 
+/** Like {@link settleWithin}, but reports whether `work` resolved (not rejected). */
+async function settleConfirmed(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    work.then(value => value !== false, () => false),
+    new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(false), timeoutMs)
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
 /**
  * Adopt `work` but stop waiting for it when `signal` aborts.
  *
@@ -176,13 +189,22 @@ export interface SftpAttrs {
  *
  * A transfer must not share `Live.sftp`: aborting it has to destroy its channel
  * without disturbing a concurrent `ssh_read`, file tree listing, or PTC file
- * operation on the same host. `close()` is idempotent and bounded by
- * `CLEANUP_SETTLE_TIMEOUT_MS`; callers await it *before* removing a temporary
- * file, so a late SFTP `OPEN` cannot recreate the file after the `rm`.
+ * operation on the same host.
+ *
+ * `close()` is idempotent. After `session.end()` it waits up to
+ * `CLEANUP_SETTLE_TIMEOUT_MS` for the server's channel close — that event is
+ * the only proof that every OPEN/WRITE already sent has been processed. `rm`
+ * runs on a *different* exec channel, so deleting the temporary file before
+ * the server confirms the close lets an in-flight `OPEN` recreate it afterwards
+ * with nobody left to clean up. `settled()` reports whether that confirmation
+ * arrived; a cleanup whose channel never confirmed must report the possible
+ * leak instead of silently leaving the file behind.
  */
 export interface SftpLease {
   readonly api: SftpLike
   close(): Promise<void>
+  /** Optional for third-party/mock leases; absent means "unknown". */
+  readonly settled?: () => boolean
 }
 
 export interface SecretMaterial {
@@ -486,9 +508,22 @@ export class SshPool {
     }
   }
 
-  /** Whether a session is cached for this host id. Diagnostics and tests only. */
+  /** Whether a session (or an in-flight opening) is cached for this host id. */
   hasSession(hostId: string): boolean {
     return this.live.has(hostId)
+  }
+
+  /**
+   * Connection slots not currently reserved.
+   *
+   * A slot is held from `reserve()` until the connection's `close`/`end`, so
+   * an operation that needs two *new* connections must check this before it
+   * takes the first one: the first connection cannot close while the operation
+   * is streaming, and the second `reserve()` would queue forever.
+   */
+  freeSlots(): number {
+    if (!Number.isFinite(this.maxConnections)) return 0
+    return Math.max(0, this.maxConnections - this.active)
   }
 
   /**
@@ -874,16 +909,20 @@ export class SshPool {
     if (signal?.aborted === true) throw abortError()
     const session = await openSftp(live.client)
     let closing: Promise<void> | undefined
+    let settled = false
     return {
       api: session.api,
+      settled: () => settled,
       close: () => {
         closing ??= (async () => {
           session.end()
-          // `end()` already queues CHANNEL_CLOSE behind every OPEN/WRITE this
-          // transfer sent, so the server cannot process a late OPEN after it.
-          // A short wait drains the close event without adding seconds to a
-          // transfer whose server never answers the handshake.
-          await settleWithin(session.closed, COOPERATIVE_SETTLE_MS)
+          // `end()` queues CHANNEL_CLOSE behind every OPEN/WRITE this transfer
+          // sent, but the server handles them in its own sftp-server child. A
+          // 250ms cooperative bound is shorter than a WAN round trip: the
+          // channel close event is the barrier that proves the queue drained,
+          // so wait the full cleanup budget for it. A healthy channel answers
+          // in milliseconds; only a dead one costs the whole budget.
+          settled = await settleWithin(session.closed, CLEANUP_SETTLE_TIMEOUT_MS)
         })()
         return closing
       },
@@ -1074,17 +1113,29 @@ export class SshPool {
     })()
     try {
       await finishOrCleanup(publish, signal, async () => {
-        // No signal: an already-aborted signal closes the channel before `rm` runs.
+        // Only runs after `beforeCleanup` confirms the channel is closed.
         await this.exec(host, secret, `rm -f ${shJoin([temporary])}`, 15_000).catch(() => undefined)
       }, async () => {
-        // A hung SFTP open/write ignores the deadline. Closing this transfer's
-        // own channel lets a late open fail instead of recreating the temp file
-        // after cleanup; the SSH connection and other SFTP channels stay up.
+        // Wait for the server to confirm this transfer's channel close before
+        // the `rm` on the separate exec channel. Return false when it never
+        // confirmed: finishOrCleanup then skips the racy `rm` and the catch
+        // below reports the possible temp path.
         await lease.close()
+        return lease.settled?.() !== false
       })
     } catch (error) {
-      if (signal?.aborted === true) throw abortError()
-      throw error
+      const failure = signal?.aborted === true ? abortError() : error
+      // `finishOrCleanup` has a bounded channel barrier; if the server never
+      // confirmed the close, the temp file may have been recreated after the
+      // `rm`. Keep the failure type and name the path for manual cleanup.
+      if (lease.settled?.() === false && failure instanceof Error) {
+        try {
+          failure.message = `${failure.message}; the SFTP channel did not confirm its close, so a temporary file may remain: ${temporary}`
+        } catch {
+          // Frozen errors keep their message.
+        }
+      }
+      throw failure
     } finally {
       void lease.close()
     }
@@ -1958,34 +2009,35 @@ function writeAt(sftp: SftpLike, handle: Buffer, data: Buffer, position: number)
 /**
  * Run `work` until it finishes or `signal` aborts.
  *
- * On failure, `cleanup` runs after `work` has settled or after a short bound.
- * An abort rejects while `work` can still be inside `open`; deleting first
- * lets that open recreate the temporary file with nobody left to remove it.
- * `beforeCleanup` tears down the channel that owns a hung callback, but only
- * once the work proves stuck: a transfer that answers its own abort needs no
- * teardown, and the connection is shared with unrelated channels. The bound
- * keeps a permanently stuck callback from hanging the tool call forever.
+ * On failure, `beforeCleanup` tears down the channel that owns the transfer's
+ * OPEN/WRITE and waits for the server to confirm its close. It runs *always*,
+ * not only when `work` proves stuck: an abort can settle the work promptly
+ * while the server-side sftp-server is still processing an OPEN that was
+ * already on the wire. `cleanup()` (the `rm`) runs on a different exec channel
+ * and must never precede that confirmation. Both steps have their own
+ * `CLEANUP_SETTLE_TIMEOUT_MS` bound, so a dead channel cannot hang the tool
+ * call forever; a hung `work` only gets the short cooperative window first.
  */
 export async function finishOrCleanup<T>(
   work: Promise<T>,
   signal: AbortSignal | undefined,
   cleanup: () => Promise<void>,
-  beforeCleanup?: () => void | Promise<void>,
+  beforeCleanup?: () => void | boolean | Promise<void | boolean>,
 ): Promise<T> {
   try {
     return await raceAbort(work, signal)
   } catch (error) {
-    const cleanupDeadline = Date.now() + CLEANUP_SETTLE_TIMEOUT_MS
-    const remaining = (): number => Math.max(0, cleanupDeadline - Date.now())
-    // Give a signal-aware transfer its short window to answer the abort.
-    // Only a callback still stuck after it costs us the channel, and the rest
-    // of the budget belongs to `cleanup()` so `rm` still runs and is awaited.
-    if (!await settleWithin(work, COOPERATIVE_SETTLE_MS)) {
-      try {
-        await beforeCleanup?.()
-      } catch {
-        // Cleanup must not mask the original failure.
-      }
+    const deadline = Date.now() + CLEANUP_SETTLE_TIMEOUT_MS
+    const remaining = (): number => Math.max(250, deadline - Date.now())
+    // Give a signal-aware transfer its short window to answer the abort before
+    // the channel is ended. A callback still stuck after it is not awaited:
+    // `session.end()` makes the server reject the pending requests.
+    await settleWithin(work, COOPERATIVE_SETTLE_MS)
+    if (beforeCleanup !== undefined) {
+      const confirmed = await settleConfirmed(Promise.resolve().then(beforeCleanup), remaining())
+      // Without the server's channel-close confirmation an `rm` can race a
+      // late OPEN. Skip it and let the caller report the possible temp path.
+      if (!confirmed) throw error
     }
     await settleWithin(cleanup(), remaining())
     throw error
@@ -2102,8 +2154,9 @@ export async function streamChunksToSftp(
       remote = await raceAbort(opening, signal)
     } catch (error) {
       // An abort can win while `open` is still in flight. Wait briefly for the
-      // late handle and close it; the caller's lease close destroys the channel
-      // after the bound, so a late `open` cannot recreate the temp file.
+      // late handle so it can be closed. The barrier against a late `OPEN`
+      // recreating the temp file is the caller's lease close, which waits for
+      // the server's channel close on the full cleanup budget before `rm`.
       if (signal?.aborted === true) {
         await settleWithin(opening.then(value => closeHandle(sftp, value)), COOPERATIVE_SETTLE_MS)
       }
@@ -2142,11 +2195,11 @@ export async function streamChunksToSftp(
     // A hung `close` callback must not hide the transfer result or turn an
     // aborted transfer into an unbounded cleanup. The signal race returns
     // immediately on abort; the bound covers a dead channel with no signal.
-    if (remote !== undefined) await settleWithin(raceAbort(closeHandle(sftp, remote), signal))
+    if (remote !== undefined) await settleWithin(raceAbort(closeHandle(sftp, remote), signal), COOPERATIVE_SETTLE_MS)
     // Reaching the end already closed the source. Anything else — a ceiling,
     // an abort, a failed write — has to close it from here.
     if (!finished && typeof iterator.return === 'function') {
-      await settleWithin(raceAbort(Promise.resolve().then(() => iterator.return!()), signal))
+      await settleWithin(raceAbort(Promise.resolve().then(() => iterator.return!()), signal), COOPERATIVE_SETTLE_MS)
     }
   }
 }

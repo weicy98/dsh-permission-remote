@@ -69,6 +69,13 @@ export const PROBE_GUIDES = [
     where: 'src/remote-world.ts installRemoteWorld() subprocess.spawn patch',
     next: 'npm run test:ptc',
   },
+  {
+    id: 'module-hooks-vm-flag',
+    match: 'bootstrapArgs no longer passes --experimental-vm-modules for the vm-modules worker',
+    meaning: 'The rc.2 worker imports node:module registerHooks for ESM imports. Its node-script bootstrapArgs must still pass --experimental-vm-modules, and the remote Node must be >= 22.15 (that named export was added in 22.15 / 23.5). The shim launches the official argv with only the worker path swapped.',
+    where: 'src/upstream-worker.ts probeContract() moduleHooksRequired()/nodeScriptVmModules and src/ptc-shim.mjs spawnWorker()',
+    next: 'npm run check:upstream -- --explain',
+  },
 ]
 
 /**
@@ -173,6 +180,149 @@ export const SANDBOX_PROFILE_GUIDES = [
   },
 ]
 
+/**
+ * Terminal seam probes. `src/upstream-terminal.ts` owns these; the regression
+ * test in `tests/upstream-map.spec.ts` reads its `failures.push(...)` literals,
+ * so adding or rewording one without a row here fails the test.
+ *
+ * @type {readonly Guide[]}
+ */
+export const TERMINAL_GUIDES = [
+  {
+    id: 'terminal-spawn-missing',
+    match: 'dsh-api-terminal-controller: `async spawn(...)` not found',
+    meaning: 'The controller no longer declares an async spawn(). The sidebar and model terminal wrappers bind to it.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/sidebar-terminal.ts installSidebarBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-spawn-arity',
+    match: 'dsh-api-terminal-controller: TerminalController.spawn has',
+    meaning: 'rc.1 takes 4 parameters and rc.2 takes 5 (agent, owner, id, prepare, signal). A wrapper with any other arity drops or misreads the signal.',
+    where: 'src/sidebar-terminal.ts installSidebarBridge() variadic spawn wrapper',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-create-arity',
+    match: 'dsh-api-terminal-controller: TerminalController.create has',
+    meaning: 'The create() wrapper forwards three arguments and supplies a default signal when the RPC omits it.',
+    where: 'src/sidebar-terminal.ts installSidebarBridge() create wrapper',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-shells-arity',
+    match: 'dsh-api-terminal-controller: TerminalController.shells has',
+    meaning: 'The shells() wrapper forwards two arguments and supplies a default signal when the RPC omits it.',
+    where: 'src/sidebar-terminal.ts installSidebarBridge() shells wrapper',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-open-for-agent',
+    match: 'dsh-api-terminal-controller: openForAgent -> allocate -> this.spawn path is broken',
+    meaning: 'rc.2 added openForAgent. It must reach allocate(), and allocate() must call this.spawn, so the wrapped spawn (and its readiness guard) covers agent terminals.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/sidebar-terminal.ts installSidebarBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-controller-session-id',
+    match: 'dsh-api-terminal-controller: spawnTerminal receives DSH_SESSION_ID from agent.id at',
+    meaning: 'Sidebar authorization reads spec.env.DSH_SESSION_ID. The controller is its producer; dsh-terminal-bash sets the same variable for a different backend and cannot stand in.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/sidebar-terminal.ts installTerminalSpawnBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-controller-spawn-call',
+    match: 'dsh-api-terminal-controller: no longer calls subprocess.spawnTerminal',
+    meaning: 'The controller must reach subprocess.spawnTerminal; that is the method the plugin wraps to route remote PTYs.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/sidebar-terminal.ts installTerminalSpawnBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-bash-session-id',
+    match: 'dsh-terminal-bash: childEnvironment no longer sets DSH_SESSION_ID from spec.owner.id',
+    meaning: 'The dumb/model terminal backend needs its own session identity in childEnvironment.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-bash-missing',
+    match: 'dsh-terminal-bash: not installed in a DSH build that ships the terminal controller',
+    meaning: 'A full DSH install always ships this package. A missing file must fail, not silently skip.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run check:upstream -- --explain',
+  },
+  {
+    id: 'terminal-runtime-method',
+    match: 'dsh-subprocess-local: `async spawnTerminal(spec) {` not found',
+    meaning: 'The real runtime method lives here. `dsh-subprocess/lib/index.js` only has a {@link} comment, so a substring probe on that file stays green after a rename or removal.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/sidebar-terminal.ts installTerminalSpawnBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-runtime-missing',
+    match: 'dsh-subprocess-local: not installed in a DSH build that ships the terminal controller',
+    meaning: 'A full DSH install always ships the local subprocess provider. A missing file must fail, not silently skip.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run check:upstream -- --explain',
+  },
+  {
+    id: 'terminal-runtime-arity',
+    match: 'dsh-subprocess-local: spawnTerminal has',
+    meaning: 'The bridge calls spawnTerminal with one spec. A different arity means the wrapped signature no longer matches.',
+    where: 'src/sidebar-terminal.ts installTerminalSpawnBridge()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-subprocess-missing',
+    match: 'dsh-subprocess: not installed in a DSH build that ships the terminal controller',
+    meaning: 'A full DSH install always ships the abstract subprocess package; a missing file must fail, not silently report rc.1-style n/a.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run check:upstream -- --explain',
+  },
+  {
+    id: 'terminal-subprocess-catalogue',
+    match: 'dsh-subprocess: SUBPROCESS_ERROR_CODES catalogue not found; rc.2+ needs stable subprocess error codes',
+    meaning: 'rc.2 and later expose a stable SUBPROCESS_* error catalogue. Dropping it forces message-text classification.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-version',
+    match: 'is not in the verified terminal contract list',
+    meaning: 'This DSH version has not been smoke-tested against the terminal wrappers. Add it only after the smoke suite passes.',
+    where: 'src/upstream-terminal.ts VERIFIED_TERMINAL_DSH_VERSIONS',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-runtime-environment',
+    match: 'dsh-subprocess-local: `async terminalEnvironment(signal)` not found',
+    meaning: 'rc.2 calls this pre-existing API twice per agent terminal (default shell and HISTFILE). The plugin overrides it with the remote route, so removing it would fall back to this computer\'s $SHELL.',
+    where: 'src/upstream-terminal.ts probeTerminalContract() and src/remote-world.ts installRemoteWorld()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'terminal-core-missing',
+    match: 'dsh-terminal: not installed in a DSH build that ships the terminal controller',
+    meaning: 'A full DSH install always ships the terminal base service. A missing file must fail, not silently skip.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run check:upstream -- --explain',
+  },
+  {
+    id: 'terminal-error-codes',
+    match: 'dsh-terminal: TerminalError no longer carries a stable code',
+    meaning: 'rc.1 and rc.2 both expose TerminalError.code. Losing it forces message-text classification, which breaks whenever upstream rewords an error.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run smoke:terminal',
+  },
+  {
+    id: 'subprocess-error-codes',
+    match: 'dsh-subprocess: SubprocessError no longer carries SUBPROCESS_* codes',
+    meaning: 'rc.2 introduced SUBPROCESS_ERROR_CODES and a coded SubprocessError. The catalogue without the class (or vice versa) means stable error routing is gone.',
+    where: 'src/upstream-terminal.ts probeTerminalContract()',
+    next: 'npm run smoke:terminal',
+  },
+]
+
 /** Non-probe failures the upgrade path must also explain. */
 export const CHANNEL_GUIDES = [
   {
@@ -210,7 +360,7 @@ export const CHANNEL_GUIDES = [
  */
 export function guideFor(message) {
   const text = String(message)
-  const all = [...PROBE_GUIDES, ...SANDBOX_PROFILE_GUIDES, ...CHANNEL_GUIDES]
+  const all = [...PROBE_GUIDES, ...SANDBOX_PROFILE_GUIDES, ...CHANNEL_GUIDES, ...TERMINAL_GUIDES]
   return all.find(guide => text.includes(guide.match))
 }
 

@@ -144,14 +144,14 @@ DSH 的 `present` 只认本机文件：它逐个 `lstat` / `resolve` / `stat` �
 - **路径怎么定。** 远端绝对路径直接用；`~` / `~/` 用**那一端主机自己**的 `$HOME` 展开（源、目标各查各的）；源端相对路径锚在会话的远端目录上，但 `target_path` 没有可锚定的 base，相对路径会被拒绝，请用绝对路径或 `~/`。目标端也可以传占位路径，但必须属于 `target_host`，否则报错。
 - **两道闸门不同。** 源端按读放行，和 `ssh_read` 一致：`deny` 和未信任直接拒绝，不额外审批。目标端按写，和 `ssh_write` / `ssh_upload` 一致：`ask` 主机需要 `danger-full-access` 或一次审批，卡面同时写明两端（`copy A:src to B:dst`）。因此「目标 trust + 源 ask」这种组合可以在不弹 A 的审批的情况下把 A 的文件搬走——这是刻意的选择，和读取工具保持同一套策略，不是遗漏。
 - **拒绝清单。** 源端必须是普通文件（`lstat`，符号链接 / 目录 / FIFO / 设备一律拒绝，文件大小先对上限预检）；目标端不允许是目录或符号链接；两端任一端是 `/`、或同一台主机上源和目标是同一个规范化路径，都在读字节之前拒绝。
-- **失败清理。** 每次上传/复制都用**本次传输自己的 SFTP 通道**（`openSftpLease`），不与 `ssh_read`、文件树、PTC 文件操作共用。目标端先写同目录临时文件，成功后 `mv -f` 替换并保留原权限位。失败或超时时先等这次传输在 250 毫秒内响应中止；**只有仍在卡住时**才关闭这条传输通道（不断开 SSH 连接），关闭完成后再删目标端临时文件——`rm` 不带已中止的 signal，否则清理通道会先被关掉。这样迟到的 SFTP `OPEN` 不可能在 `rm` 之后重建临时文件。`ssh_upload`/`ssh_copy`/`ssh_download`/对话上传共用同一套 lease 收尾；正常响应了中止的传输不需要任何拆除。
-- **连接占用。** 跨主机复制同时持有源、目标各一条连接，因此要求连接池 `maxConnections`（默认 4，目前只在插件配置里可改，设置页没有这一项）至少为 2；连接池满了会排队；配置了超时的话，那个调用会按自己的超时先返回，排队位置留给下一个调用者，不会波及同主机上已经建立的连接；超时填 `0` 时只能等连接释放或手动取消。两台主机可以是同一台（按普通复制处理），那样只占一条。
+- **失败清理。** 每次上传/复制都用**本次传输自己的 SFTP 通道**（`openSftpLease`），不与 `ssh_read`、文件树、PTC 文件操作共用。目标端先写同目录临时文件，成功后 `mv -f` 替换并保留原权限位。`close()` 在 `session.end()` 之后用完整的 5 秒清理预算等**服务端确认这条通道关闭**（`session.closed`）——250 毫秒比广域网往返短，关掉本地通道不等于服务器已经处理完排在前面的 `OPEN`。只有拿到这个确认，才在另一条 exec 通道上跑 `rm -f`；`rm` 不带已中止的 signal，否则清理通道会先被关掉。这样迟到的 SFTP `OPEN` 不可能在 `rm` 之后重建临时文件。`ssh_upload`/`ssh_copy`/`ssh_download`/对话上传共用同一套 lease 收尾；通道始终没确认关闭时，错误里会带上临时文件路径，提示可能有残留，且不会去 `mv` 发布一个可能不完整的文件。
+- **连接占用。** 跨主机复制同时持有源、目标各一条连接，因此要求连接池 `maxConnections`（默认 4，目前只在插件配置里可改，设置页没有这一项）至少为 2。一条槽只在连接关闭时归还，而复制期间第一条连接不可能关闭，所以 `ssh_copy` 先按「源/目标是否已在池里」算出还需要几条新连接，空闲槽不够就在审批之前直接报「连接槽不足」，目标腿连之前再查一次，避免第二台主机在 `reserve()` 里排队到超时（超时填 `0` 时更是永远不返回）。其它调用仍按原来的方式排队：配置了超时的话，那个调用会按自己的超时先返回，排队位置留给下一个调用者，不会波及同主机上已经建立的连接；超时填 `0` 时只能等连接释放或手动取消。两台主机可以是同一台（按普通复制处理），那样只占一条。
 
 ## 远端 run_code（PTC）
 
 远端 `run_code` / `workflow` 使用宿主同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` 的 `process.js`。插件只做四件事：定位/校验上游 worker、按 hash 上传、用 SSH 转发的 fd 7 socket 提供控制通道、把 `sandbox.confine` / `subprocess.spawn` 适配到远端。帧协议、程序运行、超时/输出上限、错误分类和工具回桥全部由官方 runtime 负责。
 
-- 远端需要 Node.js 22+；worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
+- 远端需要 Node.js 22+；DSH 0.2.2-rc.2 的 worker 引入 `node:module` 的 `registerHooks`（该 API 自 22.15 / 23.5 才有），因此配 rc.2 的宿主要求远端 **22.15+（23.0–23.4 不含该 API，23.5+ 或 24+ 也可）**。下限不写死在版本标签上，而是从即将上传的 `process.js` 字节推导并记进 manifest 的 `minimumNodeMinor`；`ensureWorker` 在上传前拒绝过旧的远端 Node，并提示升级后重新探测。worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
 - `process.env` 为空；`cwd`/相对路径在远端。支持 per-call function-body、persistent-in-memory REPL 和 vm-script（scriptPersistence）；保留状态按 state owner 留在远端进程，沙箱模式变化时由官方 runtime invalidate。
 - 上游契约、manifest 与升级 runbook 见 [upstream-ptc-worker.md](upstream-ptc-worker.md)。
 - 如果远端 sshd 禁用 streamlocal，会尝试 loopback TCP；两者都不可用时明确失败，不静默回退本机。

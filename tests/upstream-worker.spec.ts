@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -10,11 +10,13 @@ import {
   ptcShimSource,
   clearWorkerCache,
   ensureWorker,
+  nodeSupportsWorker,
   readWorkerManifest,
   writeOverlayManifest,
 } from '../src/upstream-worker.ts'
+import { PTC_MIN_NODE_MODULE_HOOKS_MINOR } from '../src/probe.ts'
 
-async function fixture(): Promise<string> {
+async function fixture(options: { moduleHooks?: boolean, vmModules?: boolean, vmModulesFlag?: boolean } = {}): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'dsh-ptc-upstream-'))
   await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.0.0-fixture' }))
   const runtime = join(root, 'node_modules', '@deepseek-ai', 'dsh-ptc-runtime-node')
@@ -25,6 +27,8 @@ async function fixture(): Promise<string> {
   await writeFile(join(subprocess, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-subprocess', version: '0.0.0-fixture' }))
   await writeFile(join(runtime, 'lib', 'process.js'), [
     'import { Socket } from "node:net";',
+    ...options.moduleHooks === true ? ['import { registerHooks, syncBuiltinESMExports } from "node:module";'] : [],
+    ...options.vmModules === true ? ['const SourceModule = vm.SourceTextModule;'] : [],
     'const SUBPROCESS_CONTROL_ENV = "DSH_SUBPROCESS_CONTROL";',
     'const channel = new Socket({ fd: 7, readable: true, writable: true });',
     'function openInheritedControlChannel() { return channel }',
@@ -33,6 +37,9 @@ async function fixture(): Promise<string> {
   ].join('\n'))
   await writeFile(join(runtime, 'lib', 'index.js'), [
     'const result = fs.processPathFromHostPath(path);',
+    ...options.vmModulesFlag === true
+      ? ['function bootstrapArgs(kind) { switch (kind) { case "node-script": return ["--experimental-vm-modules", "x"]; default: return []; } }']
+      : [],
     'return [mapped(fileURLToPath(new URL("./process.js", import.meta.url))), String(maxMessageBytes)];',
     'const handle = this.ctx.subprocess.spawn({ stdio: { control: "pipe" } });',
   ].join('\n'))
@@ -188,6 +195,121 @@ test('unrecorded bytes name the installed-host command and never --update', asyn
   }
 })
 
+
+test('the rc.2 module-hooks worker raises the Node minor floor from its own bytes', async () => {
+  const root = await fixture({ moduleHooks: true, vmModules: true, vmModulesFlag: true })
+  try {
+    const worker = locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true })
+    const probes = probeContract(worker)
+    assert.equal(probes.requiresModuleHooks, true)
+    assert.equal(probes.nodeScriptVmModules, true)
+    assert.equal(probes.minimumNodeMinor, PTC_MIN_NODE_MODULE_HOOKS_MINOR)
+    assert.equal(worker.minimumNodeMinor, PTC_MIN_NODE_MODULE_HOOKS_MINOR)
+    assert.equal(manifestEntryFor(worker).minimumNodeMinor, PTC_MIN_NODE_MODULE_HOOKS_MINOR)
+    assert.deepEqual(probes.failures, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a module-hooks worker without the vm-modules bootstrap flag fails the probe', async () => {
+  const root = await fixture({ moduleHooks: true, vmModules: true })
+  try {
+    assert.throws(
+      () => locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true }),
+      /--experimental-vm-modules/u,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a NODE_OPTIONS mention alone does not satisfy the vm-modules bootstrap probe', async () => {
+  // The shim resets the environment to PATH/TEMP/TMP, so the flag must be in
+  // the bootstrap argv; a stray NODE_OPTIONS assignment elsewhere is not enough.
+  const root = await fixture({ moduleHooks: true, vmModules: true })
+  try {
+    const indexPath = join(root, 'node_modules', '@deepseek-ai', 'dsh-ptc-runtime-node', 'lib', 'index.js')
+    await writeFile(indexPath, `${await readFile(indexPath, 'utf8')}\nconst env = { NODE_OPTIONS: "--experimental-vm-modules" };\n`)
+    assert.throws(
+      () => locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true }),
+      /--experimental-vm-modules/u,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an rc.1-style worker keeps the Node 22 floor', async () => {
+  const root = await fixture()
+  try {
+    const worker = locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true })
+    assert.equal(probeContract(worker).requiresModuleHooks, false)
+    assert.equal(probeContract(worker).minimumNodeMinor, 0)
+    assert.equal(manifestEntryFor(worker).minimumNodeMinor, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('nodeSupportsWorker accepts 22.15+ and newer majors, refuses 22.14 and 21', () => {
+  const floor = PTC_MIN_NODE_MODULE_HOOKS_MINOR
+  assert.equal(nodeSupportsWorker({ version: '22.15.0', major: 22, minor: 15 }, floor), true)
+  assert.equal(nodeSupportsWorker({ version: '22.20.0', major: 22, minor: 20 }, floor), true)
+  assert.equal(nodeSupportsWorker({ version: '23.5.0', major: 23, minor: 5 }, floor), true)
+  assert.equal(nodeSupportsWorker({ version: '23.4.0', major: 23, minor: 4 }, floor), false)
+  assert.equal(nodeSupportsWorker({ version: '24.1.0', major: 24, minor: 1 }, floor), true)
+  assert.equal(nodeSupportsWorker({ version: '22.14.0', major: 22, minor: 14 }, floor), false)
+  assert.equal(nodeSupportsWorker({ version: '21.7.0', major: 21, minor: 7 }, floor), false)
+  // A probe that only reported the major cannot prove the rc.2 API exists.
+  assert.equal(nodeSupportsWorker({ version: '22', major: 22 }, floor), false)
+  assert.equal(nodeSupportsWorker({ version: '23', major: 23 }, floor), false)
+  assert.equal(nodeSupportsWorker({ version: '22.0.0', major: 22, minor: 0 }, 0), true)
+  assert.equal(nodeSupportsWorker({ version: '23.0.0', major: 23, minor: 0 }, 0), true)
+})
+
+test('ensureWorker refuses a remote Node older than the uploaded worker needs', async () => {
+  const root = await fixture({ moduleHooks: true, vmModules: true, vmModulesFlag: true })
+  const previous = process.env.DSH_INSTALL_ROOT
+  process.env.DSH_INSTALL_ROOT = root
+  clearWorkerCache()
+  try {
+    await assert.rejects(
+      () => ensureWorker({} as never, { id: 'h1', host: '10.0.0.1' } as never, {}, '/home/dev', undefined, {
+        allowUnverified: true,
+        remoteNode: { version: '22.14.0', major: 22, minor: 14 },
+      }),
+      /requires Node\.js 22\.15 or newer/u,
+    )
+  } finally {
+    clearWorkerCache()
+    if (previous === undefined) delete process.env.DSH_INSTALL_ROOT
+    else process.env.DSH_INSTALL_ROOT = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an rc.2 overlay written before minimumNodeMinor existed still matches', async () => {
+  const root = await fixture({ moduleHooks: true, vmModules: true, vmModulesFlag: true })
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-legacy-overlay-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const worker = locateUpstreamWorker({ DSH_INSTALL_ROOT: root }, { allowUnverified: true })
+    const entry = { ...manifestEntryFor(worker) } as Record<string, unknown>
+    delete entry.minimumNodeMinor
+    writeOverlayManifest({ contractVersion: 1, verified: [entry as never] })
+    // Without allowUnverified the manifest must accept the legacy entry by
+    // worker bytes; its missing floor is unrecorded, not proof of rc.1.
+    const located = locateUpstreamWorker({ DSH_INSTALL_ROOT: root })
+    assert.equal(located.dshVersion, '0.0.0-fixture')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(root, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
+  }
+})
 
 test('a DSH root without the runtime package does not fall back to the plugin dev dependency', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-ptc-empty-'))

@@ -19,7 +19,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import { assertSandboxProfilesLoad } from '../src/profile-contract.ts'
-import { clearOverlayManifest, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, readOverlayManifest, readWorkerManifest, writeOverlayManifest } from '../src/upstream-worker.ts'
+import { clearOverlayManifest, locateUpstreamWorker, manifestEntryFor, overlayManifestPath, readOverlayManifest, readWorkerManifest, sameWorkerContract, writeOverlayManifest } from '../src/upstream-worker.ts'
 import { applyDshRoot, exitAfterFlush, isEntryPoint, isInstalledPackage, probeFailures, renderFailureGuide, UPGRADE_FLAGS, unknownFlagLines, unknownFlags, withDshRoot } from './cli-common.mjs'
 
 export { isInstalledPackage }
@@ -313,8 +313,7 @@ function runGate(options, env) {
     return { code: 0, entry }
   }
   const existing = readOverlayManifest(env)
-  const verified = existing.verified.filter(item => !(item.dshVersion === entry.dshVersion
-    && item.ptcRuntimeNodeVersion === entry.ptcRuntimeNodeVersion))
+  const verified = existing.verified.filter(item => !sameWorkerContract(item, entry))
   verified.push(entry)
   let wrote
   try {

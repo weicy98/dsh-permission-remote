@@ -16,6 +16,7 @@ import { PassThrough, type Readable } from 'node:stream'
 import { symbols } from '@deepseek-ai/cordis'
 import type { HostConfig } from './config.ts'
 import { routeByCwd, type RemoteRoute } from './router.ts'
+import { rememberTerminalHistory, runRemoteTerminal } from './terminal-remote-state.ts'
 import { shJoin, shQuote } from './shell-quote.ts'
 import type { ExecResult, OpenPty, PtyChannel, PtyRequest, SecretMaterial } from './ssh-pool.ts'
 import { hostTag } from './workspaces.ts'
@@ -107,6 +108,31 @@ function environmentPrefix(env: Readonly<Record<string, string>> | undefined): s
     return `${key}=${shQuote(value)}`
   })
   return assignments.length > 0 ? `env ${assignments.join(' ')} ` : ''
+}
+
+/**
+ * Point a confined bwrap terminal argv at the directory the command will
+ * `cd` into.
+ *
+ * The generic `sandbox.confine` branch only knows `policy.workspaceRoot`, which
+ * is the Session workspace root — not `terminal_open`'s requested subdirectory.
+ * It therefore leaves `--chdir` out. Bubblewrap without `--chdir` silently
+ * starts in `$HOME` (or `/`) when the inherited cwd is shadowed by
+ * `--tmpfs /tmp` and not bound back, so the terminal path adds the real cwd
+ * here, after routing, where it is known.
+ *
+ * `seatbelt` keeps its external `cd` (it inherits the calling directory); a
+ * `danger-full-access` argv is a bare shell and is left untouched.
+ */
+export function confineTerminalCwd(argv: readonly string[], remoteCwd: string): readonly string[] {
+  if (argv[0] !== 'bwrap') return argv
+  const separator = argv.indexOf('--')
+  if (separator < 0) return argv
+  const at = argv.lastIndexOf('--chdir', separator)
+  const out = [...argv]
+  if (at >= 0 && at + 1 < separator) out[at + 1] = remoteCwd
+  else out.splice(separator, 0, '--chdir', remoteCwd)
+  return out
 }
 
 /**
@@ -483,9 +509,19 @@ export function installSidebarBridge(ctx: BridgeContext, core: SidebarCore, term
     // and `openForAgent`, so the readiness guard lives here.
     terminal.spawn = async (...args: unknown[]) => {
       const agent = args[0] as { session?: object }
-      requireRemoteTerminalReady(sessionRoute(directories, agent))
+      const route = sessionRoute(directories, agent)
+      requireRemoteTerminalReady(route)
       await materializeRemotePlaceholder(directories, agent)
-      return (originalSessionSpawn as (...all: unknown[]) => Promise<unknown>)(...args)
+      if (route === undefined) return (originalSessionSpawn as (...all: unknown[]) => Promise<unknown>)(...args)
+      // rc.2's `prepare()` runs inside this call, and it consults
+      // `subprocess.terminalEnvironment()` without a cwd. Run the allocation in
+      // an async scope so only calls made by it see the remote route; a
+      // concurrent local session keeps its own default shell.
+      const id = typeof args[2] === 'string'
+        ? args[2]
+        : (args[2] as { id?: unknown } | undefined)?.id
+      if (typeof id === 'string') rememberTerminalHistory(id, route)
+      return runRemoteTerminal(route, () => (originalSessionSpawn as (...all: unknown[]) => Promise<unknown>)(...args))
     }
   }
   return () => {
@@ -514,7 +550,16 @@ export function installTerminalSpawnBridge(ctx: BridgeContext, core: TerminalSpa
     ctx.logger?.warn('[@dsh-permission-remote] terminal spawn bridge already installed')
     return undefined
   }
-  const originalSpawn = subprocess.spawnTerminal.bind(subprocess)
+  // `spawnTerminal` is a prototype method on dsh-subprocess-local, not an own
+  // property. A DSH build that renamed or removed it must fail here with an
+  // actionable message instead of a TypeError on `.bind` (or, worse, silently
+  // leaving the official tool to open a local PTY). `check:upstream` probes the
+  // same shape; this is the runtime backstop for an already-installed plugin.
+  const runtimeSpawn = subprocess.spawnTerminal
+  if (typeof runtimeSpawn !== 'function') {
+    throw new Error('[@dsh-permission-remote] the installed DSH subprocess service has no spawnTerminal(); run `npm run check:upstream` against this DSH install')
+  }
+  const originalSpawn = runtimeSpawn.bind(subprocess)
   subprocess.spawnTerminal = async spec => {
     const route = routeByCwd(spec.cwd)
     if (route.kind !== 'remote') return originalSpawn(spec)
@@ -648,7 +693,7 @@ async function openRemoteTerminal(core: TerminalSpawnCore, route: RemoteRoute, s
   if (spec.argv.length === 0) throw new Error('sidebar terminal is missing a shell')
   const host = core.requireHost(route.hostId)
   const opened = await core.pool.openPty(host, await core.secret(host), {
-    command: sidebarCommand(route.remoteCwd, spec.argv, spec.env),
+    command: sidebarCommand(route.remoteCwd, confineTerminalCwd(spec.argv, route.remoteCwd), spec.env),
     term: spec.terminalType,
     cols: spec.cols,
     rows: spec.rows,
@@ -666,7 +711,7 @@ async function openModelTerminal(core: TerminalSpawnCore, route: RemoteRoute, sp
   const host = core.requireHost(route.hostId)
   const secret = await core.secret(host)
   const opened = await core.pool.openPty(host, secret, {
-    command: modelTerminalCommand(route.remoteCwd, spec.argv, spec.env, id),
+    command: modelTerminalCommand(route.remoteCwd, confineTerminalCwd(spec.argv, route.remoteCwd), spec.env, id),
     term: spec.terminalType,
     cols: spec.cols,
     rows: spec.rows,

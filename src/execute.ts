@@ -49,7 +49,7 @@ const require = createRequire(import.meta.url)
 const READ_CAP = 1024 * 1024
 
 export type RemoteNodeStatus =
-  | { readonly available: true, readonly path: string, readonly version: string, readonly major: number }
+  | { readonly available: true, readonly path: string, readonly version: string, readonly major: number, readonly minor?: number }
   | { readonly available: false, readonly reason: 'missing' | 'old', readonly version?: string }
 
 export interface RunnerStatus {
@@ -202,7 +202,7 @@ export async function probeNode(pool: SshPool, host: HostConfig, secret: SecretM
   const parsed = parseNodeProbe(probed.stdout)
   if (parsed === null) return { available: false, reason: 'missing' }
   if (parsed.major < PTC_MIN_NODE_MAJOR) return { available: false, reason: 'old', version: parsed.version }
-  return { available: true, path: parsed.path, version: parsed.version, major: parsed.major }
+  return { available: true, path: parsed.path, version: parsed.version, major: parsed.major, minor: parsed.minor }
 }
 
 export async function installBubblewrap(pool: SshPool, host: HostConfig, secret: SecretMaterial, status: RunnerStatus): Promise<ExecResult> {

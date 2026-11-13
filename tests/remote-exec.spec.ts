@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import type { RunnerStatus } from '../src/execute.ts'
-import { installRemoteWorld } from '../src/remote-world.ts'
+import { installRemoteWorld, peekSpillDirectory } from '../src/remote-world.ts'
 import { LocalTransport } from './helpers/local-ptc.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 
@@ -91,7 +91,10 @@ test('generic remote spawn collects stdout/stderr and maps the remote cwd', asyn
 })
 
 test('small collected output does not create a local spill directory', async () => {
-  const before = new Set(await readdir(tmpdir()))
+  // A readdir snapshot of os.tmpdir() is shared with every spec file node --test
+  // runs in parallel, so another process's spill directory would look like a
+  // false positive. The spill directory is process-wide: observe it directly.
+  assert.equal(peekSpillDirectory(), undefined, 'an earlier test already created the shared spill directory')
   const h = await harness()
   try {
     const handle = h.spawn(spec(h.placeholder, {
@@ -102,9 +105,7 @@ test('small collected output does not create a local spill directory', async () 
       },
     }))
     await handle.done
-    const after = await readdir(tmpdir())
-    const created = after.filter(name => name.startsWith('dsh-remote-spill-') && !before.has(name))
-    assert.deepEqual(created, [])
+    assert.equal(peekSpillDirectory(), undefined, 'small output must not spill to disk')
   } finally {
     await h.close()
   }

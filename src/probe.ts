@@ -23,6 +23,17 @@ export function probeOutcome(exitCode: number | null, timedOut: boolean, stderr 
 /** PTC worker minimum: process.js uses Promise.withResolvers (Node 22+). */
 export const PTC_MIN_NODE_MAJOR = 22
 
+/**
+ * DSH 0.2.2-rc.2's worker imports `registerHooks` from `node:module` for ESM
+ * import support. That named export only exists from Node 22.15 / 23.5, and an
+ * ESM link error would stop the worker before any control frame is exchanged.
+ * The requirement is derived from the worker bytes, not the DSH version label.
+ */
+export const PTC_MIN_NODE_MODULE_HOOKS_MINOR = 15
+
+/** The same API landed in Node 23.5; Node 23.0-23.4 still lack it. */
+export const PTC_MIN_NODE_MODULE_HOOKS_MINOR_NEXT = 5
+
 /** Markers keep a login-shell banner out of the node lookup. */
 export const NODE_LOOKUP_BEGIN = '__DSH_NODE_BEGIN__'
 export const NODE_LOOKUP_END = '__DSH_NODE_END__'
@@ -31,6 +42,7 @@ export interface RemoteNode {
   readonly path: string
   readonly version: string
   readonly major: number
+  readonly minor: number
 }
 
 /**
@@ -77,10 +89,12 @@ export function parseNodeProbe(stdout: string): RemoteNode | null {
   const versionIndex = lines.findLastIndex(line => /^\d+\.\d+\.\d+/.test(line))
   if (versionIndex < 1) return null
   const version = lines[versionIndex] ?? ''
-  const major = Number(version.split('.')[0])
+  const [majorText = '', minorText = ''] = version.split('.')
+  const major = Number(majorText)
+  const minor = Number(minorText)
   const nodePath = lines.slice(0, versionIndex).reverse().find(line => posix.isAbsolute(line) && !/\s/.test(line))
-  if (nodePath === undefined || !Number.isInteger(major)) return null
-  return { path: nodePath, version, major }
+  if (nodePath === undefined || !Number.isInteger(major) || !Number.isInteger(minor)) return null
+  return { path: nodePath, version, major, minor }
 }
 
 /**

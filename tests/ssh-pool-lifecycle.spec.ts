@@ -369,6 +369,42 @@ test('closing a transfer lease leaves the shared connection and other SFTP work 
   })
 })
 
+test('closing a transfer lease waits past the cooperative window for the server channel close', async () => {
+  // A WAN round trip is longer than COOPERATIVE_SETTLE_MS (250ms). Ending the
+  // channel is not the same as the server confirming its close: `rm` on a
+  // separate exec channel must not run before that confirmation.
+  let confirmClose: () => void = () => undefined
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('sftp', function (this: Client, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, sftp: unknown) => void
+      const api = Object.assign(new EventEmitter(), {
+        end: () => { confirmClose = () => api.emit('end') },
+      })
+      process.nextTick(() => {
+        api.emit('ready')
+        callback(undefined, api)
+      })
+      return this
+    } as unknown as Client['sftp'], async () => {
+      const pool = new SshPool(2)
+      const lease = await pool.openSftpLease(host, {})
+      assert.equal(lease.settled?.(), false)
+      const closing = lease.close()
+      // `session.end()` has already installed the confirmation callback.
+      setTimeout(() => confirmClose(), 400)
+      const started = Date.now()
+      await closing
+      const elapsed = Date.now() - started
+      assert.ok(elapsed >= 300, `close returned after ${elapsed}ms; it must wait for the server's channel close, not 250ms`)
+      assert.equal(lease.settled?.(), true)
+      await pool.dispose()
+    })
+  })
+})
+
 test('a caller that aborts while queued never opens a connection', async () => {
   // Removing `reserve(signal)` must not make an abandoned queued call open and
   // cache a connection that then holds the only slot.
