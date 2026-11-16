@@ -78,6 +78,8 @@ interface TransferApi {
   attrs: Array<{ path: string, follow: boolean }>
   writes: Array<{ path: string, bytes: number }>
   modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]>
+  /** One-shot large-transfer approval requests. */
+  approvals: Array<{ toolName: string, detail: ApprovalDetail }>
   /** Hosts whose whole connection was dropped. A shared connection must not be. */
   invalidated: string[]
   /** Hosts whose SFTP channel alone was closed, which is what a stuck transfer needs. */
@@ -106,6 +108,10 @@ function api(options: {
   freeSlots?: number
   /** When false, the lease reports that the server never confirmed its channel close. */
   leaseSettled?: boolean
+  /** One-shot approval for a transfer over the byte ceiling. */
+  approveTransfer?: (toolName: string, detail: ApprovalDetail) => boolean
+  /** Explicit approval outcome, for cancellation/unavailable cases. */
+  approvalOutcome?: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 } = {}): TransferApi {
   // The home probe is cached per host id across tests; every fixture starts
   // from an unknown `$HOME`, so a hang override is actually exercised.
@@ -119,6 +125,7 @@ function api(options: {
   const modes: Array<[string | undefined, string | undefined, ApprovalDetail | undefined]> = []
   const invalidated: string[] = []
   const sftpClosed: string[] = []
+  const approvals: Array<{ toolName: string, detail: ApprovalDetail }> = []
 
   const pool = {
     exec: async (
@@ -255,6 +262,11 @@ function api(options: {
       hostOf: id => (options.hosts ?? [host()]).find(item => item.id === id),
       secretOf: async () => ({}),
       statusOf: async () => status,
+      requestTransferApproval: async (_exec, toolName, _subject, detail) => {
+        approvals.push({ toolName, detail })
+        if (options.approvalOutcome !== undefined) return options.approvalOutcome
+        return options.approveTransfer?.(toolName, detail) ? 'allowed-once' : 'rejected'
+      },
       resolveMode: async (_exec, requested, justification, _tool, _subject, detail) => {
         modes.push([requested, justification, detail])
         if (requested === 'danger-full-access' && justification !== undefined) return 'danger-full-access'
@@ -268,6 +280,7 @@ function api(options: {
     attrs,
     writes,
     modes,
+    approvals,
     invalidated,
     sftpClosed,
   }
@@ -679,7 +692,8 @@ test('the configured timeout reaches the remote write, and zero installs no dead
     assert.equal(upload.execs[0]?.timeoutMs, 4321)
     const unlimited = api()
     await runSshUpload(unlimited.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, NO_TRANSFER_LIMITS)
-    assert.equal(unlimited.execs[0]?.timeoutMs, 0)
+    // Control commands keep a fixed 30 s guard even when the data deadline is disabled.
+    assert.equal(unlimited.execs[0]?.timeoutMs, 30_000)
   } finally {
     await rm(local, { recursive: true, force: true })
   }
@@ -864,19 +878,19 @@ test('the 0-byte, exact-ceiling, and over-ceiling boundaries hold', async () => 
     for (const size of [0, cap, cap + 1]) {
       const source = join(local, `u-${size}.bin`)
       await writeFile(source, Buffer.alloc(size, 0x61))
-      const upload = api()
+      const upload = api({ approveTransfer: () => false })
       const run = runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/x' }, {}, { maxBytes: cap, timeoutMs: 0 })
       if (size > cap) {
-        await assert.rejects(run, /over the 4 byte transfer ceiling/)
+        await assert.rejects(run, /one-time approval was not granted/)
       } else {
         assert.equal((await run).bytes, size)
       }
 
-      const download = api({ attrs: () => ({ type: 'file', size }), remoteBytes: Buffer.alloc(size, 0x62) })
+      const download = api({ approveTransfer: () => false, attrs: () => ({ type: 'file', size }), remoteBytes: Buffer.alloc(size, 0x62) })
       const target = join(local, `d-${size}.bin`)
       const pulled = runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/x', local_path: target }, {}, { maxBytes: cap, timeoutMs: 0 })
       if (size > cap) {
-        await assert.rejects(pulled, /over the 4 byte transfer ceiling/)
+        await assert.rejects(pulled, /one-time approval was not granted/)
       } else {
         assert.equal((await pulled).bytes, size)
         assert.equal((await readFile(target)).length, size)
@@ -961,6 +975,7 @@ test('an aborted upload closes its transfer lease and removes the temp without t
 
 test('a never-settling upload copy is bounded, closes only the SFTP channel, and removes the temp', async () => {
   const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
   try {
     const source = join(local, 'a.bin')
     await writeFile(source, 'abcd')
@@ -979,6 +994,7 @@ test('a never-settling upload copy is bounded, closes only the SFTP channel, and
     assert.deepEqual(upload.sftpClosed, ['prod1'], 'the stuck SFTP channel must be closed')
     assert.match(upload.commands.join('\n'), /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
   } finally {
+    clearInterval(keepAlive)
     await rm(local, { recursive: true, force: true })
   }
 })
@@ -1002,6 +1018,7 @@ test('an upload still publishes when every write was acknowledged but the close 
 
 test('a timed-out upload whose channel never closes names the possible leak but keeps its error type', async () => {
   const local = await tempDir()
+  const keepAlive = setInterval(() => undefined, 5)
   try {
     const source = join(local, 'a.bin')
     await writeFile(source, 'abcd')
@@ -1025,6 +1042,7 @@ test('a timed-out upload whose channel never closes names the possible leak but 
     // late OPEN could recreate the file after a premature delete.
     assert.doesNotMatch(upload.commands.join('\n'), /rm -f '\/srv\/\.dsh-permission-remote-[0-9a-f]+'/)
   } finally {
+    clearInterval(keepAlive)
     await rm(local, { recursive: true, force: true })
   }
 })
@@ -1034,6 +1052,89 @@ test('a copy still publishes when every write was acknowledged but the close is 
   const value = await runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, LIMITS)
   assert.equal(value.bytes, 5)
   assert.match(copy.commands.join('\n'), /mv -f/)
+})
+
+test('an over-ceiling upload asks once and continues with only that call unbound', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcdefgh')
+    const upload = api({ approveTransfer: () => true })
+    const value = await runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 4, timeoutMs: 0 })
+    assert.equal(value.bytes, 8)
+    assert.equal(upload.approvals.length, 1)
+    assert.equal(upload.approvals[0]?.toolName, 'ssh_upload')
+    assert.match(upload.approvals[0]?.detail.en ?? '', /8 bytes.*4 byte transfer ceiling/)
+    assert.equal(upload.writes[0]?.bytes, 8)
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('a denied over-ceiling upload is actionable and does not touch the remote', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcdefgh')
+    const upload = api({ approveTransfer: () => false })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 4, timeoutMs: 0 }),
+      (error: Error) => /one-time approval was not granted/.test(error.message)
+        && /Settings → SSH hosts/.test(error.message),
+    )
+    assert.equal(upload.approvals.length, 1)
+    assert.deepEqual(upload.writes, [])
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('an over-ceiling download asks once and continues', async () => {
+  const local = await tempDir()
+  try {
+    const target = join(local, 'd.bin')
+    const download = api({
+      approveTransfer: () => true,
+      attrs: () => ({ type: 'file', size: 8 }),
+      remoteBytes: Buffer.from('abcdefgh'),
+    })
+    const value = await runSshDownload(download.api, host({ opsPolicy: 'trust' }), { remote_path: '/srv/a.bin', local_path: target }, {}, { maxBytes: 4, timeoutMs: 0 })
+    assert.equal(value.bytes, 8)
+    assert.equal(download.approvals.length, 1)
+    assert.equal(download.approvals[0]?.toolName, 'ssh_download')
+    assert.equal((await readFile(target)).toString(), 'abcdefgh')
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('cancelling a large-transfer approval is an AbortError, not a retryable failure', async () => {
+  const local = await tempDir()
+  try {
+    const source = join(local, 'a.bin')
+    await writeFile(source, 'abcdefgh')
+    const upload = api({ approvalOutcome: 'cancelled' })
+    await assert.rejects(
+      () => runSshUpload(upload.api, host({ opsPolicy: 'trust' }), { local_path: source, remote_path: '/srv/a.bin' }, {}, { maxBytes: 4, timeoutMs: 0 }),
+      (error: Error) => error.name === 'AbortError',
+    )
+    assert.equal(upload.approvals.length, 1)
+    assert.deepEqual(upload.writes, [])
+  } finally {
+    await rm(local, { recursive: true, force: true })
+  }
+})
+
+test('an over-ceiling copy asks once and continues', async () => {
+  const copy = copyApi({ approveTransfer: () => true })
+  const value = await runSshCopy(copy.api, backup(), {
+    source_path: '/srv/release.tar.gz',
+    source_host: 'prod1',
+    target_path: '/backup/release.tar.gz',
+  }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 2, timeoutMs: 0 })
+  assert.equal(value.bytes, 5)
+  assert.equal(copy.approvals.length, 1)
+  assert.equal(copy.approvals[0]?.toolName, 'ssh_copy')
 })
 
 test('a timeout during the download copy is a timeout and leaves no local file', async () => {
@@ -1092,6 +1193,7 @@ function copyApi(options: {
   connectedHostIds?: string[]
   freeSlots?: number
   leaseSettled?: boolean
+  approveTransfer?: (toolName: string, detail: ApprovalDetail) => boolean
 } = {}) {
   return api({
     hosts: options.hosts ?? TWO_HOSTS,
@@ -1102,6 +1204,7 @@ function copyApi(options: {
     connectedHostIds: options.connectedHostIds,
     freeSlots: options.freeSlots,
     leaseSettled: options.leaseSettled,
+    approveTransfer: options.approveTransfer,
     attrs: (path: string) => {
       if (path.startsWith(TARGET_PREFIX)) return options.target
       if (options.source === null) return undefined
@@ -1393,10 +1496,10 @@ test('a target that is a directory or symlink is refused before the copy starts'
 })
 
 test('a source over the ceiling fails on the pre-check, and one that grows fails on the stream', async () => {
-  const big = copyApi({ source: { type: 'file', size: 4096 } })
+  const big = copyApi({ source: { type: 'file', size: 4096 }, approveTransfer: () => false })
   await assert.rejects(
     () => runSshCopy(big.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 1024, timeoutMs: 0 }),
-    /source file is 4096 bytes, over the 1024 byte transfer ceiling/,
+    /one-time approval was not granted/,
   )
   assert.deepEqual(big.reads, [])
 
@@ -1477,6 +1580,7 @@ test('a timed-out copy is a TimeoutError with the configured milliseconds', asyn
   // A real SFTP write observes the signal and rejects, which is what lets the
   // cleanup path await the copy before removing the temp. The fake has to do
   // the same or the cleanup wait would be the test's own bug.
+  const keepAlive = setInterval(() => undefined, 5)
   const copy = copyApi({
     sendChunks: (_target, _remotePath, _source, limits) => new Promise((_resolve, reject) => {
       const signal = limits?.signal
@@ -1489,21 +1593,27 @@ test('a timed-out copy is a TimeoutError with the configured milliseconds', asyn
     () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 0, timeoutMs: 20 }),
     (error: Error) => error.name === 'TimeoutError' && /transfer timed out after 20 ms/.test(error.message),
   )
+  clearInterval(keepAlive)
 })
 
 test('a never-settling copy send is bounded, closes only the SFTP channels, and removes the temp', async () => {
   const copy = copyApi({ sendChunks: () => new Promise(() => {}) })
+  const keepAlive = setInterval(() => undefined, 5)
   const started = Date.now()
-  await assert.rejects(
+  try {
+    await assert.rejects(
     () => runSshCopy(copy.api, backup(), { source_path: '/srv/release.tar.gz', source_host: 'prod1', target_path: '/backup/x' }, {}, selector => TWO_HOSTS.find(item => item.id === selector)!, { maxBytes: 0, timeoutMs: 20 }),
     (error: Error) => error.name === 'TimeoutError',
-  )
-  assert.ok(Date.now() - started < 2_000, 'a stuck copy must not wait out the full cleanup bound')
-  // Both connections stay up: the source may be the session's own host, and
-  // the target's terminals and commands are not part of this failure.
-  assert.deepEqual(copy.invalidated, [], 'no shared connection may be dropped')
-  assert.deepEqual(copy.sftpClosed.sort(), ['backup1', 'prod1'], 'both stuck SFTP channels must be closed')
-  assert.match(copy.commands.join('\n'), /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+    )
+    assert.ok(Date.now() - started < 2_000, 'a stuck copy must not wait out the full cleanup bound')
+    // Both connections stay up: the source may be the session's own host, and
+    // the target's terminals and commands are not part of this failure.
+    assert.deepEqual(copy.invalidated, [], 'no shared connection may be dropped')
+    assert.deepEqual(copy.sftpClosed.sort(), ['backup1', 'prod1'], 'both stuck SFTP channels must be closed')
+    assert.match(copy.commands.join('\n'), /rm -f '\/backup\/\.dsh-permission-remote-[0-9a-f]+'/)
+  } finally {
+    clearInterval(keepAlive)
+  }
 })
 
 test('~/ on either end expands against that host\'s own home', async () => {

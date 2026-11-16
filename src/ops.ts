@@ -19,6 +19,8 @@ import { shJoin } from './shell-quote.ts'
 import { CLEANUP_SETTLE_TIMEOUT_MS, isSftpMissing, settleWithin, type SecretMaterial, type SftpLease } from './ssh-pool.ts'
 
 const READ_CAP = 1024 * 1024
+/** `mkdir`/`mv` are control commands, not the data stream; never let them hang forever. */
+const TRANSFER_CONTROL_TIMEOUT_MS = 30_000
 const HOME_BEGIN = '__DSH_OPS_HOME_BEGIN__'
 const HOME_END = '__DSH_OPS_HOME_END__'
 
@@ -519,12 +521,13 @@ function refusePlaceholderSource(localPath: string, toolName: 'ssh_upload' | 'ss
 }
 
 /**
- * Refuse a local path that is not a regular file, and one already over the ceiling.
+ * Refuse a local path that is not a regular file, and return its size for the
+ * ceiling decision.
  *
  * The size is only a pre-check. The stream counts the bytes it reads, so a
  * file that grows afterwards is still stopped without being buffered.
  */
-async function assertLocalSource(path: string, maxBytes: number): Promise<void> {
+async function assertLocalSource(path: string): Promise<number> {
   let info
   try {
     info = await lstat(path)
@@ -535,9 +538,7 @@ async function assertLocalSource(path: string, maxBytes: number): Promise<void> 
   if (info.isSymbolicLink()) throw new Error(`refusing to transfer a symbolic link: ${path}`)
   if (info.isDirectory()) throw new Error(`local path is a directory: ${path}`)
   if (!info.isFile()) throw new Error(`local path is not a regular file: ${path}`)
-  if (maxBytes > 0 && info.size > maxBytes) {
-    throw new Error(`local file is ${info.size} bytes, over the ${maxBytes} byte transfer ceiling`)
-  }
+  return info.size
 }
 
 /**
@@ -623,9 +624,50 @@ function notePossibleLeak(error: unknown, leases: readonly (SftpLease | undefine
 }
 
 /** One cleanup budget for close+rm, so a dead channel cannot stack two waits. */
+function transferCommandTimeout(limits: OpsTransferLimits): number {
+  return limits.timeoutMs > 0 ? limits.timeoutMs : TRANSFER_CONTROL_TIMEOUT_MS
+}
+
 function cleanupBudget(): () => number {
   const deadline = Date.now() + CLEANUP_SETTLE_TIMEOUT_MS
   return () => Math.max(250, deadline - Date.now())
+}
+
+/**
+ * A transfer larger than the configured byte ceiling gets one extra, explicit
+ * approval instead of a dead-end error. The approval is separate from the
+ * sandbox gate: a trusted host has no sandbox prompt, and a session already in
+ * danger-full-access must still be asked when one transfer is unusually large.
+ * On approval only this call runs without a byte ceiling; the setting is not
+ * changed.
+ */
+async function approveOverCeiling(
+  hostApi: ToolHost,
+  exec: ToolExec,
+  toolName: string,
+  subject: string,
+  detail: ApprovalDetail,
+  size: number,
+  limits: OpsTransferLimits,
+): Promise<OpsTransferLimits> {
+  if (limits.maxBytes <= 0 || size <= limits.maxBytes) return limits
+  const request = hostApi.requestTransferApproval
+  const describe = {
+    en: `${detail.en} — ${size} bytes, over the ${limits.maxBytes} byte transfer ceiling; allow this one transfer`,
+    zh: `${detail.zh} — 文件 ${size} 字节，超过 ${limits.maxBytes} 字节单次传输上限；仅本次放行`,
+  }
+  const outcome = request === undefined ? 'unavailable' : await request(exec, toolName, subject, describe)
+  if (outcome === 'cancelled') throw abortError()
+  if (outcome !== 'allowed-once') {
+    const reason = outcome === 'rejected'
+      ? 'the user rejected the one-time large-transfer approval'
+      : 'no approval channel is available for the one-time large-transfer approval'
+    throw new Error(
+      `${toolName}: ${size} bytes is over the ${limits.maxBytes} byte transfer ceiling; ${reason} (the one-time approval was not granted). `
+      + 'Ask the user to approve the transfer, or raise "Transfer ceiling" in Settings → SSH hosts (0 means no ceiling).',
+    )
+  }
+  return { ...limits, maxBytes: 0 }
 }
 
 /**
@@ -680,6 +722,10 @@ export async function runSshUpload(
   refusePlaceholderSource(localPath, 'ssh_upload')
   const display = remotePathForDisplay(remoteRequest, 'remote_path')
   const displayZh = remotePathForDisplay(remoteRequest, 'remote_path', undefined, '远端 $HOME')
+  const approvalDetail = {
+    en: `upload ${clip(localPath, 120)} to ${clip(display, 120)} on ${hostLabel(host)}`,
+    zh: `把 ${clip(localPath, 120)} 上传到 ${hostLabel(host)} 的 ${clip(displayZh, 120)}`,
+  }
   await requireOps(
     hostApi,
     host,
@@ -687,14 +733,12 @@ export async function runSshUpload(
     args as OpsApprovalArgs,
     'ssh_upload',
     hostSubject(host, 'remote file upload'),
-    {
-      en: `upload ${clip(localPath, 120)} to ${clip(display, 120)} on ${hostLabel(host)}`,
-      zh: `把 ${clip(localPath, 120)} 上传到 ${hostLabel(host)} 的 ${clip(displayZh, 120)}`,
-    },
+    approvalDetail,
   )
   throwIfAborted(exec.signal)
+  const sourceSize = await assertLocalSource(localPath)
+  limits = await approveOverCeiling(hostApi, exec, 'ssh_upload', hostSubject(host, 'remote file upload'), approvalDetail, sourceSize, limits)
   const signal = transferDeadline(exec, limits)
-  await assertLocalSource(localPath, limits.maxBytes)
   const secret = await withTransferDeadline(hostApi.secretOf(host), signal, exec.signal, limits)
   throwIfTransferAborted(signal, exec.signal, limits)
   // `resolveOpsPath` runs the remote `$HOME` probe for `~/`; racing it here
@@ -722,7 +766,7 @@ export async function runSshUpload(
   const directory = posix.dirname(remotePath)
   const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
   const mkdir = await withTransferDeadline(
-    hostApi.pool.exec(host, secret, `mkdir -p ${shJoin([directory])}`, limits.timeoutMs, signal),
+    hostApi.pool.exec(host, secret, `mkdir -p ${shJoin([directory])}`, transferCommandTimeout(limits), signal),
     signal,
     exec.signal,
     limits,
@@ -748,7 +792,7 @@ export async function runSshUpload(
     await withTransferDeadline(lease.close(), signal, exec.signal, limits)
     const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([remotePath])}`
     const moved = await withTransferDeadline(
-      hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, remotePath])}${bits}`, limits.timeoutMs, signal),
+      hostApi.pool.exec(host, secret, `mv -f ${shJoin([tmp, remotePath])}${bits}`, transferCommandTimeout(limits), signal),
       signal,
       exec.signal,
       limits,
@@ -799,6 +843,10 @@ export async function runSshDownload(
   refusePlaceholderSource(localPath, 'ssh_download')
   const display = remotePathForDisplay(remoteRequest, 'remote_path')
   const displayZh = remotePathForDisplay(remoteRequest, 'remote_path', undefined, '远端 $HOME')
+  const approvalDetail = {
+    en: `download ${clip(display, 120)} from ${hostLabel(host)} to ${clip(localPath, 120)}`,
+    zh: `把 ${hostLabel(host)} 的 ${clip(displayZh, 120)} 下载到 ${clip(localPath, 120)}`,
+  }
   await requireOps(
     hostApi,
     host,
@@ -806,19 +854,19 @@ export async function runSshDownload(
     args as OpsApprovalArgs,
     'ssh_download',
     hostSubject(host, 'remote file download'),
-    {
-      en: `download ${clip(display, 120)} from ${hostLabel(host)} to ${clip(localPath, 120)}`,
-      zh: `把 ${hostLabel(host)} 的 ${clip(displayZh, 120)} 下载到 ${clip(localPath, 120)}`,
-    },
+    approvalDetail,
   )
   throwIfAborted(exec.signal)
-  const signal = transferDeadline(exec, limits)
-  const secret = await withTransferDeadline(hostApi.secretOf(host), signal, exec.signal, limits)
+  // The preflight (home probe, path resolution, remote stat, approval) has its
+  // own deadline. A user answering a large-transfer prompt must not consume
+  // the data-transfer deadline before any byte moves.
+  const preflightSignal = transferDeadline(exec, limits)
+  const secret = await withTransferDeadline(hostApi.secretOf(host), preflightSignal, exec.signal, limits)
   // See the upload side: a `~/` home probe must not outlive the transfer
   // deadline just because it has no signal of its own.
   const remotePath = await withTransferDeadline(
     resolveOpsPath(hostApi, host, secret, remoteRequest, 'remote_path'),
-    signal,
+    preflightSignal,
     exec.signal,
     limits,
   )
@@ -828,8 +876,8 @@ export async function runSshDownload(
   // unapproved call must not probe the local filesystem either.
   await assertLocalTarget(localPath)
   const info = await withTransferDeadline(
-    remoteTargetOf(hostApi, host, secret, remotePath, false, signal),
-    signal,
+    remoteTargetOf(hostApi, host, secret, remotePath, false, preflightSignal),
+    preflightSignal,
     exec.signal,
     limits,
   )
@@ -837,9 +885,8 @@ export async function runSshDownload(
   if (info.type !== 'file') {
     throw new Error(`remote path is not a regular file (${info.type}): ${remotePath}`)
   }
-  if (limits.maxBytes > 0 && info.size > limits.maxBytes) {
-    throw new Error(`remote file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
-  }
+  limits = await approveOverCeiling(hostApi, exec, 'ssh_download', hostSubject(host, 'remote file download'), approvalDetail, info.size, limits)
+  const signal = transferDeadline(exec, limits)
   throwIfTransferAborted(signal, exec.signal, limits)
   const temporary = `${localPath}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
   const handle = await openExclusiveTemp(temporary)
@@ -1095,6 +1142,10 @@ export async function runSshCopy(
   const sourceDisplayZh = remotePathForDisplay(sourceRef.request, 'source_path', sourceRef.base, '远端 $HOME')
   const targetDisplay = remotePathForDisplay(targetRequest, 'target_path')
   const targetDisplayZh = remotePathForDisplay(targetRequest, 'target_path', undefined, '远端 $HOME')
+  const approvalDetail = {
+    en: `copy ${clip(sourceDisplay, 80)} on ${hostLabel(source)} to ${clip(targetDisplay, 80)} on ${hostLabel(target)}`,
+    zh: `把 ${hostLabel(source)} 的 ${clip(sourceDisplayZh, 80)} 复制到 ${hostLabel(target)} 的 ${clip(targetDisplayZh, 80)}`,
+  }
   await requireOps(
     hostApi,
     target,
@@ -1102,24 +1153,23 @@ export async function runSshCopy(
     args as OpsApprovalArgs,
     'ssh_copy',
     hostSubject(target, 'remote file copy'),
-    {
-      en: `copy ${clip(sourceDisplay, 80)} on ${hostLabel(source)} to ${clip(targetDisplay, 80)} on ${hostLabel(target)}`,
-      zh: `把 ${hostLabel(source)} 的 ${clip(sourceDisplayZh, 80)} 复制到 ${hostLabel(target)} 的 ${clip(targetDisplayZh, 80)}`,
-    },
+    approvalDetail,
   )
   throwIfAborted(exec.signal)
-  const signal = transferDeadline(exec, limits)
-  const sourceSecret = await withTransferDeadline(hostApi.secretOf(source), signal, exec.signal, limits)
-  const targetSecret = await withTransferDeadline(hostApi.secretOf(target), signal, exec.signal, limits)
+  // Preflight uses its own deadline; the approval prompt must not eat the
+  // data-transfer deadline before the first byte moves.
+  const preflightSignal = transferDeadline(exec, limits)
+  const sourceSecret = await withTransferDeadline(hostApi.secretOf(source), preflightSignal, exec.signal, limits)
+  const targetSecret = await withTransferDeadline(hostApi.secretOf(target), preflightSignal, exec.signal, limits)
   const sourcePath = await withTransferDeadline(
     resolveCopyPath(hostApi, source, sourceSecret, sourceRef.request, sourceRef.base, 'source_path'),
-    signal,
+    preflightSignal,
     exec.signal,
     limits,
   )
   const targetPath = await withTransferDeadline(
     resolveCopyPath(hostApi, target, targetSecret, targetRequest, undefined, 'target_path'),
-    signal,
+    preflightSignal,
     exec.signal,
     limits,
   )
@@ -1129,16 +1179,15 @@ export async function runSshCopy(
     throw new Error(`source_path and target_path are the same file on ${hostLabel(source)}: ${sourcePath}`)
   }
   const info = await withTransferDeadline(
-    remoteTargetOf(hostApi, source, sourceSecret, sourcePath, false, signal),
-    signal,
+    remoteTargetOf(hostApi, source, sourceSecret, sourcePath, false, preflightSignal),
+    preflightSignal,
     exec.signal,
     limits,
   )
   if (info === undefined) throw new Error(`no file at source path on ${hostLabel(source)}: ${sourcePath}`)
   if (info.type !== 'file') throw new Error(`source path is not a regular file (${info.type}) on ${hostLabel(source)}: ${sourcePath}`)
-  if (limits.maxBytes > 0 && info.size > limits.maxBytes) {
-    throw new Error(`source file is ${info.size} bytes, over the ${limits.maxBytes} byte transfer ceiling`)
-  }
+  limits = await approveOverCeiling(hostApi, exec, 'ssh_copy', hostSubject(target, 'remote file copy'), approvalDetail, info.size, limits)
+  const signal = transferDeadline(exec, limits)
   // Connecting the source consumed a slot; a concurrent caller may have taken
   // another. The target leg must not enter reserve() with no connection able
   // to close and hand a slot back.
@@ -1155,7 +1204,7 @@ export async function runSshCopy(
   const directory = posix.dirname(targetPath)
   const tmp = posix.join(directory, `.dsh-permission-remote-${randomBytes(8).toString('hex')}`)
   const mkdir = await withTransferDeadline(
-    hostApi.pool.exec(target, targetSecret, `mkdir -p ${shJoin([directory])}`, limits.timeoutMs, signal),
+    hostApi.pool.exec(target, targetSecret, `mkdir -p ${shJoin([directory])}`, transferCommandTimeout(limits), signal),
     signal,
     exec.signal,
     limits,
@@ -1198,7 +1247,7 @@ export async function runSshCopy(
     )
     const bits = existing?.mode === undefined ? '' : ` && chmod ${(existing.mode & 0o7777).toString(8)} ${shJoin([targetPath])}`
     const moved = await withTransferDeadline(
-      hostApi.pool.exec(target, targetSecret, `mv -f ${shJoin([tmp, targetPath])}${bits}`, limits.timeoutMs, signal),
+      hostApi.pool.exec(target, targetSecret, `mv -f ${shJoin([tmp, targetPath])}${bits}`, transferCommandTimeout(limits), signal),
       signal,
       exec.signal,
       limits,

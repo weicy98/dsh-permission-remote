@@ -155,8 +155,8 @@ test('transfer limits are volatile, defaulted, and readable through the getter',
   assert.equal(Config.dict?.transferTimeoutMs?.meta.volatile, true)
   const resolved = Config({ hosts: [host('h1')], maxConnections: 4 }) as unknown as { transferMaxBytes: unknown, transferTimeoutMs: unknown }
   const config = readConfig(resolved)
-  assert.equal(config.transferMaxBytes, 32 * 1024 * 1024)
-  assert.equal(config.transferTimeoutMs, 120_000)
+  assert.equal(config.transferMaxBytes, 1024 * 1024 * 1024)
+  assert.equal(config.transferTimeoutMs, 0)
 })
 
 test('a stored zero survives: it is the "no limit" sentinel', () => {
@@ -221,7 +221,7 @@ test('a corrupt volatile limit falls back to the default, not to "no limit"', ()
   for (const corrupt of [-1, Number.NaN, Number.NEGATIVE_INFINITY]) {
     updateVolatile(resolved.transferMaxBytes, createVolatile(corrupt))
     updateVolatile(resolved.transferTimeoutMs, createVolatile(corrupt))
-    assert.equal(config.transferMaxBytes, 32 * 1024 * 1024, `maxBytes after ${corrupt}`)
-    assert.equal(config.transferTimeoutMs, 120_000, `timeoutMs after ${corrupt}`)
+    assert.equal(config.transferMaxBytes, 1024 * 1024 * 1024, `maxBytes after ${corrupt}`)
+    assert.equal(config.transferTimeoutMs, 0, `timeoutMs after ${corrupt}`)
   }
 })

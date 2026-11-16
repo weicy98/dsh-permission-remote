@@ -27,6 +27,7 @@ import {
   withSignal,
   type RunnerStatus,
   type StagedFile,
+  type ApprovalDetail,
   type ToolExec,
   type ToolHost,
 } from './execute.ts'
@@ -1778,6 +1779,43 @@ export class Core {
     return this.allowsRemoteCwd({ kind: 'remote', hostId, remoteCwd: '/', placeholderCwd: '/' }, agent.session?.header?.cwd)
   }
 
+  /**
+   * Ask for a one-shot large-transfer approval.
+   *
+   * This is deliberately separate from `resolveMode`: a session already in
+   * danger-full-access must still be asked when a single transfer exceeds the
+   * operator's byte ceiling, and a trusted host has no sandbox approval at all.
+   * Any missing answerer fails closed.
+   */
+  private async requestTransferApproval(exec: ToolExec, toolName: string, subject: string, detail: ApprovalDetail): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'> {
+    const approval = this.ctx.get('approval') as {
+      request(request: {
+        agent: unknown
+        toolName: string
+        callId?: string
+        reason?: string
+        displayReason?: ApprovalDetail
+        signal?: AbortSignal
+      }): Promise<string>
+    } | undefined
+    if (approval === undefined || exec.agent === undefined) return 'unavailable'
+    try {
+      const outcome = await approval.request({
+        agent: exec.agent,
+        toolName,
+        ...exec.callId === undefined ? {} : { callId: exec.callId },
+        reason: `${subject}: ${detail.en}`,
+        displayReason: detail,
+        ...exec.signal === undefined ? {} : { signal: exec.signal },
+      })
+      return outcome === 'allowed-once' || outcome === 'rejected' || outcome === 'cancelled' ? outcome : 'unavailable'
+    } catch {
+      // The approval service can refuse outside an open turn; fail closed
+      // instead of turning that into an unhandled tool failure.
+      return 'unavailable'
+    }
+  }
+
   toolHost(jobs: ToolHost['jobs']): ToolHost {
     return {
       pool: this.pool,
@@ -1786,6 +1824,7 @@ export class Core {
       statusOf: host => this.probe(host.id),
       createWorkspace: (host, remotePath, title, signal) => this.registerWorkspace(host, remotePath, title, signal),
       resolveMode: buildResolveMode(this.ctx),
+      requestTransferApproval: (exec, toolName, subject, detail) => this.requestTransferApproval(exec, toolName, subject, detail),
       loginEnvOf: (host, signal) => this.loginEnvs.get(host.id, signal),
       loginEnvFileOf: (host, signal) => this.loginEnvFile(host, signal),
       forgetHostAttrs: hostId => this.forgetHostAttrs(hostId),
@@ -3196,7 +3235,7 @@ function opsTools(core: Core, currentCwd: (exec: ToolExec) => string | undefined
   const limits = () => core.transferLimits()
   return [publishOpsTool({
       name: 'ssh_hosts',
-      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, ssh_copy, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, uploads, downloads, copies, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs without a prompt; "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
+      description: 'List the configured SSH hosts for ops on another machine: id, name, address, user, ops policy, and whether the host key is trusted. Call this before ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, ssh_copy, or ssh_workspace when you do not know the host id or name. Policy "ask" allows reads but needs danger-full-access for commands, writes, uploads, downloads, copies, and workspace registration, so pass sandbox_permissions "danger-full-access" and a justification; "trust" runs ordinary ops without a prompt (a transfer over the configured ceiling still asks one one-time approval); "deny" accepts nothing. An untrusted host must be trusted in Settings → SSH hosts first.',
       parameters: {},
       output: textOutput(value => {
         const hosts = Array.isArray(value.hosts) ? value.hosts as Array<ReturnType<typeof opsHostView>> : []
@@ -3224,7 +3263,7 @@ function opsTools(core: Core, currentCwd: (exec: ToolExec) => string | undefined
       },
     }), publishOpsTool({
       name: 'ssh_copy',
-      description: 'Copy one file from one configured SSH host to another, streaming it between the two SFTP channels: it never lands on the machine running DSH and is never held in memory as a whole file. This is how a session inside a remote workspace moves a file to another host — that session has no useful local path, because ssh_upload reads the machine running DSH. source_path may be an absolute remote path, a path starting with "~/", or a placeholder path returned by read or the file tree; source_host may be omitted when the path is a placeholder path (its host comes from the path) or when this session is in a remote workspace (its host is the source). target_host is required. Reading the source follows ssh_read: a denied or untrusted source host is refused and needs no approval. Writing the target follows ssh_write: on an "ask" host this needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied, and the approval card names both ends. The filesystem root "/" and copying a file onto itself are refused. The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates it, an existing file keeps its permission bits, and a new file uses the remote umask. A source symlink, directory, or special file (FIFO/device) is refused, and so is a target that is a directory or symlink. Single files only, no recursion or resume; the byte ceiling and timeout come from Settings and 0 means unlimited. Cross-host copies hold one connection to each host at the same time. Call ssh_hosts when you do not know a host id or name.',
+      description: 'Copy one file from one configured SSH host to another, streaming it between the two SFTP channels: it never lands on the machine running DSH and is never held in memory as a whole file. This is how a session inside a remote workspace moves a file to another host — that session has no useful local path, because ssh_upload reads the machine running DSH. source_path may be an absolute remote path, a path starting with "~/", or a placeholder path returned by read or the file tree; source_host may be omitted when the path is a placeholder path (its host comes from the path) or when this session is in a remote workspace (its host is the source). target_host is required. Reading the source follows ssh_read: a denied or untrusted source host is refused and needs no approval. Writing the target follows ssh_write: on an "ask" host this needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied, and the approval card names both ends. The filesystem root "/" and copying a file onto itself are refused. The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates it, an existing file keeps its permission bits, and a new file uses the remote umask. A source symlink, directory, or special file (FIFO/device) is refused, and so is a target that is a directory or symlink. Single files only, no recursion or resume; transfers above the configured transfer ceiling (1 GiB by default) ask for one one-time approval (Settings → Transfer ceiling; 0 means no ceiling). Cross-host copies hold one connection to each host at the same time. Call ssh_hosts when you do not know a host id or name.',
       parameters: {
         source_host: { type: 'string', description: 'SSH host id, name, or address to copy from; omit it to take the host from a placeholder source_path, or the current remote workspace host' },
         source_path: { type: 'string', required: true, description: 'Absolute remote path, a path starting with "~/", or a placeholder path from read or the file tree' },
@@ -3291,7 +3330,7 @@ function opsTools(core: Core, currentCwd: (exec: ToolExec) => string | undefined
       },
     }), publishOpsTool({
       name: 'ssh_upload',
-      description: 'Copy one local file to a configured SSH host over the SSH connection. This is for ops on a machine that is not your current workspace. local_path is an absolute path on the machine running DSH — never a remote path or a remote workspace placeholder path, which a placeholder path in this session is: it is refused before the approval prompt. To move a file between two SSH hosts, use ssh_copy instead. remote_path is an absolute remote path or starts with "~/". The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates the original, an existing file keeps its permission bits when the server reports them, and a new file uses the remote umask. The filesystem root "/" is refused, and so is a final symlink, a directory, or a special file (FIFO/device). Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      description: 'Copy one local file to a configured SSH host over the SSH connection. This is for ops on a machine that is not your current workspace. local_path is an absolute path on the machine running DSH — never a remote path or a remote workspace placeholder path, which a placeholder path in this session is: it is refused before the approval prompt. To move a file between two SSH hosts, use ssh_copy instead. remote_path is an absolute remote path or starts with "~/". The bytes are written beside the target and renamed with mv -f, so a dropped connection never truncates the original, an existing file keeps its permission bits when the server reports them, and a new file uses the remote umask. The filesystem root "/" is refused, and so is a final symlink, a directory, or a special file (FIFO/device). Single files only; transfers above the configured transfer ceiling (1 GiB by default) ask for one one-time approval (Settings → Transfer ceiling; 0 means no ceiling). On an "ask" host this needs danger-full-access: pass sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         local_path: { type: 'string', required: true, description: 'Absolute path on the machine running DSH' },
@@ -3306,7 +3345,7 @@ function opsTools(core: Core, currentCwd: (exec: ToolExec) => string | undefined
       },
     }), publishOpsTool({
       name: 'ssh_download',
-      description: 'Copy one file from a configured SSH host to a local path over SFTP. This is for ops on a machine that is not your current workspace. remote_path is an absolute remote path or starts with "~/"; local_path is an absolute path on the machine running DSH whose parent directory already exists (a remote workspace placeholder path is refused before the approval prompt). The file is replaced atomically and gets mode 0600. A remote symlink, directory, or special file (FIFO/device) is refused, and so is a local directory or symlink at the target. Single files only; the byte ceiling and timeout come from Settings and 0 means unlimited. Downloading writes a local file, so it is gated like ssh_write: on an "ask" host it needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
+      description: 'Copy one file from a configured SSH host to a local path over SFTP. This is for ops on a machine that is not your current workspace. remote_path is an absolute remote path or starts with "~/"; local_path is an absolute path on the machine running DSH whose parent directory already exists (a remote workspace placeholder path is refused before the approval prompt). The file is replaced atomically and gets mode 0600. A remote symlink, directory, or special file (FIFO/device) is refused, and so is a local directory or symlink at the target. Single files only; transfers above the configured transfer ceiling (1 GiB by default) ask for one one-time approval (Settings → Transfer ceiling; 0 means no ceiling). Downloading writes a local file, so it is gated like ssh_write: on an "ask" host it needs danger-full-access, with sandbox_permissions "danger-full-access" and a one-sentence justification when the call is denied. Call ssh_hosts when you do not know the host id or name.',
       parameters: {
         host: { type: 'string', required: true, description: 'SSH host id, name, or address from ssh_hosts' },
         remote_path: { type: 'string', required: true, description: 'Absolute remote path or a path starting with "~/"' },

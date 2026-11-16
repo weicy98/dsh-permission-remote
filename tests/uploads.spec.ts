@@ -17,7 +17,7 @@ const placeholder = path.join(root, 'lo', encodeRemotePath(REMOTE))
 const ID = 'abcdef0123456789ffff'
 const HOST_PATH = '/tmp/notes.txt'
 const UPLOADED = '/home/me/.dsh-permission-remote/uploads/abcdef0123456789/notes.txt'
-const CAP = 32 * 1024 * 1024
+const CAP = UPLOAD_CAP
 
 interface StreamOptions {
   sessionId?: string
@@ -312,7 +312,8 @@ test('an existing symbolic link at the upload path is refused, not followed and 
 })
 
 test('a fresh upload is not copied again, and a changed mtime is', async () => {
-  assert.deepEqual(uploadCeiling(undefined), { bytes: UPLOAD_CAP, source: 'upload' })
+  assert.equal(UPLOAD_CAP, 1024 * 1024 * 1024)
+  assert.deepEqual(uploadCeiling(undefined), { bytes: 1024 * 1024 * 1024, source: 'upload' })
   assert.deepEqual(uploadCeiling(0), { bytes: 0, source: 'transfer' })
   assert.deepEqual(uploadCeiling(1024), { bytes: 1024, source: 'transfer' })
   assert.deepEqual(uploadCeiling(64 * 1024 * 1024), { bytes: 64 * 1024 * 1024, source: 'transfer' })
@@ -393,11 +394,19 @@ test('the fresh window does not slide forward on each recheck', async () => {
   assert.ok(stats > afterPublish)
 })
 
-test('a raised transfer ceiling allows a chat upload above 32 MiB, and 0 does not cap it', async () => {
+test('a raised transfer ceiling allows a chat upload, a lower ceiling rejects one, and 0 does not cap it', async () => {
   const raised = setup()
   raised.setMax(64 * 1024 * 1024)
   await pull(raised.listener, { sessionId: 's1', messages: fileMessage(40 * 1024 * 1024) })
   assert.equal(raised.puts.length, 1)
+
+  // A file above the configured ceiling must be skipped even though it is
+  // below the 1 GiB factory default; this catches a ceiling that is ignored.
+  const restricted = setup()
+  restricted.setMax(64 * 1024 * 1024)
+  await pull(restricted.listener, { sessionId: 's1', messages: fileMessage(80 * 1024 * 1024) })
+  assert.equal(restricted.puts.length, 0)
+  assert.match(restricted.warnings.join('\n'), /67108864 byte transfer limit/)
 
   const open = setup()
   open.setMax(0)

@@ -26,7 +26,7 @@ import { remotePathInside } from './workspaces.ts'
  * Default chat-upload ceiling when the caller does not supply the transfer
  * setting. Production passes that setting, so this is only the fallback.
  */
-export const UPLOAD_CAP = 32 * 1024 * 1024
+export const UPLOAD_CAP = 1024 * 1024 * 1024
 /** How long a ready upload skips the re-copy. The parent-symlink walk still runs. */
 export const UPLOAD_FRESH_MS = 60_000
 const LEAF_MAX = 120
@@ -34,9 +34,8 @@ const LEAF_MAX = 120
 /**
  * The byte ceiling for one chat upload.
  *
- * A positive transfer setting is the ceiling, including values above 32 MiB.
- * `0` is the settings-page "no limit" sentinel. Omitting the setting keeps
- * the historical 32 MiB default.
+ * A positive transfer setting is the ceiling. `0` is the settings-page
+ * "no limit" sentinel. Omitting the setting keeps the 1 GiB default.
  */
 export function uploadCeiling(configured: number | undefined): { bytes: number, source: 'upload' | 'transfer' } {
   if (configured === undefined) return { bytes: UPLOAD_CAP, source: 'upload' }
@@ -71,7 +70,7 @@ export interface UploadAccess {
   }
   /**
    * Settings-page transfer ceiling. `0` means no byte ceiling. Omission keeps
-   * the 32 MiB default.
+   * the 1 GiB default.
    */
   maxUploadBytes?(): number
   /** Settings-page transfer deadline. `0` or omission means no deadline. */

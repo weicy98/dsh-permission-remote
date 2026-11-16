@@ -13,7 +13,7 @@ import {
   validateEscalationArgs,
   type SandboxMode,
 } from '@deepseek-ai/dsh-sandbox'
-import type { HostConfig } from './config.ts'
+import { TRANSFER_MAX_BYTES_DEFAULT, type HostConfig } from './config.ts'
 import { distroInstallFor, parseOsRelease, type DistroInstall } from './install-commands.ts'
 import { remoteRoots } from './remote-write.ts'
 import {
@@ -80,6 +80,8 @@ export interface ApprovalDetail {
   readonly zh: string
 }
 
+export type TransferApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
 export interface ToolHost {
   readonly pool: SshPool
   readonly hostOf: (hostId: string) => HostConfig | undefined
@@ -92,6 +94,8 @@ export interface ToolHost {
    */
   readonly createWorkspace?: (host: HostConfig, remotePath: string, title?: string, signal?: AbortSignal) => Promise<{ path: string, remotePath: string, title: string, created: boolean }>
   readonly resolveMode: (exec: ToolExec, requested: string | undefined, justification: string | undefined, toolName: string, subject: string, detail?: ApprovalDetail) => Promise<SandboxMode>
+  /** Ask the user to allow one transfer above the configured byte ceiling. */
+  readonly requestTransferApproval?: (exec: ToolExec, toolName: string, subject: string, detail: ApprovalDetail) => Promise<TransferApprovalOutcome>
   /** Captured Bash startup exports for this host. Empty when the capture failed or timed out. */
   readonly loginEnvOf?: (host: HostConfig, signal?: AbortSignal) => Promise<string>
   /**
@@ -737,7 +741,8 @@ export async function stagePresentFiles(
  * carries no approval of its own. The two messages differ because an operator
  * who raised the setting needs to know the ceiling is not the number they set.
  */
-function presentCeiling(configured: number): { limit: number, source: 'setting' | 'no-limit' | 'raised' } {
+function presentCeiling(configured: number): { limit: number, source: 'setting' | 'no-limit' | 'raised' | 'default' } {
+  if (configured === TRANSFER_MAX_BYTES_DEFAULT) return { limit: HARD_MAX_BYTES, source: 'default' }
   if (configured > 0 && configured <= HARD_MAX_BYTES) return { limit: configured, source: 'setting' }
   // `0` is the operator asking for no transfer limit; a value above the ceiling
   // is them asking for more than a delivery will ever allow. They read
@@ -746,12 +751,14 @@ function presentCeiling(configured: number): { limit: number, source: 'setting' 
   return { limit: HARD_MAX_BYTES, source: 'raised' }
 }
 
-function presentTooLarge(requested: string, size: number, ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' }): FsError {
+function presentTooLarge(requested: string, size: number, ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' | 'default' }): FsError {
   const where = ceiling.source === 'setting'
     ? `${ceiling.limit} byte delivery limit`
     : ceiling.source === 'no-limit'
       ? `${ceiling.limit} byte snapshot limit (the transfer setting asks for no limit)`
-      : `${ceiling.limit} byte snapshot limit (the transfer setting asks for more, which a delivery does not allow)`
+      : ceiling.source === 'default'
+        ? `${ceiling.limit} byte snapshot limit`
+        : `${ceiling.limit} byte snapshot limit (the transfer setting asks for more, which a delivery does not allow)`
   return new FsError(`Cannot present ${requested}: the remote file is ${size} bytes, over the ${where}`, 'FS_TOO_LARGE')
 }
 
@@ -814,7 +821,7 @@ async function stageIntoCache(
   remotePath: string,
   requested: string,
   expected: number,
-  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' },
+  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' | 'default' },
   exec: ToolExec | undefined,
 ): Promise<PendingSnapshot & { remotePath: string }> {
   const limit = ceiling.limit
@@ -892,7 +899,7 @@ async function readRemoteFile(
   secret: SecretMaterial,
   remotePath: string,
   requested: string,
-  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' },
+  ceiling: { limit: number, source: 'setting' | 'no-limit' | 'raised' | 'default' },
   exec: ToolExec | undefined,
 ): Promise<{ remotePath: string, requested: string, data: Buffer }> {
   const limit = ceiling.limit

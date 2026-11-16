@@ -1696,7 +1696,7 @@ function Section(props: SectionProps): JSX.Element {
             type="text"
             inputMode="numeric"
             value={transferMaxDraft}
-            placeholder="33554432"
+            placeholder="1073741824"
             disabled={busy}
             onChange={event => setTransferMaxDraft(event.target.value.replace(/[^0-9]/g, ''))}
           />
@@ -1709,7 +1709,7 @@ function Section(props: SectionProps): JSX.Element {
             type="text"
             inputMode="numeric"
             value={transferTimeoutDraft}
-            placeholder="120000"
+            placeholder="0"
             disabled={busy}
             onChange={event => setTransferTimeoutDraft(event.target.value.replace(/[^0-9]/g, ''))}
           />

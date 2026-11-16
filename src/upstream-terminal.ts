@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** DSH versions whose terminal API this plugin is verified against. */
-export const VERIFIED_TERMINAL_DSH_VERSIONS = ['0.2.2-rc.1', '0.2.2-rc.2'] as const
+export const VERIFIED_TERMINAL_DSH_VERSIONS = ['0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3'] as const
 
 export interface TerminalContractProbe {
   readonly failures: string[]

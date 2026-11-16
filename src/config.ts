@@ -2,11 +2,11 @@ import Schema from '@deepseek-ai/schemastery'
 import { createVolatile, isVolatile, updateVolatile, type Volatile } from '@deepseek-ai/cosmokit'
 import { isValidHostId } from './router.ts'
 
-/** Default ceiling for one transfer: the same 32 MiB `present` and uploads use. */
-export const TRANSFER_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
+/** Default ceiling for one transfer: 1 GiB. A one-time approval can lift it. */
+export const TRANSFER_MAX_BYTES_DEFAULT = 1024 * 1024 * 1024
 
-/** Default transfer deadline. Long enough for 32 MiB on a slow link. */
-export const TRANSFER_TIMEOUT_MS_DEFAULT = 120_000
+/** Default transfer deadline: no deadline. Set a positive value to bound a slow link. */
+export const TRANSFER_TIMEOUT_MS_DEFAULT = 0
 
 /**
  * Largest accepted deadline. Node's timer clock is a signed 32-bit millisecond
@@ -84,19 +84,19 @@ export const Config = Schema.object({
    */
   remoteRoot: Schema.string().default('').volatile(),
   /**
-   * Byte ceiling for one chat upload, `ssh_upload`, or `ssh_download`.
-   * `0` means no byte ceiling. The copy is still bound by
-   * {@link transferTimeoutMs}: a slow link stops at that deadline before the
-   * disk fills. Volatile so the settings page can write it; a non-volatile
-   * field would be read once at load and every save would be a silent no-op.
+   * Byte ceiling for one chat upload, `ssh_upload`, `ssh_download`, or `ssh_copy`.
+   * `0` means no byte ceiling. Ops transfers above the ceiling ask for a
+   * one-time approval instead of failing outright. The copy is still bound by
+   * {@link transferTimeoutMs} when that is positive. Volatile so the settings
+   * page can write it; a non-volatile field would be read once at load and
+   * every save would be a silent no-op.
    */
   transferMaxBytes: Schema.natural().default(TRANSFER_MAX_BYTES_DEFAULT).volatile(),
   /**
    * Abort deadline for one chat upload, `ssh_upload`, or `ssh_download`, in
-   * milliseconds. `0` means no deadline. This stays in force when the byte
-   * ceiling is `0`. Ops tools surface it as `TimeoutError`. A chat upload
-   * logs the same deadline and lets the turn continue. A hung SFTP request
-   * itself cannot be cancelled mid-flight.
+   * milliseconds. `0` (the default) means no deadline. Ops tools surface it
+   * as `TimeoutError`. A chat upload logs the same deadline and lets the turn
+   * continue. A hung SFTP request itself cannot be cancelled mid-flight.
    */
   transferTimeoutMs: Schema.natural().default(TRANSFER_TIMEOUT_MS_DEFAULT).max(TRANSFER_TIMEOUT_MS_MAX).volatile(),
 })

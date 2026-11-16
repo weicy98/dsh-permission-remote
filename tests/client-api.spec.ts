@@ -137,8 +137,8 @@ test('transfer limits are read back, with 0 preserved as "no limit"', async () =
   const { face } = fakeFace(undefined)
   // The describe() double has no namespaces; assert the documented defaults.
   const loaded = await readHosts(face)
-  assert.equal(loaded.transferMaxBytes, 32 * 1024 * 1024)
-  assert.equal(loaded.transferTimeoutMs, 120_000)
+  assert.equal(loaded.transferMaxBytes, 1024 * 1024 * 1024)
+  assert.equal(loaded.transferTimeoutMs, 0)
 
   const stored = {
     namespaces: [{

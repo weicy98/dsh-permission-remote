@@ -92,8 +92,8 @@ export interface HostSettings {
 }
 
 /** Defaults mirrored from the host schema for rows saved before the field existed. */
-const TRANSFER_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
-const TRANSFER_TIMEOUT_MS_DEFAULT = 120_000
+const TRANSFER_MAX_BYTES_DEFAULT = 1024 * 1024 * 1024
+const TRANSFER_TIMEOUT_MS_DEFAULT = 0
 
 /**
  * Mirrors `TRANSFER_TIMEOUT_MS_MAX` in `config.ts`; the browser bundle cannot
