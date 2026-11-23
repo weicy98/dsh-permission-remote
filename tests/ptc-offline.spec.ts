@@ -142,7 +142,12 @@ test('the official Node runtime executes return and logs through the shim', asyn
     const result = await h.runtime.run(spec)
     assert.equal(result.error, undefined, JSON.stringify(result))
     assert.deepEqual(result.value, 2)
-    assert.deepEqual(result.logs, ['hello remote'])
+    // DSH 0.2.3 replaced `logs: string[]` with `output: PtcOutput[]`, and its
+    // fragments keep their emitted line breaks — the old `logs` entries were
+    // trimmed. Compare the concatenated text, not one bare line.
+    const text = result.output.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
+    assert.equal(text.trimEnd(), 'hello remote')
+    assert.equal(result.outputTruncated, undefined)
   } finally {
     await h.dispose()
   }

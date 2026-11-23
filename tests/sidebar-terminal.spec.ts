@@ -9,6 +9,7 @@ import { Context, symbols } from '@deepseek-ai/cordis'
 import type { HostConfig } from '../src/config.ts'
 import { apply } from '../src/index.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
+import { remoteTerminalRoute } from '../src/terminal-remote-state.ts'
 import {
   confineTerminalCwd,
   foregroundProbeCommand,
@@ -172,8 +173,15 @@ class Terminals {
     return [{ path: '/bin/local-zsh', name: 'zsh', args: ['-i'] }]
   }
 
+  /** Routes observed inside each `create` call, in order. */
+  createRoutes: Array<{ hostId: string, remoteCwd: string } | undefined> = []
+
   async create(agent: { session?: object }, request: Record<string, unknown>, _signal: AbortSignal): Promise<{ marker: string, request: Record<string, unknown> }> {
     this.createCalls.push(request)
+    // Upstream `userLaunch` calls `terminalEnvironment()` with no cwd when
+    // `shellPath` is absent, so the remote route must be in scope here.
+    const route = remoteTerminalRoute()
+    this.createRoutes.push(route === undefined ? undefined : { hostId: route.hostId, remoteCwd: route.remoteCwd })
     return { marker: this.marker, request }
   }
 }
@@ -593,10 +601,20 @@ test('an explicit shell that the remote does not have becomes the first remote s
   await box.terminal.create(remoteAgent, { title: 'plain' }, signal)
   assert.equal(box.terminal.createCalls[2]!.shellPath, undefined)
   assert.equal(Object.hasOwn(box.terminal.createCalls[2]!, 'shellPath'), false)
+  // An absent `shellPath` makes upstream `userLaunch` resolve the default shell
+  // through `terminalEnvironment()`, which carries no cwd. The allocation must
+  // run inside the remote route scope, or that call reports THIS computer's
+  // platform and `$SHELL` and the terminal opens with the local default shell.
+  assert.deepEqual(box.terminal.createRoutes[2], { hostId: 'host1', remoteCwd: '/remote/src' })
 
   box.directories.cwd = '/tmp/project'
   await box.terminal.create(remoteAgent, { shellPath: '/usr/bin/fish' }, signal)
   assert.equal(box.terminal.createCalls[3]!.shellPath, '/usr/bin/fish')
+  // A local session must never inherit the remote route.
+  assert.equal(box.terminal.createRoutes[3], undefined)
+  // One observation per `create` call: the indexes above are call positions, so
+  // an extra internal call (or a lost one) must fail here rather than shift them.
+  assert.equal(box.terminal.createRoutes.length, box.terminal.createCalls.length)
 
   box.directories.cwd = placeholder
   box.core.loadShells = async () => []

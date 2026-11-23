@@ -166,6 +166,11 @@ function alignFsErrors(h: Harness, FsErrorCtor: any): void {
 async function boot(opts: { official?: boolean } = {}): Promise<Host> {
   const o = official!
   const ctx = new o.cordis.Context()
+  // DSH 0.2.3 chain: ToolRuntime injects `systemPrompt`, which injects
+  // `sessionProjections`. Providing the stub only after mounting them leaves
+  // both plugins inactive and the agent scope never starts, so `addAgent`
+  // fails with "agent scope did not start" even though the plugin is fine.
+  ctx.provide('sessionProjections', { register: () => () => undefined, get: () => undefined })
   await ctx.plugin(o.sysp.SystemPrompt, SYS_CONFIG)
   await ctx.plugin(o.tools.ToolRuntime)
 
@@ -584,6 +589,7 @@ test('a placeholder path is passed through and a local session uses the official
 test('a bare remote path is refused by the guard when no editor shadow is mounted', { skip: SKIP }, async () => {
   const o = official!
   const ctx = new o.cordis.Context()
+  ctx.provide('sessionProjections', { register: () => () => undefined, get: () => undefined })
   await ctx.plugin(o.sysp.SystemPrompt, SYS_CONFIG)
   await ctx.plugin(o.tools.ToolRuntime)
   const h = createHarness()

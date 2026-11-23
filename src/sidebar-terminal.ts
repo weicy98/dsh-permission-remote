@@ -499,7 +499,16 @@ export function installSidebarBridge(ctx: BridgeContext, core: SidebarCore, term
         request = { ...request, shellPath: fallback.path }
       }
     }
-    return originalCreate(agent, request, opSignal)
+    // `shellPath` is optional upstream, and when it is absent `userLaunch` calls
+    // `resolveShell` → `subprocess.terminalEnvironment()` with no cwd. That is
+    // the same no-cwd call `spawn`'s `prepare()` makes, so this allocation needs
+    // the remote route in scope too: without it, `remote-world`'s override sees
+    // no `remoteTerminalRoute()` and answers with THIS computer's platform and
+    // `$SHELL`, so a remote terminal would open with the local default shell.
+    // The marker is set only here and only for a remote route, so a local
+    // session keeps its own default.
+    if (route === undefined) return originalCreate(agent, request, opSignal)
+    return runRemoteTerminal(route, () => originalCreate(agent, request, opSignal))
   }
   if (originalSessionSpawn !== undefined) {
     // Forward every argument: the official `spawn` signature changed from

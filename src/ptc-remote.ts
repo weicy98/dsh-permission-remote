@@ -53,15 +53,47 @@ export interface PtcFailure {
   readonly message: string
 }
 
+/**
+ * One captured output fragment. The plugin only ever *constructs* text blocks
+ * (its fabricated failures carry none), but the type must stay wide enough for
+ * the upstream union: `dispatch` returns the official runtime's result
+ * unchanged, and that result can hold `image` blocks too.
+ *
+ * DSH `0.2.3-alpha.2` replaced `PtcRunResult.logs: string[]` with the required
+ * `output: PtcOutput[]` and added `outputTruncated`. The executor reads
+ * `result.output.flatMap(block => block.type === 'text' ? [block.text] : [])`,
+ * so a result built with only `logs` throws inside the executor instead of
+ * reporting the program failure.
+ */
+export type PtcOutputBlock =
+  | { readonly type: 'text', readonly text: string }
+  | { readonly type: 'image', readonly attachment: unknown }
+
 export interface PtcRunResult {
-  readonly logs: string[]
+  readonly output: PtcOutputBlock[]
+  readonly outputTruncated?: boolean
   readonly value?: unknown
   readonly error?: PtcFailure
   readonly sandbox?: { readonly mode: string, readonly denied: boolean, readonly enforcement?: 'full' | 'partial' }
 }
 
+/**
+ * The `programFormat` values the upstream Node runtime can report.
+ *
+ * `scoped-repl` arrived with DSH `0.2.3-alpha.2`, which changed the default
+ * `executionMode` from `per-call` to `persistent-in-memory` with `replScoped`
+ * on. A list that only knew the earlier three values made `isRuntime()` reject
+ * the official runtime, so `attachRemotePtc` never wrapped it and every remote
+ * `run_code` was refused as "PTC runtime not installed" — a fail-closed break,
+ * but a break. Keep this list in step with `PtcProgramFormat` in
+ * `@deepseek-ai/dsh-ptc-runtime`.
+ */
+export const PTC_PROGRAM_FORMATS = ['function-body', 'repl', 'script', 'scoped-repl'] as const
+
+export type PtcProgramFormat = typeof PTC_PROGRAM_FORMATS[number]
+
 export interface PtcRuntimeLike {
-  readonly programFormat: 'function-body' | 'repl' | 'script'
+  readonly programFormat: PtcProgramFormat
   run(spec: PtcRunSpec): Promise<PtcRunResult>
   readonly executionInstructions?: string
   readonly config?: {
@@ -96,7 +128,9 @@ interface CordisLike {
 }
 
 function failure(kind: PtcFailureKind, message: string): PtcRunResult {
-  return { logs: [], error: { kind, message } }
+  // `output` is required by PtcRunResult and read unconditionally by the
+  // executor, so a fabricated failure must still carry an empty array.
+  return { output: [], error: { kind, message } }
 }
 
 function messageOf(error: unknown): string {
@@ -155,9 +189,7 @@ function isRuntime(value: unknown): value is PtcRuntimeLike {
   try {
     const candidate = value as PtcRuntimeLike
     return typeof candidate.run === 'function'
-      && (candidate.programFormat === 'function-body'
-        || candidate.programFormat === 'repl'
-        || candidate.programFormat === 'script')
+      && (PTC_PROGRAM_FORMATS as readonly unknown[]).includes(candidate.programFormat)
   } catch {
     return false
   }

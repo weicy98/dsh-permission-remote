@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-remote",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "private": false,
   "description": "SSH remote workspaces for the dsh web GUI, reusing the session sandbox mode and approval flow.",
   "type": "module",
@@ -76,8 +76,8 @@
     "@vscode/ripgrep-linux-x64": "^1.15.11"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.1.0",
-    "@deepseek-ai/cosmokit": "^1.8.6",
+    "@deepseek-ai/cordis": "^4.1.0 || ^4.2.0-alpha.1",
+    "@deepseek-ai/cosmokit": "^1.8.6 || ^1.10.0-alpha.1",
     "@deepseek-ai/dsh-atomic-write": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-credentials": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-fs": ">=0.2.2-rc.1 <0.3.0",
@@ -86,22 +86,36 @@
     "@deepseek-ai/dsh-settings": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-typert-protocol": ">=0.2.2-rc.1 <0.3.0",
-    "@deepseek-ai/schemastery": "^3.19.0",
+    "@deepseek-ai/schemastery": "^3.19.0 || ^3.20.0-alpha.1",
     "@deepseek-ai/dsh-fs-patch": ">=0.2.2-rc.1 <0.3.0"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-ptc-runtime-node": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-subprocess": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tool-executor-native": "^0.2.2-rc.1",
-    "@deepseek-ai/dsh-tool-executor-ptc": "^0.2.2-rc.1",
+    "@deepseek-ai/cordis": "4.2.0-alpha.1",
+    "@deepseek-ai/cordis-plugin-group": "1.2.0-alpha.1",
+    "@deepseek-ai/cordis-plugin-include": "1.2.0-alpha.1",
+    "@deepseek-ai/cordis-plugin-loader": "1.2.0-alpha.1",
+    "@deepseek-ai/cosmokit": "1.10.0-alpha.1",
+    "@deepseek-ai/dsh-atomic-write": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-credentials": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-fs": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-fs-patch": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-ptc-runtime-node": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-sandbox": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-settings": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-subprocess": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-tool-executor-native": "^0.2.3-alpha.2",
+    "@deepseek-ai/dsh-tool-executor-ptc": "^0.2.3-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.2.3-alpha.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.3-alpha.2",
+    "@deepseek-ai/schemastery": "3.20.0-alpha.1",
     "@types/node": "^24.0.0",
     "@types/react": "~18.3.1",
     "@types/semver": "^7.8.0",
     "@types/ssh2": "^1.15.5",
     "esbuild": "^0.25.9",
     "semver": "^7.8.5",
-    "typescript": "^5.9.3",
-    "@deepseek-ai/dsh-fs-patch": "0.2.2-rc.1"
+    "typescript": "^5.9.3"
   }
 }

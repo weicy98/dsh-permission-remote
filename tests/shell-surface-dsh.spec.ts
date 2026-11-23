@@ -91,6 +91,10 @@ async function presentPtc(agent: HostAgent): Promise<void> {
 
 async function boot() {
   const ctx = new Context()
+  // DSH 0.2.3 chain: ToolRuntime injects `systemPrompt`, which injects
+  // `sessionProjections`. Without this stub neither plugin activates and every
+  // scoped context below fails to start.
+  ctx.provide('sessionProjections', { register: () => () => undefined, get: () => undefined })
   await ctx.plugin(SystemPrompt, {
     includeHarnessIdentity: false,
     includeRuntimeContext: false,

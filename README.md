@@ -80,7 +80,8 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 
 - 程序里的 `process.env` 与本地 PTC 一样为空；相对路径和 `process.cwd()` 都在远端工作区。
 - 支持 per-call `function-body`、`persistent-in-memory` 的 REPL，以及 `vm-script`（`scriptPersistence` 开启时保留状态）；保留状态按 state owner 留在 SSH 主机进程内。
-- 远端需要 Node.js 22+（DSH 0.2.2-rc.2 的 worker 用到 `node:module` 的 `registerHooks`，该主机需要 **22.15+（或 23.5+、24+）**；下限由上传的 worker 字节推导，太旧会在 `run_code` 里直接报出来）。插件把官方 worker 按 hash 上传到 `~/.dsh-permission-remote/ptc/<hash>/`，不因升级而重复上传。
+- DSH 0.2.3 起 `persistent-in-memory` 默认开启 `replScoped`，运行时报告的 `programFormat` 变成 `scoped-repl`；插件按上游的完整枚举判定，所以远端 `run_code` 在新版默认配置下照常可用。程序写法相应改为「最后一条表达式即完成值、不写顶层 `return`、用 `await import(...)` 而非 `require`」。
+- 远端需要 Node.js 22+（DSH 0.2.2-rc.2 及 0.2.3 的 worker 用到 `node:module` 的 `registerHooks`，该主机需要 **22.15+（或 23.5+、24+）**；下限由上传的 worker 字节推导，太旧会在 `run_code` 里直接报出来）。插件把官方 worker 按 hash 上传到 `~/.dsh-permission-remote/ptc/<hash>/`，不因升级而重复上传。
 - 远端 SSH 需要允许 streamlocal 转发；不支持时回退 loopback TCP，两者都不可用会给出明确错误。
 - 上游 worker 契约和升级流程见 [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md)。
 
@@ -136,7 +137,7 @@ dsh plugin --profile web add /绝对路径/dsh-permission-remote
 - **可选的 `apply_patch` / `str_replace_editor`。** 两者默认都关着，由组合配置决定是否启用了 `@deepseek-ai/dsh-tool-fs` 的 `applyPatch` 或挂载 `@deepseek-ai/dsh-tool-str-replace-editor`；启用后在远端执行，遵守同一套 Permissions、审批和沙箱，整补丁先预检、失败不回滚。细节见[详细说明](docs/advanced.md#可选的-apply_patch--str_replace_editor)。
 - **DSH 跑在 Windows 上时**，远端工作区只暴露远端 `bash`；`pwsh`、`powershell`、`cmd` 会被工具过滤和守卫挡住。`minimal` 这类完整 persona 不会被改写。
 - **项目说明文件**：会话读取 `AGENTS.md` / `CLAUDE.md` 及其 `.local` 时走文件系统接口，占位路径读到远端那份；`$DSH_HOME` 下的全局文件仍是本机。
-- **「运行代码」在远端工作区里跑在 SSH 主机上。** 它使用宿主同版本官方 PTC worker；`process.env` 为空，支持 per-call、persistent-in-memory 和 vm-script（scriptPersistence）。
+- **「运行代码」在远端工作区里跑在 SSH 主机上。** 它使用宿主同版本官方 PTC worker；`process.env` 为空，支持 per-call、persistent-in-memory、scoped-repl 和 vm-script（scriptPersistence）。
 - 只支持直连的 Linux 或 macOS；不支持跳板机和 Windows 远端。网络中断时正在进行的操作会失败，已写入远端的文件不会回滚。
 
 ## 开发
@@ -218,7 +219,7 @@ In a remote workspace, `run_code` / `workflow` executes on the SSH host using th
 
 - Program `process.env` is empty, exactly like local PTC; relative paths and `process.cwd()` are on the remote workspace.
 - Per-call `function-body`, `persistent-in-memory` REPL, and `vm-script` with `scriptPersistence` are supported; retained state stays in the SSH host process keyed by state owner.
-- The remote host needs Node.js 22+ (DSH 0.2.2-rc.2's worker imports `registerHooks` from `node:module`, so that host needs **22.15+ (or 23.5+, 24+)**; the floor is derived from the uploaded worker bytes and an older Node is reported by `run_code`). The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
+- The remote host needs Node.js 22+ (the DSH 0.2.2-rc.2 and 0.2.3 workers import `registerHooks` from `node:module`, so that host needs **22.15+ (or 23.5+, 24+)**; the floor is derived from the uploaded worker bytes and an older Node is reported by `run_code`). The plugin uploads the official worker by hash to `~/.dsh-permission-remote/ptc/<hash>/` and reuses it across runs.
 - The SSH server must allow streamlocal forwarding; otherwise the plugin falls back to loopback TCP and reports a clear error if both fail.
 - Upstream contract and upgrade steps: [docs/upstream-ptc-worker.md](docs/upstream-ptc-worker.md). The same runbook is offered to the agent as the `upstream-ptc-upgrade` skill, and `npm run upgrade:ptc` runs the probe, offline, and (with `--live`) real-host gates before recording anything.
 
@@ -253,7 +254,7 @@ The right sidebar's terminal on a remote workspace connects to that host: the sh
 - **Optional `apply_patch` / `str_replace_editor`** are off unless the composition enables `applyPatch` or mounts the editor package. They then run remotely under the same Permissions, approval, and sandbox; a patch is preflighted first and is not rolled back on failure. Details: [detailed notes](docs/advanced.md#可选的-apply_patch--str_replace_editor).
 - **Windows-hosted DSH** exposes only the remote `bash` in a remote workspace; `pwsh` / `powershell` / `cmd` are filtered and guarded. A `complete: true` persona is not rewritten.
 - **Project instruction files** (`AGENTS.md`, `CLAUDE.md`, and `.local`) are read through the filesystem service, so placeholder paths read the remote copy; global files under `$DSH_HOME` stay local.
-- **Run Code runs on the SSH host in a remote workspace.** It uses the host's exact official PTC worker; `process.env` is empty and per-call, persistent-in-memory, and vm-script modes are supported.
+- **Run Code runs on the SSH host in a remote workspace.** It uses the host's exact official PTC worker; `process.env` is empty and per-call, persistent-in-memory, scoped-repl, and vm-script modes are supported.
 - Direct Linux or macOS only; no jump hosts or Windows remotes. A dropped connection fails the running operation and files already written stay on the remote.
 
 ### Development

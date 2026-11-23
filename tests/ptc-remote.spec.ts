@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import type { RunnerStatus } from '../src/execute.ts'
-import { attachRemotePtc, isRemotePtcRuntime, type PtcRunResult, type PtcRunSpec, type RemotePtcDeps } from '../src/ptc-remote.ts'
+import { PTC_PROGRAM_FORMATS, attachRemotePtc, isRemotePtcRuntime, type PtcRunResult, type PtcRunSpec, type RemotePtcDeps } from '../src/ptc-remote.ts'
 import { disposeSpillDirectory, installRemoteWorld, pruneSpillDirectory, remoteWorldContext, sharedSpillDirectory } from '../src/remote-world.ts'
 import { mapRemoteToLocal } from '../src/router.ts'
 
@@ -22,7 +22,7 @@ function runtime() {
     config: { launch: { kind: 'node-script', executable: process.execPath } },
     async run(_spec: PtcRunSpec): Promise<PtcRunResult> {
       this.calls += 1
-      return { logs: ['local'] }
+      return { output: [{ type: 'text' as const, text: 'local' }] }
     },
   }
 }
@@ -47,7 +47,7 @@ test('a local cwd reaches the original runtime and remote preflight fails closed
   const value = runtime()
   const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps(env))
   try {
-    assert.deepEqual(await value.run({ program: 'return 1', cwd: '/tmp/local', timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local' } }), { logs: ['local'] })
+    assert.deepEqual(await value.run({ program: 'return 1', cwd: '/tmp/local', timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local' } }), { output: [{ type: 'text', text: 'local' }] })
     const remote = await value.run({ program: 'return 1', cwd: placeholder, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: placeholder } })
     assert.equal(remote.error?.kind, 'exception')
     assert.match(remote.error?.message ?? '', /execution world is not installed/u)
@@ -113,7 +113,7 @@ test('a cd-to-root cwd still pins the sandbox root to the session workspace', as
   value.run = async (spec: PtcRunSpec) => {
     const world = remoteWorldContext.getStore()
     if (world !== undefined) captured.push({ remoteCwd: world.remoteCwd, remoteRoot: world.remoteRoot })
-    return { logs: [String(spec.cwd)] }
+    return { output: [{ type: 'text' as const, text: String(spec.cwd) }] }
   }
   const base = deps(env)
   const custom: RemotePtcDeps = {
@@ -139,6 +139,36 @@ shimRemotePath: '/home/dev/ptc-shim.mjs', digest: 'x',
   } finally {
     restore()
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('every upstream programFormat the official runtime reports is wrapped', async () => {
+  // DSH 0.2.3-alpha.2 changed the default executionMode from `per-call` to
+  // `persistent-in-memory` with `replScoped`, so the official runtime now
+  // reports `programFormat: 'scoped-repl'`. A guard that only knew the earlier
+  // three values silently stopped wrapping, and every remote `run_code` then
+  // failed with "the remote PTC runtime is not installed". Drive every format
+  // the upstream union declares so a new one cannot go unnoticed again.
+  for (const programFormat of PTC_PROGRAM_FORMATS) {
+    const value = { ...runtime(), programFormat }
+    const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps({}))
+    try {
+      assert.equal(isRemotePtcRuntime(value), true, `${programFormat} must be wrapped`)
+      assert.equal(restore.installed, true)
+    } finally {
+      restore()
+    }
+  }
+  // A format outside the upstream union is still refused, so a renamed or
+  // foreign runtime never reaches the local execution world through us.
+  for (const programFormat of ['module', 'per-call', '', undefined]) {
+    const value = { ...runtime(), programFormat }
+    const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps({}))
+    try {
+      assert.equal(isRemotePtcRuntime(value), false, `${String(programFormat)} must not be wrapped`)
+    } finally {
+      restore()
+    }
   }
 })
 
@@ -246,7 +276,7 @@ test('a failure at the third wrap mutation rolls back run and the mark', async (
     assert.equal(hostile.run, original, 'run must be restored after a late failure')
     assert.equal(hostile.executionInstructions, 'base instructions')
     assert.equal(warnings.length, 1)
-    assert.deepEqual(await hostile.run({ program: 'return 1', cwd: '/tmp/local', timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local' } }), { logs: ['local'] })
+    assert.deepEqual(await hostile.run({ program: 'return 1', cwd: '/tmp/local', timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/tmp/local' } }), { output: [{ type: 'text', text: 'local' }] })
   } finally {
     restore()
   }
@@ -373,7 +403,7 @@ test('a sandbox-unavailable result also invalidates the cached probe', async () 
   const env = { DSH_HOME: home }
   const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
   const value = runtime()
-  value.run = async () => ({ logs: [], error: { kind: 'sandbox-unavailable', message: 'remote sandbox probe failed' } })
+  value.run = async () => ({ output: [], error: { kind: 'sandbox-unavailable', message: 'remote sandbox probe failed' } })
   const forgotten: string[] = []
   const custom: RemotePtcDeps = {
     ...deps(env),
@@ -410,7 +440,7 @@ test('a failed run on a host whose probe lacks ripgrep invalidates the cached pr
   const env = { DSH_HOME: home }
   const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
   const value = runtime()
-  value.run = async () => ({ logs: [], error: { kind: 'exception', message: 'rg: command not found' } })
+  value.run = async () => ({ output: [], error: { kind: 'exception', message: 'rg: command not found' } })
   const forgotten: string[] = []
   const custom: RemotePtcDeps = {
     ...deps(env),
@@ -447,7 +477,7 @@ test('a failed run on a host whose probe reports upload-failed ripgrep also re-p
   const env = { DSH_HOME: home }
   const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
   const value = runtime()
-  value.run = async () => ({ logs: [], error: { kind: 'exception', message: 'rg: command not found' } })
+  value.run = async () => ({ output: [], error: { kind: 'exception', message: 'rg: command not found' } })
   const forgotten: string[] = []
   const custom: RemotePtcDeps = {
     ...deps(env),

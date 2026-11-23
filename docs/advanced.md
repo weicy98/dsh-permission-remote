@@ -151,8 +151,10 @@ DSH 的 `present` 只认本机文件：它逐个 `lstat` / `resolve` / `stat` �
 
 远端 `run_code` / `workflow` 使用宿主同版本官方 `@deepseek-ai/dsh-ptc-runtime-node` 的 `process.js`。插件只做四件事：定位/校验上游 worker、按 hash 上传、用 SSH 转发的 fd 7 socket 提供控制通道、把 `sandbox.confine` / `subprocess.spawn` 适配到远端。帧协议、程序运行、超时/输出上限、错误分类和工具回桥全部由官方 runtime 负责。
 
-- 远端需要 Node.js 22+；DSH 0.2.2-rc.2 的 worker 引入 `node:module` 的 `registerHooks`（该 API 自 22.15 / 23.5 才有），因此配 rc.2 的宿主要求远端 **22.15+（23.0–23.4 不含该 API，23.5+ 或 24+ 也可）**。下限不写死在版本标签上，而是从即将上传的 `process.js` 字节推导并记进 manifest 的 `minimumNodeMinor`；`ensureWorker` 在上传前拒绝过旧的远端 Node，并提示升级后重新探测。worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
-- `process.env` 为空；`cwd`/相对路径在远端。支持 per-call function-body、persistent-in-memory REPL 和 vm-script（scriptPersistence）；保留状态按 state owner 留在远端进程，沙箱模式变化时由官方 runtime invalidate。
+- 远端需要 Node.js 22+；自 DSH 0.2.2-rc.2 起（含 0.2.3）的 worker 引入 `node:module` 的 `registerHooks`（该 API 自 22.15 / 23.5 才有），因此这些宿主要求远端 **22.15+（23.0–23.4 不含该 API，23.5+ 或 24+ 也可）**。下限不写死在版本标签上，而是从即将上传的 `process.js` 字节推导并记进 manifest 的 `minimumNodeMinor`；`ensureWorker` 在上传前拒绝过旧的远端 Node，并提示升级后重新探测。worker 以 `process.mjs` 上传，不能直接用 `.js`（ESM 解析问题）。
+- `process.env` 为空；`cwd`/相对路径在远端。支持 per-call function-body、persistent-in-memory 的 REPL / scoped-repl 和 vm-script（scriptPersistence）；保留状态按 state owner 留在远端进程，沙箱模式变化时由官方 runtime invalidate。
+- DSH 0.2.3 把 `executionMode` 的默认值从 `per-call` 改成 `persistent-in-memory`，并且默认 `replScoped: true`，于是 `programFormat` 多出第四种取值 `scoped-repl`。插件的包装守卫按上游 `PtcProgramFormat` 的完整枚举判定（`PTC_PROGRAM_FORMATS`），漏一种就会让官方 runtime 不被包装、远端 `run_code` 被守卫以「PTC 未安装」拒绝，所以新增取值时必须同步这个常量。scoped-repl 的程序写法是：最后一条顶层表达式即完成值，不能写顶层 `return`，导入模块用 `await import(...)`。
+- DSH 0.2.3 的 `PtcRunResult` 用必填的 `output: PtcOutput[]` 取代了 `logs: string[]`，并新增 `outputTruncated`；执行器无条件读 `result.output`。插件自己构造的失败结果也必须带 `output`，否则远端预检失败时执行器会抛 TypeError 而不是报出原始错误。text 片段保留原始换行，不再像 `logs` 那样逐条裁剪。
 - 上游契约、manifest 与升级 runbook 见 [upstream-ptc-worker.md](upstream-ptc-worker.md)。
 - 如果远端 sshd 禁用 streamlocal，会尝试 loopback TCP；两者都不可用时明确失败，不静默回退本机。
 
