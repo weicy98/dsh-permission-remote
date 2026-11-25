@@ -64,13 +64,29 @@ export interface PtcFailure {
  * `result.output.flatMap(block => block.type === 'text' ? [block.text] : [])`,
  * so a result built with only `logs` throws inside the executor instead of
  * reporting the program failure.
+ *
+ * Both fields are carried, for the two executors this plugin has to serve:
+ * the 0.2.2 rc line reads `result.logs`, and 0.2.3 reads `result.output`. The
+ * plugin only *constructs* results for its own refusals ({@link failure});
+ * a successful run returns the official runtime's result unchanged, which
+ * already has whichever field its own executor expects. Carrying both costs
+ * one empty array and removes the rc break: without it an rc host hit a
+ * TypeError from inside the executor instead of the real refusal message.
  */
 export type PtcOutputBlock =
   | { readonly type: 'text', readonly text: string }
   | { readonly type: 'image', readonly attachment: unknown }
 
 export interface PtcRunResult {
+  /** Read by the 0.2.3 line. */
   readonly output: PtcOutputBlock[]
+  /**
+   * Read by the 0.2.2 rc line, which never saw `output`.
+   *
+   * Optional because the official runtime's own result is returned unchanged
+   * and only ever carries the field its own DSH version produces.
+   */
+  readonly logs?: readonly string[]
   readonly outputTruncated?: boolean
   readonly value?: unknown
   readonly error?: PtcFailure
@@ -128,9 +144,11 @@ interface CordisLike {
 }
 
 function failure(kind: PtcFailureKind, message: string): PtcRunResult {
-  // `output` is required by PtcRunResult and read unconditionally by the
-  // executor, so a fabricated failure must still carry an empty array.
-  return { output: [], error: { kind, message } }
+  // A fabricated failure must satisfy whichever executor is installed: 0.2.3
+  // reads `output`, the 0.2.2 rc line reads `logs`. Leaving one out does not
+  // degrade the message, it replaces it with a TypeError thrown from inside
+  // the executor, so both empty arrays are always present.
+  return { output: [], logs: [], error: { kind, message } }
 }
 
 function messageOf(error: unknown): string {

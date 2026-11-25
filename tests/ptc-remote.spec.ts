@@ -103,6 +103,39 @@ test('run_code refuses a policy root belonging to a different SSH host', async (
 })
 
 
+test('a fabricated refusal satisfies both the rc and the 0.2.3 executor', async () => {
+  // DSH 0.2.2 rc reads `result.logs`, 0.2.3 reads `result.output`. A refusal
+  // built with only one of them does not lose its message gracefully: the
+  // executor throws a TypeError on the missing field, so the operator saw an
+  // internal type error instead of the actual reason the run was refused.
+  const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-remote-shape-'))
+  const env = { DSH_HOME: home }
+  const placeholder = mapRemoteToLocal('h1', '/srv/app', env)!
+  const other = mapRemoteToLocal('h2', '/srv/app', env)!
+  const value = runtime()
+  const restore = attachRemotePtc({ get: name => name === 'ptcRuntime' ? value : undefined, on: () => () => undefined }, deps(env))
+  try {
+    const result = await value.run({ program: 'return 1', cwd: placeholder, timeoutMs: 1000, bindings: [], sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: other } })
+    assert.equal(result.error?.kind, 'exception')
+    // Exactly the two reads the upstream executors perform.
+    assert.ok(Array.isArray(result.output), '0.2.3 reads result.output.flatMap(...)')
+    assert.ok(Array.isArray(result.logs), '0.2.2 rc reads result.logs')
+    assert.deepEqual(
+      result.output.flatMap(block => block.type === 'text' ? [block.text] : []),
+      [],
+      'the 0.2.3 read must not throw on a refusal',
+    )
+    assert.doesNotThrow(
+      () => (result.logs as readonly string[]).map(text => text),
+      'the rc read must not throw on a refusal',
+    )
+    assert.equal(value.calls, 0)
+  } finally {
+    restore()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('a cd-to-root cwd still pins the sandbox root to the session workspace', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-ptc-remote-root-'))
   const env = { DSH_HOME: home }
