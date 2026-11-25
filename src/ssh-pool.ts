@@ -13,6 +13,60 @@ import { shJoin } from './shell-quote.ts'
 const OUTPUT_CAP = 1024 * 1024
 const FORWARD_OPEN_TIMEOUT_MS = 10_000
 
+/**
+ * How long one channel-open may wait for the server's confirmation.
+ *
+ * A silently dead link (VPN switch, suspended laptop, expired NAT mapping) sends
+ * no FIN and no RST: the socket stays ESTABLISHED, `client.exec` never calls
+ * back, and the only other signal is SSH keepalive at
+ * `SSH_KEEPALIVE_INTERVAL_MS × (keepaliveCountMax + 1)` — a minute of a tool call
+ * that looks hung. Answering CHANNEL_OPEN_CONFIRMATION is one round trip plus
+ * the server's own scheduling, so ten seconds means the connection is gone
+ * rather than slow. Firing here drops the connection so the next attempt dials a
+ * fresh one instead of reusing a dead socket.
+ */
+export const CHANNEL_OPEN_TIMEOUT_MS = 10_000
+
+/**
+ * The window {@link openWatchdog} actually uses.
+ *
+ * Tests cannot wait ten seconds per case, so they shorten it here. Production
+ * code never assigns to it: the constant above is the shipped value.
+ */
+let channelOpenWindowMs = CHANNEL_OPEN_TIMEOUT_MS
+
+/** Shorten the channel-open window for one test, returning the previous value. */
+export function setChannelOpenWindowForTest(ms: number): () => void {
+  const previous = channelOpenWindowMs
+  channelOpenWindowMs = ms > 0 ? ms : CHANNEL_OPEN_TIMEOUT_MS
+  return () => { channelOpenWindowMs = previous }
+}
+
+/**
+ * How long a caller may wait for a connection slot when it supplied no deadline.
+ *
+ * A slot is released only when its connection closes, and a pooled connection
+ * stays open until the plugin unloads. With the default `maxConnections` of 4, a
+ * fifth host would otherwise wait forever: the queue had no timer at all, so
+ * `timeoutMs` on the tool call was ignored and the tool call never returned.
+ * This is a backstop for callers that ask for no deadline of their own; a caller
+ * that does supply one is bounded by that instead.
+ */
+export const DEFAULT_SLOT_WAIT_TIMEOUT_MS = 60_000
+
+/**
+ * The backstop {@link SshPool} actually applies to a caller that supplied no
+ * deadline. Tests shorten it; production code never assigns to it.
+ */
+let slotWaitBackstopMs = DEFAULT_SLOT_WAIT_TIMEOUT_MS
+
+/** Shorten the slot-wait backstop for one test, returning the previous value. */
+export function setSlotWaitForTest(ms: number): () => void {
+  const previous = slotWaitBackstopMs
+  slotWaitBackstopMs = ms > 0 ? ms : DEFAULT_SLOT_WAIT_TIMEOUT_MS
+  return () => { slotWaitBackstopMs = previous }
+}
+
 function abortError(): Error {
   const error = new Error('SSH operation aborted')
   error.name = 'AbortError'
@@ -168,6 +222,42 @@ export interface DirEntry {
   readonly path: string
 }
 
+/**
+ * Time one channel open and report whether the server ever confirmed it.
+ *
+ * `arm()` starts the window; `settle()` cancels it once the server answers. If
+ * the window elapses first, the callback runs with how long it waited, and the
+ * caller treats the connection as dead.
+ *
+ * This is the only signal a silently dead link gives: the socket stays
+ * ESTABLISHED and ssh2's callback is simply never invoked, so without this the
+ * failure surfaces only when the command's own timeout fires — one dead link
+ * turned into a full timeout for every command, with no reconnect between them.
+ */
+function openWatchdog(callback: (waitedMs: number) => void, limitMs?: number): { settle(): void } {
+  const started = Date.now()
+  // A caller with a short deadline must not be made to sit through the full
+  // window first: the command's own timer would fire inside it and the result
+  // would look like a slow command rather than a dead link.
+  const window = limitMs !== undefined && limitMs > 0
+    ? Math.min(channelOpenWindowMs, limitMs)
+    : channelOpenWindowMs
+  const timer = setTimeout(() => {
+    callback(Date.now() - started)
+  }, window)
+  // The window is a per-call guard, not a reason to keep the process alive.
+  timer.unref?.()
+  return {
+    settle: () => clearTimeout(timer),
+  }
+}
+
+/** How a host is named in a pool error: its configured name, or its address. */
+function hostLabel(host: HostConfig): string {
+  const name = host.name.trim()
+  return name.length > 0 ? name : host.host
+}
+
 /** One directory entry, including files. `sftpList` stays directories only. */
 export interface RemoteDirEntry {
   readonly name: string
@@ -295,6 +385,17 @@ export class SshFailure extends Error {
      * a translation or a rephrase would silently downgrade the code.
      */
     readonly limitExceeded?: boolean,
+    /**
+     * The connection this attempt used is believed dead, so a retry on a fresh
+     * one is safe.
+     *
+     * A silently dead link makes `client.exec` never call back, and the request
+     * never reached the server, so replaying it cannot repeat a side effect.
+     * This is deliberately separate from the message text: `isRetryableOpenFailure`
+     * matched English wording, and a localised or rephrased message would have
+     * silently stopped replaying.
+     */
+    readonly connectionDead?: boolean,
   ) {
     super(message)
     this.name = 'SshFailure'
@@ -349,11 +450,17 @@ export function isSftpPermissionDenied(error: unknown): boolean {
 /**
  * A channel-open request that failed because the pooled connection was already
  * gone: the socket died while we waited for CHANNEL_OPEN_CONFIRMATION, so ssh2
- * reports it as "No response from server". The remote never ran the command, so
- * replaying it on a fresh connection is safe.
+ * reports it as "No response from server", or the open watchdog gave up on a
+ * link that never answered. The remote never ran the command, so replaying it
+ * on a fresh connection is safe.
+ *
+ * `connectionDead` is checked first: it is set by the code that detected the
+ * dead link, so a localised or rephrased message cannot turn a replayable
+ * failure into a hard one.
  */
 export function isRetryableOpenFailure(error: unknown): boolean {
   if (!(error instanceof SshFailure) || error.stage !== 'exec') return false
+  if (error.connectionDead === true) return true
   return /no response from server|not connected|connection lost/i.test(error.message)
 }
 
@@ -386,6 +493,16 @@ interface Live {
 interface OpeningState {
   waiters: number
   settled: boolean
+  /**
+   * Set once this opening has taken a concurrency slot.
+   *
+   * A caller's deadline bounds only the queue wait: after the slot is held the
+   * connect is bounded by ssh2's own `readyTimeout`, which is deliberately
+   * longer than a tool call's own timeout. Without this flag the deadline would
+   * have to cover both, and a slow-but-working WAN link would fail a short
+   * command before it ever ran.
+   */
+  reserved: boolean
 }
 
 const FINGERPRINT_PREFIX = 'SHA256:'
@@ -534,7 +651,10 @@ export class SshPool {
     if (request.signal?.aborted) throw new SshFailure('pty allocation aborted', 'pty')
     const live = await this.acquire(host, secret, true, request.signal)
     if (request.signal?.aborted) throw new SshFailure('pty allocation aborted', 'pty')
-    const channel = await execPty(live.client, request)
+    const channel = await execPty(live.client, request, () => {
+      live.markDead()
+      void closeLive(live)
+    })
     if (request.signal?.aborted) {
       try {
         channel.close()
@@ -559,7 +679,14 @@ export class SshPool {
   }
 
   async exec(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<ExecResult> {
-    const commandHandle = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput)
+    // One deadline for the whole call, including the replay below. A dead link
+    // is detected by the channel-open watchdog and then replays on a fresh
+    // connection; charging the retry a second full budget would make a 3 s
+    // command return after 6 s or more, which is exactly the "it hangs" the
+    // caller is trying to avoid.
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : undefined
+    const remaining = (): number => deadline === undefined ? timeoutMs : Math.max(1, deadline - Date.now())
+    const commandHandle = await this.open(host, secret, command, remaining(), signal, stdin, onOutput)
     try {
       return await commandHandle.done
     } catch (error) {
@@ -568,16 +695,26 @@ export class SshPool {
       // open again on a fresh connection — the next command would otherwise
       // keep hitting the same stale socket.
       if (signal?.aborted === true || !isRetryableOpenFailure(error)) throw error
+      if (deadline !== undefined && Date.now() >= deadline) throw error
       await this.dropSession(host.id)
-      const retried = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput)
+      const retried = await this.open(host, secret, command, remaining(), signal, stdin, onOutput)
       return retried.done
     }
   }
 
   /** `timeoutMs` of 0 waits until the command exits, the signal aborts, or `close` kills its channel. */
   async open(host: HostConfig, secret: SecretMaterial, command: string, timeoutMs: number, signal?: AbortSignal, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): Promise<RemoteCommand> {
-    const live = await this.acquire(host, secret, true, signal)
-    const commandHandle = openChannel(live.client, command, timeoutMs, stdin, onOutput)
+    // The caller's own deadline also bounds the queue wait: a command that can
+    // only run for `timeoutMs` must not spend longer than that behind a full
+    // pool. `0` means no deadline of its own, so the pool's backstop applies.
+    const live = await this.acquire(host, secret, true, signal, timeoutMs)
+    // A link that never answers the channel-open is dead, not slow: drop the
+    // pooled connection so `exec` replays this command on a fresh one instead of
+    // leaving every later command to burn its own timeout on the same socket.
+    const commandHandle = openChannel(live.client, command, timeoutMs, stdin, onOutput, () => {
+      live.markDead()
+      void closeLive(live)
+    })
     if (signal !== undefined) {
       const abort = () => commandHandle.close()
       if (signal.aborted) commandHandle.close()
@@ -651,7 +788,24 @@ export class SshPool {
       }
     }
     try {
+      const watchdog = openWatchdog(waitedMs => {
+        if (settled || stream !== undefined) return
+        settled = true
+        if (closeTimer !== undefined) clearTimeout(closeTimer)
+        stdout.end()
+        stderr.end()
+        live.markDead()
+        void closeLive(live)
+        rejectDone(new SshFailure(
+          `the SSH connection did not answer the channel-open request within ${waitedMs} ms; the link is probably dead`,
+          'exec',
+          undefined,
+          undefined,
+          true,
+        ))
+      })
       live.client.exec(command, (error, opened) => {
+        watchdog.settle()
         if (error) {
           if (!settled) {
             settled = true
@@ -907,7 +1061,10 @@ export class SshPool {
   async openSftpLease(host: HostConfig, secret: SecretMaterial, signal?: AbortSignal): Promise<SftpLease> {
     const live = await this.acquire(host, secret, true, signal)
     if (signal?.aborted === true) throw abortError()
-    const session = await openSftp(live.client)
+    const session = await openSftp(live.client, undefined, () => {
+      live.markDead()
+      void closeLive(live)
+    })
     let closing: Promise<void> | undefined
     let settled = false
     return {
@@ -1038,7 +1195,18 @@ export class SshPool {
       // until something else drops the whole connection. The identity check
       // keeps a late error from an older session clearing a newer one.
       let opening!: Promise<SftpSession>
-      opening = openSftp(live.client, () => { if (live.sftp === opening) live.sftp = undefined }).catch(error => {
+      opening = openSftp(
+        live.client,
+        () => { if (live.sftp === opening) live.sftp = undefined },
+        // A dead link is not a protocol fault: the whole connection is gone, so
+        // dropping only the SFTP channel would leave the next call to wait on
+        // the same dead socket again.
+        () => {
+          if (live.sftp === opening) live.sftp = undefined
+          live.markDead()
+          void closeLive(live)
+        },
+      ).catch(error => {
         if (live.sftp === opening) live.sftp = undefined
         throw error
       })
@@ -1255,23 +1423,104 @@ export class SshPool {
    * caller detaches before the connection is up, the opening is aborted so no
    * unused connection is created and no slot is held for it.
    */
-  private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, signal?: AbortSignal): Promise<Live> {
+  private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, signal?: AbortSignal, queueWaitMs?: number): Promise<Live> {
     if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     let state = this.openings.get(host.id)
     if (state === undefined) {
-      state = { waiters: 0, settled: false }
+      state = { waiters: 0, settled: false, reserved: false }
       this.openings.set(host.id, state)
     }
     const joined = state
     joined.waiters += 1
+    // One departure per caller, whichever comes first: the shared opening
+    // settling, this caller aborting, or its queue deadline firing. The count
+    // is what tells `openLive` whether anybody still wants the connection, so
+    // a caller that gave up must leave it here — decrementing only when the
+    // shared promise settles would keep a waiting count alive after the tool
+    // call already returned, and the slot, once freed, would dial for nobody.
+    let left = false
+    const leave = (): void => {
+      if (left) return
+      left = true
+      joined.waiters -= 1
+      if (joined.waiters <= 0) this.forgetOpening(host.id, joined)
+    }
     const opening = claimPending(this.live, host.id, () => this.openLive(host, secret, requireTrust, joined))
     void opening.then(
       () => { joined.settled = true; this.forgetOpening(host.id, joined) },
       () => { joined.settled = true; this.forgetOpening(host.id, joined) },
     )
-    return detachOnAbort(opening, signal).finally(() => {
-      joined.waiters -= 1
-      if (joined.waiters <= 0) this.forgetOpening(host.id, joined)
+    const shared = detachOnAbort(opening, signal).finally(leave)
+    return this.boundQueueWait(shared, joined, host, queueWaitMs, leave)
+  }
+
+  /**
+   * Stop waiting for a connection slot once `limit` elapses, while this caller
+   * is still queued.
+   *
+   * The queue has no other deadline: a slot returns only when its connection
+   * closes, and a pooled connection outlives every command, so a caller behind a
+   * full pool would wait until the plugin unloads. That is the hang the model saw
+   * as "the remote takes forever to connect".
+   *
+   * Only this caller detaches. The shared opening keeps its queue position for
+   * the other callers on the host, and when the last one leaves the grant that
+   * eventually arrives is released instead of caching a connection nobody
+   * asked for (`openLive` re-checks the waiter count).
+   *
+   * The bound covers the whole wait for a usable connection, not only the
+   * queue: a slot taken on a dead network still has to complete a handshake,
+   * and ssh2's own `readyTimeout` is a fixed 20 s that knows nothing about the
+   * tool call. Bounding only the queue left a 3 s command returning after 30 s
+   * — 30 s on a dead link, and the same on a slow one it gave up on.
+   *
+   * The shared opening is untouched; only this caller stops waiting on it.
+   */
+  private boundQueueWait(
+    work: Promise<Live>,
+    state: OpeningState,
+    host: HostConfig,
+    limit: number | undefined,
+    leave: () => void,
+  ): Promise<Live> {
+    const bound = limit !== undefined && limit > 0 ? limit : slotWaitBackstopMs
+    if (!(bound > 0)) return work
+    return new Promise<Live>((resolve, reject) => {
+      let settled = false
+      const finish = (settle: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        settle()
+      }
+      const timer = setTimeout(() => {
+        if (settled) return
+        work.catch(() => undefined)
+        leave()
+        // Which stage ran out decides the message: still queued is a slot
+        // problem, past the queue is a slow or dead handshake. Both are the
+        // caller's own deadline, so both must end the call.
+        finish(() => reject(state.reserved
+          ? new SshFailure(
+            `the SSH connection to ${hostLabel(host)} did not become ready within ${bound} ms`,
+            'connect',
+            undefined,
+            undefined,
+            true,
+          )
+          : new SshFailure(
+            `no free SSH connection slot for ${hostLabel(host)} within ${bound} ms: `
+            + `${this.maxConnections} connection${this.maxConnections === 1 ? '' : 's'} are held by this host or other hosts and a slot returns only when its connection closes. `
+            + 'Close a sidebar terminal, or raise maxConnections in the plugin config',
+            'slots',
+          )))
+      }, Math.min(bound, 2 ** 31 - 1))
+      // The wait is bounded per caller, not meant to keep the process alive.
+      timer.unref?.()
+      work.then(
+        value => finish(() => resolve(value)),
+        error => finish(() => reject(error)),
+      )
     })
   }
 
@@ -1289,6 +1538,10 @@ export class SshPool {
   private openLive(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, state: OpeningState): Promise<Live> {
     return (async () => {
       await this.reserve()
+      // The slot is held now, so a caller's queue deadline must stop applying:
+      // from here the connect is bounded by ssh2's `readyTimeout`, and a short
+      // command's own timeout must not decide whether a slow link may dial.
+      state.reserved = true
       if (this.disposed) {
         this.release()
         throw new SshFailure('SSH pool is disposed', 'connect')
@@ -1374,7 +1627,16 @@ function connect(host: HostConfig, secret: SecretMaterial, accept: (key: Buffer)
       client.end()
       reject(error instanceof Error ? error : new SshFailure(String(error), 'connect'))
     }
-    client.once('ready', () => resolve(client))
+    client.once('ready', () => {
+      // Nagle's algorithm plus the peer's delayed ACK turns every unanswered
+      // SFTP request into a ~40 ms stall: measured here on a loopback host,
+      // one serial 64 KiB READ took 45 ms (1.4 MiB/s) with batching on and
+      // 1.5 ms (43 MiB/s) with it off. ssh2 never calls `setNoDelay` itself,
+      // and it must happen after the socket exists but before the first
+      // request, so the handshake is the only place for it.
+      client.setNoDelay(true)
+      resolve(client)
+    })
     client.once('error', fail)
     // A live connection can emit `error` again later (a keepalive timeout, a
     // socket reset). The `once` above is already spent, and EventEmitter throws
@@ -1440,11 +1702,24 @@ export function channelLimitMessage(error: unknown): SshFailure | undefined {
   )
 }
 
-function execPty(client: Client, request: PtyRequest): Promise<PtyChannel> {
+function execPty(client: Client, request: PtyRequest, onDeadLink?: () => void): Promise<PtyChannel> {
   return new Promise((resolve, reject) => {
+    // A sidebar terminal against a dead link otherwise opens as a tab that
+    // never prints anything: the PTY channel-open is just as silent as an exec.
+    const watchdog = openWatchdog(waitedMs => {
+      onDeadLink?.()
+      reject(new SshFailure(
+        `the SSH connection did not answer the PTY channel request within ${waitedMs} ms; the link is probably dead`,
+        'pty',
+        undefined,
+        undefined,
+        true,
+      ))
+    })
     client.exec(request.command, {
       pty: { term: request.term, cols: request.cols, rows: request.rows },
     }, (error, stream) => {
+      watchdog.settle()
       if (error) {
         reject(channelLimitMessage(error) ?? new SshFailure(error.message, 'pty'))
         return
@@ -1454,7 +1729,14 @@ function execPty(client: Client, request: PtyRequest): Promise<PtyChannel> {
   })
 }
 
-function openChannel(client: Client, command: string, timeoutMs: number, stdin?: string | Buffer, onOutput?: (chunk: CommandChunk) => void): RemoteCommand {
+function openChannel(
+  client: Client,
+  command: string,
+  timeoutMs: number,
+  stdin?: string | Buffer,
+  onOutput?: (chunk: CommandChunk) => void,
+  onDeadLink?: () => void,
+): RemoteCommand {
   let settled = false
   let cause: 'exit' | 'timeout' | 'cancel' | 'truncate' = 'exit'
   let stream: ExecStream | undefined
@@ -1494,6 +1776,7 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
   const finish = (code?: number | null, signal?: string | null) => {
     if (settled) return
     settled = true
+    watchdog.settle()
     flushDecoder('stdout')
     flushDecoder('stderr')
     clearTimeout(timer)
@@ -1512,6 +1795,25 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
     if (settled || cause !== 'exit') return
     cause = next
     if (stream === undefined) {
+      // The caller's deadline fired before the server ever confirmed the
+      // channel. That is not a slow command: the request never left, so a
+      // timeout result would hide a dead link and let the next command wait on
+      // the same socket again. Report it as dead and let `exec` redial.
+      if (next === 'timeout') {
+        settled = true
+        watchdog.settle()
+        clearTimeout(timer)
+        clearTimeout(fallback)
+        onDeadLink?.()
+        rejectDone(new SshFailure(
+          `the SSH connection never confirmed the channel-open; the link is probably dead`,
+          'exec',
+          undefined,
+          undefined,
+          true,
+        ))
+        return
+      }
       finish(null, null)
       return
     }
@@ -1531,9 +1833,28 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
   // overflows and fires after 1 ms. Callers cap their own values, but clamp
   // here too so no caller can turn a big timeout into an instant failure.
   const timer = timeoutMs > 0 ? setTimeout(() => stop('timeout'), Math.min(timeoutMs, 2 ** 31 - 1)) : undefined
+  // A dead link never invokes the exec callback, so the command timer is the
+  // only thing that would fire: every command on that connection burns its full
+  // timeout, and none of them notices the connection is gone. This window makes
+  // the first command report a dead link instead.
+  const watchdog = openWatchdog(waitedMs => {
+    if (settled || stream !== undefined) return
+    settled = true
+    clearTimeout(timer)
+    clearTimeout(fallback)
+    onDeadLink?.()
+    rejectDone(new SshFailure(
+      `the SSH connection did not answer the channel-open request within ${waitedMs} ms; the link is probably dead`,
+      'exec',
+      undefined,
+      undefined,
+      true,
+    ))
+  }, timeoutMs)
   try {
     client.exec(command, (error, opened) => {
       if (error) {
+        watchdog.settle()
         if (!settled) {
           settled = true
           clearTimeout(timer)
@@ -1541,6 +1862,7 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
         }
         return
       }
+      watchdog.settle()
       stream = opened as unknown as ExecStream
       const push = (target: Buffer[], chunk: Buffer, which: 'stdout' | 'stderr') => {
         const used = target.reduce((sum, part) => sum + part.length, 0)
@@ -1586,6 +1908,7 @@ function openChannel(client: Client, command: string, timeoutMs: number, stdin?:
     // `client.exec` throws synchronously once the socket is gone, so the error
     // never reaches the callback. Surface it as the same rejection instead of
     // throwing out of `openChannel` where no caller expects it.
+    watchdog.settle()
     settled = true
     clearTimeout(timer)
     clearTimeout(fallback)
@@ -1622,6 +1945,8 @@ interface SftpLike {
   write(handle: Buffer, buffer: Buffer, offset: number, length: number, position: number, callback: (error: Error | undefined, endOffset: number) => void): void
   /** One-packet write budget from ssh2 (`_maxWriteLen`), when this session has it. */
   _maxWriteLen?: number
+  /** One-packet read budget from ssh2 (`_maxReadLen`), when this session has it. */
+  _maxReadLen?: number
   close(handle: Buffer, callback: (error: Error | undefined) => void): void
   rename(oldPath: string, newPath: string, callback: (error: Error | undefined) => void): void
   /** OpenSSH's atomic POSIX rename extension, when the server offers it. */
@@ -1634,9 +1959,24 @@ interface SftpLike {
   on(event: 'end' | 'close', listener: () => void): void
 }
 
-function openSftp(client: Client, onFatal?: () => void): Promise<SftpSession> {
+function openSftp(client: Client, onFatal?: () => void, onDeadLink?: () => void): Promise<SftpSession> {
   return new Promise((resolve, reject) => {
+    // Opening the SFTP subsystem is a channel open like any other, so a dead
+    // link answers it exactly the same way: never. Without this window the
+    // first file-tool call on a dead connection waits for the keepalive to give
+    // up, then reports "No response from server" a minute later.
+    const watchdog = openWatchdog(waitedMs => {
+      onDeadLink?.()
+      reject(new SshFailure(
+        `the SSH connection did not answer the SFTP channel request within ${waitedMs} ms; the link is probably dead`,
+        'sftp',
+        undefined,
+        undefined,
+        true,
+      ))
+    })
     client.sftp((error, sftp) => {
+      watchdog.settle()
       if (error) {
         reject(new SshFailure(error.message, 'sftp'))
         return
@@ -1781,6 +2121,28 @@ function readdir(sftp: SftpLike, remotePath: string): Promise<ReadonlyArray<{ fi
 }
 
 const READ_CHUNK = 64 * 1024
+/**
+ * How many bytes of reads may sit unanswered. A single 64 KiB window at a
+ * time measured 1.4 MiB/s on a LAN host while the same link reached 40+ MiB/s
+ * once a window was queued, so the window is what the throughput depends on.
+ * 1 MiB matches {@link WRITE_BUDGET}: a cross-host copy then holds about 2 MiB
+ * of buffers no matter which leg is the slower one.
+ */
+const READ_BUDGET = 1024 * 1024
+/** Hard cap on concurrent READ requests, independent of their size. */
+const MAX_INFLIGHT_READS = 16
+
+/**
+ * One read request. A server that advertises `_maxReadLen` (OpenSSH: 261120,
+ * i.e. 256 KiB minus overhead) accepts a request that big, and asking for it
+ * instead of 64 KiB quarters the number of round trips. Anything at or below
+ * 64 KiB, or a missing advertisement, keeps the conservative window.
+ */
+function readChunkBytes(sftp: SftpLike): number {
+  const packet = sftp._maxReadLen
+  if (typeof packet !== 'number' || !Number.isSafeInteger(packet) || packet <= READ_CHUNK) return READ_CHUNK
+  return Math.min(packet, 256 * 1024)
+}
 
 /**
  * `ls -l` style longname. The first character is the type only when the next
@@ -2245,7 +2607,20 @@ export async function streamLocalToSftp(
   }
 }
 
-/** Sequential windows from one handle. A short read ends the file. */
+/**
+ * Read a file as one ordered stream of chunks, with a window of reads in flight.
+ *
+ * One read at a time makes the peer round trip the bottleneck: a 32 MiB file
+ * took 23 s over a LAN link (1.4 MiB/s) because every 64 KiB waited for its
+ * own reply. Issuing a bounded window of reads keeps the link busy, which is
+ * the same trade ssh2's own `fastGet` makes. Slots are consumed strictly in
+ * order, so the stream stays sequential byte for byte.
+ *
+ * A short read is the one case where the queued slots were issued at offsets
+ * that no longer line up, because slots are spaced by the requested length.
+ * Rare before EOF (a server that caps replies below `_maxReadLen`): the queued
+ * reads are dropped and the window re-anchors on the byte actually reached.
+ */
 export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
   const opening = openRead(sftp, remotePath)
   let handle: Buffer
@@ -2259,16 +2634,46 @@ export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal
     }
     throw error
   }
+  const chunkBytes = readChunkBytes(sftp)
+  // Bounded by bytes as well as by a request count: a server that advertises
+  // 256 KiB replies still holds about `READ_BUDGET` of buffers, not 16 × 256 KiB.
+  const window = Math.max(1, Math.min(MAX_INFLIGHT_READS, Math.floor(READ_BUDGET / chunkBytes)))
+  const queued: Array<Promise<Buffer>> = []
+  // Offset the next queue slot asks for. It advances by the *requested*
+  // length, so every slot holds a full chunk unless a read comes back short.
+  let issueAt = 0
+  // Bytes handed to the consumer so far: where a re-anchored window starts.
+  let position = 0
+  const issue = (): void => {
+    queued.push(raceAbort(readAt(sftp, handle, issueAt, chunkBytes), signal))
+    issueAt += chunkBytes
+  }
+  const refill = (): void => {
+    while (queued.length < window) issue()
+  }
   try {
-    let position = 0
+    refill()
     while (true) {
       if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
-      const chunk = await raceAbort(readAt(sftp, handle, position, READ_CHUNK), signal)
+      const chunk = await queued.shift()!
       if (chunk.length === 0) return
       position += chunk.length
+      if (chunk.length < chunkBytes) {
+        // The queued slots were spaced by the full chunk that never arrived, so
+        // their offsets no longer line up with the bytes. Drop them (observing
+        // each so its eventual failure is not an unhandled rejection) and
+        // re-anchor the window on the byte actually reached.
+        for (const dropped of queued.splice(0)) dropped.catch(() => undefined)
+        issueAt = position
+      }
       yield chunk
+      refill()
     }
   } finally {
+    // Nothing observes a queued read after the consumer stops. The handle
+    // close below fails them at the protocol layer, and this keeps that
+    // failure from surfacing as an unhandled rejection.
+    for (const dropped of queued.splice(0)) dropped.catch(() => undefined)
     await settleWithin(closeHandle(sftp, handle))
   }
 }

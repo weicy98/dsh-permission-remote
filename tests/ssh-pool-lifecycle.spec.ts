@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
 import type { HostConfig } from '../src/config.ts'
-import { SshPool } from '../src/ssh-pool.ts'
+import { SshFailure, SshPool, setChannelOpenWindowForTest, setSlotWaitForTest } from '../src/ssh-pool.ts'
 
 const host: HostConfig = {
   id: 'host118',
@@ -437,4 +437,156 @@ test('a caller that aborts while queued never opens a connection', async () => {
       await pool.dispose()
     })
   })
+})
+
+test('a caller queued behind a full pool returns instead of waiting forever', async () => {
+  // A slot returns only when its connection closes, and a pooled connection
+  // outlives every command. With the default maxConnections of 4, the fifth
+  // host queued with no timer at all: the tool call's own timeoutMs was
+  // ignored and the call never returned.
+  let connects = 0
+  await withConnect(function (this: Client) {
+    connects += 1
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      process.nextTick(() => {
+        callback(undefined, stream)
+        stream.emit('close', 0)
+      })
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(1)
+      const held = { ...host, id: 'held' }
+      const queued = { ...host, id: 'queued' }
+      await pool.exec(held, {}, 'echo hi', 5_000)
+      assert.equal(pool.freeSlots(), 0)
+      const started = Date.now()
+      await assert.rejects(
+        () => pool.exec(queued, {}, 'echo hi', 300),
+        (error: Error) => error instanceof SshFailure
+          && error.stage === 'slots'
+          && /no free SSH connection slot/.test(error.message)
+          && /maxConnections/.test(error.message),
+      )
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 3_000, `the queued call returned after ${elapsed}ms; it must honour its own timeout`)
+      // The queued host must not become a cached connection just because it once
+      // waited: freeing the held slot has to give the grant back, not dial.
+      pool.invalidate(held.id)
+      await new Promise(resolve => setTimeout(resolve, 80))
+      assert.equal(connects, 1, 'an abandoned queued call must never dial')
+      assert.equal(pool.freeSlots(), 1, 'the slot handed to the abandoned call must come back')
+      await pool.dispose()
+    })
+  })
+})
+
+test('a caller with no timeout still leaves the queue', async () => {
+  // `timeoutMs` of 0 means no deadline of the caller's own, which used to mean
+  // no deadline at all. The pool's backstop has to end the wait instead.
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      process.nextTick(() => {
+        callback(undefined, stream)
+        stream.emit('close', 0)
+      })
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(1)
+      const restore = setSlotWaitForTest(120)
+      try {
+        await pool.exec({ ...host, id: 'held' }, {}, 'echo hi', 5_000)
+        await assert.rejects(
+          () => pool.exec({ ...host, id: 'queued' }, {}, 'echo hi', 0),
+          (error: Error) => /no free SSH connection slot/.test(error.message),
+        )
+      } finally {
+        restore()
+        await pool.dispose()
+      }
+    })
+  })
+})
+
+test('a channel-open that is never answered means the link is dead', async () => {
+  // A silently dead link keeps the socket ESTABLISHED and never invokes the
+  // exec callback. Without the watchdog every command on that connection burned
+  // its own full timeout and none of them noticed.
+  const restore = setChannelOpenWindowForTest(60)
+  try {
+    let connects = 0
+    await withConnect(function (this: Client) {
+      connects += 1
+      process.nextTick(() => this.emit('ready'))
+      return this
+    }, async () => {
+      await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+        const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+        // First connection: never answer. Second: answer normally.
+        if (connects === 1) return this
+        const stream = fakeStream()
+        process.nextTick(() => {
+          callback(undefined, stream)
+          stream.emit('close', 0)
+        })
+        return this
+      } as unknown as Client['exec'], async () => {
+        const pool = new SshPool(4)
+        const started = Date.now()
+        const result = await pool.exec(host, {}, 'echo hi', 60_000)
+        const elapsed = Date.now() - started
+        assert.equal(result.code, 0, 'the command must be replayed on a fresh connection')
+        assert.ok(elapsed < 5_000, `the dead link took ${elapsed}ms to notice`)
+        assert.equal(connects, 2, 'a dead connection must be replaced, not reused')
+        await pool.dispose()
+      })
+    })
+  } finally {
+    restore()
+  }
+})
+
+test('a dead link releases its connection slot so later calls are not stuck', async () => {
+  // The dead connection holds a slot until something closes it. Detecting the
+  // dead link has to return that slot, or the pool starves exactly when the
+  // network is the problem.
+  const restore = setChannelOpenWindowForTest(60)
+  try {
+    let connects = 0
+    await withConnect(function (this: Client) {
+      connects += 1
+      process.nextTick(() => this.emit('ready'))
+      return this
+    }, async () => {
+      await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+        const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+        if (connects === 1) return this
+        const stream = fakeStream()
+        process.nextTick(() => {
+          callback(undefined, stream)
+          stream.emit('close', 0)
+        })
+        return this
+      } as unknown as Client['exec'], async () => {
+        const pool = new SshPool(1)
+        await pool.exec(host, {}, 'echo hi', 5_000)
+        assert.equal(pool.freeSlots(), 0)
+        await pool.exec(host, {}, 'echo hi', 5_000)
+        assert.equal(pool.freeSlots(), 0, 'the replacement connection keeps the slot it took')
+        assert.equal(pool.hasSession(host.id), true, 'the replacement connection is the cached one')
+        await pool.dispose()
+      })
+    })
+  } finally {
+    restore()
+  }
 })
