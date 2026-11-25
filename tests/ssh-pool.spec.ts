@@ -55,6 +55,8 @@ test('connect sends SSH keepalives on the shared connection', async () => {
     opsPolicy: 'ask' as const,
   }
   assert.equal(sshConnectOptions(host).keepaliveInterval, SSH_KEEPALIVE_INTERVAL_MS)
+  // ssh2's default count of 3 gives 15s x 4 = 60s before a dead link is noticed.
+  assert.equal(sshConnectOptions(host).keepaliveCountMax, 2)
   assert.equal(sshConnectOptions(host).readyTimeout, 20_000)
   const seen: ConnectConfig[] = []
   const original = Client.prototype.connect
@@ -68,6 +70,7 @@ test('connect sends SSH keepalives on the shared connection', async () => {
     await assert.rejects(() => pool.exec(host, {}, 'true', 1000), /stopped before the network/)
     assert.equal(seen.length, 1)
     assert.equal(seen[0]!.keepaliveInterval, 15_000)
+    assert.equal(seen[0]!.keepaliveCountMax, 2)
     assert.equal(seen[0]!.host, '10.0.0.5')
     assert.equal(seen[0]!.port, 22)
     assert.equal(seen[0]!.username, 'me')

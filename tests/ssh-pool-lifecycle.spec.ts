@@ -590,3 +590,209 @@ test('a dead link releases its connection slot so later calls are not stuck', as
     restore()
   }
 })
+
+test('a queued command and its own run share one budget', async () => {
+  // `open()` used to hand the same `timeoutMs` to both `acquire()` and
+  // `openChannel()`, so a caller that spent 150 ms queueing still got a full
+  // 300 ms to run: a 300 ms budget took 453 ms in practice.
+  let connects = 0
+  await withConnect(function (this: Client) {
+    connects += 1
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      // The command takes 400 ms: more than what is left of a 300 ms budget
+      // once 150 ms of queueing is charged.
+      process.nextTick(() => {
+        callback(undefined, stream)
+        setTimeout(() => stream.emit('close', 0), 400)
+      })
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(1)
+      const blocker = { ...host, id: 'blocker' }
+      const target = { ...host, id: 'target' }
+      const held = pool.exec(blocker, {}, 'hold', 10_000).catch(() => undefined)
+      void connects
+      await new Promise(resolve => setTimeout(resolve, 150))
+      const started = Date.now()
+      const settled = await pool.exec(target, {}, 'cmd', 300).then(
+        () => 'returned',
+        (error: Error) => error.message,
+      )
+      const elapsed = Date.now() - started
+      // Either the queue ate the budget (no slot message) or the command was cut
+      // off; either way the caller must not wait a second full 300 ms.
+      assert.ok(elapsed < 400, `${settled}: the whole call took ${elapsed}ms for a 300ms budget`)
+      pool.invalidate(blocker.id)
+      void held
+      await pool.dispose()
+    })
+  })
+})
+
+test('a command cut short by its own timeout is not a dead link', async () => {
+  // A healthy server needs longer than the command's deadline to confirm the
+  // channel-open. Treating that as a dead link dropped the shared connection
+  // and with it every sidebar terminal and PTC channel on the host.
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      // Confirmed after 80 ms: healthy, but slower than a 200 ms caller allows.
+      setTimeout(() => callback(undefined, stream), 80)
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(4)
+      const result = await pool.exec(host, {}, 'slow-open', 200)
+      assert.equal(result.timedOut, true, 'a short deadline must surface as a timeout')
+      assert.equal(pool.hasSession(host.id), true, 'the shared connection must survive a caller giving up')
+      await pool.dispose()
+    })
+  })
+})
+
+test('a command answered after the dead-link verdict is closed, not run', async () => {
+  // The watchdog rejects and drops the connection; the server can still confirm
+  // the channel afterwards. Writing stdin then would run a tool call that was
+  // already reported as failed — and that `exec` may already have replayed.
+  const restore = setChannelOpenWindowForTest(20)
+  const writes: string[] = []
+  try {
+    await withConnect(function (this: Client) {
+      process.nextTick(() => this.emit('ready'))
+      return this
+    }, async () => {
+      await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+        const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+        const stream = Object.assign(fakeStream(), {
+          write: (data: Buffer | string) => {
+            writes.push(Buffer.isBuffer(data) ? data.toString() : data)
+            return true
+          },
+          end: () => undefined,
+        })
+        // Confirmed well after the watchdog window, on both the first attempt
+        // and the replay (the replay dials a fresh connection, so it gets its
+        // own call here).
+        setTimeout(() => callback(undefined, stream), 60)
+        return this
+      } as unknown as Client['exec'], async () => {
+        const pool = new SshPool(4)
+        // The first attempt reports the dead link and replays; the replay's own
+        // budget is already spent, so the call settles as a timeout. Either
+        // outcome is fine here — what matters is that the late channel stays
+        // silent.
+        const settled = await pool.exec(host, {}, 'cmd', 30, undefined, 'STDIN-DATA').then(
+          result => `returned timedOut=${result.timedOut}`,
+          (error: Error) => `rejected: ${error.message.slice(0, 40)}`,
+        )
+        assert.ok(
+          /returned timedOut=true|rejected/.test(settled),
+          `the call must settle, got: ${settled}`,
+        )
+        await new Promise(resolve => setTimeout(resolve, 100))
+        assert.deepEqual(writes, [], 'a late channel must not receive stdin')
+        await pool.dispose()
+      })
+    })
+  } finally {
+    restore()
+  }
+})
+
+test('an abandoned opening releases its slot instead of holding it for readyTimeout', async () => {
+  // ssh2's handshake budget is a fixed 20 s. When every caller gave up, the
+  // opening still kept its slot for that whole time, so in a small pool every
+  // other host got "no free connection slot" for something nobody wanted.
+  await withConnect(function (this: Client) {
+    // A handshake that never completes.
+    return this
+  }, async () => {
+    const pool = new SshPool(1)
+    await assert.rejects(() => pool.exec({ ...host, id: 'gone' }, {}, 'x', 200), /did not become ready/)
+    assert.equal(pool.freeSlots(), 1, 'the slot must come back as soon as the last caller leaves')
+    // And the next host must not wait for the abandoned handshake either.
+    const started = Date.now()
+    await assert.rejects(() => pool.exec({ ...host, id: 'next' }, {}, 'y', 300), /did not become ready/)
+    const waited = Date.now() - started
+    assert.ok(waited < 1_500, `the next host waited ${waited}ms behind an abandoned opening`)
+    await pool.dispose()
+  })
+})
+
+test('cancelling a PTY allocation returns without waiting for the watchdog', async () => {
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client) {
+      // The server never confirms the PTY channel.
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(4)
+      const controller = new AbortController()
+      const started = Date.now()
+      const pending = pool.openPty(host, {}, {
+        command: 'bash',
+        term: 'xterm-256color',
+        cols: 80,
+        rows: 24,
+        signal: controller.signal,
+      })
+      setTimeout(() => controller.abort(), 30)
+      await assert.rejects(() => pending, /pty allocation aborted/)
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 1_000, `the cancel took ${elapsed}ms; it must not wait for the watchdog window`)
+      await pool.dispose()
+    })
+  })
+})
+
+test('a cached SFTP channel on a dead link reports instead of hanging on keepalive', async () => {
+  // The channel-open watchdog covers only the first use of a host. Afterwards
+  // the channel is cached, so a link that dies leaves every stat/readdir/realpath
+  // hanging until SSH keepalive gives up (15 s × 4 = 60 s). That is what made
+  // `read`, the file tree and the directory picker look frozen.
+  await withConnect(function (this: Client) {
+    process.nextTick(() => this.emit('ready'))
+    return this
+  }, async () => {
+    let answer = true
+    await withClientMethod('sftp', function (this: Client, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, sftp: unknown) => void
+      const sftp = Object.assign(new EventEmitter(), {
+        end: () => undefined,
+        stat: (_path: string, done: (error: Error | undefined, stats: unknown) => void) => {
+          // The link is dead: the request is never answered.
+          if (!answer) return
+          done(undefined, { size: 0, mode: 0o644, isDirectory: () => false })
+        },
+      })
+      process.nextTick(() => {
+        sftp.emit('ready')
+        callback(undefined, sftp)
+      })
+      return this
+    } as unknown as Client['sftp'], async () => {
+      const pool = new SshPool(2)
+      // First request opens and caches the channel.
+      await pool.sftpStat(host, {}, '/etc/hostname')
+      answer = false
+      const started = Date.now()
+      await assert.rejects(
+        () => pool.sftpStat(host, {}, '/etc/hostname'),
+        (error: Error) => error instanceof SshFailure && /did not answer within/.test(error.message),
+      )
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 15_000, `the cached channel waited ${elapsed}ms; keepalive alone is 60s`)
+      await pool.dispose()
+    })
+  })
+})

@@ -156,6 +156,42 @@ test('a consumer that stops early closes the handle and leaves no unhandled reje
   assert.deepEqual(seen, [], 'an abandoned window must not become an unhandled rejection')
 })
 
+test('a read behind the head that fails is never an unhandled rejection', async () => {
+  // The consumer awaits only the head of the window. A non-head read that
+  // rejects has no handler until the loop reaches it — and when a re-anchor
+  // drops it, only `finally` would see it. Node emits `unhandledRejection` at
+  // the moment the promise rejects unobserved, and dsh exits on that.
+  //
+  // The success-only early-stop case above never produced a rejected promise,
+  // so it could not catch this; here every read but the head fails.
+  const seen: unknown[] = []
+  const onRejection = (reason: unknown) => seen.push(reason)
+  process.on('unhandledRejection', onRejection)
+  try {
+    const sftp = {
+      _maxReadLen: CHUNK,
+      open(_path: string, _flags: string, callback: (error: Error | undefined, handle: Buffer) => void) {
+        callback(undefined, Buffer.from('handle'))
+      },
+      close(_handle: Buffer, callback: (error: Error | undefined) => void) {
+        callback(undefined)
+      },
+      read(_handle: Buffer, _buffer: Buffer, _offset: number, _length: number, position: number, callback: (error: Error | undefined, bytesRead: number) => void) {
+        // The head reports EOF late; everything queued behind it fails at once.
+        if (position === 0) setTimeout(() => callback(undefined, 0), 30)
+        else setTimeout(() => callback(new Error(`read failed at ${position}`), 0), 5)
+      },
+    }
+    for await (const _chunk of readOpenChunks(sftp as never, '/x')) {
+      // The head ends the stream at EOF; nothing else is yielded.
+    }
+    await new Promise(resolve => setTimeout(resolve, 120))
+  } finally {
+    process.off('unhandledRejection', onRejection)
+  }
+  assert.deepEqual(seen, [], `${seen.length} queued read(s) became an unhandled rejection`)
+})
+
 test('a new connection disables Nagle on its socket', async () => {
   // Nagle plus the peer's delayed ACK cost ~45 ms per unanswered SFTP request
   // on the host this was measured against, which is what turned a copy into a
