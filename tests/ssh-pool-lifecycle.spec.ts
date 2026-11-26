@@ -651,7 +651,15 @@ test('a command cut short by its own timeout is not a dead link', async () => {
   // A healthy server needs longer than the command's deadline to confirm the
   // channel-open. Treating that as a dead link dropped the shared connection
   // and with it every sidebar terminal and PTC channel on the host.
+  //
+  // The assertion must count DIALS, not just check that a session exists at the
+  // end: a dead-link verdict triggers `exec`'s replay, which dials a fresh
+  // connection and succeeds — leaving `hasSession` true and the test green even
+  // with the bug present. What the bug actually costs is the shared connection
+  // plus an extra connect.
+  let connects = 0
   await withConnect(function (this: Client) {
+    connects += 1
     process.nextTick(() => this.emit('ready'))
     return this
   }, async () => {
@@ -665,6 +673,8 @@ test('a command cut short by its own timeout is not a dead link', async () => {
       const pool = new SshPool(4)
       const result = await pool.exec(host, {}, 'slow-open', 200)
       assert.equal(result.timedOut, true, 'a short deadline must surface as a timeout')
+      assert.equal(connects, 1, 'giving up must not be read as a dead link and trigger a redial')
+      // The connection the caller gave up on is still the cached one.
       assert.equal(pool.hasSession(host.id), true, 'the shared connection must survive a caller giving up')
       await pool.dispose()
     })
