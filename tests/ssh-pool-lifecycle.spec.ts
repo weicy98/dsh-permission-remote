@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
 import type { HostConfig } from '../src/config.ts'
-import { remainingBudget, setChannelOpenWindowForTest, setSlotWaitForTest, setSftpRequestWindowForTest, SshFailure, SshPool } from '../src/ssh-pool.ts'
+import { KEEPALIVE_DETECTION_MS, remainingBudget, setChannelOpenWindowForTest, setSlotWaitForTest, setSftpRequestWindowForTest, SshFailure, SshPool, sshConnectOptions } from '../src/ssh-pool.ts'
 
 const host: HostConfig = {
   id: 'host118',
@@ -850,6 +850,128 @@ test('a cached SFTP channel on a dead link reports instead of hanging on keepali
         assert.ok(elapsed < 5_000, `${name} waited ${elapsed}ms; the request ceiling must end it`)
       }
       restore()
+      await pool.dispose()
+    })
+  })
+})
+
+test('the keepalive window is derived from ssh2s formula, not a hand count', () => {
+  // ssh2 does not give up at `interval × countMax`. It pings every interval and
+  // drops the connection only when the unanswered count EXCEEDS countMax, so
+  // the real window is interval × (countMax + 1).
+  //
+  // This constant exists because the number was written out by hand twice and
+  // was wrong both times: countMax = 2 at a 15 s interval is 45 s, not 30 s.
+  const options = sshConnectOptions(host)
+  assert.equal(KEEPALIVE_DETECTION_MS, (options.keepaliveInterval as number) * ((options.keepaliveCountMax as number) + 1))
+  assert.equal(KEEPALIVE_DETECTION_MS, 30_000)
+  // Reaching 30 s by shortening the interval rather than the count keeps two
+  // missed replies tolerable, so a brief blip cannot kill a healthy session.
+  assert.ok((options.keepaliveCountMax as number) >= 2, 'one lost reply must not tear down a connection')
+})
+
+test('a replay that cannot reconnect says so instead of blaming the handshake', async () => {
+  // The first attempt is judged dead by the watchdog, then the reconnect never
+  // comes up. The retry's own error is "did not become ready within 18000 ms",
+  // which on its own reads like the FIRST connect was simply slow. It must name
+  // both facts and stay marked as a dead link.
+  const restore = setChannelOpenWindowForTest(30)
+  let connects = 0
+  try {
+    await withConnect(function (this: Client) {
+      connects += 1
+      // Only the first connection is healthy; the replay's never completes.
+      if (connects === 1) process.nextTick(() => this.emit('ready'))
+      return this
+    }, async () => {
+      await withClientMethod('exec', function (this: Client) {
+        // The channel-open is never answered, so the watchdog fires.
+        return this
+      } as unknown as Client['exec'], async () => {
+        const pool = new SshPool(4)
+        const started = Date.now()
+        await assert.rejects(
+          () => pool.exec(host, {}, 'cmd', 3_000),
+          (error: Error) => {
+            assert.ok(error instanceof SshFailure)
+            assert.equal(error.stage, 'connect')
+            assert.equal(error.connectionDead, true, 'a dead link must stay classifiable after a failed replay')
+            assert.match(error.message, /judged dead/)
+            assert.match(error.message, /replaying also failed/)
+            return true
+          },
+        )
+        const elapsed = Date.now() - started
+        assert.ok(elapsed < 3_500, `the call took ${elapsed}ms for a 3000ms budget`)
+        await pool.dispose()
+      })
+    })
+  } finally {
+    restore()
+  }
+})
+
+test('a caller joining an aborted opening dials its own connection', async () => {
+  // `leave()` aborts the shared opening when its last caller gives up, but the
+  // entry survives until the opening settles. A caller arriving in that window
+  // used to join the cancelled flight and fail with an error of its own making.
+  //
+  // HONEST LIMIT: this case does NOT fail if the guard is removed. The window
+  // is a single microtask wide and the entry is normally gone before a later
+  // caller can observe it, so the assertion below is a guard against a
+  // regression that widens the window, not a reproduction of the original
+  // race. It is kept because it also pins the sharing behaviour that the guard
+  // must not break.
+  let connects = 0
+  await withConnect(function (this: Client) {
+    connects += 1
+    // Slow enough that the abort lands mid-handshake.
+    setTimeout(() => this.emit('ready'), 300)
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      process.nextTick(() => {
+        callback(undefined, stream)
+        stream.emit('close', 0)
+      })
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(4)
+      const first = pool.exec(host, {}, 'a', 50).then(() => 'ok', () => 'gave up')
+      // Land inside the abort window, after the first caller has left.
+      await new Promise(resolve => setTimeout(resolve, 60))
+      const second = pool.exec(host, {}, 'b', 5_000)
+      assert.equal(await first, 'gave up')
+      const result = await second
+      assert.equal(result.code, 0, 'the later caller must succeed on its own connection')
+      assert.equal(connects, 2, 'it must dial rather than reuse the cancelled flight')
+      await pool.dispose()
+    })
+  })
+})
+
+test('concurrent callers on one host still share a single connection', async () => {
+  // The abort-window guard must not turn every caller into its own dial.
+  let connects = 0
+  await withConnect(function (this: Client) {
+    connects += 1
+    setTimeout(() => this.emit('ready'), 50)
+    return this
+  }, async () => {
+    await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+      const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+      const stream = fakeStream()
+      process.nextTick(() => {
+        callback(undefined, stream)
+        stream.emit('close', 0)
+      })
+      return this
+    } as unknown as Client['exec'], async () => {
+      const pool = new SshPool(4)
+      await Promise.all([1, 2, 3].map(index => pool.exec(host, {}, `c${index}`, 5_000)))
+      assert.equal(connects, 1, 'three concurrent callers must share one dial')
       await pool.dispose()
     })
   })

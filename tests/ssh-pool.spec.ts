@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { StringDecoder } from 'node:string_decoder'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
-import { SshFailure, SshPool, SSH_KEEPALIVE_INTERVAL_MS, exitFields, isByteLimitExceeded, sshConnectOptions, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
+import { SshFailure, SshPool, KEEPALIVE_DETECTION_MS, SSH_KEEPALIVE_INTERVAL_MS, exitFields, isByteLimitExceeded, sshConnectOptions, takeChannelText, truncationMarker } from '../src/ssh-pool.ts'
 
 test('channel text keeps a character split across SSH chunks', () => {
   const decoder = new StringDecoder('utf8')
@@ -55,8 +55,12 @@ test('connect sends SSH keepalives on the shared connection', async () => {
     opsPolicy: 'ask' as const,
   }
   assert.equal(sshConnectOptions(host).keepaliveInterval, SSH_KEEPALIVE_INTERVAL_MS)
-  // ssh2's default count of 3 gives 15s x 4 = 60s before a dead link is noticed.
+  // ssh2 gives up only when unanswered pings EXCEED countMax, so the window is
+  // interval x (countMax + 1). At 10s and 2 that is 30s; the same count at 15s
+  // would be 45s, which is what an earlier comment got wrong.
   assert.equal(sshConnectOptions(host).keepaliveCountMax, 2)
+  assert.equal(sshConnectOptions(host).keepaliveInterval, 10_000)
+  assert.equal(KEEPALIVE_DETECTION_MS, 30_000)
   assert.equal(sshConnectOptions(host).readyTimeout, 20_000)
   const seen: ConnectConfig[] = []
   const original = Client.prototype.connect
@@ -69,7 +73,7 @@ test('connect sends SSH keepalives on the shared connection', async () => {
     const pool = new SshPool(1)
     await assert.rejects(() => pool.exec(host, {}, 'true', 1000), /stopped before the network/)
     assert.equal(seen.length, 1)
-    assert.equal(seen[0]!.keepaliveInterval, 15_000)
+    assert.equal(seen[0]!.keepaliveInterval, 10_000)
     assert.equal(seen[0]!.keepaliveCountMax, 2)
     assert.equal(seen[0]!.host, '10.0.0.5')
     assert.equal(seen[0]!.port, 22)

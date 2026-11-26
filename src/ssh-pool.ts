@@ -19,11 +19,12 @@ const FORWARD_OPEN_TIMEOUT_MS = 10_000
  * A silently dead link (VPN switch, suspended laptop, expired NAT mapping) sends
  * no FIN and no RST: the socket stays ESTABLISHED, `client.exec` never calls
  * back, and the only other signal is SSH keepalive at
- * `SSH_KEEPALIVE_INTERVAL_MS × (keepaliveCountMax + 1)` — a minute of a tool call
- * that looks hung. Answering CHANNEL_OPEN_CONFIRMATION is one round trip plus
- * the server's own scheduling, so ten seconds means the connection is gone
- * rather than slow. Firing here drops the connection so the next attempt dials a
- * fresh one instead of reusing a dead socket.
+ * `KEEPALIVE_DETECTION_MS` (30 s with the shipped keepalive settings) — a
+ * noticeable pause for a tool call that otherwise looks hung. Answering
+ * CHANNEL_OPEN_CONFIRMATION is one round trip plus the server's own scheduling,
+ * so ten seconds means the connection is gone rather than slow. Firing here
+ * drops the connection so the next attempt dials a fresh one instead of reusing
+ * a dead socket.
  */
 export const CHANNEL_OPEN_TIMEOUT_MS = 10_000
 
@@ -270,9 +271,9 @@ export function remainingBudget(deadline: number | undefined, fallbackMs: number
  *
  * The channel is cached per connection, so the channel-open watchdog covers
  * only the first use of a host. A link that dies afterwards leaves every later
- * request hanging until SSH keepalive gives up (15 s × 4 = 60 s), which is what
- * made `read`, the file tree and the directory picker look frozen while the
- * connection was already gone.
+ * request hanging until SSH keepalive gives up (`KEEPALIVE_DETECTION_MS`, 30 s),
+ * which is what made `read`, the file tree and the directory picker look frozen
+ * while the connection was already gone.
  *
  * A metadata request is one round trip. Ten seconds is generous for that and
  * still an order of magnitude better than keepalive; a transfer's own bytes are
@@ -381,14 +382,31 @@ export interface SecretMaterial {
 /**
  * SSH-level keepalive for connections that stay open for hours.
  *
- * ssh2's default count is 3, which with a 15 s interval meant a dead link went
- * unnoticed for 15 s × (3 + 1) = 60 s. A count of 2 halves that to 30 s without
- * costing anything on a healthy link: a keepalive reply is one tiny packet.
+ * ssh2 does not report a dead link at `interval × countMax`: it pings on every
+ * interval and only gives up when the count of unanswered pings EXCEEDS
+ * `keepaliveCountMax`, so the window is `interval × (keepaliveCountMax + 1)`.
+ *
+ * The shipped values are 10 s and 2, which gives 10 × 3 = 30 s. Both numbers
+ * matter: shortening the interval reaches 30 s without dropping to a count of
+ * 1, which would let a single lost keepalive reply (a brief blip, a busy
+ * server) tear down a healthy connection. The cost is one ~50-byte ping per
+ * 10 s, about 422 KiB/day per connection.
+ *
+ * Kept in one place because a comment that computes this by hand has already
+ * been wrong twice: `countMax = 2` at 15 s is 45 s, not 30 s.
  */
-export const SSH_KEEPALIVE_INTERVAL_MS = 15_000
+export const SSH_KEEPALIVE_INTERVAL_MS = 10_000
 
-/** Unanswered keepalives before ssh2 drops the connection (default is 3). */
+/** Unanswered keepalives before ssh2 drops the connection (its default is 3). */
 export const SSH_KEEPALIVE_COUNT_MAX = 2
+
+/**
+ * How long ssh2 tolerates a silent peer: `interval × (countMax + 1)`.
+ *
+ * Derived rather than written out, so a change to either constant cannot leave
+ * a stale number in the docs or in an error message.
+ */
+export const KEEPALIVE_DETECTION_MS = SSH_KEEPALIVE_INTERVAL_MS * (SSH_KEEPALIVE_COUNT_MAX + 1)
 
 export function sshConnectOptions(host: HostConfig): ConnectConfig {
   return {
@@ -553,6 +571,29 @@ export function isRetryableOpenFailure(error: unknown): boolean {
   if (!(error instanceof SshFailure) || error.stage !== 'exec') return false
   if (error.connectionDead === true) return true
   return /no response from server|not connected|connection lost/i.test(error.message)
+}
+
+/**
+ * Describe a failed replay as what it is: a dead link plus an unusable retry.
+ *
+ * The retry's own error is usually a plain connect failure ("did not become
+ * ready within N ms"), which on its own reads like the FIRST attempt was slow.
+ * The caller already knows the first attempt was judged dead, so the combined
+ * message has to carry both facts, and it must stay marked `connectionDead` so
+ * a caller can classify it as a network fault rather than a command timeout.
+ */
+function replayFailure(first: unknown, retry: unknown): SshFailure {
+  const firstText = first instanceof Error ? first.message : String(first)
+  const retryText = retry instanceof Error ? retry.message : String(retry)
+  // The first attempt was already judged dead (that is why we replayed), so the
+  // combined failure is always a dead-link failure.
+  return new SshFailure(
+    `the SSH connection was judged dead (${firstText}); reconnecting and replaying also failed (${retryText})`,
+    'connect',
+    undefined,
+    undefined,
+    true,
+  )
 }
 
 interface SftpSession {
@@ -797,8 +838,17 @@ export class SshPool {
       // budget after it instead of charging the retry the pre-drop remainder.
       await this.dropSession(host.id)
       if (deadline !== undefined && Date.now() >= deadline) throw error
-      const retried = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput, deadline)
-      return retried.done
+      try {
+        const retried = await this.open(host, secret, command, timeoutMs, signal, stdin, onOutput, deadline)
+        return await retried.done
+      } catch (retryError) {
+        // A retry that never got a connection would otherwise surface as
+        // "did not become ready within 18000 ms", which reads like a handshake
+        // that was slow from the start. It was not: the first connection was
+        // already judged dead and this one never came up. Say so, and keep the
+        // dead-link marker so callers can tell a network fault from a timeout.
+        throw replayFailure(error, retryError)
+      }
     }
   }
 
@@ -1561,6 +1611,17 @@ export class SshPool {
   private acquire(host: HostConfig, secret: SecretMaterial, requireTrust: boolean, signal?: AbortSignal, queueWaitMs?: number, deadline?: number): Promise<Live> {
     if (this.disposed) return Promise.reject(new SshFailure('SSH pool is disposed', 'connect'))
     let state = this.openings.get(host.id)
+    // An aborted opening is dead on arrival: `leave()` aborts it when its last
+    // caller gives up, but the entry is only removed once the opening settles
+    // (`forgetOpening` needs `settled`). A caller arriving in that window would
+    // otherwise join a cancelled connect and fail for no reason of its own.
+    //
+    // The cached promise has to go too: `claimPending` keys it by host id, so
+    // leaving it would hand the next caller that same rejected flight.
+    if (state !== undefined && state.controller.signal.aborted) {
+      state = undefined
+      this.live.delete(host.id)
+    }
     if (state === undefined) {
       state = { waiters: 0, settled: false, controller: new AbortController(), reserved: false }
       this.openings.set(host.id, state)
