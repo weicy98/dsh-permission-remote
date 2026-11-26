@@ -2311,6 +2311,12 @@ function openSftp(client: Client, onFatal?: () => void, onDeadLink?: () => void,
   })
 }
 
+/**
+ * Four call sites reach this through `void closeLive(live)` from a dead-link
+ * handler, where nothing observes a rejection. The function must therefore
+ * never reject: dsh treats an unhandled rejection as fatal and exits, which
+ * would take every other host in the pool down with the one dead link.
+ */
 async function closeLive(live: Live): Promise<void> {
   try {
     const session = await live.sftp
@@ -2318,7 +2324,12 @@ async function closeLive(live: Live): Promise<void> {
   } catch {
     // Opening SFTP failed; the client close still releases the session slot.
   }
-  live.client.end()
+  try {
+    live.client.end()
+  } catch {
+    // The socket was already destroyed, or the transport threw while
+    // unwinding. The slot was released by `markDead` in every caller.
+  }
 }
 
 /**

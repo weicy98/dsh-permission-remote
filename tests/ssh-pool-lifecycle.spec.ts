@@ -555,6 +555,48 @@ test('a channel-open that is never answered means the link is dead', async () =>
   }
 })
 
+test('a dead link whose socket close throws still leaves no unhandled rejection', async () => {
+  // Every dead-link verdict calls `void closeLive(live)` from a `close`/`error`
+  // handler, so nothing observes a rejection there. A transport that throws out
+  // of `client.end()` must not turn one dead host into a fatal process error
+  // for the whole session.
+  const restore = setChannelOpenWindowForTest(60)
+  try {
+    let connects = 0
+    const rejections = await trackUnhandled(async () => {
+      await withConnect(function (this: Client) {
+        connects += 1
+        process.nextTick(() => this.emit('ready'))
+        return this
+      }, async () => {
+        await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
+          const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
+          if (connects === 1) return this
+          const stream = fakeStream()
+          process.nextTick(() => {
+            callback(undefined, stream)
+            stream.emit('close', 0)
+          })
+          return this
+        } as unknown as Client['exec'], async () => {
+          await withClientMethod('end', function (this: Client) {
+            throw new Error('socket already destroyed')
+          } as unknown as Client['end'], async () => {
+            const pool = new SshPool(4)
+            const result = await pool.exec(host, {}, 'echo hi', 60_000)
+            assert.equal(result.code, 0, 'the command still runs on the replacement connection')
+            await new Promise(resolve => setTimeout(resolve, 40))
+            await pool.dispose()
+          })
+        })
+      })
+    })
+    assert.deepEqual(rejections, [], 'closing a dead connection must not reject into an unhandled rejection')
+  } finally {
+    restore()
+  }
+})
+
 test('a dead link releases its connection slot so later calls are not stuck', async () => {
   // The dead connection holds a slot until something closes it. Detecting the
   // dead link has to return that slot, or the pool starves exactly when the
