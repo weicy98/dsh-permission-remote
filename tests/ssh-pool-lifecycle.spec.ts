@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events'
 import test from 'node:test'
 import { Client, type ConnectConfig } from '../src/ssh2-client.ts'
 import type { HostConfig } from '../src/config.ts'
-import { SshFailure, SshPool, setChannelOpenWindowForTest, setSlotWaitForTest } from '../src/ssh-pool.ts'
+import { remainingBudget, setChannelOpenWindowForTest, setSlotWaitForTest, setSftpRequestWindowForTest, SshFailure, SshPool } from '../src/ssh-pool.ts'
 
 const host: HostConfig = {
   id: 'host118',
@@ -591,47 +591,60 @@ test('a dead link releases its connection slot so later calls are not stuck', as
   }
 })
 
-test('a queued command and its own run share one budget', async () => {
+test('the command timer receives what is left, not a fresh timeoutMs', async () => {
   // `open()` used to hand the same `timeoutMs` to both `acquire()` and
-  // `openChannel()`, so a caller that spent 150 ms queueing still got a full
-  // 300 ms to run: a 300 ms budget took 453 ms in practice.
+  // `openChannel()`, so time already spent queueing or handshaking was charged
+  // AGAIN to the command: a 300 ms budget took 453 ms in practice.
+  //
+  // Total elapsed time alone cannot see this — a queue timeout of the same
+  // length ends the call first, which is why an earlier version of this case
+  // passed even with the fix reverted. The handshake delay is what makes the
+  // two behaviours distinguishable: 500 ms budget minus 200 ms handshake must
+  // leave 300 ms for the command, so the call ends near 500 ms, not 700 ms.
   let connects = 0
   await withConnect(function (this: Client) {
     connects += 1
-    process.nextTick(() => this.emit('ready'))
+    // The handshake itself consumes part of the caller's budget.
+    setTimeout(() => this.emit('ready'), 200)
     return this
   }, async () => {
     await withClientMethod('exec', function (this: Client, _command: string, ...rest: unknown[]) {
       const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, stream: unknown) => void
-      const stream = fakeStream()
-      // The command takes 400 ms: more than what is left of a 300 ms budget
-      // once 150 ms of queueing is charged.
-      process.nextTick(() => {
-        callback(undefined, stream)
-        setTimeout(() => stream.emit('close', 0), 400)
+      const stream = Object.assign(fakeStream(), {
+        // Answer the timeout path the way a real channel does, so the reading
+        // is the command timer rather than the pool's 2 s fallback.
+        signal: (_name: string, done: () => void) => {
+          done()
+          setImmediate(() => stream.emit('close', null, 'KILL'))
+        },
+        close: () => { setImmediate(() => stream.emit('close', null, 'KILL')) },
       })
+      process.nextTick(() => callback(undefined, stream))
       return this
     } as unknown as Client['exec'], async () => {
-      const pool = new SshPool(1)
-      const blocker = { ...host, id: 'blocker' }
-      const target = { ...host, id: 'target' }
-      const held = pool.exec(blocker, {}, 'hold', 10_000).catch(() => undefined)
-      void connects
-      await new Promise(resolve => setTimeout(resolve, 150))
+      const pool = new SshPool(4)
       const started = Date.now()
-      const settled = await pool.exec(target, {}, 'cmd', 300).then(
-        () => 'returned',
-        (error: Error) => error.message,
-      )
+      const result = await pool.exec(host, {}, 'cmd', 500)
       const elapsed = Date.now() - started
-      // Either the queue ate the budget (no slot message) or the command was cut
-      // off; either way the caller must not wait a second full 300 ms.
-      assert.ok(elapsed < 400, `${settled}: the whole call took ${elapsed}ms for a 300ms budget`)
-      pool.invalidate(blocker.id)
-      void held
+      void connects
+      assert.equal(result.timedOut, true, 'the command must run out of budget')
+      assert.ok(
+        elapsed < 620,
+        `the call took ${elapsed}ms: a 500ms budget minus a 200ms handshake must leave 300ms for the command`,
+      )
       await pool.dispose()
     })
   })
+})
+
+test('remainingBudget clamps instead of returning a negative delay', () => {
+  // Node treats a negative setTimeout delay as 0, and the clamp keeps the
+  // reported number meaningful in the error message and in the watchdog.
+  const now = Date.now()
+  assert.equal(remainingBudget(undefined, 400), 400, 'no deadline keeps the caller value')
+  assert.equal(remainingBudget(undefined, 0), 0, 'a 0 timeout stays 0 (no deadline)')
+  assert.equal(remainingBudget(now + 250, 400), 250, 'an absolute budget wins over the nominal timeout')
+  assert.equal(remainingBudget(now - 10, 400), 1, 'an elapsed budget is the smallest positive delay')
 })
 
 test('a command cut short by its own timeout is not a dead link', async () => {
@@ -769,11 +782,37 @@ test('a cached SFTP channel on a dead link reports instead of hanging on keepali
       const callback = rest.find(item => typeof item === 'function') as (error: Error | undefined, sftp: unknown) => void
       const sftp = Object.assign(new EventEmitter(), {
         end: () => undefined,
+        // Every request is silently dropped once `answer` flips: that is what a
+        // dead link looks like at this layer.
         stat: (_path: string, done: (error: Error | undefined, stats: unknown) => void) => {
-          // The link is dead: the request is never answered.
           if (!answer) return
-          done(undefined, { size: 0, mode: 0o644, isDirectory: () => false })
+          done(undefined, { size: 4, mode: 0o644, isDirectory: () => false })
         },
+        readdir: (_path: string, done: (error: Error | undefined, list: unknown[]) => void) => {
+          if (!answer) return
+          done(undefined, [])
+        },
+        realpath: (_path: string, done: (error: Error | undefined, resolved: string) => void) => {
+          if (!answer) return
+          done(undefined, '/etc/hostname')
+        },
+        readFile: (_path: string, done: (error: Error | undefined, data: Buffer) => void) => {
+          if (!answer) return
+          done(undefined, Buffer.from('body'))
+        },
+        writeFile: (_path: string, _body: Buffer | string, done: (error: Error | undefined) => void) => {
+          if (!answer) return
+          done(undefined)
+        },
+        open: (_path: string, _flags: string, done: (error: Error | undefined, handle: Buffer) => void) => {
+          if (!answer) return
+          done(undefined, Buffer.from('handle'))
+        },
+        read: (_handle: Buffer, buffer: Buffer, _offset: number, length: number, _position: number, done: (error: Error | undefined, bytesRead: number) => void) => {
+          if (!answer) return
+          done(undefined, length)
+        },
+        close: (_handle: Buffer, done: (error: Error | undefined) => void) => done(undefined),
       })
       process.nextTick(() => {
         sftp.emit('ready')
@@ -782,16 +821,35 @@ test('a cached SFTP channel on a dead link reports instead of hanging on keepali
       return this
     } as unknown as Client['sftp'], async () => {
       const pool = new SshPool(2)
+      const restore = setSftpRequestWindowForTest(60)
       // First request opens and caches the channel.
       await pool.sftpStat(host, {}, '/etc/hostname')
       answer = false
-      const started = Date.now()
-      await assert.rejects(
-        () => pool.sftpStat(host, {}, '/etc/hostname'),
-        (error: Error) => error instanceof SshFailure && /did not answer within/.test(error.message),
-      )
-      const elapsed = Date.now() - started
-      assert.ok(elapsed < 15_000, `the cached channel waited ${elapsed}ms; keepalive alone is 60s`)
+      // Every operation that reuses the cached channel must report. Covering
+      // only `stat` is what let the first version of this fix miss `read` and
+      // `write` — the `read` tool's own path — which still hung forever.
+      const operations: Array<[string, () => Promise<unknown>]> = [
+        ['stat', () => pool.sftpStat(host, {}, '/etc/hostname')],
+        ['list', () => pool.sftpList(host, {}, '/etc')],
+        ['realpath', () => pool.sftpRealpath(host, {}, '.')],
+        ['read', () => pool.sftpRead(host, {}, '/etc/hostname')],
+        ['read+capped', () => pool.sftpRead(host, {}, '/etc/hostname', 1024)],
+        ['write', () => pool.sftpWrite(host, {}, '/tmp/x', 'body')],
+        ['readChunks', async () => { for await (const _chunk of pool.sftpReadChunks(host, {}, '/etc/hostname')) { /* drain */ } }],
+        // A cancel-only signal is not a deadline: the `read` tool passes one.
+        ['read+signal', () => pool.sftpRead(host, {}, '/etc/hostname', undefined, new AbortController().signal)],
+      ]
+      for (const [name, operation] of operations) {
+        const started = Date.now()
+        await assert.rejects(
+          operation,
+          (error: Error) => error instanceof SshFailure && /did not answer within/.test(error.message),
+          `${name} must report on a dead cached channel`,
+        )
+        const elapsed = Date.now() - started
+        assert.ok(elapsed < 5_000, `${name} waited ${elapsed}ms; the request ceiling must end it`)
+      }
+      restore()
       await pool.dispose()
     })
   })

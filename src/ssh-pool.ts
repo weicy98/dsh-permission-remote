@@ -260,7 +260,7 @@ function openWatchdog(callback: (waitedMs: number) => void): { settle(): void } 
  * that is already out of time still schedules its timer and settles at once
  * rather than firing immediately with a confusing 1 ms reading.
  */
-function remainingBudget(deadline: number | undefined, fallbackMs: number): number {
+export function remainingBudget(deadline: number | undefined, fallbackMs: number): number {
   if (deadline === undefined) return fallbackMs
   return Math.max(1, deadline - Date.now())
 }
@@ -282,6 +282,20 @@ function remainingBudget(deadline: number | undefined, fallbackMs: number): numb
 export const SFTP_REQUEST_TIMEOUT_MS = 10_000
 
 /**
+ * The window {@link boundedSftpRequest} actually uses. Tests shorten it so a
+ * case covering every cached-channel operation does not spend a minute of
+ * wall-clock waiting for the ceiling it is asserting.
+ */
+let sftpRequestWindowMs = SFTP_REQUEST_TIMEOUT_MS
+
+/** Shorten the per-request window for one test, returning the previous value. */
+export function setSftpRequestWindowForTest(ms: number): () => void {
+  const previous = sftpRequestWindowMs
+  sftpRequestWindowMs = ms > 0 ? ms : SFTP_REQUEST_TIMEOUT_MS
+  return () => { sftpRequestWindowMs = previous }
+}
+
+/**
  * Bound one SFTP request, reporting a dead link rather than a slow server.
  *
  * The underlying request cannot be cancelled (SFTP v3 has no cancellation), so
@@ -289,7 +303,13 @@ export const SFTP_REQUEST_TIMEOUT_MS = 10_000
  * alone here: only the channel-open watchdog decides that a link is dead, and
  * this request timing out is one caller's budget, not proof about the host.
  */
-function boundedSftpRequest<T>(work: Promise<T>, stage: string, timeoutMs = SFTP_REQUEST_TIMEOUT_MS): Promise<T> {
+function boundedSftpRequest<T>(work: Promise<T>, stage: string, timeoutMs = sftpRequestWindowMs): Promise<T> {
+  // `0` means "no ceiling here": the caller bounded this work some other way
+  // (its own abort signal, or a transfer deadline).
+  if (!(timeoutMs > 0)) {
+    work.catch(() => undefined)
+    return work
+  }
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<T>((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -1144,8 +1164,14 @@ export class SshPool {
   async sftpRead(host: HostConfig, secret: SecretMaterial, remotePath: string, maxBytes?: number, signal?: AbortSignal): Promise<Buffer> {
     if (signal?.aborted) throw new SshFailure('sftp read aborted', 'sftp-read')
     const session = await this.sftp(host, secret, signal)
+    // A whole-file read is the `read` tool's main path, and the SFTP channel is
+    // cached, so nothing else bounds it once the link dies: it would wait for
+    // keepalive (60 s) and report nothing useful.
+    //
+    // A caller's `signal` is not a deadline — the `read` tool passes one that
+    // only fires on cancel — so the request bound applies either way.
     if (maxBytes !== undefined) {
-      const size = await statSize(session, remotePath)
+      const size = await boundedSftpRequest(statSize(session, remotePath), 'sftp-read')
       if (size > maxBytes) throw new SshFailure(`file is ${size} bytes, over the ${maxBytes} byte limit`, 'sftp-read', undefined, true)
       // Enforce the cap on the bytes actually read too: the size above is only
       // the pre-read stat, and a file that grows afterwards must not be pulled
@@ -1156,7 +1182,7 @@ export class SshPool {
     // without a byte cap. Use the chunked path with no practical cap rather
     // than the eager readFile helper, which cannot observe an abort.
     if (signal !== undefined) return readAllCapped(session, remotePath, Number.MAX_SAFE_INTEGER, signal)
-    return readAll(session, remotePath)
+    return boundedSftpRequest(readAll(session, remotePath), 'sftp-read')
   }
 
   /**
@@ -1252,7 +1278,7 @@ export class SshPool {
 
   async sftpWrite(host: HostConfig, secret: SecretMaterial, remotePath: string, body: Buffer | string): Promise<void> {
     const session = await this.sftp(host, secret)
-    await writeAll(session, remotePath, body)
+    await boundedSftpRequest(writeAll(session, remotePath, body), 'sftp-write')
   }
 
   async sftpRename(host: HostConfig, secret: SecretMaterial, fromPath: string, toPath: string): Promise<void> {
@@ -1505,7 +1531,7 @@ export class SshPool {
   /** One byte window. A short reply is read again until the window is full or a read returns nothing. */
   async sftpReadAt(host: HostConfig, secret: SecretMaterial, remotePath: string, offset: number, length: number): Promise<Buffer> {
     const session = await this.sftp(host, secret)
-    return readOpenRange(session, remotePath, offset, length)
+    return boundedSftpRequest(readOpenRange(session, remotePath, offset, length), 'sftp-read')
   }
 
   /** Chunks from one open handle. Stopping the generator closes the handle. */
@@ -1849,13 +1875,11 @@ function execPty(client: Client, request: PtyRequest, onDeadLink?: () => void, s
       if (settled) return false
       settled = true
       watchdog?.settle()
-      clearTimeout(abortTimer)
       detach()
       return true
     }
     // Cancelling before the server confirms must not leave the caller waiting
     // for the watchdog window: a closed terminal tab should return at once.
-    let abortTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
       if (!settle()) return
       reject(new SshFailure('pty allocation aborted', 'pty'))
@@ -2838,7 +2862,19 @@ export async function streamLocalToSftp(
  * reads are dropped and the window re-anchors on the byte actually reached.
  */
 export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal?: AbortSignal): AsyncGenerator<Buffer> {
-  const opening = openRead(sftp, remotePath)
+  // The SFTP channel is cached and a stream can be long, so no single ceiling
+  // can cover the whole file. What must still be bounded is ONE request going
+  // unanswered: on a dead link that is the difference between reporting in ten
+  // seconds and waiting for keepalive (60 s) with nothing to show.
+  //
+  // This applies whether or not the caller passed a signal. A signal is a
+  // cancellation channel, not a deadline: the `read` tool passes its own
+  // `exec.signal`, which only fires when the operator cancels, so treating
+  // "has a signal" as "is bounded" would leave the common case unbounded.
+  // Per-request bounds compose safely with a slow-but-working transfer, because
+  // each request is answered long before ten seconds even at 1 MiB/s.
+  const bound = <T>(work: Promise<T>, stage: string): Promise<T> => boundedSftpRequest(work, stage)
+  const opening = bound(openRead(sftp, remotePath), 'sftp-read')
   let handle: Buffer
   try {
     handle = await raceAbort(opening, signal)
@@ -2878,7 +2914,7 @@ export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal
     return work
   }
   const issue = (): void => {
-    queued.push(track(raceAbort(readAt(sftp, handle, issueAt, chunkBytes), signal)))
+    queued.push(track(raceAbort(bound(readAt(sftp, handle, issueAt, chunkBytes), 'sftp-read'), signal)))
     issueAt += chunkBytes
   }
   const refill = (): void => {
@@ -2907,6 +2943,6 @@ export async function* readOpenChunks(sftp: SftpLike, remotePath: string, signal
     // close below fails them at the protocol layer, and this keeps that
     // failure from surfacing as an unhandled rejection.
     for (const dropped of queued.splice(0)) dropped.catch(() => undefined)
-    await settleWithin(closeHandle(sftp, handle))
+    await settleWithin(bound(closeHandle(sftp, handle), 'sftp-read'))
   }
 }
